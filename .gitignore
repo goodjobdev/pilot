@@ -1,0 +1,15 @@
+# Operational records: deployment identifiers, hostnames and progress logs.
+# Kept on the machine, never published.
+operations/
+
+node_modules/
+dist/
+.env
+.env.*
+!.env.example
+.data/
+playwright-report/
+test-results/
+*.log
+
+.DS_Store

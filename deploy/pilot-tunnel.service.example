@@ -1,0 +1,16 @@
+[Unit]
+Description=Pilot tunnel
+After=network-online.target project-dashboard.service
+Wants=network-online.target project-dashboard.service
+
+[Service]
+Type=simple
+ExecStart=%h/apps/pilot/tools/cloudflared/2026.10.0/cloudflared tunnel --no-autoupdate --metrics 127.0.0.1:4318 run --token-file %h/.config/pilot/tunnel-token
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+UMask=0077
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

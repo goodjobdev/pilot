@@ -1,0 +1,19 @@
+[Unit]
+Description=Pilot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/apps/pilot/current
+EnvironmentFile=%h/.config/pilot/environment
+# Lucky's inventoried unprivileged runtime; adjust for another host.
+ExecStart=%h/.local/nodejs/bin/node %h/apps/pilot/current/dist/server.mjs
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=60
+UMask=0077
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

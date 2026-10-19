@@ -1,0 +1,10 @@
+# Merge a dedicated ingress into the approved named tunnel; do not replace
+# existing routes or print credential JSON. Create Access policy BEFORE routing.
+tunnel: EXISTING_OR_DEDICATED_TUNNEL_ID
+credentials-file: /approved/private/path/credentials.json
+ingress:
+  - hostname: dashboard.YOUR_DOMAIN
+    service: http://127.0.0.1:4317
+    originRequest:
+      httpHostHeader: dashboard.YOUR_DOMAIN
+  - service: http_status:404

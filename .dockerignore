@@ -1,0 +1,20 @@
+# Keep the container build context small and free of local state.
+# The pilot Dockerfile copies only package.json, pnpm-lock.yaml and dist.
+node_modules
+.git
+.github
+src
+tests
+scripts
+docs
+deploy
+!deploy/pilot/Dockerfile
+test-results
+playwright-report
+.env
+.env.*
+deploy/pilot/.env*
+deploy/pilot/tunnel-token
+.pnpm-store
+*.tar.gz
+.DS_Store
