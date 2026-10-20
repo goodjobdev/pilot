@@ -3,10 +3,32 @@ import type { DocEntry,DocSnapshot } from '../shared/docs';
 import type { AgentView } from '../shared/agent';
 const token=document.querySelector<HTMLMetaElement>('meta[name="dashboard-token"]')?.content??'';
 let csrf='';
-export class ApiError extends Error {constructor(public status:number,message:string){super(message);}}
+export type ApiErrorKind = 'http' | 'session' | 'network';
+export class ApiError extends Error {constructor(public status:number,message:string,public kind:ApiErrorKind='http'){super(message);}}
+/** True when the request was answered by the sign-in layer rather than the application. */
+export function isSessionExpired(error:unknown):boolean{return error instanceof ApiError&&error.kind==='session';}
+let onExpiry:(()=>void)|null=null;
+/** Registers a single handler so any request can report an expired session. */
+export function whenSessionExpires(handler:()=>void){onExpiry=handler;}
 export async function request<T>(path:string,method='GET',data?:unknown):Promise<T> {
-  const res=await fetch('/api'+path,{method,headers:{'x-dashboard-token':token,'x-dashboard-csrf':csrf,...(data===undefined?{}:{'content-type':'application/json'})},...(data===undefined?{}:{body:JSON.stringify(data)})});
-  const value=await res.json();if(!res.ok)throw new ApiError(res.status,value.error??'Request failed');return value;
+  let res:Response;
+  try{
+    // A manual redirect matters: an authenticating proxy answers an expired session with a
+    // redirect to its login page, and fetch cannot follow a cross-origin redirect. Without
+    // this the browser reports a network failure and the real cause is invisible.
+    res=await fetch('/api'+path,{method,redirect:'manual',headers:{'x-dashboard-token':token,'x-dashboard-csrf':csrf,...(data===undefined?{}:{'content-type':'application/json'})},...(data===undefined?{}:{body:JSON.stringify(data)})});
+  }catch{
+    throw new ApiError(0,'The server could not be reached. Check your connection and try again.','network');
+  }
+  if(res.type==='opaqueredirect'||res.status===0){
+    onExpiry?.();
+    throw new ApiError(0,'Your sign-in has expired. Reload the page to sign in again, then retry.','session');
+  }
+  let value:any;
+  try{value=await res.json();}
+  catch{throw new ApiError(res.status,'The server returned an unexpected response. Reload the page and try again.','network');}
+  if(!res.ok)throw new ApiError(res.status,value.error??'Request failed');
+  return value as T;
 }
 export async function session(){const data=await request<{csrf?:string}>('/session');csrf=data.csrf??'';}
 export const api={

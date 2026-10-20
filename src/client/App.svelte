@@ -15,7 +15,7 @@
  import DocView from './DocView.svelte';
  import DocEditor from './DocEditor.svelte';
  import AgentsView from './AgentsView.svelte';
- import { api,session,ApiError,download } from './api';
+ import { api,session,ApiError,download,whenSessionExpires } from './api';
  import type { Board,Operation,Project,Snapshot } from '../shared/model';
  import type { DocEntry,DocSnapshot } from '../shared/docs';
  import { newTask } from '../shared/model';
@@ -36,6 +36,7 @@
  let inbox=$state<{path:string;line:number;text:string;anchor:string|null;id:string}[]>([]),focusAnchor=$state<string|null>(null),inboxMenu=$state<HTMLDivElement>();
  let agentQuestions=$state<{id:string;text:string}[]>([]);
  let alertState=$state<AlertState>('off'),alertBusy=$state(false),alertMessage=$state('');
+ let sessionExpired=$state(false);
  let docPathSet=$derived(new Set(docs.map(d=>d.path)));
  let shell=$state<HTMLDivElement>();
  let unlinked=$derived(snapshot?snapshot.board.tasks.filter(t=>t.scope==='active'&&!t.archived&&specState(t,docPathSet)==='unlinked').length:0);
@@ -58,7 +59,21 @@
    document.documentElement.style.setProperty('--header-h',(top>0?top:42)+'px');
  }
  onMount(()=>{const onResize=()=>measureHeader();window.addEventListener('resize',onResize);return()=>window.removeEventListener('resize',onResize);});
- onMount(()=>{void boot();return onAlertNavigation(url=>void followAlert(url));});
+ onMount(()=>{
+   // Any request that meets the sign-in layer instead of the application reports here, and a
+   // periodic probe warns before a form is filled in rather than after it fails.
+   whenSessionExpires(()=>{sessionExpired=true;});
+   const probe=setInterval(()=>{if(document.visibilityState==='visible')void checkSession();},300000);
+   const onVisible=()=>{if(document.visibilityState==='visible')void checkSession();};
+   document.addEventListener('visibilitychange',onVisible);
+   void boot();
+   const stopAlerts=onAlertNavigation(url=>void followAlert(url));
+   return ()=>{clearInterval(probe);document.removeEventListener('visibilitychange',onVisible);stopAlerts();};
+ });
+ async function checkSession(){
+   try{await session();sessionExpired=false;}
+   catch(e){if(e instanceof ApiError&&e.kind==='session')sessionExpired=true;}
+ }
  $effect(()=>{void refreshAlertState();});
  async function refreshAlertState(){
    try{alertState=await readAlertState();}catch{alertState='unsupported';}
@@ -242,6 +257,9 @@
    {/if}
   </div>
  </header>
+ {#if sessionExpired}
+ <div class="error workspace-error" role="alert">Your sign-in has expired. Reload to sign in again; nothing you saved has been lost.<div class="row"><button class="primary" onclick={()=>location.reload()}>Reload and sign in</button></div></div>
+ {/if}
  {#if project}
  {#if error}<div class="error workspace-error" role="alert">{error}<div class="row">{#if failed}<button onclick={exported}>Export unsaved draft</button><button onclick={()=>select(project!)}>Reload & review</button>{:else if !snapshot}<button onclick={locate}>Locate folder</button>{#if missingBoard}<button onclick={initialize}>Confirm & initialize board</button>{/if}{/if}</div></div>{/if}
  <div class="commandbar">

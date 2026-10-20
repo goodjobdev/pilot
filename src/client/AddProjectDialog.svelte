@@ -1,10 +1,10 @@
 <script lang="ts">
  import { onMount } from 'svelte';
- import { api,request } from './api';
+ import { api,request,isSessionExpired } from './api';
  import type { Project } from '../shared/model';
  let { onclose,oncreated }:{onclose:()=>void;oncreated:(p:Project)=>void}=$props();
  let dialog:HTMLDialogElement;
- let name=$state(''),repository=$state(''),managed=$state(true),path=$state(''),error=$state(''),busy=$state(false);
+ let name=$state(''),repository=$state(''),managed=$state(true),path=$state(''),error=$state(''),busy=$state(false),expired=$state(false);
  let preview=$state<{path:string;boardPath:string;detected:string[]}|null>(null);
  let folders=$state<{name:string;path:string}[]>([]),roots=$state<string[]>([]);
  let suggestions=$state<{name:string;path:string;remote:string}[]>([]);
@@ -13,7 +13,7 @@
  async function inspect(){try{preview=await request('/preview','POST',{path});error='';}catch(e){error=(e as Error).message;}}
  async function submit(){
    busy=true;error='';try {const project=await api.register({name:name.trim(),managed,repository,path:managed?undefined:path,confirm:true});oncreated(project);}
-   catch(e){error=(e as Error).message;}finally{busy=false;}
+   catch(e){error=(e as Error).message;expired=isSessionExpired(e);}finally{busy=false;}
  }
 </script>
 <dialog bind:this={dialog} oncancel={onclose}>
@@ -31,7 +31,7 @@
  {#if folders.length}<div class="folder-list">{#each folders as f}<button type="button" onclick={()=>browse(f.path)}>▸ {f.name}</button>{/each}</div>{/if}
  {#if preview}<div class="callout"><strong>Planning file</strong><code>{preview.boardPath}</code><small>Detected: {preview.detected.join(', ')||'No common task documents'}. Original files will not be rewritten.</small></div>{/if}
  {/if}
- {#if error}<p role="alert" class="error">{error}</p>{/if}
+ {#if error}<p role="alert" class="error">{error}{#if expired}<button type="button" class="compact-button" onclick={()=>location.reload()}>Reload and sign in</button>{/if}</p>{/if}
  <footer class="row"><button type="button" onclick={onclose}>Cancel</button><button class="primary" type="submit" disabled={busy||!name.trim()||(!managed&&!preview)}>{busy?'Creating…':'Confirm & add project'}</button></footer>
  </form>
 </dialog>
