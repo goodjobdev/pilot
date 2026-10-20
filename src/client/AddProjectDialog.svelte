@@ -22,7 +22,7 @@
  <form onsubmit={(e)=>{e.preventDefault();void submit();}}>
  <label>Project name<input required maxlength="100" bind:value={name} placeholder="e.g. Runway"></label>
  {#if suggestions.length}<label>Start from workspace inventory<select onchange={(e)=>{const p=suggestions[Number(e.currentTarget.value)];if(p){name=p.name;repository=p.remote;}}}><option value="-1">Choose a suggestion…</option>{#each suggestions as p,i}<option value={i}>{p.name} · {p.path} (source path only)</option>{/each}</select></label>{/if}
- <label>Repository URL <small>(optional, never cloned automatically)</small><input bind:value={repository} placeholder="Descriptive link only"></label>
+ <label>Repository URL <small>(optional · deploy key and worktree setup follows)</small><input bind:value={repository} placeholder="https://github.com/organisation/project.git"></label>
  <div class="segmented"><button type="button" class:active={managed} onclick={()=>managed=true}>Managed workspace</button><button type="button" class:active={!managed} onclick={()=>managed=false}>Existing server folder</button></div>
  {#if managed}<div class="callout">Creates a persistent planning folder on the dashboard server. No code, install, account or Git setup needed. Your board starts empty; import selected documents afterward.</div>
  {:else}

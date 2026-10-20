@@ -22,7 +22,10 @@ Three surfaces over one project's own files, plus derived state that can be rebu
    and app-managed paths are never served or edited. Reads and writes are size-capped.
 4. **The agent harness is the only execution surface.** There is no shell endpoint and no
    general file API. Agent tools resolve their paths through the same containment helper, so a
-   registered project root is the boundary.
+   registered project root is the boundary for the current question/note tools. Repository
+   setup is a separate fixed-operation provisioning path (keygen, access check, clone and
+   worktree): no arbitrary commands, hooks, installs, commits or pushes. See
+   [Project connections](PROJECT-CONNECTIONS.md).
 5. **Everything is behind the same door.** Every route — documents, agents, alerts, assets —
    passes the same authentication, session CSRF, origin and Host checks. There is no bypass
    mode, no anonymous route, and the process binds loopback only.

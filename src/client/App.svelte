@@ -15,6 +15,8 @@
  import DocView from './DocView.svelte';
  import DocEditor from './DocEditor.svelte';
  import AgentsView from './AgentsView.svelte';
+ import ProviderSettings from './ProviderSettings.svelte';
+ import ProjectConnection from './ProjectConnection.svelte';
  import { api,session,ApiError,download,whenSessionExpires } from './api';
  import type { Board,Operation,Project,Snapshot } from '../shared/model';
  import type { DocEntry,DocSnapshot } from '../shared/docs';
@@ -36,7 +38,7 @@
  let inbox=$state<{path:string;line:number;text:string;anchor:string|null;id:string}[]>([]),focusAnchor=$state<string|null>(null),inboxMenu=$state<HTMLDivElement>();
  let agentQuestions=$state<{id:string;text:string}[]>([]);
  let alertState=$state<AlertState>('off'),alertBusy=$state(false),alertMessage=$state('');
- let sessionExpired=$state(false);
+ let sessionExpired=$state(false),providersOpen=$state(false),connectionOpen=$state(false);
  let docPathSet=$derived(new Set(docs.map(d=>d.path)));
  let shell=$state<HTMLDivElement>();
  let unlinked=$derived(snapshot?snapshot.board.tasks.filter(t=>t.scope==='active'&&!t.archived&&specState(t,docPathSet)==='unlinked').length:0);
@@ -135,7 +137,8 @@
    try{const filters=JSON.parse(localStorage.getItem('dashboard.filters.'+p.id)??'null');if(filters){search=filters.search??'';domain=filters.domain??'all';status=filters.status??'all';scope=filters.scope??'all';view=window.innerWidth<750?'List':filters.view??'Dependencies';}else{search='';domain='all';status='all';scope='all';}}catch{/* defaults */}
    try{const v=await api.board(p.id);if(project?.id===p.id)snapshot=v;}catch(e){if(project?.id===p.id){error=(e as Error).message;missingBoard=e instanceof ApiError&&e.status===404;}}finally{loading=false;void loadDocs();void loadInbox();}
  }
- async function created(p:Project){adding=false;projects=await api.projects();await select(p);}
+ async function created(p:Project){adding=false;projects=await api.projects();await select(p);if(p.repository)connectionOpen=true;}
+ async function connected(){const id=project?.id;projects=await api.projects();const p=projects.find(p=>p.id===id);if(p)await select(p);}
  async function initialize(){if(!project)return;try{snapshot=await api.initialize(project.id);error='';missingBoard=false;}catch(e){error=(e as Error).message;}}
  async function remove(){if(!project||!leave()||!confirm('Unregister this project? Planning files will NOT be deleted.'))return;try{await api.remove(project.id);projects=await api.projects();project=null;snapshot=null;if(projects[0])await select(projects[0]);}catch(e){error=(e as Error).message;}}
  async function locate(){if(!project)return;const path=prompt('Approved folder on the dashboard server',project.path);if(!path)return;try{await api.relocate(project.id,path);projects=await api.projects();await select(projects.find(p=>p.id===project!.id)!);}catch(e){error=(e as Error).message;}}
@@ -230,12 +233,14 @@
   <div class="workspace-identity"><span class="workspace-prefix">WORKSPACE /</span><h1>{project?.name??'Pilot'}</h1></div>
   {#if project}<span class="authority-badge" class:adopted={snapshot?.board.adoption==='adopted'} title={snapshot?.board.adoption==='adopted'?'Adopted task planning; original specs/evidence remain authoritative.':'Original documents remain authoritative. This board is a planning mirror.'}>{snapshot?.board.adoption==='adopted'?'Adopted board':'Planning mirror'}</span>{/if}
   <div class="appbar-end">
+   <button class="icon-button" aria-label="Providers & models" title="Providers & models" onclick={()=>providersOpen=true}><Icon name="settings"/></button>
    <button class="icon-button" onclick={()=>theme=theme==='dark'?'light':'dark'} aria-label="Toggle theme" title="Toggle light / dark theme"><Icon name={theme==='dark'?'sun':'moon'}/></button>
    {#if project}
    <div class="popover actions-popover" bind:this={actionsMenu}>
     <button class="icon-button" aria-label="Board actions" title="Board actions" aria-expanded={actionsOpen} aria-controls="board-commands" onclick={()=>{actionsOpen=!actionsOpen;filtersOpen=false;}}><Icon name="more"/></button>
     <div id="board-commands" hidden={!actionsOpen} class="popover-panel action-list" role="group" aria-label="Board actions">
-     <span class="popover-heading">BOARD COMMANDS</span>
+     <span class="popover-heading">PROJECT & BOARD</span>
+     <button onclick={()=>command(()=>connectionOpen=true)}><Icon name="shield"/>Repository & deploy key</button>
      <button disabled={!snapshot||saving||failed||inspectorDirty} onclick={()=>command(()=>importing=true)}><Icon name="import"/>Import documents</button>
      <button disabled={!snapshot||saving||failed||inspectorDirty} onclick={()=>command(()=>settings=true)}><Icon name="settings"/>Areas & milestones</button>
      <button disabled={!snapshot} onclick={()=>command(exported)}><Icon name="export"/>Export board</button>
@@ -292,7 +297,7 @@
   <span class="wiki-hint">Documentation is the source of work: write the intent, then link the work to it.</span>
   <div class="commandbar-end"><button class="compact-button wiki-tree-toggle" aria-label="Show documents" onclick={()=>treeOpen=true}><Icon name="book" size={14}/><span>Documents</span></button></div>
   {:else}
-  <span class="wiki-hint">Scripted test provider: replies are deterministic and no model is called. Put [pause] in a message to hold the run open while you steer or stop it.</span>
+  <span class="wiki-hint">Choose a model per session. Real calls require provider credentials and explicit opt-in in settings.</span>
   {/if}
  </div>
  <div class="view-area">
@@ -330,7 +335,7 @@
   <span class="save-indicator" class:dirty={docConflict||docDirty} role="status">{docConflict?'Conflict':docDirty?'Unapplied edits':docMessage||'Saved'}</span>
  {:else if view==='Agents'}
   <span class="file-state">Agent harness · one durable SQLite session per project</span>
-  <span class="save-indicator" role="status">Scripted provider</span>
+  <span class="save-indicator" role="status">Durable session</span>
  {:else}
   <span class="file-state">Persistent markdown · {snapshot?.board.tasks.length??0} tasks · {visible.length} matching</span>
   <div class="readiness-summary" title="Task checkpoints, not whole-project acceptance"><span><i class="indicator ready"></i>{ready} ready</span><span><i class="indicator doing"></i>{doing} in progress</span><span><i class="indicator waiting"></i>{waiting} waiting</span><span>{done} complete</span></div>
@@ -343,3 +348,5 @@
 {#if settings&&snapshot}<BoardSettings board={snapshot.board} onclose={()=>settings=false} onoperation={mutate}/>{/if}
 {#if importing&&project}<ImportReview projectId={project.id} onclose={()=>importing=false} onapplied={imported}/>{/if}
 {#if adding}<AddProjectDialog onclose={()=>adding=false} oncreated={created}/>{/if}
+{#if providersOpen}<ProviderSettings onclose={()=>providersOpen=false}/>{/if}
+{#if connectionOpen&&project}<ProjectConnection {project} onclose={()=>connectionOpen=false} onconnected={()=>void connected()}/>{/if}

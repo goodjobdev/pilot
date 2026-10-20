@@ -88,7 +88,6 @@ export function agentEntryView(entry: unknown): AgentEntry | null {
   const messages = Array.isArray(record.model) ? (record.model as Record<string, unknown>[]) : [];
   const last = messages.at(-1) ?? {};
   const content = last.content;
-  const usage = last.usage as { input?: number; output?: number } | undefined;
   const data = record.data && typeof record.data === 'object' ? (record.data as Record<string, unknown>) : null;
   // A custom entry carries its text in data rather than in provider messages.
   const customText = data && typeof data.text === 'string' ? data.text : '';
@@ -101,7 +100,7 @@ export function agentEntryView(entry: unknown): AgentEntry | null {
     thinking: thinkingOf(content),
     tools: toolsOf(content),
     stopReason: typeof last.stopReason === 'string' ? last.stopReason : null,
-    error: (usage && typeof (usage as { errorMessage?: string }).errorMessage === 'string' ? (usage as { errorMessage: string }).errorMessage : null),
+    error: typeof last.errorMessage==='string'?last.errorMessage:null,
     data
   };
 }

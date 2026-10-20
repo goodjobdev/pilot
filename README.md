@@ -16,6 +16,11 @@ place, reachable from your phone, with the repositories still owning the truth.
   live transcript, steering, stopping, and questions the agent asks that you answer once.
   A run that dies mid-tool resumes from its last checkpoint, and a tool that may have
   partially run is reported as interrupted rather than repeated.
+- **Repository connections.** Generate a project deploy key in the UI and explicitly connect
+  an isolated review worktree; no automatic installs, commits or pushes.
+- **Providers and models.** Add API keys or sign in from settings, pick a default for new
+  sessions, and star favourites so they appear first. The scripted provider remains the free
+  initial default; real calls require explicit opt-in.
 - **Phone alerts.** Web Push for questions, finished runs and failures, with a link that
   opens the exact project.
 - **A planning board.** The dependency canvas, milestone timeline and task list this app
@@ -96,9 +101,14 @@ session recorded.
   the application refuses to start until an operator confirms no writer remains and clears
   it — fail-closed, but with `restart: unless-stopped` that means a crash-loop until someone
   intervenes.
-- **The shipped agent provider is a scripted local stand-in.** It makes the whole path
-  testable and free; it is not a model. [docs/PROVIDER-SIGNIN.md](docs/PROVIDER-SIGNIN.md)
-  sets out what adopting a real provider takes.
+- **The default provider is a scripted local stand-in.** Real provider adapters are available
+  through [Providers & models](docs/PROVIDER-SIGNIN.md); credentials and live sign-in are the
+  owner's responsibility. Tests use synthetic providers, not billed acceptance calls. Agent
+  tools are still question/note operations, not a complete coding toolchain.
+- **Uncommitted code is not a GitHub backup.** Repository worktrees and deployment keys are
+  described in [Project connections](docs/PROJECT-CONNECTIONS.md). Review and back up before
+  a real migration. Pilot supersedes the earlier dashboard, without automatically importing
+  its data or shutting it down.
 - **Some internal names keep the historical `DASHBOARD_*` prefix** for environment variables
   and paths. They are stable on purpose; the product name is Pilot.
 
@@ -111,6 +121,6 @@ Pilot builds on other people's work: [Pi](https://github.com/earendil-works/pi) 
 `@xyflow/svelte` for the interface, and Marked, DOMPurify and Mermaid for rendering.
 Those projects keep their own licences.
 
-Every direct dependency is MIT, ISC, or MPL-2.0 (Mozilla's file-level licence, which
-applies to those files rather than to code that uses them). There is no GPL, AGPL or
-non-commercial dependency, which is why this project can be MIT.
+The direct dependency licence review found MIT, ISC, and MPL-2.0/Apache-2.0
+licences. Dependencies retain their own licences; this is not an exhaustive
+transitive licence or legal audit.

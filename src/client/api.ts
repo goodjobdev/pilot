@@ -10,7 +10,7 @@ export function isSessionExpired(error:unknown):boolean{return error instanceof 
 let onExpiry:(()=>void)|null=null;
 /** Registers a single handler so any request can report an expired session. */
 export function whenSessionExpires(handler:()=>void){onExpiry=handler;}
-export async function request<T>(path:string,method='GET',data?:unknown):Promise<T> {
+export async function request<T>(path:string,method='GET',data?:unknown,retried=false):Promise<T> {
   let res:Response;
   try{
     // A manual redirect matters: an authenticating proxy answers an expired session with a
@@ -27,10 +27,20 @@ export async function request<T>(path:string,method='GET',data?:unknown):Promise
   let value:any;
   try{value=await res.json();}
   catch{throw new ApiError(res.status,'The server returned an unexpected response. Reload the page and try again.','network');}
+  // This code is returned only by authorize(), before body parsing or any side effect.
+  // Never retry network failures, generic 403s, conflicts, or admitted mutations.
+  if(res.status===403&&value.code==='SESSION_CSRF'&&!retried&&method!=='GET'&&method!=='HEAD'){
+    await session();
+    return request<T>(path,method,data,true);
+  }
   if(!res.ok)throw new ApiError(res.status,value.error??'Request failed');
   return value as T;
 }
-export async function session(){const data=await request<{csrf?:string}>('/session');csrf=data.csrf??'';}
+let renewing:Promise<void>|undefined;
+export function session():Promise<void>{
+  if(!renewing)renewing=request<{csrf?:string}>('/session').then(data=>{csrf=data.csrf??'';}).finally(()=>{renewing=undefined;});
+  return renewing;
+}
 export const api={
   projects:()=>request<Project[]>('/projects'),
   register:(data:unknown)=>request<Project>('/projects','POST',data),

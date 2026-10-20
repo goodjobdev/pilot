@@ -45,7 +45,7 @@ export async function authorize(req:IncomingMessage,config:SecurityConfig):Promi
  if(!['GET','HEAD'].includes(req.method??'')) {
    if(req.headers.origin!==config.origin)throw new HttpError(403,'Same-origin request required');
    if(!String(req.headers['content-type']).startsWith('application/json'))throw new HttpError(415,'JSON request required');
-   if(config.mode==='hosted'){const id=sessionId(req);if(!id||!equal(String(req.headers['x-dashboard-csrf']??''),csrf(config,id,subject)))throw new HttpError(403,'Session CSRF token required');}
+   if(config.mode==='hosted'){const id=sessionId(req);if(!id||!equal(String(req.headers['x-dashboard-csrf']??''),csrf(config,id,subject)))throw new HttpError(403,'Session CSRF token required','SESSION_CSRF');}
  }
  return subject;
 }

@@ -13,6 +13,8 @@ import { DocStore } from './docs-store';
 import { HarnessHost } from './agents/harness-host';
 import { AlertStore,type AlertTransport } from './alerts';
 import { Catalog } from './catalog';
+import { ProviderStore } from './providers';
+import { RepositoryStore } from './repositories';
 import { browse,within } from './paths';
 import { authorize,headers,localConfig,hostedConfig,establishSession,type SecurityConfig } from './security';
 import { emptyBoard } from '../shared/model';
@@ -20,11 +22,12 @@ import { serializeBoard } from '../shared/markdown';
 export interface AppOptions {dataRoot:string;browseRoots:string[];security:SecurityConfig;clientRoot?:string;registry?:string;agents?:'on'|'off';agentPauseMs?:number;alertTransport?:AlertTransport;alertSubject?:string;alertCooldownMs?:number}
 export async function createApp(options:AppOptions){
   const boards=new BoardStore(options.dataRoot),docs=new DocStore(),catalog=new Catalog(options.dataRoot,options.browseRoots,boards);await catalog.init();
+  const providers=new ProviderStore(catalog.root),repositories=new RepositoryStore(catalog.root);
   const alerts=new AlertStore(options.dataRoot,{subject:options.alertSubject??(process.env.DASHBOARD_OWNER?'mailto:'+process.env.DASHBOARD_OWNER:undefined),transport:options.alertTransport,cooldownMs:options.alertCooldownMs});
   await alerts.init();
   // The agent harness is the only execution surface. It is off unless the instance enables it explicitly.
   const agents=new HarnessHost({
-    dataRoot:options.dataRoot,
+    dataRoot:options.dataRoot,providers,
     enabled:(options.agents??(process.env.DASHBOARD_AGENTS==='on'?'on':'off'))==='on',
     pauseMs:options.agentPauseMs??Number(process.env.DASHBOARD_AGENT_PAUSE_MS??2500),
     onEvent:event=>{
@@ -52,6 +55,34 @@ export async function createApp(options:AppOptions){
           let body='';for await(const chunk of req){body+=chunk.toString();if(Buffer.byteLength(body)>8*1024*1024)throw new HttpError(413,'Request too large');}
           try{payload=JSON.parse(body);}catch{throw new HttpError(400,'Invalid JSON');}
         }
+        if(path==='/api/settings/providers'&&req.method==='GET'){json(await providers.view());return;}
+        if(path==='/api/settings/models'&&req.method==='POST'){json(await providers.savePreferences(payload));return;}
+        const providerRoute=path.match(/^\/api\/settings\/providers\/([a-z0-9-]+)(?:\/(key|login))?$/);
+        if(providerRoute){
+          if(providerRoute[2]==='key'&&req.method==='POST'){await providers.saveKey(providerRoute[1],payload);json({ok:true});return;}
+          if(providerRoute[2]==='login'&&req.method==='POST'){json(await providers.startLogin(providerRoute[1]));return;}
+          if(!providerRoute[2]&&req.method==='DELETE'){await providers.logout(providerRoute[1]);json({ok:true});return;}
+        }
+        const loginRoute=path.match(/^\/api\/settings\/logins\/([a-f0-9-]{36})$/);
+        if(loginRoute){
+          if(req.method==='GET'){json(providers.login(loginRoute[1]));return;}
+          if(req.method==='POST'){json(providers.reply(loginRoute[1],payload));return;}
+          if(req.method==='DELETE'){await providers.cancel(loginRoute[1]);json({ok:true});return;}
+        }
+        const repositoryRoute=path.match(/^\/api\/projects\/([a-f0-9-]{36})\/repository(?:\/(key|test|connect))?$/);
+        if(repositoryRoute){
+          const p=catalog.get(repositoryRoute[1]),action=repositoryRoute[2];
+          if(!action&&req.method==='GET'){json(await repositories.view(p));return;}
+          if(action==='key'&&req.method==='POST'){json(await repositories.generate(p));return;}
+          if(action==='key'&&req.method==='DELETE'){json(await repositories.removeKey(p));return;}
+          if(action==='test'&&req.method==='POST'){json(await repositories.test(p));return;}
+          if(action==='connect'&&req.method==='POST'){
+            if(payload.confirm!==true)throw new HttpError(422,'Explicit confirmation required');
+            json(await repositories.connect(p,async()=>{await boards.drain();await docs.drain();await agents.detach(p);},async()=>catalog.attachWorktree(p.id)));return;
+          }
+        }
+        const scopedProject=path.match(/^\/api\/projects\/([a-f0-9-]{36})(?:\/|$)/)?.[1];
+        if(scopedProject&&repositories.isConnecting(scopedProject))throw new HttpError(409,'Repository connection in progress. Retry after it finishes.');
         if(path==='/api/session' && req.method==='GET'){json(establishSession(req,res,options.security,subject));return;}
         if(path==='/api/roots' && req.method==='GET'){json(options.browseRoots);return;}
         if(path==='/api/alerts' && req.method==='GET'){json({enabled:alerts.enabled,publicKey:alerts.publicKey,subscriptions:alerts.count});return;}
@@ -68,7 +99,7 @@ export async function createApp(options:AppOptions){
           if(req.method==='GET'){json(await catalog.list());return;}
           if(req.method==='POST'){json(await catalog.register(payload),201);return;}
         }
-        const agentsRoute=path.match(/^\/api\/projects\/([a-f0-9-]{36})\/agents(?:\/(stream|input|abort|answer))?$/);
+        const agentsRoute=path.match(/^\/api\/projects\/([a-f0-9-]{36})\/agents(?:\/(stream|input|abort|answer|model))?$/);
         if(agentsRoute){
           const p=catalog.get(agentsRoute[1]);
           if(!agents.enabled){
@@ -76,6 +107,7 @@ export async function createApp(options:AppOptions){
             throw new HttpError(503,'Agents are disabled on this instance');
           }
           if(agentsRoute[2]===undefined&&req.method==='GET'){json({enabled:true,view:await agents.view(p)});return;}
+          if(agentsRoute[2]==='model'&&req.method==='POST'){const c=z.strictObject({model:z.strictObject({provider:z.string().min(1).max(100),modelId:z.string().min(1).max(200)}).nullable()}).parse(payload);json(await agents.setModel(p,c.model));return;}
           if(agentsRoute[2]==='input'&&req.method==='POST'){
             const data=z.strictObject({text:z.string().min(1).max(8000),mode:z.enum(['followUp','steer','reject']).default('followUp'),requestId:z.string().min(1).max(200).optional()}).parse(payload);
             json(await agents.submit(p,data));return;
@@ -171,11 +203,11 @@ export async function createApp(options:AppOptions){
     }catch(e){
       const err=e as Error;const code=e instanceof HttpError?e.status:(e as NodeJS.ErrnoException).code==='ENOENT'?404:400;
       console.error(req.method+' '+logged+' -> '+code+' '+err.message);
-      res.statusCode=code;res.setHeader('Content-Type','application/json');res.end(JSON.stringify({error:err.message}));
+      res.statusCode=code;res.setHeader('Content-Type','application/json');res.end(JSON.stringify({error:err.message,...(e instanceof HttpError&&e.code?{code:e.code}:{})}));
     }
   });
   server.requestTimeout=30000;server.headersTimeout=10000;
-  return {server,catalog,boards,docs,agents,alerts,close:async()=>{await new Promise<void>((ok,fail)=>server.close(e=>e?fail(e):ok()));await boards.drain();await docs.drain();await agents.close();await catalog.close();}};
+  return {server,catalog,boards,docs,agents,alerts,providers,repositories,close:async()=>{await new Promise<void>((ok,fail)=>server.close(e=>e?fail(e):ok()));await repositories.close();await boards.drain();await docs.drain();await agents.close();await providers.close();await catalog.close();}};
 }
 // Loopback by default. A container must bind its own interface for the published
 // port to reach it, so the pilot sets this explicitly while the published port

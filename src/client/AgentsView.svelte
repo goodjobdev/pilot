@@ -2,11 +2,22 @@
  import { api,agentStream } from './api';
  import type { AgentView } from '../shared/agent';
  import Icon from './Icon.svelte';
+ import {request} from './api';
+ import {modelKey,type ProviderSettings} from '../shared/settings';
  let { projectId,onerror,onquestions }:{ projectId:string; onerror:(message:string)=>void; onquestions?:()=>void }=$props();
  let view=$state<AgentView|null>(null),enabled=$state(true),status=$state('Connecting…'),draft=$state(''),sending=$state(false),problem=$state('');
  let answers=$state<Record<string,string>>({}),answering=$state('');
  let transcript=$state<HTMLDivElement>();
  let controller:AbortController|null=null;
+ let modelSettings=$state<ProviderSettings|null>(null),selectedModel=$state(''),modelBusy=$state(false);
+ async function loadModels(){try{modelSettings=await request('/settings/providers');}catch(e){problem=(e as Error).message;}}
+ async function chooseModel(){
+  if(modelBusy)return;modelBusy=true;problem='';
+  const m=modelSettings?.models.find(m=>modelKey(m)===selectedModel);
+  try{view=await request('/projects/'+projectId+'/agents/model','POST',{model:m?{provider:m.provider,modelId:m.modelId}:null});}
+  catch(e){problem=(e as Error).message;}
+  finally{modelBusy=false;}
+ }
  $effect(()=>{
    const id=projectId;
    let cancelled=false;
@@ -14,7 +25,8 @@
      try{
        const snapshot=await api.agents(id);
        if(cancelled)return;
-       enabled=snapshot.enabled;view=snapshot.view;
+       enabled=snapshot.enabled;view=snapshot.view;selectedModel=view?.model?.provider==='faux'?'':view?.model?modelKey(view.model):'';
+       await loadModels();
        if(!snapshot.enabled){status='Agents are disabled on this instance';return;}
      }catch(e){if(!cancelled){status=(e as Error).message;onerror((e as Error).message);}return;}
      controller?.abort();
@@ -60,9 +72,13 @@
 <section class="agents">
  <header class="agents-head">
   <div>
-   <span class="eyebrow">SCRIPTED TEST PROVIDER</span>
+   <span class="eyebrow">{!view?.model||view.model.provider==='faux'?'SCRIPTED TEST PROVIDER':'MODEL PROVIDER'}</span>
    <h2>{view?.model?view.model.provider+' / '+view.model.modelId:'Agent'}</h2>
   </div>
+  <label class="model-picker">Session model<select aria-label="Session model" bind:value={selectedModel} disabled={working||modelBusy} onfocus={()=>void loadModels()} onchange={()=>void chooseModel()}>
+   <option value="">Scripted test provider (free)</option>
+   {#each modelSettings?.models.filter(m=>m.configured)??[] as m (modelKey(m))}<option value={modelKey(m)}>{modelSettings?.preferences.favourites.some(c=>modelKey(c)===modelKey(m))?'★ ':''}{m.provider} / {m.name}</option>{/each}
+  </select></label>
   <span class="pill" title="No model is called and nothing is spent: replies come from a deterministic local provider.">no model called</span>
   <span class="agent-state" class:busy={working} role="status">{working?'Working…':'Idle'}</span>
   <button class="compact-button" aria-label="Stop the agent" disabled={!working} onclick={()=>void stop()}><Icon name="close" size={14}/><span>Stop</span></button>
@@ -91,7 +107,7 @@
  {/if}
  <!-- svelte-ignore a11y_no_static_element_interactions -->
  <div class="agent-transcript" bind:this={transcript} aria-label="Agent transcript">
-  {#if !view?.entries.length}<p class="agent-empty">No messages yet. Send one below — the scripted provider answers without calling a model.</p>{/if}
+  {#if !view?.entries.length}<p class="agent-empty">No messages yet. The scripted provider is free. A real model uses the connected provider account; existing tools are question and note operations only.</p>{/if}
   {#each view?.entries??[] as entry (entry.id)}
   <article class="agent-entry {entry.kind}">
    <span class="agent-role">{entry.kind==='user'?'You':entry.kind==='assistant'?'Agent':entry.kind==='tool'?'Tool':entry.kind}</span>
@@ -122,6 +138,7 @@
 <style>
  .agents{flex:1;min-height:0;display:flex;flex-direction:column}
  .agents-head{display:flex;align-items:center;gap:10px;padding:8px 12px;border-bottom:1px solid var(--line);background:var(--panel);flex-wrap:wrap}
+ .model-picker{min-width:180px;max-width:100%;font-size:10px}.model-picker select{max-width:100%}
  .agents-head h2{margin:3px 0 0;font-size:13px}
  .agent-state{font:9px var(--mono);color:var(--muted)}.agent-state.busy{color:var(--accent)}
  .agents-problem{margin:10px 12px 0}

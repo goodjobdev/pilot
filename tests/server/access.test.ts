@@ -26,8 +26,18 @@ test('signed Access identity, expiry, audience, CSRF and untrusted requests',asy
  const auth={...host,'cf-access-jwt-assertion':await sign()},res=await fetch(origin+'/api/session',{headers:auth}),session=await res.json() as any,cookie=res.headers.get('set-cookie')!.split(';')[0];
  const write={...auth,origin:security.origin,'content-type':'application/json',cookie};
  assert.equal((await fetch(origin+'/api/projects',{method:'POST',headers:write,body:'{}'})).status,403);
+ const sensitive=await fetch(origin+'/api/settings/providers/openai/key',{method:'POST',headers:write,body:JSON.stringify({key:'fake-not-live'})});
+ assert.equal(sensitive.status,403);assert.equal((await sensitive.json() as any).code,'SESSION_CSRF');
  const accepted=await fetch(origin+'/api/projects',{method:'POST',headers:{...write,'x-dashboard-csrf':session.csrf},body:JSON.stringify({name:'Owner fixture',managed:true,confirm:true})});assert.equal(accepted.status,201);
  assert.equal((await fetch(origin+'/api/projects',{method:'POST',headers:{...write,origin:'https://evil.example','x-dashboard-csrf':session.csrf},body:'{}'})).status,403);
  assert.equal((await fetch(origin+'/api/projects',{headers:{...auth,host:'evil.example'}})).status,403);
+ // A backend restart rotates the HMAC secret but the old tab and cookie survive.
+ security.token='new-boot-secret';
+ const stale=await fetch(origin+'/api/projects',{method:'POST',headers:{...write,'x-dashboard-csrf':session.csrf},body:JSON.stringify({name:'Restart fixture',managed:true,confirm:true})});
+ assert.equal(stale.status,403);assert.equal((await stale.json() as any).code,'SESSION_CSRF');
+ assert.equal(app.catalog.projects.length,1); // rejection happened before a write
+ const renewed=await (await fetch(origin+'/api/session',{headers:{...auth,cookie}})).json() as any;
+ const retry=await fetch(origin+'/api/projects',{method:'POST',headers:{...write,'x-dashboard-csrf':renewed.csrf},body:JSON.stringify({name:'Restart fixture',managed:true,confirm:true})});
+ assert.equal(retry.status,201);assert.equal(app.catalog.projects.length,2);
  }finally{await app.close();}
 });

@@ -97,8 +97,18 @@ with older ones.
 
 ## Operational notes
 
-- **A restart invalidates browser sessions.** The session secret is generated at boot, so
-  reload the interface after a restart.
+Provider credentials and model preferences are configured through **Providers & models**.
+Project deploy keys and review worktrees are configured through **Board actions → Repository
+& deploy key**. See [Provider sign-in](PROVIDER-SIGNIN.md) and
+[Project connections](PROJECT-CONNECTIONS.md) for storage, revocation and backup limitations.
+The container includes Git and OpenSSH for fixed provisioning only; it still has no general
+coding tools. These features do not change the Access application or tunnel policy.
+
+
+- **A restart rotates the CSRF secret.** The client renews its same-origin session and retries
+  once only for the explicit `SESSION_CSRF` rejection, which occurs before any mutation.
+  Generic permission errors, network failures and conflicts are not retried. Old clients need
+  one reload to pick up this behaviour.
 - **An unclean kill leaves `service.lock`.** Startup fails closed until an operator confirms
   no writer remains and removes that lock. With `restart: unless-stopped` this looks like a
   crash-loop, so check the log for the lock message before assuming a code fault.

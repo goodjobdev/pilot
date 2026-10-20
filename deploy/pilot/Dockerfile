@@ -16,7 +16,7 @@ ENV NODE_ENV=production \
 # ca-certificates is only recommended by curl, so it must be named explicitly for
 # TLS tools inside the image to trust anything.
 RUN apt-get update \
- && apt-get install --no-install-recommends --yes curl ca-certificates \
+ && apt-get install --no-install-recommends --yes curl ca-certificates git openssh-client \
  && rm -rf /var/lib/apt/lists/* \
  && npm install --global pnpm@12.14.0 \
  && useradd --uid 10001 --user-group --create-home --shell /usr/sbin/nologin pilot \

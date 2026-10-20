@@ -6,7 +6,7 @@ import { applyOperation } from '../shared/schema';
 import { parseBoard,serializeBoard } from '../shared/markdown';
 import { safePath } from './paths';
 export const hash=(text:string)=>createHash('sha256').update(text).digest('hex');
-export class HttpError extends Error {constructor(public status:number,message:string){super(message);}}
+export class HttpError extends Error {constructor(public status:number,message:string,public code?:string){super(message);}}
 export async function atomicWrite(path:string,text:string) {
   const tmp=path+'.'+randomUUID()+'.tmp';
   const file=await open(tmp,'wx',0o600);

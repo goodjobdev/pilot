@@ -3,6 +3,7 @@ import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { BACKGROUND_CONTEXT } from '@earendil-works/chord/context';
 import { createModels } from '@earendil-works/pi-ai/models';
+import { createAssistantMessageEventStream } from '@earendil-works/pi-ai/utils/event-stream';
 import { fauxAssistantMessage, fauxProvider, fauxToolCall, type FauxProviderHandle, type FauxResponseFactory } from '@earendil-works/pi-ai/providers/faux';
 import { Harness, createRegistry, defineExtension, defineTool, section } from '@earendil-works/pi-durable';
 import { openNodeSqliteStorage } from '@earendil-works/pi-durable/storage/sqlite/node';
@@ -11,6 +12,8 @@ import { safePath } from '../paths';
 import { agentViewFrom, type AgentView } from '../../shared/agent';
 import type { Project } from '../../shared/model';
 import { HttpError } from '../board-store';
+import type { ProviderStore } from '../providers';
+import type { ModelChoice } from '../../shared/settings';
 
 export type AgentInputMode = 'followUp' | 'steer' | 'reject';
 const uuidPattern = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
@@ -164,6 +167,7 @@ export interface HarnessHostOptions {
   enabled: boolean;
   /** How long a [pause] message holds the run open, in milliseconds. */
   pauseMs?: number;
+  providers?: ProviderStore;
   /** Called when a run needs a person, finishes or fails, with no browser attached. */
   onEvent?: (event: AgentEvent) => void;
 }
@@ -200,8 +204,40 @@ export class HarnessHost {
       const path = this.storagePath(project);
       await mkdir(join(path, '..'), { recursive: true, mode: 0o700 });
       const provider = fauxProvider();
-      const models = createModels();
+      const models = createModels({credentials:this.options.providers?.credentials,authContext:{env:async()=>undefined,fileExists:async()=>false}});
+      for(const p of this.options.providers?.models.getProviders()??[])models.setProvider(p);
       models.setProvider(provider.provider);
+      const stream=models.streamSimple.bind(models);
+      // Generation hooks are advisory: ordinary exceptions are reported then ignored.
+      // Enforce policy at dispatch, including queued inputs and checkpoint recovery.
+      models.streamSimple=(model,context,options)=>{
+        const output=createAssistantMessageEventStream();
+        void (async()=>{
+          try{
+            if(model.provider!==provider.provider.id){
+              if(!this.options.providers)throw new HttpError(409,'Real providers are not configured');
+              await this.options.providers.assertUsable({provider:model.provider,modelId:model.id});
+              let turns=0;
+              for(const message of [...context.messages].reverse()){if(message.role==='user')break;if(message.role==='assistant')turns++;}
+              if(turns>=8)throw new HttpError(409,'Pilot stopped at eight model turns. Review before sending another message.');
+            }
+            options?.signal?.throwIfAborted();
+            const source=stream(model,context,{...options,maxTokens:Math.min(options?.maxTokens??4096,4096)});
+            const safeError='Model request failed. Check the provider connection, model access and quota.';
+            // Provider/OAuth exceptions may embed raw response bodies. Never persist
+            // those as UI errors; retain usage and partial model output only.
+            for await(const event of source)output.push(event.type==='error'?{...event,error:{...event.error,errorMessage:safeError}}:event);
+            const result=await source.result();
+            output.end(result.stopReason==='error'?{...result,errorMessage:safeError}:result);
+          }catch(error){
+            const detail=error instanceof HttpError?error.message:'Provider request failed. Check the provider connection and try again.';
+            const reason=options?.signal?.aborted?'aborted' as const:'error' as const;
+            const message={...fauxAssistantMessage(detail,{stopReason:reason,errorMessage:detail}),provider:model.provider,model:model.id,api:model.api};
+            output.push({type:'error',reason,error:message});output.end(message);
+          }
+        })();
+        return output;
+      };
       scriptedResponses(provider, this.options.pauseMs ?? 2500);
       const storage = await openNodeSqliteStorage(path);
       const question = questionExtension();
@@ -209,8 +245,10 @@ export class HarnessHost {
       const registry = createRegistry();
       registry.install(question);
       registry.install(notes);
-      const harness = await Harness.open(storage, { models, registry }, BACKGROUND_CONTEXT);
-      const conversation = await harness.root(BACKGROUND_CONTEXT, { agent: { model: { provider: provider.provider.id, modelId: provider.getModel().id }, extensions: [question,notes] } });
+      const harness = await Harness.open(storage, { models, registry,settings:{retry:{enabled:false},stream:{maxRetries:0,timeoutMs:120000},compaction:{enabled:false}} }, BACKGROUND_CONTEXT);
+      const initial=await this.options.providers?.defaultModel();
+      const conversation = await harness.root(BACKGROUND_CONTEXT, { agent: { model: initial??{ provider: provider.provider.id, modelId: provider.getModel().id }, extensions: [question,notes] } });
+      // Never replace an existing session's model with a newly changed global default.
       // Continue any run the previous process left unfinished.
       harness.resume();
       // Watch this conversation so a question, a finished run or a failure is reported even
@@ -279,6 +317,8 @@ export class HarnessHost {
     if (text.length > 8000) throw new HttpError(413, 'Message is too long');
     return this.serial('agent:' + project.id, async () => {
       const hosted = await this.open(project);
+      const selected=(await hosted.conversation.agent(BACKGROUND_CONTEXT)).model;
+      if(selected&&selected.provider!==hosted.provider.provider.id)await this.options.providers?.assertUsable(selected);
       const whenBusy = input.mode === 'steer' ? 'steer' as const : input.mode === 'reject' ? 'reject' as const : undefined;
       try {
         const submission = await hosted.conversation.submit({ type: 'input', content: text, ...(whenBusy ? { whenBusy } : {}), ...(input.requestId ? { requestId: input.requestId } : {}) }, BACKGROUND_CONTEXT);
@@ -321,6 +361,28 @@ export class HarnessHost {
     await this.serial('agent:' + project.id, async () => {
       const hosted = await this.open(project);
       await hosted.conversation.abort(BACKGROUND_CONTEXT);
+    });
+  }
+  async setModel(project:Project,choice:ModelChoice|null):Promise<AgentView>{
+    this.assertEnabled();
+    return this.serial('agent:'+project.id,async()=>{
+      const hosted=await this.open(project);
+      if((await this.view(project)).working)throw new HttpError(409,'Stop the current run before changing models');
+      if(choice){
+        if(!this.options.providers)throw new HttpError(503,'Provider settings unavailable');
+        const m=this.options.providers.models.getModel(choice.provider,choice.modelId);
+        if(!m)throw new HttpError(422,'Unknown model');
+      }
+      await hosted.conversation.configure({model:choice??{provider:hosted.provider.provider.id,modelId:hosted.provider.getModel().id}},BACKGROUND_CONTEXT);
+      return this.view(project);
+    });
+  }
+  async detach(project:Project):Promise<void>{
+    await this.serial('agent:'+project.id,async()=>{
+      const pending=this.hosted.get(project.id);if(!pending)return;
+      const hosted=await pending;
+      if((await this.view(project)).working)throw new HttpError(409,'Stop the agent before connecting a repository');
+      await hosted.close();this.hosted.delete(project.id);
     });
   }
   async close(): Promise<void> {

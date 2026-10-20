@@ -1,6 +1,7 @@
 # One capped development container. Deliberate boundaries:
 #   * publishes on loopback only — nothing reaches it from the network by default
-#   * no host networking, no docker socket, no production mounts, no SSH keys
+#   * no host networking, no docker socket, no production mounts or host SSH keys
+#   * project-scoped deploy keys may be generated inside the private data volume
 #   * non-root user, all capabilities dropped, no-new-privileges, read-only root
 #   * hard CPU / memory / PID limits and rotated logs
 name: pi-workspace-pilot

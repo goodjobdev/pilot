@@ -21,8 +21,8 @@ assumes, and what it does not protect, so you can decide whether that fits.
 | Path escape | One containment helper refuses absolute paths, `..` and symlinks; generated folders and app-managed paths are never served or edited |
 | Resource abuse | Read and write size caps, a document-count cap, a bounded subscription list, and bounded search/inbox scans |
 | Untrusted rendering | Markdown is sanitised; assets are limited to images and static HTML/SVG; mockups render in a sandboxed frame with no scripts and no same-origin access; a strict Content-Security-Policy covers the application |
-| Agent execution | No shell or general file API exists. Agent tools are bounded to a registered project's workspace, and the harness is the only execution surface |
-| Credentials | Provider credentials are never written to the repository; alert keys live in the data directory (0600) and are excluded from backups; nothing sensitive is logged |
+| Agent execution | No general shell/file API exists. Current agent tools are questions and project notes. Fixed Git/SSH-keygen operations are available only through explicit repository provisioning, with no hooks, installs, commits or pushes |
+| Credentials | Provider credentials and project deploy keys live outside project roots in 0600 files/0700 folders, excluded from ordinary backups; settings reads return status/public keys only. Login and Git failures do not echo raw credential response bodies or command output |
 | Host escape | The container drops all capabilities, runs non-root with a read-only root filesystem, has no Docker socket and no host mounts |
 
 ## What is not protected
@@ -32,6 +32,10 @@ assumes, and what it does not protect, so you can decide whether that fits.
 - **Agent behaviour inside a project.** An agent may write to the workspace you registered.
   Bounded tools are not a sandbox: register directories you are willing to have modified, and
   run the application in a container rather than on a workstation.
+- **Same-container shell access.** Secrets are not encrypted at rest. Code running as the
+  application user can read provider credentials and deploy keys; these are not per-agent
+  sandboxes. Write deploy keys are repository-scoped, not branch-scoped. Use provider budgets,
+  GitHub repository rules and a separate execution boundary before enabling general shell tools.
 - **Multi-user abuse.** There is one owner, no roles, no quotas and no rate limiting. It is not
   multi-tenant.
 - **Backups.** They deliberately exclude credentials, alert keys and agent sessions. Treat a

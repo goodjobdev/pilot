@@ -20,6 +20,7 @@ test('transcript entries map to renderable text, thinking and tool calls', () =>
   assert.equal(agentEntryView({ id: 5, kind: 'app.note' })?.kind, 'other');
   assert.equal(agentEntryView({ id: 6 }), null);
   assert.equal(agentEntryView(null), null);
+  assert.equal(agentEntryView({id:7,kind:'pi.assistant',model:[{role:'assistant',content:[],stopReason:'error',errorMessage:'Model connection required'}]})?.error,'Model connection required');
 });
 
 test('the view reports working state, the inbox and usage', () => {

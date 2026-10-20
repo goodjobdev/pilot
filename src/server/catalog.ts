@@ -47,6 +47,16 @@ export class Catalog {
       return project;
     });
   }
+  /** Internal provisioning only; HTTP callers cannot supply this path. */
+  async attachWorktree(id:string){
+    await this.boards.serial('catalog',async()=>{
+      const p=this.get(id);if(!p.managed)throw new HttpError(409,'Only managed workspaces can connect');
+      const path=await safePath(this.root,'repositories/'+p.id+'/agent');
+      if(!(await stat(path)).isDirectory())throw new HttpError(409,'Worktree not ready');
+      const previous=p.path;p.path=path;
+      try{await this.persist();}catch(e){p.path=previous;throw e;}
+    });
+  }
   async remove(id:string){await this.boards.serial('catalog',async()=>{this.get(id);const before=this.projects;this.projects=this.projects.filter(p=>p.id!==id);try{await this.persist();}catch(e){this.projects=before;throw e;}});}
   async relocate(id:string,path:string){await this.boards.serial('catalog',async()=>{const canonical=await approvedDirectory(path,this.browseRoots);if(this.projects.some(p=>p.id!==id&&p.path===canonical))throw Error('Folder already registered');const p=this.get(id),old=p.path;p.path=canonical;try{await this.persist();}catch(e){p.path=old;throw e;}});}
 }
