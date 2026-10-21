@@ -2,8 +2,8 @@ import { readFile,chmod } from 'node:fs/promises';
 import { atomicWrite } from './board-store';
 import { safePath } from './paths';
 
-/** One app process owns the data root (Catalog's service.lock). All private JSON
- * read-modify-writes share a queue, including credential refresh and logout. */
+/** One app process owns the data root (the startup service lock, service.lock). All private
+ * JSON read-modify-writes share a queue, including credential refresh and logout. */
 export class PrivateStore<T> {
  private tail:Promise<unknown>=Promise.resolve();
  constructor(private root:string,private relative:string,private initial:()=>T,private validate:(input:unknown)=>T){}

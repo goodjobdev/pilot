@@ -6,7 +6,7 @@
   "description": "Self-hosted planning workspace: documentation is the source of work, and durable Pi agents work from it.",
   "type": "module",
   "engines": {
-    "node": ">=22"
+    "node": ">=24.0.0"
   },
   "packageManager": "pnpm@12.10.1",
   "scripts": {

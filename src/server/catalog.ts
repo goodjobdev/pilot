@@ -1,4 +1,4 @@
-import { access,mkdir,open,readFile,realpath,stat,readdir,unlink } from 'node:fs/promises';
+import { access,mkdir,readFile,realpath,stat,readdir } from 'node:fs/promises';
 import { constants } from 'node:fs';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -11,13 +11,11 @@ import { approvedDirectory,safePath } from './paths';
 const projectSchema=z.strictObject({id:z.string().uuid(),name:z.string().min(1).max(100),path:z.string(),managed:z.boolean(),repository:z.string().max(500),created:z.string().datetime()});
 const catalogSchema=z.strictObject({version:z.literal(1),projects:z.array(projectSchema).max(1000)});
 export class Catalog {
-  projects:Project[]=[]; root='';private lockPath='';private lock:Awaited<ReturnType<typeof open>>|undefined;
+  projects:Project[]=[]; root='';
   constructor(public requestedRoot:string,public browseRoots:string[],public boards:BoardStore){}
   async init(){
     await mkdir(this.requestedRoot,{recursive:true,mode:0o700});this.root=await realpath(this.requestedRoot);
-    this.lockPath=join(this.root,'service.lock');
-    try {this.lock=await open(this.lockPath,'wx',0o600);await this.lock.writeFile(JSON.stringify({pid:process.pid,started:new Date().toISOString()}));}
-    catch(e){if((e as NodeJS.ErrnoException).code==='EEXIST')throw Error('Catalog already locked. Verify prior service exit before manual stale-lock recovery.');throw e;}
+    // Root ownership is the startup service lock (src/server/service-lock.ts); Catalog holds no lock.
     try {const path=await safePath(this.root,'catalog.json');this.projects=catalogSchema.parse(JSON.parse(await readFile(path,'utf8'))).projects;}
     catch(e){
       if((e as NodeJS.ErrnoException).code!=='ENOENT'){await this.close();throw e;}
@@ -25,7 +23,8 @@ export class Catalog {
       try{await this.persist();}catch(writeError){await this.close();throw writeError;}
     }
   }
-  async close(){if(this.lock){await this.lock.close();this.lock=undefined;await unlink(this.lockPath);}}
+  /** No lock to release: the startup service lock owns the root for the whole process. */
+  async close(){}
   private async persist(){await atomicWrite(await safePath(this.root,'catalog.json'),JSON.stringify({version:1,projects:this.projects},null,2)+'\n');}
   get(id:string){const p=this.projects.find(p=>p.id===id);if(!p)throw new HttpError(404,'Project not registered');return p;}
   async list(){return Promise.all(this.projects.map(async p=>{let state:Project['state']='available';try{await stat(p.path);await access(p.path,constants.W_OK);}catch(e){state=(e as NodeJS.ErrnoException).code==='ENOENT'?'missing':'read-only';}return {...p,state};}));}

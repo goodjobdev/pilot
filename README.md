@@ -16,6 +16,11 @@ place, reachable from your phone, with the repositories still owning the truth.
   live transcript, steering, stopping, and questions the agent asks that you answer once.
   A run that dies mid-tool resumes from its last checkpoint, and a tool that may have
   partially run is reported as interrupted rather than repeated.
+- **Named sessions.** Each project's conversation is adopted as a named, durable session with
+  links to the board task, the specification and the workspace it is about. Names are unique
+  within a project, every change is revision-checked, and a link is only accepted when the board,
+  the documentation or the approved roots actually contain it. See
+  [Sessions](docs/SESSIONS.md) and [Migrating the legacy conversation](docs/MIGRATION.md).
 - **Repository connections.** Generate a project deploy key in the UI and explicitly connect
   an isolated review worktree; no automatic installs, commits or pushes.
 - **Providers and models.** Add API keys or sign in from settings, pick a default for new
@@ -42,12 +47,13 @@ place, reachable from your phone, with the repositories still owning the truth.
    (canonical, in git)       session + task checkpoints
 ```
 
-Markdown is canonical. The index, the layout, the alerts and the agent sessions are all
-derived or working state — losing them costs you convenience, never your documentation.
+Markdown is canonical. The index, the layout, the alerts, the agent sessions and the
+named-session registry are all derived or working state — losing them costs you convenience,
+never your documentation.
 
 ## Quick start
 
-Requires Node 22+ and pnpm.
+Requires Node 24+ (the first major where `node:sqlite` is unflagged) and pnpm.
 
 ```sh
 pnpm install
@@ -56,9 +62,13 @@ DASHBOARD_MODE=local DASHBOARD_DATA=/tmp/pilot-data PORT=4317 pnpm start
 ```
 
 Open <http://127.0.0.1:4317>. Local mode embeds a session token in the page it serves and
-must never be exposed through a tunnel. For a real deployment see
-[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md); for what the security model does and does not
-protect, see [docs/SECURITY.md](docs/SECURITY.md).
+must never be exposed through a tunnel. A hosted start also requires an immutable release
+manifest (`DASHBOARD_RELEASE_MANIFEST`, or `release.json` beside the build) and refuses to start
+without one. Startup creates the durable control store (`control.sqlite` in the data root) before
+it listens, and refuses to serve if it cannot. `/healthz` is unauthenticated liveness; the
+authenticated `/readyz` reports expected-version readiness from the open control store, and
+`node dist/server.mjs --doctor` prints a read-only diagnosis without taking the lock. For a real deployment see [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md); for
+what the security model does and does not protect, see [docs/SECURITY.md](docs/SECURITY.md).
 
 Browser tests need Playwright's Chromium once:
 
@@ -86,7 +96,10 @@ pnpm test:browser
 containment and conflict handling, DAG invariants, the question protocol, alert delivery
 through a stubbed transport, multi-project isolation, a 500-task board, and a real
 kill-mid-tool recovery run that spawns the server, kills it, and checks what the durable
-session recorded.
+session recorded. The named-session registry is covered the same way: link refusals for every
+kind, a symlink that leads out of the approved roots, stale revisions, idempotent repeats, an
+idempotent and dry-runnable migration, and a real start that adopts a project's conversation
+exactly once.
 
 ## Honest limitations
 

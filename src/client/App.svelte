@@ -15,6 +15,7 @@
  import DocView from './DocView.svelte';
  import DocEditor from './DocEditor.svelte';
  import AgentsView from './AgentsView.svelte';
+ import ActionPalette from './ActionPalette.svelte';
  import ProviderSettings from './ProviderSettings.svelte';
  import ProjectConnection from './ProjectConnection.svelte';
  import { api,session,ApiError,download,whenSessionExpires } from './api';
@@ -34,7 +35,7 @@
  let sidebarHidden=$state(localStorage.getItem('dashboard.sidebar.hidden')==='true'||(localStorage.getItem('dashboard.sidebar.hidden')===null&&window.innerWidth<900));
  let actionsMenu=$state<HTMLDivElement>(),filtersMenu=$state<HTMLDivElement>();
  let docs=$state<DocEntry[]>([]),doc=$state<DocSnapshot|null>(null),docDraft=$state(''),docEditing=$state(false),docDirty=$state(false),docConflict=$state(false),docSaving=$state(false),docMessage=$state(''),docsError=$state(''),treeOpen=$state(false);
- let actionsOpen=$state(false),filtersOpen=$state(false),inboxOpen=$state(false);
+ let actionsOpen=$state(false),filtersOpen=$state(false),inboxOpen=$state(false),paletteOpen=$state(false);
  let inbox=$state<{path:string;line:number;text:string;anchor:string|null;id:string}[]>([]),focusAnchor=$state<string|null>(null),inboxMenu=$state<HTMLDivElement>();
  let agentQuestions=$state<{id:string;text:string}[]>([]);
  let alertState=$state<AlertState>('off'),alertBusy=$state(false),alertMessage=$state('');
@@ -117,7 +118,14 @@
  function command(action:()=>void){actionsOpen=false;action();}
  function outside(e:MouseEvent){if(!(e.target instanceof Node))return;if(actionsOpen&&!actionsMenu?.contains(e.target))actionsOpen=false;if(filtersOpen&&!filtersMenu?.contains(e.target))filtersOpen=false;if(inboxOpen&&!inboxMenu?.contains(e.target))inboxOpen=false;}
  function keys(e:KeyboardEvent){
-   if(e.key==='Escape'){if(actionsOpen){actionsOpen=false;actionsMenu?.querySelector('button')?.focus();e.preventDefault();}if(filtersOpen){filtersOpen=false;filtersMenu?.querySelector('button')?.focus();e.preventDefault();}if(inboxOpen){inboxOpen=false;inboxMenu?.querySelector('button')?.focus();e.preventDefault();}return;}
+   if(e.key==='Escape'){if(paletteOpen){paletteOpen=false;e.preventDefault();return;}if(actionsOpen){actionsOpen=false;actionsMenu?.querySelector('button')?.focus();e.preventDefault();}if(filtersOpen){filtersOpen=false;filtersMenu?.querySelector('button')?.focus();e.preventDefault();}if(inboxOpen){inboxOpen=false;inboxMenu?.querySelector('button')?.focus();e.preventDefault();}return;}
+   // The command palette (⌘/Ctrl K). While a text field or an editor has focus the shortcut is not
+   // swallowed, exactly like the sidebar toggle above: typing a document must never open a dialog.
+   if((e.metaKey||e.ctrlKey)&&!e.altKey&&!e.shiftKey&&e.key.toLowerCase()==='k'){
+     if(paletteOpen){paletteOpen=false;e.preventDefault();return;}
+     if(e.target instanceof Element&&e.target.closest('input,textarea,select,[contenteditable]:not([contenteditable="false"])'))return;
+     e.preventDefault();paletteOpen=true;return;
+   }
    if((e.metaKey||e.ctrlKey)&&!e.altKey&&!e.shiftKey&&e.key.toLowerCase()==='b'&&!(e.target instanceof Element&&e.target.closest('input,textarea,select,[contenteditable]:not([contenteditable="false"])'))){e.preventDefault();toggleSidebar();}
  }
  function leave(){return !(saving||failed||inspectorDirty||docDirty)||confirm('There are unsaved edits. Export your draft before leaving. Discard these edits?');}
@@ -244,6 +252,7 @@
      <button disabled={!snapshot||saving||failed||inspectorDirty} onclick={()=>command(()=>importing=true)}><Icon name="import"/>Import documents</button>
      <button disabled={!snapshot||saving||failed||inspectorDirty} onclick={()=>command(()=>settings=true)}><Icon name="settings"/>Areas & milestones</button>
      <button disabled={!snapshot} onclick={()=>command(exported)}><Icon name="export"/>Export board</button>
+     <button aria-label="Commands" onclick={()=>command(()=>{paletteOpen=true;})}><Icon name="more"/>Commands… <small style="margin-left:auto;color:var(--muted)">⌘/Ctrl K</small></button>
      <button disabled={saving} onclick={()=>command(()=>{void select(project!);})}><Icon name="refresh"/>Reload</button>
      {#if snapshot?.board.adoption==='mirror'}
      <div class="menu-separator"></div>
@@ -350,3 +359,4 @@
 {#if adding}<AddProjectDialog onclose={()=>adding=false} oncreated={created}/>{/if}
 {#if providersOpen}<ProviderSettings onclose={()=>providersOpen=false}/>{/if}
 {#if connectionOpen&&project}<ProjectConnection {project} onclose={()=>connectionOpen=false} onconnected={()=>void connected()}/>{/if}
+{#if paletteOpen}<ActionPalette projectId={project?.id??null} onclose={()=>paletteOpen=false}/>{/if}

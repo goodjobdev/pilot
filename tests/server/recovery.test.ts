@@ -30,6 +30,17 @@ function freePort(): Promise<number> {
 }
 
 /**
+ * The entrypoint validates the whole environment, so this test must not inherit a deployment's
+ * values: an ambient DASHBOARD_ORIGIN, CF_ACCESS_*, DASHBOARD_EXPOSURE or DASHBOARD_ALLOWED_HOSTS
+ * would make every start here fail closed before the behaviour under test is reached.
+ */
+const DEPLOYMENT_VARIABLES=['DASHBOARD_MODE','DASHBOARD_EXPOSURE','DASHBOARD_BIND','DASHBOARD_ALLOWED_HOSTS','DASHBOARD_RELEASE','DASHBOARD_ROOT_ID','DASHBOARD_SHUTDOWN_DEADLINE_MS','DASHBOARD_ORIGIN','CF_ACCESS_TEAM','CF_ACCESS_AUD','DASHBOARD_OWNER','DASHBOARD_DATA','DASHBOARD_ROOTS','DASHBOARD_REGISTRY','PORT'];
+function testEnv(overrides:NodeJS.ProcessEnv):NodeJS.ProcessEnv {
+  const env:{[name:string]:string|undefined}={...process.env};
+  for(const name of DEPLOYMENT_VARIABLES)delete env[name];
+  return {...env,...overrides} as NodeJS.ProcessEnv;
+}
+/**
  * A killed process must not leave the vault unusable, and a tool that already ran must not run
  * again. This spawns the real server bundle, kills it in the middle of a tool call, restarts it
  * on the same data, and checks what the durable session recorded.
@@ -47,7 +58,7 @@ test('a run killed mid-tool resumes from its checkpoint and never replays an uns
   const data=join(root,'data');
   const port=await freePort();
   const base='http://127.0.0.1:'+port;
-  const env={ ...process.env,DASHBOARD_MODE:'local',DASHBOARD_DATA:data,PORT:String(port),DASHBOARD_AGENTS:'on',DASHBOARD_AGENT_PAUSE_MS:'100',DASHBOARD_REGISTRY:'',DASHBOARD_ROOTS:'' };
+  const env=testEnv({ DASHBOARD_MODE:'local',DASHBOARD_DATA:data,PORT:String(port),DASHBOARD_AGENTS:'on',DASHBOARD_AGENT_PAUSE_MS:'100',DASHBOARD_REGISTRY:'',DASHBOARD_ROOTS:'' });
   const startServer=()=>spawn(process.execPath,[join(release,'server.mjs')],{env,stdio:['ignore','pipe','pipe']});
   const waitForListening=(child:ChildProcess)=>new Promise<void>((ok,fail)=>{
     const timer=setTimeout(()=>fail(Error('the server did not start listening')),10000);

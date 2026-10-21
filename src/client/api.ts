@@ -1,6 +1,8 @@
 import type { Board,Operation,Project,Snapshot } from '../shared/model';
 import type { DocEntry,DocSnapshot } from '../shared/docs';
 import type { AgentView } from '../shared/agent';
+import type { ActionDescriptor,LiveActivity } from '../shared/actions';
+import type { MediaView } from '../shared/images';
 const token=document.querySelector<HTMLMetaElement>('meta[name="dashboard-token"]')?.content??'';
 let csrf='';
 export type ApiErrorKind = 'http' | 'session' | 'network';
@@ -41,6 +43,12 @@ export function session():Promise<void>{
   if(!renewing)renewing=request<{csrf?:string}>('/session').then(data=>{csrf=data.csrf??'';}).finally(()=>{renewing=undefined;});
   return renewing;
 }
+/** The ambient scope an action runs in. A dimension an action requires and this omits is refused. */
+export type ActionScope={projectId?:string;sessionId?:string};
+/** The registry as the server offers it: only implemented actions, only ones this scope can use. */
+export interface ActionListView{readOnly:true;scope:{projectId:string|null;sessionId:string|null};actions:ActionDescriptor[]}
+/** One execution: the id that ran and the handler's own result. */
+export interface ActionExecution{action:string;result:unknown}
 export const api={
   projects:()=>request<Project[]>('/projects'),
   register:(data:unknown)=>request<Project>('/projects','POST',data),
@@ -59,11 +67,40 @@ export const api={
   unsubscribeAlerts:(endpoint:string)=>request<{count:number}>('/alerts/unsubscribe','POST',{endpoint}),
   testAlert:()=>request<{sent:number;failed:number;skipped:boolean}>('/alerts/test','POST',{}),
   agents:(id:string)=>request<{enabled:boolean;view:AgentView|null}>('/projects/'+id+'/agents'),
-  agentInput:(id:string,body:{text:string;mode:'followUp'|'steer'|'reject';requestId?:string})=>request<{submissionId:string;queued:boolean}>('/projects/'+id+'/agents/input','POST',body),
+  /** A message carries text, the ids of stored images, or both. */
+  agentInput:(id:string,body:{text:string;mode:'followUp'|'steer'|'reject';requestId?:string;images?:string[]})=>request<{submissionId:string;queued:boolean}>('/projects/'+id+'/agents/input','POST',body),
   agentAbort:(id:string)=>request<{ok:true}>('/projects/'+id+'/agents/abort','POST',{}),
   agentAnswer:(id:string,body:{questionId:string;text:string})=>request<{submissionId:string}>('/projects/'+id+'/agents/answer','POST',body),
+  /**
+   * One image, through the upload path. The declared name and type travel with it but the server
+   * decides what the bytes are; a refusal is answered with the server's own per-image reason and code.
+   */
+  uploadImage:(id:string,body:{data:string;name?:string;declaredType?:string})=>request<{media:MediaView}>('/projects/'+id+'/agents/media','POST',body),
+  /**
+   * The command registry, its live read-only projection and one action's execution. The registry is
+   * the only source of what the palette may offer: nothing in the client hardcodes a capability.
+   */
+  sessions:(projectId:string)=>request<{sessions:{id:string;name:string;revision:number}[]}>('/sessions?projectId='+encodeURIComponent(projectId)),
+  actions:(scope:ActionScope={})=>{
+    const query=new URLSearchParams();
+    if(scope.projectId)query.set('projectId',scope.projectId);
+    if(scope.sessionId)query.set('sessionId',scope.sessionId);
+    const suffix=query.toString();
+    return request<ActionListView>('/actions'+(suffix?'?'+suffix:''));
+  },
+  actionActivity:(projectId:string)=>request<LiveActivity>('/actions/activity?projectId='+encodeURIComponent(projectId)),
+  runAction:(id:string,body:{params?:Record<string,unknown>;scope?:ActionScope}={})=>request<ActionExecution>('/actions/execute','POST',{id,...body}),
 };
 export function assetUrl(id:string,path:string){return '/api/projects/'+id+'/docs/asset?path='+encodeURIComponent(path);}
+/**
+ * Stored media is served owner-only, so it is fetched with the session header and shown as a blob
+ * URL: an <img src> request cannot carry that header. The URL is the caller's to revoke.
+ */
+export async function mediaBlobUrl(id:string):Promise<string>{
+  const res=await fetch('/api/media/'+id,{headers:{'x-dashboard-token':token}});
+  if(!res.ok)throw new ApiError(res.status,'Image unavailable');
+  return URL.createObjectURL(await res.blob());
+}
 /**
  * Documentation assets are fetched with the session header rather than referenced by
  * URL, because an <img> or <iframe> request cannot carry it and would only work where

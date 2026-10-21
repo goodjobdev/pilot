@@ -1,12 +1,43 @@
 <script lang="ts">
  import { api,agentStream } from './api';
  import type { AgentView } from '../shared/agent';
+ import { uniqueImageFiles,type ImageDraft } from '../shared/images';
+ import ImageComposer from './ImageComposer.svelte';
  import Icon from './Icon.svelte';
  import {request} from './api';
  import {modelKey,type ProviderSettings} from '../shared/settings';
  let { projectId,onerror,onquestions }:{ projectId:string; onerror:(message:string)=>void; onquestions?:()=>void }=$props();
  let view=$state<AgentView|null>(null),enabled=$state(true),status=$state('Connecting…'),draft=$state(''),sending=$state(false),problem=$state('');
  let answers=$state<Record<string,string>>({}),answering=$state('');
+ // The images attached to the next message, and the one way the composer's upload path is fed.
+ let media=$state<ImageDraft[]>([]),composerApi=$state<{add:(files:File[])=>void}|null>(null),composerDragging=$state(false);
+ const readyImages=$derived(media.filter(item=>item.status==='ready'&&item.id).map(item=>item.id as string));
+ // An image that is still uploading is not part of `readyImages` and its bytes are not stored yet, so
+ // a send now would leave it out of the message and then clear the strip. The send waits for it, and
+ // this is the one reading both the buttons and the sender use.
+ const uploadingImages=$derived(media.some(item=>item.status==='uploading'));
+ /**
+  * The one paste and drop handler for the whole composer area, which is what makes a gesture handled
+  * exactly once: the strip inside it has no handler of its own, an event another handler has already
+  * taken is left alone, and the default is prevented once per gesture that really carries a file.
+  */
+ function composerEvent(event:ClipboardEvent|DragEvent){
+   if(event.defaultPrevented||!composerApi)return;
+   let files:File[];
+   if(event instanceof ClipboardEvent){
+     const fromItems=[...(event.clipboardData?.items??[])].filter(entry=>entry.kind==='file').map(entry=>entry.getAsFile()).filter((file):file is File=>file!==null);
+     // A clipboard that lists its files only in `files` is read there instead, never as well.
+     files=fromItems.length?fromItems:[...(event.clipboardData?.files??[])];
+   }else{
+     files=[...(event.dataTransfer?.files??[])];
+   }
+   if(files.length===0)return;
+   event.preventDefault();
+   composerDragging=false;
+   // One gesture is one enqueue: a file this gesture lists twice (through items and through files, or
+   // twice over) is taken once, so one drop or paste can never become two items and two uploads.
+   composerApi.add(uniqueImageFiles(files));
+ }
  let transcript=$state<HTMLDivElement>();
  let controller:AbortController|null=null;
  let modelSettings=$state<ProviderSettings|null>(null),selectedModel=$state(''),modelBusy=$state(false);
@@ -47,10 +78,16 @@
    onquestions?.();
  });
  async function send(mode:'followUp'|'steer'){
-   const text=draft.trim();
-   if(text===''||sending)return;
+   const text=draft.trim(),images=readyImages;
+   // A message needs text or an image; a refused image is never sent, and stays visible until removed.
+   if((text===''&&images.length===0)||sending)return;
+   // An upload in flight is not a stored image. Sending here would send the text without it and then
+   // wipe the strip, silently leaving an accepted image behind, so the message is held with its own
+   // reason instead. The Send and Steer buttons are disabled on this very condition, with the state
+   // named next to them, so a person never reaches this branch without being told why.
+   if(uploadingImages){problem='An image is still uploading. Wait for it to finish, then send — sending now would leave it out of the message.';return;}
    sending=true;problem='';
-   try{await api.agentInput(projectId,{text,mode,requestId:crypto.randomUUID()});draft='';}
+   try{await api.agentInput(projectId,{text,mode,requestId:crypto.randomUUID(),images});draft='';media=[];}
    catch(e){problem=(e as Error).message;}
    finally{sending=false;}
  }
@@ -125,11 +162,15 @@
   {#each view.inbox as item (item.id)}<p><span class="pill">{item.mode}</span>{item.text}</p>{/each}
  </div>
  {/if}
- <div class="agent-composer">
+ <!-- svelte-ignore a11y_no_static_element_interactions -->
+ <div class="agent-composer" onpaste={(event)=>composerEvent(event)} ondrop={(event)=>composerEvent(event)}
+      ondragover={(event)=>{event.preventDefault();composerDragging=true;}} ondragleave={()=>composerDragging=false}>
+  <ImageComposer projectId={projectId} bind:items={media} dragging={composerDragging} handle={(composer)=>{composerApi=composer;}}/>
   <label>Message the agent<textarea aria-label="Message the agent" bind:value={draft} placeholder="Ask for something, or include [pause] to hold the run open while you steer or stop it."></textarea></label>
   <div class="row">
-   <button class="primary compact-button" aria-label="Send message" disabled={sending||draft.trim()===''} onclick={()=>void send('followUp')}><Icon name="arrow" size={14}/><span>{working?'Queue follow-up':'Send'}</span></button>
-   <button class="compact-button" aria-label="Steer the run" disabled={sending||!working||draft.trim()===''} onclick={()=>void send('steer')}>Steer current run</button>
+   <button class="primary compact-button" aria-label="Send message" disabled={sending||uploadingImages||(draft.trim()===''&&readyImages.length===0)} title={uploadingImages?'An image is still uploading: the message is held until it is stored':undefined} onclick={()=>void send('followUp')}><Icon name="arrow" size={14}/><span>{working?'Queue follow-up':'Send'}</span></button>
+   <button class="compact-button" aria-label="Steer the run" disabled={sending||uploadingImages||!working||(draft.trim()===''&&readyImages.length===0)} title={uploadingImages?'An image is still uploading: the message is held until it is stored':undefined} onclick={()=>void send('steer')}>Steer current run</button>
+   {#if uploadingImages}<small class="agent-upload-state" role="status">Uploading an image — the message is held until it is stored</small>{/if}
    <small class="agent-status">{status}{view?.usage.input?(' · '+view.usage.input+' in / '+view.usage.output+' out'):''}</small>
   </div>
  </div>
@@ -164,4 +205,5 @@
  .agent-composer{border-top:1px solid var(--line);background:var(--panel);padding:10px 12px}
  .agent-composer textarea{min-height:80px;font:12px/1.6 var(--mono)}
  .agent-status{color:var(--muted)}
+ .agent-upload-state{color:var(--accent)}
 </style>

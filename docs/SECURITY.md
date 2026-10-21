@@ -17,7 +17,7 @@ assumes, and what it does not protect, so you can decide whether that fits.
 | Access | The application verifies the signed assertion itself — signature, issuer, audience, expiry and the allowed owner — rather than trusting identity headers. No bypass mode, no anonymous route |
 | Cross-site writes | Session-bound CSRF plus same-origin and JSON content-type checks |
 | Host confusion | The Host header must match the configured origin |
-| Exposure | Loopback binding only; nothing listens publicly, and the container publishes on `127.0.0.1` |
+| Exposure | `host-loopback` — the default, and the only profile local mode allows — binds `127.0.0.1`. A container may bind its own interface only with hosted mode plus `container-private-interface`, which serves the published port inside its private network namespace; the host still publishes on `127.0.0.1` only, and the surrounding network stays an operator-attested fact |
 | Path escape | One containment helper refuses absolute paths, `..` and symlinks; generated folders and app-managed paths are never served or edited |
 | Resource abuse | Read and write size caps, a document-count cap, a bounded subscription list, and bounded search/inbox scans |
 | Untrusted rendering | Markdown is sanitised; assets are limited to images and static HTML/SVG; mockups render in a sandboxed frame with no scripts and no same-origin access; a strict Content-Security-Policy covers the application |

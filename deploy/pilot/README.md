@@ -19,12 +19,23 @@ with the next phase and inherits the same boundaries.
 
 ## Use
 
+The compose file runs the container profile, which must be hosted mode with the
+container-private-interface exposure (a published port reaches the container's own interface,
+never its loopback). Copy the hosted example; the local example is a host-loopback profile for
+running the app directly on the host, never inside this container.
+
 ```sh
-cp env.local.example .env          # or env.hosted.example for the Access route
+cp env.hosted.example .env          # hosted + container-private-interface
 docker compose --env-file .env build
 docker compose --env-file .env up -d
 docker compose --env-file .env ps
 ```
+
+Replace the `CF_ACCESS_TEAM` placeholder and `DASHBOARD_ORIGIN`/`DASHBOARD_HEALTH_HOST`
+hostname with the real Access team subdomain and this pilot's hostname before starting; the
+process validates them and refuses to start otherwise. Keep `DASHBOARD_HEALTH_HOST` equal to
+the origin host so the compose healthcheck's `Host` header is never empty (an empty or
+mismatching Host is a 403).
 
 Verify the boundary, not just the app:
 
@@ -33,8 +44,8 @@ docker inspect pi-workspace-pilot --format '{{.Config.User}} {{.HostConfig.Reado
 docker port pi-workspace-pilot                     # must show 127.0.0.1 only
 docker exec pi-workspace-pilot id                  # must show uid 10001, never 0
 docker exec pi-workspace-pilot sh -c 'test ! -e /var/run/docker.sock && echo "no docker socket"'
-curl -fsS -H 'Host: 127.0.0.1:4319' http://127.0.0.1:4319/healthz
-curl -s -o /dev/null -w '%{http_code}\n' -H 'Host: 127.0.0.1:4319' http://127.0.0.1:4319/api/projects   # 401 without a session
+curl -fsS -H 'Host: pilot-dashboard.example.com' http://127.0.0.1:4319/healthz   # the origin host, not 127.0.0.1
+curl -s -o /dev/null -w '%{http_code}\n' -H 'Host: pilot-dashboard.example.com' http://127.0.0.1:4319/api/projects   # 401 without a session
 ```
 
 ## Remote access options

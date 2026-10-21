@@ -1,17 +1,33 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp,writeFile } from 'node:fs/promises';
+import { mkdir,mkdtemp,readFile,rm,writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { request } from 'node:http';
+import { DatabaseSync } from 'node:sqlite';
 import { createApp } from '../../src/server/main';
 import { localConfig } from '../../src/server/security';
+import { ControlStore } from '../../src/server/state/control-store';
+import { DeliveryLedger } from '../../src/server/state/delivery';
+import { SessionLifecycleService, SessionLifecycleStore } from '../../src/server/state/session-lifecycle';
+import type { AlertPayload } from '../../src/server/alerts';
+import { observeStorageSchema } from '../../src/server/release';
+import { newTask } from '../../src/shared/model';
+import { ACTION_DESCRIPTORS, ACTION_IDS, LIVE_RUN_DETAILS, LIVE_RUN_REASONS, LIVE_TOOL_REASONS } from '../../src/shared/actions';
+
+const listen=(app:Awaited<ReturnType<typeof createApp>>,security:ReturnType<typeof localConfig>)=>new Promise<void>(ok=>app.server.listen(0,'127.0.0.1',()=>{security.origin='http://127.0.0.1:'+(app.server.address() as any).port;ok();}));
+const hostProbe=(port:string,host:string):Promise<number>=>new Promise((ok,fail)=>{const req=request({host:'127.0.0.1',port,path:'/readyz',headers:{host}},res=>{res.resume();ok(res.statusCode??0);});req.on('error',fail);req.end();});
 test('API authentication, origin, content type and project isolation',async()=>{
  const security=localConfig('http://127.0.0.1:0'),app=await createApp({dataRoot:await mkdtemp(join(tmpdir(),'dashboard-api-')),browseRoots:[],security});
  await new Promise<void>(ok=>app.server.listen(0,'127.0.0.1',ok));security.origin='http://127.0.0.1:'+(app.server.address() as any).port;
  try{
  const url=security.origin,token={'x-dashboard-token':security.token};
  assert.equal((await fetch(url+'/api/projects')).status,401);
+ // Stored media is behind the same owner-only session and the same Host check as every other route,
+ // and an unknown id is simply unknown rather than a path.
+ assert.equal((await fetch(url+'/api/media/'+'a'.repeat(64))).status,401);
+ assert.equal((await fetch(url+'/api/media/..%2f..%2fetc%2fpasswd',{headers:token})).status,404);
  assert.equal((await fetch(url+'/api/projects',{method:'POST',headers:{...token,'content-type':'application/json',origin:'https://evil.example'},body:'{}'})).status,403);
  const res=await fetch(url+'/api/projects',{method:'POST',headers:{...token,'content-type':'application/json',origin:url},body:JSON.stringify({name:'Test',managed:true,confirm:true})});assert.equal(res.status,201);
  assert.equal((await fetch(url+'/api/projects/00000000-0000-4000-8000-000000000000/board',{headers:token})).status,404);
@@ -60,4 +76,870 @@ test('document routes enforce authentication, origin, containment and revisions'
  assert.equal((await fetch(base+'/asset?path='+encodeURIComponent('../outside.png'),{headers:token})).status,400);
  assert.equal((await fetch(base+'/asset',{headers:token})).status,400);
  }finally{await app.close();}
+});
+test('readyz reports the schema observed from the live store handle rather than a second connection',async()=>{
+ // The observation root is deliberately empty and the handle lives in another root: a second
+ // connection would answer storage-schema-absent, so a 200 can only come from the live handle.
+ const dataRoot=await mkdtemp(join(tmpdir(),'dashboard-ready-live-data-'));
+ const storeRoot=await mkdtemp(join(tmpdir(),'dashboard-ready-live-store-'));
+ const store=new ControlStore(storeRoot);
+ const observeSchema=()=>{try{return {state:'present' as const,version:store.schemaVersion()};}catch(error){return {state:'malformed' as const,reason:(error as Error).message};}};
+ const security=localConfig('http://127.0.0.1:0');
+ const app=await createApp({dataRoot,browseRoots:[],security,readiness:{releaseId:'v1.2.3',schemaId:'pilot-state-1',manifestValid:true,lockHeld:()=>true,observeSchema}});
+ await listen(app,security);
+ try{
+  assert.deepEqual(observeStorageSchema(dataRoot),{state:'absent'},'a second connection sees no schema there');
+  const ready=await fetch(security.origin+'/readyz',{headers:{'x-dashboard-token':security.token}});
+  assert.equal(ready.status,200,'the open handle is the authority');
+  const body=await ready.json();
+  assert.deepEqual(body,{ok:true,releaseId:'v1.2.3',schemaId:'pilot-state-1',lockHeld:true,dataRootWritable:true,reasons:[]});
+  assert.ok(!JSON.stringify(body).includes(storeRoot),'readiness must not leak a filesystem path');
+  // A closed handle is no longer evidence: readiness degrades instead of claiming the on-disk view.
+  store.close();
+  const closed=await fetch(security.origin+'/readyz',{headers:{'x-dashboard-token':security.token}});
+  assert.equal(closed.status,503);
+  assert.ok((await closed.json()).reasons.includes('storage-schema-unreadable'));
+ }finally{
+  store.close();
+  await app.close();
+  await rm(dataRoot,{recursive:true,force:true});
+  await rm(storeRoot,{recursive:true,force:true});
+ }
+});
+test('readyz is authenticated expected-version readiness, read-only and path-free',async()=>{
+ const root=await mkdtemp(join(tmpdir(),'dashboard-ready-'));
+ const store=new ControlStore(root);store.close();
+ const before=await readFile(join(root,'control.sqlite'));
+ const security=localConfig('http://127.0.0.1:0');
+ const app=await createApp({dataRoot:root,browseRoots:[],security,readiness:{releaseId:'v1.2.3',schemaId:'pilot-state-1',manifestValid:true,lockHeld:()=>true}});
+ await listen(app,security);
+ try{
+  const url=security.origin,token={'x-dashboard-token':security.token};
+  assert.equal((await fetch(url+'/readyz')).status,401,'readiness is behind owner auth, unlike liveness');
+  assert.equal(await hostProbe(new URL(url).port,'evil.example'),403,'the wrong-Host 403 still applies');
+  const res=await fetch(url+'/readyz',{headers:token});
+  assert.equal(res.status,200);
+  const ready=await res.json();
+  assert.deepEqual(ready,{ok:true,releaseId:'v1.2.3',schemaId:'pilot-state-1',lockHeld:true,dataRootWritable:true,reasons:[]});
+  assert.ok(!JSON.stringify(ready).includes(root),'readiness must not leak a filesystem path');
+  assert.deepEqual(await readFile(join(root,'control.sqlite')),before,'readiness must not rewrite the storage schema');
+  assert.equal((await fetch(url+'/healthz')).status,200,'liveness stays unauthenticated and unchanged');
+  assert.equal((await fetch(url+'/readyz',{method:'POST',headers:{...token,'content-type':'application/json',origin:url}})).status,405);
+ }finally{await app.close();await rm(root,{recursive:true,force:true});}
+ // No lock held, and an absent schema: both are machine-readable 503 reasons.
+ const root2=await mkdtemp(join(tmpdir(),'dashboard-ready2-'));
+ const security2=localConfig('http://127.0.0.1:0');
+ const app2=await createApp({dataRoot:root2,browseRoots:[],security:security2,readiness:{releaseId:'unreleased-local',schemaId:'pilot-state-1',lockHeld:()=>false}});
+ await listen(app2,security2);
+ try{
+  const res=await fetch(security2.origin+'/readyz',{headers:{'x-dashboard-token':security2.token}});
+  assert.equal(res.status,503);
+  const body=await res.json();
+  assert.equal(body.ok,false);
+  assert.ok(body.reasons.includes('service-lock-not-held'));
+  assert.ok(body.reasons.includes('storage-schema-absent'));
+ }finally{await app2.close();await rm(root2,{recursive:true,force:true});}
+ // An observed schema that does not match the expected schemaId is a mismatch.
+ const root3=await mkdtemp(join(tmpdir(),'dashboard-ready3-'));
+ const db=new DatabaseSync(join(root3,'control.sqlite'));
+ db.exec('CREATE TABLE control_schema(version INTEGER PRIMARY KEY);');db.exec('INSERT INTO control_schema(version) VALUES (2);');db.close();
+ const security3=localConfig('http://127.0.0.1:0');
+ const app3=await createApp({dataRoot:root3,browseRoots:[],security:security3,readiness:{releaseId:'r',schemaId:'pilot-state-1',lockHeld:()=>true}});
+ await listen(app3,security3);
+ try{
+  const body=await (await fetch(security3.origin+'/readyz',{headers:{'x-dashboard-token':security3.token}})).json();
+  assert.equal(body.ok,false);
+  assert.ok(body.reasons.includes('storage-schema-mismatch'));
+ }finally{await app3.close();await rm(root3,{recursive:true,force:true});}
+});
+
+test('the approvals API is owner-only, scope-guarded and single-use, and consuming performs no action',async()=>{
+ const root=await mkdtemp(join(tmpdir(),'dashboard-approvals-api-'));
+ const store=new ControlStore(root);
+ const security=localConfig('http://127.0.0.1:0');
+ const app=await createApp({dataRoot:root,browseRoots:[],security,control:store});
+ await listen(app,security);
+ const url=security.origin,token={'x-dashboard-token':security.token},writes={...token,'content-type':'application/json',origin:url};
+ const target={remote:'git@github.com:owner/repo.git',branch:'main',commitSha:'a'.repeat(40)};
+ const approve=(over:Record<string,unknown>={})=>fetch(url+'/api/approvals',{method:'POST',headers:writes,body:JSON.stringify({kind:'push',scope:{projectId:'project-a'},target,expiresAt:new Date(Date.now()+600000).toISOString(),...over})});
+ const consume=(id:string,over:Record<string,unknown>={})=>fetch(url+'/api/approvals/'+id+'/consume',{method:'POST',headers:writes,body:JSON.stringify({scope:{projectId:'project-a'},kind:'push',target,consumedBy:'owner',...over})});
+ try{
+  assert.equal((await fetch(url+'/api/approvals?projectId=project-a')).status,401,'approvals are behind owner auth');
+  assert.equal((await fetch(url+'/api/approvals',{method:'POST',headers:{'content-type':'application/json',origin:url},body:'{}'})).status,401,'writing an approval needs the owner token');
+  const wrongHost=await new Promise<number>((ok,fail)=>{const req=request({host:'127.0.0.1',port:new URL(url).port,path:'/api/approvals?projectId=project-a',headers:{host:'evil.example','x-dashboard-token':security.token}},res=>{res.resume();ok(res.statusCode??0);});req.on('error',fail);req.end();});
+  assert.equal(wrongHost,403,'the unchanged Host check applies to approvals too');
+
+  const created=await approve();assert.equal(created.status,201);
+  const record=(await created.json()).approval;
+  assert.equal(record.state,'pending');assert.match(record.nonce,/^[a-f0-9]{64}$/);assert.deepEqual(record.target,target);
+  assert.equal((await approve({kind:'transfer'})).status,422,'an unknown kind fails closed');
+  assert.equal((await approve({target:{remote:target.remote,branch:'main'}})).status,422,'a missing target field fails closed');
+  assert.equal((await approve({target:{...target,force:true}})).status,422,'an unknown target field fails closed');
+  assert.equal((await approve({expiresAt:new Date(Date.now()-1000).toISOString()})).status,422,'a non-future expiry fails closed');
+  assert.equal((await approve({expiresAt:new Date(Date.now()+3*3600*1000).toISOString()})).status,422,'a lifetime beyond the documented maximum fails closed');
+  assert.equal((await approve({confirm:true})).status,400,'an unknown request field fails closed');
+  assert.equal((await fetch(url+'/api/approvals',{headers:token})).status,422,'there is no unscoped listing');
+  const otherProject=await approve({scope:{projectId:'project-b'}});assert.equal(otherProject.status,201);
+  const otherId=(await otherProject.json()).approval.id;
+  // A listing is scoped exactly: it returns that scope's approvals and nothing from another one.
+  const listed=await (await fetch(url+'/api/approvals?projectId=project-a',{headers:token})).json();
+  assert.deepEqual(listed.approvals.map((entry:any)=>entry.id),[record.id]);
+  const listedOther=await (await fetch(url+'/api/approvals?projectId=project-b',{headers:token})).json();
+  assert.deepEqual(listedOther.approvals.map((entry:any)=>entry.id),[otherId]);
+  // A listing is a discovery aid, not a credential store: the single-use nonce stays in the create
+  // response, which is the only response that hands it out. The listing returns the same record
+  // otherwise, so nothing else about it changed.
+  assert.equal('nonce' in listed.approvals[0],false,'the listing does not return the approval nonce');
+  assert.equal('nonce' in listedOther.approvals[0],false);
+  assert.equal(listed.approvals[0].state,'pending');
+  assert.equal(listed.approvals[0].kind,'push');
+  assert.deepEqual(listed.approvals[0].target,target);
+  assert.equal((await fetch(url+'/api/approvals/'+otherId+'?projectId=project-a',{headers:token})).status,403,'another project\'s approval is not readable here');
+  const read=await fetch(url+'/api/approvals/'+record.id+'?projectId=project-a',{headers:token});
+  assert.equal(read.status,200);assert.equal((await read.json()).approval.state,'pending');
+  assert.equal((await fetch(url+'/api/approvals/'+record.id,{headers:token})).status,422,'a read still has to name a scope');
+  assert.equal((await fetch(url+'/api/approvals/'+record.id+'?sessionId=session-a',{headers:token})).status,403,'the exact scope is required');
+  assert.equal((await fetch(url+'/api/approvals/'+randomUUID()+'?projectId=project-a',{headers:token})).status,404);
+  assert.equal((await fetch(url+'/api/approvals/'+record.id,{method:'POST',headers:writes,body:'{}'})).status,405);
+
+  const mismatch=await consume(record.id,{target:{...target,commitSha:'b'.repeat(40)}});assert.equal(mismatch.status,409);
+  assert.match((await mismatch.json()).error,/different push target/);
+  assert.equal((await consume(record.id,{kind:'publish',target:{channel:'stable',artifact:'pilot-0.1.0'}})).status,409,'a valid target for the wrong kind is still refused');
+  assert.equal((await consume(record.id,{kind:'publish'})).status,422,'a target that does not belong to the requested kind fails closed');
+  const consumed=await consume(record.id);assert.equal(consumed.status,200);
+  const result=await consumed.json();
+  // Consuming records the authorisation and returns the exact target. It performs nothing.
+  assert.deepEqual(Object.keys(result).sort(),['approval','target']);
+  assert.deepEqual(result.target,target);
+  assert.equal(result.approval.state,'consumed');assert.equal(result.approval.consumedBy,'owner');
+  const replay=await consume(record.id);assert.equal(replay.status,409);
+  assert.match((await replay.json()).error,/already consumed/);
+  assert.equal((await (await fetch(url+'/api/approvals/'+record.id+'?projectId=project-a',{headers:token})).json()).approval.state,'consumed');
+
+  const second=await approve();assert.equal(second.status,201);
+  const secondId=(await second.json()).approval.id;
+  const revoked=await fetch(url+'/api/approvals/'+secondId+'/revoke',{method:'POST',headers:writes,body:JSON.stringify({scope:{projectId:'project-a'},revokedBy:'owner',reason:'superseded'})});
+  assert.equal(revoked.status,200);assert.equal((await revoked.json()).approval.state,'revoked');
+  const afterRevoke=await consume(secondId);assert.equal(afterRevoke.status,409);assert.match((await afterRevoke.json()).error,/was revoked at/);
+ }finally{await app.close();store.close();await rm(root,{recursive:true,force:true});}
+ // Without a live control store the routes refuse rather than guessing at a scope.
+ const bare=await mkdtemp(join(tmpdir(),'dashboard-approvals-bare-'));
+ const bareSecurity=localConfig('http://127.0.0.1:0');
+ const bareApp=await createApp({dataRoot:bare,browseRoots:[],security:bareSecurity});
+ await listen(bareApp,bareSecurity);
+ try{
+  assert.equal((await fetch(bareSecurity.origin+'/api/approvals?projectId=project-a',{headers:{'x-dashboard-token':bareSecurity.token}})).status,503);
+ }finally{await bareApp.close();await rm(bare,{recursive:true,force:true});}
+});
+
+test('a start reconciles the delivery ledger: it re-sends only what the tag makes idempotent and acknowledges the real receipt',async()=>{
+  const root=await mkdtemp(join(tmpdir(),'dashboard-delivery-reconcile-'));
+  const store=new ControlStore(root);
+  const ledger=new DeliveryLedger(store);
+  const questionId='11111111-1111-4111-8111-111111111111';
+  const scope={projectId:'project-a',sessionId:'session-1'};
+  const admitted=ledger.admitQuestion({...scope,questionId,text:'Should I proceed?',askedAt:1700000000000});
+  const outboxRow=(store.db.prepare('SELECT revision FROM outboxes WHERE id=?').get(admitted.outbox.id) as {revision:number});
+  const sent:AlertPayload[]=[];
+  const transport=async(_subscription:unknown,payload:AlertPayload)=>{sent.push(payload);};
+  const first=localConfig('http://127.0.0.1:0');
+  const app=await createApp({dataRoot:root,browseRoots:[],security:first,control:store,alertTransport:transport});
+  await listen(app,first);
+  try{
+    const token={'x-dashboard-token':first.token};
+    const writes={...token,'content-type':'application/json',origin:first.origin};
+    // No device is subscribed, so the channel sent nothing: the row is not claimed as delivered.
+    assert.equal(sent.length,0,'a start with no subscribed device sends nothing');
+    assert.deepEqual(ledger.deliveries(scope).questions.map((entry)=>[entry.delivered,entry.receipt]),[[false,null]],'an undelivered notification is not acknowledged');
+    assert.equal((await fetch(first.origin+'/api/alerts/subscribe',{method:'POST',headers:writes,body:JSON.stringify({endpoint:'https://push.example.test/one',keys:{p256dh:'B'.repeat(80),auth:'C'.repeat(20)}})})).status,200);
+  }finally{await app.close();}
+
+  // A restart with a subscribed device: the same pending row is re-sent, and this time the channel
+  // reports a real receipt, which is exactly what the ledger acknowledges.
+  const second=localConfig('http://127.0.0.1:0');
+  const restarted=await createApp({dataRoot:root,browseRoots:[],security:second,control:store,alertTransport:transport});
+  await listen(restarted,second);
+  let deliveredRevision=1;
+  try{
+    assert.deepEqual(sent.map((payload)=>[payload.tag,payload.title,payload.body.includes('Should I proceed?')]),[['pilot-question-'+questionId,'An agent needs an answer',false]],'the re-send is tagged by the question id and carries no question text');
+    const row=ledger.deliveries(scope).questions[0];
+    assert.equal(row.delivered,true);
+    assert.deepEqual(row.receipt,{sent:1,failed:0,skipped:false});
+    assert.equal(typeof row.acknowledgedAt,'string');
+    deliveredRevision=(store.db.prepare('SELECT revision FROM outboxes WHERE id=?').get(admitted.outbox.id) as {revision:number}).revision;
+    assert.equal(outboxRow.revision,deliveredRevision-1,'the re-send wrote exactly one acknowledgement');
+  }finally{await restarted.close();}
+
+  // A further start has nothing outstanding: a settled delivery is not re-sent, and its row is not
+  // rewritten, so a restart can never duplicate an effect.
+  const third=localConfig('http://127.0.0.1:0');
+  const again=await createApp({dataRoot:root,browseRoots:[],security:third,control:store,alertTransport:transport});
+  await listen(again,third);
+  try{
+    assert.equal(sent.length,1,'a settled notification is never re-sent');
+    assert.equal((store.db.prepare('SELECT revision FROM outboxes WHERE id=?').get(admitted.outbox.id) as {revision:number}).revision,deliveredRevision,'the acknowledgement is written once');
+    assert.equal((store.db.prepare('SELECT count(*) AS n FROM operations WHERE kind=?').get('question.delivery') as {n:number}).n,1,'a restart duplicates no row');
+    assert.equal(ledger.reconcileOnStartup().entries.length,0);
+  }finally{await again.close();store.close();await rm(root,{recursive:true,force:true});}
+});
+test('the sessions API is owner-only, resolves every link kind and is revision-checked',async()=>{
+ const root=await mkdtemp(join(tmpdir(),'dashboard-sessions-api-'));
+ const workspaces=join(root,'projects'),projectPath=join(workspaces,'workspace'),data=join(root,'data');
+ await mkdir(join(projectPath,'docs','spec'),{recursive:true,mode:0o755});
+ await mkdir(data,{recursive:true,mode:0o700});
+ const store=new ControlStore(data);
+ const security=localConfig('http://127.0.0.1:0');
+ const app=await createApp({dataRoot:data,browseRoots:[workspaces],security,control:store});
+ await listen(app,security);
+ const url=security.origin,token={'x-dashboard-token':security.token},writes={...token,'content-type':'application/json',origin:url};
+ const post=(path:string,body:unknown)=>fetch(url+path,{method:'POST',headers:writes,body:JSON.stringify(body)});
+ const read=(path:string)=>fetch(url+path,{headers:token});
+ try{
+  // Behind owner authentication and the unchanged Host check, like every other route.
+  assert.equal((await fetch(url+'/api/sessions?projectId='+randomUUID())).status,401,'sessions are behind owner auth');
+  assert.equal((await fetch(url+'/api/sessions',{method:'POST',headers:{'content-type':'application/json',origin:url},body:JSON.stringify({projectId:randomUUID(),name:'Nope'})})).status,401,'creating a session needs the owner token');
+  const wrongHost=await new Promise<number>((ok,fail)=>{const req=request({host:'127.0.0.1',port:new URL(url).port,path:'/api/sessions?projectId='+randomUUID(),headers:{host:'evil.example','x-dashboard-token':security.token}},res=>{res.resume();ok(res.statusCode??0);});req.on('error',fail);req.end();});
+  assert.equal(wrongHost,403,'the unchanged Host check applies to sessions too');
+  assert.equal((await fetch(url+'/api/sessions',{method:'POST',headers:{...token,'content-type':'application/json',origin:'https://evil.example'},body:'{}'})).status,403,'a write still needs the canonical origin');
+  // A session is created for a registered project, and there is no unscoped listing.
+  const project=await (await post('/api/projects',{name:'Sessions',path:projectPath,managed:false,confirm:true})).json();
+  assert.equal((await read('/api/sessions')).status,422,'there is no unscoped listing');
+  const taskId=randomUUID();
+  const created=await post('/api/sessions',{projectId:project.id,name:'Release train'});
+  assert.equal(created.status,201);
+  const session=(await created.json()).session;
+  assert.equal(session.revision,1);
+  assert.equal(session.model,null);
+  assert.deepEqual(session.links,[]);
+  assert.equal((await post('/api/sessions',{projectId:project.id,name:'Release train'})).status,409,'a duplicate live name is refused');
+  const unknownField=await post('/api/sessions',{projectId:project.id,name:'Other',colour:'red'});
+  assert.equal(unknownField.status,422);
+  assert.match((await unknownField.json()).error,/colour/);
+  assert.equal((await post('/api/sessions',{projectId:randomUUID(),name:'Other'})).status,404,'an unregistered project is not a session scope');
+  assert.deepEqual((await (await read('/api/sessions?projectId='+project.id)).json()).sessions.map((entry:any)=>entry.id),[session.id]);
+  assert.equal((await read('/api/sessions/'+randomUUID()+'?projectId='+project.id)).status,404);
+  // Links are validated against the board, the documentation store and the approved roots, and no
+  // refusal carries a path.
+  const link=(body:unknown)=>post('/api/sessions/'+session.id+'/link',body);
+  const missingTask=await link({projectId:project.id,link:{kind:'task',taskId:randomUUID()},revision:1});
+  assert.equal(missingTask.status,404);
+  const missingTaskText=await missingTask.text();
+  assert.match(missingTaskText,/contains no task/);
+  assert.ok(!missingTaskText.includes(project.path)&&!missingTaskText.includes(data),'a refusal leaks no filesystem path');
+  assert.equal((await link({projectId:project.id,link:{kind:'document',path:'docs/spec/missing.md',anchor:null},revision:1})).status,404,'a document the store does not serve is not found');
+  assert.equal((await link({projectId:project.id,link:{kind:'document',path:'../outside.md',anchor:null},revision:1})).status,403,'a document path outside the roots is refused');
+  assert.equal((await link({projectId:project.id,link:{kind:'document',path:'notes.txt',anchor:null},revision:1})).status,403);
+  assert.equal((await link({projectId:project.id,link:{kind:'workspace',path:root},revision:1})).status,403,'a workspace outside the approved roots is refused');
+  assert.equal((await link({projectId:project.id,link:{kind:'task',taskId:'not-a-uuid'},revision:1})).status,422);
+  assert.equal((await link({projectId:project.id,link:{kind:'board',taskId},revision:1})).status,422,'an unknown link kind fails closed');
+  // The board and the documentation store of the registered project supply the link targets.
+  assert.equal((await post('/api/projects/'+project.id+'/initialize',{confirm:true})).status,200);
+  const board=await (await read('/api/projects/'+project.id+'/board')).json();
+  const put=await post('/api/projects/'+project.id+'/board',{revision:board.revision,operation:{op:'putTask',task:newTask(taskId,'Ship the release')}});
+  assert.equal(put.status,200);
+  assert.equal((await post('/api/projects/'+project.id+'/docs/document',{path:'docs/spec/product.md',text:'# Product\n'})).status,201);
+  const task=await link({projectId:project.id,link:{kind:'task',taskId},revision:1});
+  assert.equal(task.status,200);
+  const taskRecord=(await task.json()).session;
+  assert.equal(taskRecord.revision,2);
+  assert.equal((await link({projectId:project.id,link:{kind:'document',path:'./docs/spec/product.md',anchor:'intent'},revision:2})).status,200);
+  const workspace=await link({projectId:project.id,link:{kind:'workspace',path:projectPath},revision:3});
+  assert.equal(workspace.status,200);
+  const roundTrip=(await workspace.json()).session;
+  assert.equal(roundTrip.revision,4);
+  assert.deepEqual(roundTrip.links,[
+   {kind:'document',path:'docs/spec/product.md',anchor:'intent'},
+   {kind:'task',taskId},
+   {kind:'workspace',path:project.path}
+  ],'a task, a document and a workspace link round-trip, and the workspace is stored canonically');
+  const reread=(await (await read('/api/sessions/'+session.id+'?projectId='+project.id)).json()).session;
+  assert.deepEqual(reread,roundTrip);
+  // Renaming is revision-checked, and a repeat of the same name is idempotent.
+  const rename=(body:unknown)=>post('/api/sessions/'+session.id+'/rename',body);
+  const stale=await rename({projectId:project.id,name:'Renamed',revision:1});
+  assert.equal(stale.status,409);
+  assert.match((await stale.json()).error,/unchanged/);
+  assert.deepEqual((await (await read('/api/sessions/'+session.id+'?projectId='+project.id)).json()).session,roundTrip,'a stale rename changes nothing');
+  const renamed=await rename({projectId:project.id,name:'Renamed',revision:4});
+  assert.equal(renamed.status,200);
+  assert.equal((await renamed.json()).session.revision,5);
+  assert.equal((await rename({projectId:project.id,name:'Renamed',revision:5})).status,200,'renaming to the same name is idempotent');
+  // Unlinking is idempotent, and a stale unlink can never remove a link.
+  const unlink=(body:unknown)=>post('/api/sessions/'+session.id+'/unlink',body);
+  const removed=await unlink({projectId:project.id,link:{kind:'task',taskId},revision:5});
+  assert.equal(removed.status,200);
+  const afterUnlink=(await removed.json()).session;
+  assert.equal(afterUnlink.links.length,2);
+  assert.equal(afterUnlink.revision,6);
+  assert.deepEqual((await (await unlink({projectId:project.id,link:{kind:'task',taskId},revision:6})).json()).session,afterUnlink,'unlinking twice changes nothing');
+  assert.deepEqual((await (await unlink({projectId:project.id,link:{kind:'task',taskId:randomUUID()},revision:1})).json()).session,afterUnlink,'unlinking an absent link changes nothing');
+  assert.equal((await unlink({projectId:project.id,link:{kind:'document',path:'docs/spec/product.md',anchor:'intent'},revision:1})).status,409,'removing a present link with a stale revision is refused');
+  // Methods and unknown routes.
+  assert.equal((await fetch(url+'/api/sessions/'+session.id+'?projectId='+project.id,{method:'POST',headers:writes,body:'{}'})).status,405);
+  assert.equal((await read('/api/sessions/'+session.id+'/rename')).status,405);
+  assert.equal((await post('/api/sessions/'+session.id+'/archive',{})).status,404);
+  assert.equal((await read('/api/sessions/migrate')).status,405);
+  // The migration route: no conversation exists for this project, so it plans and writes nothing.
+  const listed=await (await read('/api/sessions?projectId='+project.id)).json();
+  const dry=await post('/api/sessions/migrate',{dryRun:true});
+  assert.equal(dry.status,200);
+  const report=await dry.json();
+  assert.equal(report.dryRun,true);
+  assert.deepEqual(report.counts,{projects:1,conversations:0,adopted:0,alreadyAdopted:0,withoutConversation:1,refused:0});
+  assert.deepEqual(await (await read('/api/sessions?projectId='+project.id)).json(),listed,'a dry run changes nothing');
+  const applied=await (await post('/api/sessions/migrate',{})).json();
+  assert.equal(applied.dryRun,false);
+  assert.deepEqual(applied.counts,report.counts);
+  assert.deepEqual(await (await read('/api/sessions?projectId='+project.id)).json(),listed,'a migration with nothing to adopt changes nothing');
+  assert.equal((await post('/api/sessions/migrate',{dryRun:'yes'})).status,400,'a dry-run flag that is not a boolean fails closed');
+ }finally{await app.close();store.close();await rm(root,{recursive:true,force:true});}
+ // Without a live control store the routes refuse rather than guessing at a registry.
+ const bare=await mkdtemp(join(tmpdir(),'dashboard-sessions-bare-'));
+ const bareSecurity=localConfig('http://127.0.0.1:0');
+ const bareApp=await createApp({dataRoot:bare,browseRoots:[],security:bareSecurity});
+ await listen(bareApp,bareSecurity);
+ try{
+  const bareToken={'x-dashboard-token':bareSecurity.token};
+  assert.equal((await fetch(bareSecurity.origin+'/api/sessions?projectId='+randomUUID(),{headers:bareToken})).status,503);
+  assert.equal((await fetch(bareSecurity.origin+'/api/sessions/migrate',{method:'POST',headers:{...bareToken,'content-type':'application/json',origin:bareSecurity.origin},body:'{}'})).status,503);
+  assert.equal((await fetch(bareSecurity.origin+'/api/sessions/'+randomUUID()+'/lifecycle?projectId='+randomUUID(),{headers:bareToken})).status,503,'the lifecycle routes refuse without a durable store');
+ }finally{await bareApp.close();await rm(bare,{recursive:true,force:true});}
+});
+test('the session lifecycle routes are owner-only, revision-checked and honest about which actions dispatch',async()=>{
+ const root=await mkdtemp(join(tmpdir(),'dashboard-lifecycle-api-'));
+ const data=join(root,'data');await mkdir(data,{recursive:true,mode:0o700});
+ const store=new ControlStore(data);
+ const security=localConfig('http://127.0.0.1:0');
+ const app=await createApp({dataRoot:data,browseRoots:[],security,control:store,agents:'on',agentPauseMs:100});
+ await listen(app,security);
+ const url=security.origin,token={'x-dashboard-token':security.token},writes={...token,'content-type':'application/json',origin:url};
+ const post=(p:string,body:unknown)=>fetch(url+p,{method:'POST',headers:writes,body:JSON.stringify(body)});
+ const read=(p:string)=>fetch(url+p,{headers:token});
+ const waitFor=async<T>(check:()=>Promise<T|undefined>,timeoutMs=10000):Promise<T>=>{const until=Date.now()+timeoutMs;for(;;){const value=await check();if(value!==undefined)return value;if(Date.now()>until)throw Error('condition was not met in time');await new Promise(res=>setTimeout(res,50));}};
+ try{
+  const project=await (await post('/api/projects',{name:'Lifecycle',managed:true,confirm:true})).json();
+  const session=(await (await post('/api/sessions',{projectId:project.id,name:'Lifecycle session'})).json()).session;
+  const basePath='/api/sessions/'+session.id+'/lifecycle',base=url+basePath;
+  // Behind owner auth and the unchanged Host check, exactly like every other route.
+  assert.equal((await fetch(base+'?projectId='+project.id)).status,401,'the lifecycle read is behind owner auth');
+  const wrongHost=await new Promise<number>((ok,fail)=>{const req=request({host:'127.0.0.1',port:new URL(url).port,path:'/api/sessions/'+session.id+'/lifecycle?projectId='+project.id,headers:{host:'evil.example','x-dashboard-token':security.token}},res=>{res.resume();ok(res.statusCode??0);});req.on('error',fail);req.end();});
+  assert.equal(wrongHost,403,'the unchanged Host check applies to the lifecycle too');
+  assert.equal((await fetch(base+'/stop',{method:'POST',headers:{...token,'content-type':'application/json',origin:'https://evil.example'},body:'{}'})).status,403,'a lifecycle write still needs the canonical origin');
+  // A session with no durable lifecycle row reads at the deterministic idle record.
+  const initial=(await (await read(basePath+'?projectId='+project.id)).json()).lifecycle;
+  assert.equal(initial.state,'idle');assert.equal(initial.revision,0);assert.equal(initial.attempt,0);
+  // An illegal jump is refused with a reason and changes nothing.
+  const illegal=await post(basePath+'/resume',{projectId:project.id,revision:0});
+  assert.equal(illegal.status,409);
+  assert.match((await illegal.json()).error,/Only a paused or interrupted/);
+  // A generation really runs in this process: run the agent once so the transcript has an input to continue.
+  assert.equal((await post('/api/projects/'+project.id+'/agents/input',{text:'seed the lifecycle',mode:'followUp'})).status,200);
+  const agentsBase=url+'/api/projects/'+project.id+'/agents';
+  await waitFor(async()=>{const view=await (await fetch(agentsBase,{headers:token})).json() as {view:{entries:{kind:string}[]}};return view.view.entries.some(entry=>entry.kind==='user')?true:undefined;});
+  // The durable state a live generation leaves: running, with the request identity it was submitted under.
+  const lifecycle=new SessionLifecycleStore(store);
+  lifecycle.markRunning({projectId:project.id,sessionId:session.id,requestId:'seed-request'});
+  const running=(await (await read(basePath+'?projectId='+project.id)).json()).lifecycle;
+  assert.equal(running.state,'running');assert.equal(running.revision,1);assert.equal(running.requestId,'seed-request');
+  // reconnect attaches and dispatches nothing: the record is unchanged and no effect flag is set.
+  const reconnected=await post(basePath+'/reconnect',{projectId:project.id,revision:1});
+  assert.equal(reconnected.status,200);
+  const reconnectedBody=await reconnected.json();
+  assert.deepEqual([reconnectedBody.dispatched,reconnectedBody.cancelled,reconnectedBody.unchanged],[false,false,true]);
+  assert.equal(reconnectedBody.lifecycle.revision,1,'reconnect wrote no revision');
+  // A stale revision is a conflict, not a silent overwrite.
+  const stale=await post(basePath+'/stop',{projectId:project.id,revision:0});
+  assert.equal(stale.status,409);
+  assert.match((await stale.json()).error,/is at lifecycle revision 1, not 0/);
+  // stop cancels and dispatches nothing.
+  const stopped=await post(basePath+'/stop',{projectId:project.id,revision:1});
+  assert.equal(stopped.status,200);
+  const stoppedBody=await stopped.json();
+  assert.equal(stoppedBody.lifecycle.state,'idle');assert.equal(stoppedBody.cancelled,true);assert.equal(stoppedBody.dispatched,false);
+  assert.deepEqual(await (await post(basePath+'/stop',{projectId:project.id,revision:stoppedBody.lifecycle.revision})).json().then((b:any)=>[b.unchanged,b.dispatched,b.cancelled]),[true,false,false],'stopping an already-stopped session is idempotent');
+  // A fresh generation, paused by the owner, then resumed and retried: the two dispatching actions.
+  lifecycle.markRunning({projectId:project.id,sessionId:session.id,requestId:'seed-request-2'});
+  const running2=(await (await read(basePath+'?projectId='+project.id)).json()).lifecycle;
+  assert.equal(running2.state,'running');
+  const paused=await post(basePath+'/pause',{projectId:project.id,revision:running2.revision,reason:'paused for review'});
+  assert.equal(paused.status,200);
+  const pausedBody=await paused.json();
+  assert.equal(pausedBody.lifecycle.state,'paused');assert.equal(pausedBody.lifecycle.reason,'paused for review');
+  assert.deepEqual([pausedBody.dispatched,pausedBody.cancelled],[false,true]);
+  const resumed=await post(basePath+'/resume',{projectId:project.id,revision:pausedBody.lifecycle.revision});
+  assert.equal(resumed.status,200);
+  const resumedBody=await resumed.json();
+  assert.equal(resumedBody.lifecycle.state,'running');assert.equal(resumedBody.dispatched,true);assert.equal(resumedBody.lifecycle.requestId,'seed-request-2','resume reused the original request identity');
+  lifecycle.markSettled({projectId:project.id,sessionId:session.id,outcome:'failed'});
+  const failed=await (await read(basePath+'?projectId='+project.id)).json();
+  assert.equal(failed.lifecycle.state,'failed');
+  const retried=await post(basePath+'/retry',{projectId:project.id,revision:failed.lifecycle.revision});
+  assert.equal(retried.status,200);
+  const retriedBody=await retried.json();
+  assert.equal(retriedBody.lifecycle.state,'running');assert.equal(retriedBody.dispatched,true);assert.equal(retriedBody.lifecycle.attempt,failed.lifecycle.attempt+1);
+  assert.notEqual(retriedBody.lifecycle.requestId,'seed-request-2','retry named a new request identity');
+  // Methods, unknown sessions and malformed bodies.
+  assert.equal((await fetch(base+'?projectId='+project.id,{method:'POST',headers:writes,body:'{}'})).status,405);
+  assert.equal((await read(basePath+'/stop?projectId='+project.id)).status,405);
+  assert.equal((await fetch(url+'/api/sessions/'+randomUUID()+'/lifecycle?projectId='+project.id,{headers:token})).status,404);
+  assert.equal((await read(basePath)).status,422,'a lifecycle read requires a projectId');
+  assert.equal((await post(basePath+'/resume',{projectId:project.id})).status,422,'a whole-number revision is required');
+  // A body the route does not recognise is an invalid request (422) in this application's own words,
+  // never a generic 400 echoing the schema library's raw message.
+  const unknownField=await post(basePath+'/resume',{projectId:project.id,revision:0,surprise:true});
+  assert.equal(unknownField.status,422,'an unknown lifecycle body field is an invalid request');
+  const unknownError=(await unknownField.json() as {error:string}).error;
+  assert.match(unknownError,/does not accept/,'the reason names the refusal: '+unknownError);
+  assert.ok(!/Unrecognized key|zod|Invalid input/i.test(unknownError),'the raw schema message is not echoed: '+unknownError);
+  const missingProjectId=await post(basePath+'/resume',{revision:0});
+  assert.equal(missingProjectId.status,422,'a missing projectId is an invalid request');
+  assert.match((await missingProjectId.json() as {error:string}).error,/projectId/,'the reason names the missing field');
+  assert.equal((await post(basePath+'/pause',{projectId:project.id,revision:retriedBody.lifecycle.revision,reason:'x'.repeat(400)})).status,422,'a reason beyond the bound fails closed');
+  assert.equal((await post(basePath+'/freeze',{projectId:project.id,revision:9})).status,404,'an unknown lifecycle action is not a route');
+ }finally{await app.close();store.close();await rm(root,{recursive:true,force:true});}
+});
+
+test('two concurrent retries at one lifecycle revision dispatch one generation, and the loser is refused',async()=>{
+ const root=await mkdtemp(join(tmpdir(),'dashboard-lifecycle-retry-race-'));
+ const data=join(root,'data');await mkdir(data,{recursive:true,mode:0o700});
+ const store=new ControlStore(data);
+ const security=localConfig('http://127.0.0.1:0');
+ const app=await createApp({dataRoot:data,browseRoots:[],security,control:store,agents:'on',agentPauseMs:100});
+ await listen(app,security);
+ const url=security.origin,token={'x-dashboard-token':security.token},writes={...token,'content-type':'application/json',origin:url};
+ const post=(p:string,body:unknown)=>fetch(url+p,{method:'POST',headers:writes,body:JSON.stringify(body)});
+ const waitFor=async<T>(check:()=>Promise<T|undefined>,timeoutMs=10000):Promise<T>=>{const until=Date.now()+timeoutMs;for(;;){const value=await check();if(value!==undefined)return value;if(Date.now()>until)throw Error('condition was not met in time');await new Promise(res=>setTimeout(res,25));}};
+ try{
+  const project=await (await post('/api/projects',{name:'Retry race',managed:true,confirm:true})).json();
+  const session=(await (await post('/api/sessions',{projectId:project.id,name:'Retry race session'})).json()).session;
+  const agents=url+'/api/projects/'+project.id+'/agents';
+  const view=async()=>await (await fetch(agents,{headers:token})).json() as {view:{working:boolean;entries:{kind:string}[]}};
+  // One generation really runs, so the retry has an input to re-submit and a transcript to grow.
+  assert.equal((await post('/api/projects/'+project.id+'/agents/input',{text:'retry me',mode:'followUp'})).status,200);
+  await waitFor(async()=>{const v=await view();return v.view.entries.some(entry=>entry.kind==='user')&&!v.view.working?true:undefined;});
+  const lifecycle=new SessionLifecycleStore(store);
+  lifecycle.markRunning({projectId:project.id,sessionId:session.id,requestId:'failed-attempt'});
+  lifecycle.markSettled({projectId:project.id,sessionId:session.id,outcome:'failed',reason:'the generation failed'});
+  const basePath='/api/sessions/'+session.id+'/lifecycle';
+  const failedBody=await (await fetch(url+basePath+'?projectId='+project.id,{headers:token})).json() as {lifecycle:{state:string;revision:number;attempt:number;requestId:string}};
+  assert.equal(failedBody.lifecycle.state,'failed');
+  const repliesBefore=(await view()).view.entries.filter(entry=>entry.kind==='assistant').length;
+  // Two owners tap retry at the same revision: the durable write picks one winner, and only that
+  // winner may dispatch, so the loser can never spend a second model run.
+  const [first,second]=await Promise.all([
+   post(basePath+'/retry',{projectId:project.id,revision:failedBody.lifecycle.revision}),
+   post(basePath+'/retry',{projectId:project.id,revision:failedBody.lifecycle.revision})
+  ]);
+  assert.deepEqual([first.status,second.status].sort(),[200,409],'exactly one retry wins and the loser is refused');
+  const winner=first.status===200?first:second,loser=first.status===200?second:first;
+  const winnerBody=await winner.json();
+  assert.equal(winnerBody.dispatched,true);
+  assert.equal(winnerBody.lifecycle.state,'running');
+  assert.equal(winnerBody.lifecycle.revision,failedBody.lifecycle.revision+1,'exactly one revision was written');
+  assert.equal(winnerBody.lifecycle.attempt,failedBody.lifecycle.attempt+1,'exactly one attempt was recorded');
+  assert.equal(winnerBody.lifecycle.requestId,'retry:'+session.id+':r'+(failedBody.lifecycle.revision+1),'the retry identity is derived from the revision it writes, never minted at random');
+  const loserBody=await loser.json() as {error:string};
+  assert.ok(!/zod|Unrecognized key/i.test(loserBody.error),'the refusal is an application reason, not a library message: '+loserBody.error);
+  // Exactly one generation was dispatched: the transcript grew by one reply, not two.
+  await waitFor(async()=>{const v=await view();return !v.view.working?true:undefined;});
+  assert.equal((await view()).view.entries.filter(entry=>entry.kind==='assistant').length,repliesBefore+1,'exactly one model run started for the two retries');
+  const settled=await (await fetch(url+basePath+'?projectId='+project.id,{headers:token})).json() as {lifecycle:{state:string;revision:number;attempt:number;requestId:string}};
+  assert.equal(settled.lifecycle.revision,winnerBody.lifecycle.revision,'the loser wrote no second revision');
+  assert.equal(settled.lifecycle.attempt,winnerBody.lifecycle.attempt,'the loser recorded no second attempt');
+ }finally{await app.close();store.close();await rm(root,{recursive:true,force:true});}
+});
+
+test('an owner pause of a genuinely running generation is the only writer at its revision, and the session resumes',async()=>{
+ const root=await mkdtemp(join(tmpdir(),'dashboard-lifecycle-pause-'));
+ const data=join(root,'data');await mkdir(data,{recursive:true,mode:0o700});
+ const store=new ControlStore(data);
+ const security=localConfig('http://127.0.0.1:0');
+ // The scripted provider holds the generation open for seconds, so the pause really cancels a live run
+ // and the harness's own watcher really observes it leave the working state.
+ const app=await createApp({dataRoot:data,browseRoots:[],security,control:store,agents:'on',agentPauseMs:5000});
+ await listen(app,security);
+ const url=security.origin,token={'x-dashboard-token':security.token},writes={...token,'content-type':'application/json',origin:url};
+ const post=(p:string,body:unknown)=>fetch(url+p,{method:'POST',headers:writes,body:JSON.stringify(body)});
+ const waitFor=async<T>(check:()=>Promise<T|undefined>,timeoutMs=10000):Promise<T>=>{const until=Date.now()+timeoutMs;for(;;){const value=await check();if(value!==undefined)return value;if(Date.now()>until)throw Error('condition was not met in time');await new Promise(res=>setTimeout(res,25));}};
+ try{
+  const project=await (await post('/api/projects',{name:'Pause race',managed:true,confirm:true})).json();
+  // The named session the harness's own lifecycle hooks record against: Pi's reserved root
+  // conversation, adopted under its own id exactly as the start-time legacy migration adopts it.
+  const sessionId='1';
+  const sessions=app.sessions;
+  if(!sessions)throw Error('the application under test has no session registry');
+  await sessions.adopt({projectId:project.id,sessionId,name:'The project conversation'});
+  const agents=url+'/api/projects/'+project.id+'/agents';
+  const view=async()=>await (await fetch(agents,{headers:token})).json() as {view:{working:boolean}};
+  assert.equal((await post('/api/projects/'+project.id+'/agents/input',{text:'[pause] hold this generation open',mode:'followUp'})).status,200);
+  await waitFor(async()=>{const v=await view();return v.view.working?true:undefined;});
+  // The durable record of that genuinely running generation is written by the application's own began
+  // hook, under the identity a resume reuses: nothing here writes it by hand.
+  const lifecycle=new SessionLifecycleStore(store);
+  await waitFor(async()=>lifecycle.read(project.id,sessionId).state==='running'?true:undefined);
+  const live=lifecycle.read(project.id,sessionId);
+  assert.equal(live.attempt,1,'the live generation is durably running under its own attempt');
+  // The owner's pause of that genuinely running generation. Its port is assembled here exactly as the
+  // application assembles it, so the harness watcher's own settled branch can be given the opportunity
+  // to write *before* the owner's write is attempted: the cancel waits until the conversation has really
+  // left the working state and the following event-loop turns have drained. That is the race, made
+  // deterministic - the owner's write must still win, and it must be the only one at that revision.
+  const registered=app.catalog.get(project.id);
+  const bounded=async<T>(work:Promise<T>,ms:number):Promise<T>=>await Promise.race([work,new Promise<never>((_,fail)=>setTimeout(()=>fail(Error('the conversation did not leave the working state in time')),ms))]);
+  let revisionWhileCancelling:number|null=null;
+  const service=new SessionLifecycleService(lifecycle,{
+    authoriseDispatch:()=>{},
+    resume:async({requestId})=>{await app.agents.dispatchLifecycle(registered,requestId);},
+    retry:async({requestId})=>{await app.agents.dispatchLifecycle(registered,requestId);},
+    cancel:async()=>{
+      let ended:()=>void=()=>{};const stopped=new Promise<void>(resolve=>{ended=resolve;});
+      const unsubscribe=await app.agents.subscribe(registered,value=>{if(!value.working)ended();});
+      try {
+        await app.agents.cancelLifecycle(registered);
+        await bounded(stopped,5000);
+        await new Promise(resolve=>setImmediate(resolve));
+        await new Promise(resolve=>setImmediate(resolve));
+        revisionWhileCancelling=lifecycle.read(project.id,sessionId).revision;
+      } finally { await unsubscribe(); }
+    }
+  },{clock:()=>new Date()});
+  const paused=await service.run(project.id,sessionId,'pause',{revision:live.revision,reason:'the owner paused the live generation'});
+  assert.equal(revisionWhileCancelling,live.revision,'the settled hook wrote no competing revision while the cancel was in flight');
+  assert.equal(paused.record.state,'paused','the owner\'s cancel owns the durable state');
+  assert.equal(paused.record.revision,live.revision+1,'exactly one writer at that revision');
+  assert.deepEqual([paused.dispatched,paused.cancelled],[false,true]);
+  assert.equal(paused.record.requestId,live.requestId,'the paused session keeps the identity it resumes under');
+  // The watcher's own settle has had its chance; the record must still be the owner's pause.
+  await waitFor(async()=>{const v=await view();return !v.view.working?true:undefined;});
+  await new Promise(res=>setTimeout(res,300));
+  const after=lifecycle.read(project.id,sessionId);
+  assert.equal(after.state,'paused','the settled hook did not overwrite the pause with idle');
+  assert.equal(after.revision,live.revision+1,'the settled hook wrote no competing revision');
+  assert.equal(after.attempt,live.attempt,'a pause starts no new attempt');
+  // A paused session is resumable through the application's own route, under its original identity.
+  const basePath='/api/sessions/'+sessionId+'/lifecycle';
+  const resumed=await post(basePath+'/resume',{projectId:project.id,revision:after.revision});
+  assert.equal(resumed.status,200,'a paused session resumes');
+  const resumedBody=await resumed.json();
+  assert.equal(resumedBody.lifecycle.state,'running');
+  assert.equal(resumedBody.dispatched,true);
+  assert.equal(resumedBody.lifecycle.requestId,live.requestId,'resume continued under the original request identity');
+  assert.equal(resumedBody.lifecycle.attempt,after.attempt,'resume continues the same attempt, it does not start a new one');
+  // Stop the resumed run before closing, so the test holds no live generation at teardown.
+  await post('/api/projects/'+project.id+'/agents/abort',{});
+  await waitFor(async()=>{const v=await view();return !v.view.working?true:undefined;});
+ }finally{await app.close();store.close();await rm(root,{recursive:true,force:true});}
+});
+
+test('the command registry is owner-only, lists only what this instance implements, and executes a real action',async()=>{
+ const root=await mkdtemp(join(tmpdir(),'dashboard-actions-api-'));
+ const data=join(root,'data');await mkdir(data,{recursive:true,mode:0o700});
+ const store=new ControlStore(data);
+ const security=localConfig('http://127.0.0.1:0');
+ const app=await createApp({dataRoot:data,browseRoots:[],security,control:store});
+ await listen(app,security);
+ const url=security.origin,token={'x-dashboard-token':security.token},writes={...token,'content-type':'application/json',origin:url};
+ const post=(p:string,body:unknown)=>fetch(url+p,{method:'POST',headers:writes,body:JSON.stringify(body)});
+ const read=(p:string)=>fetch(url+p,{headers:token});
+ const execute=(body:unknown)=>post('/api/actions/execute',body);
+ try{
+  // Owner-only, behind the unchanged Host check, with the same origin enforcement for the write.
+  assert.equal((await fetch(url+'/api/actions')).status,401,'the registry is behind owner auth');
+  assert.equal((await fetch(url+'/api/actions/activity?projectId='+randomUUID())).status,401,'the projection is behind owner auth');
+  const wrongHost=await new Promise<number>((ok,fail)=>{const req=request({host:'127.0.0.1',port:new URL(url).port,path:'/api/actions',headers:{host:'evil.example','x-dashboard-token':security.token}},res=>{res.resume();ok(res.statusCode??0);});req.on('error',fail);req.end();});
+  assert.equal(wrongHost,403,'the unchanged Host check applies to the registry');
+  assert.equal((await fetch(url+'/api/actions/execute',{method:'POST',headers:{...token,'content-type':'application/json',origin:'https://evil.example'},body:JSON.stringify({id:'doctor.report'})})).status,403,'executing an action is a write and needs the canonical origin');
+  assert.equal((await read('/api/actions/execute')).status,405,'executing is a POST only');
+  assert.equal((await post('/api/actions/activity',{})).status,405);
+
+  // Only implemented actions, and only ones this scope can use: the ids are exactly the registry's.
+  const globalIds=ACTION_DESCRIPTORS.filter(descriptor=>descriptor.requires.length===0).map(descriptor=>descriptor.id);
+  const scopedIds=ACTION_DESCRIPTORS.map(descriptor=>descriptor.id);
+  const unscoped=await (await read('/api/actions')).json();
+  assert.equal(unscoped.readOnly,true);
+  assert.deepEqual(unscoped.scope,{projectId:null,sessionId:null});
+  assert.deepEqual(unscoped.actions.map((action:any)=>action.id),globalIds,'with no scope, only actions that need none are offered');
+  for(const action of unscoped.actions){assert.ok(ACTION_IDS.includes(action.id));assert.ok(action.label&&action.description);assert.deepEqual(action.surfaces,['palette']);assert.ok(Array.isArray(action.parameters));assert.ok(Array.isArray(action.preconditions));}
+  // A well-formed project scope is answered by dimension, not by whether the project exists: the
+  // registry declares what the capability needs, and the handler stays the authority on existence.
+  const unregistered=await read('/api/actions?projectId='+randomUUID());
+  assert.equal(unregistered.status,200,'a project scope is answered whether or not the project exists');
+  assert.deepEqual((await unregistered.json()).actions.map((action:any)=>action.id),ACTION_DESCRIPTORS.filter(descriptor=>!descriptor.requires.includes('session')).map(descriptor=>descriptor.id));
+  assert.equal((await execute({id:'session.create',params:{name:'Orphan'},scope:{projectId:randomUUID()}})).status,404,'the handler is the authority on whether the project exists');
+
+  const project=await (await post('/api/projects',{name:'Actions',managed:true,confirm:true})).json();
+  const projectActions=await (await read('/api/actions?projectId='+project.id)).json();
+  assert.deepEqual(projectActions.actions.map((action:any)=>action.id),ACTION_DESCRIPTORS.filter(descriptor=>!descriptor.requires.includes('session')).map(descriptor=>descriptor.id),'a project scope adds the project-scoped actions');
+  const session=(await (await post('/api/sessions',{projectId:project.id,name:'Registry session'})).json()).session;
+  const full=await (await read('/api/actions?projectId='+project.id+'&sessionId='+session.id)).json();
+  assert.deepEqual(full.actions.map((action:any)=>action.id),scopedIds,'one project and one session satisfy every declared scope');
+  assert.deepEqual(full.scope,{projectId:project.id,sessionId:session.id});
+  const stop=full.actions.find((action:any)=>action.id==='session.lifecycle.stop');
+  assert.ok(stop.preconditions.some((precondition:any)=>precondition.code==='REVISION_MATCHES'));
+  assert.ok(stop.parameters.some((parameter:any)=>parameter.name==='revision'&&parameter.required===true));
+  // An action that does not exist is refused, and the refusal is precise rather than an empty list.
+  const unknown=await execute({id:'session.dance',scope:{projectId:project.id}});
+  assert.equal(unknown.status,404);const unknownBody=await unknown.json();
+  assert.equal(unknownBody.code,'UNKNOWN');
+  assert.match(unknownBody.error,/Unknown action id "session\.dance"/);
+  assert.ok(!/zod|Unrecognized key/i.test(unknownBody.error));
+  // A scope violation is refused, and nothing runs: the action needs a session the request does not name.
+  const scopeViolation=await execute({id:'session.lifecycle.stop',params:{revision:0},scope:{projectId:project.id}});
+  assert.equal(scopeViolation.status,403);const scopeBody=await scopeViolation.json();
+  assert.equal(scopeBody.code,'SCOPE');
+  assert.match(scopeBody.error,/requires the session scope/);
+  // The parameters are validated against the schema the registry published, in this application's words.
+  const extraField=await execute({id:'session.create',params:{name:'Extra',colour:'red'},scope:{projectId:project.id}});
+  assert.equal(extraField.status,422);const extraBody=await extraField.json();
+  assert.equal(extraBody.code,'INVALID');
+  assert.match(extraBody.error,/does not accept/);
+  assert.ok(!/zod|Unrecognized key/i.test(extraBody.error),'the raw schema message is not echoed: '+extraBody.error);
+  const missingField=await execute({id:'session.create',params:{},scope:{projectId:project.id}});
+  assert.equal(missingField.status,422);
+  assert.match((await missingField.json()).error,/name/);
+  // One real action, executed through the very path the palette uses: it really creates the session.
+  const created=await execute({id:'session.create',params:{name:'From the palette'},scope:{projectId:project.id}});
+  assert.equal(created.status,200);
+  const createdBody=await created.json();
+  assert.equal(createdBody.action,'session.create');
+  assert.equal(createdBody.result.name,'From the palette');
+  const listed=await (await read('/api/sessions?projectId='+project.id)).json();
+  assert.deepEqual(listed.sessions.map((entry:any)=>entry.name).sort(),['From the palette','Registry session'],'the action really wrote the session');
+  // A duplicate name is the handler's own refusal, and it arrives as such.
+  const duplicate=await execute({id:'session.create',params:{name:'From the palette'},scope:{projectId:project.id}});
+  assert.equal(duplicate.status,409);
+  assert.match((await duplicate.json()).error,/already has a live session named From the palette/);
+  // A handler refusal from the lifecycle path too: a stale revision is a conflict that changed nothing.
+  const stale=await execute({id:'session.rename',params:{name:'Renamed',revision:99},scope:{projectId:project.id,sessionId:session.id}});
+  assert.equal(stale.status,409);
+  assert.match((await stale.json()).error,/is at revision 1, not 99/);
+  const renamed=await execute({id:'session.rename',params:{name:'Renamed',revision:session.revision},scope:{projectId:project.id,sessionId:session.id}});
+  assert.equal(renamed.status,200);
+  assert.equal((await renamed.json()).result.name,'Renamed');
+  // A session that does not exist is the handler's not-found, not a scope violation.
+  const absent=await execute({id:'session.lifecycle.reconnect',params:{revision:0},scope:{projectId:project.id,sessionId:randomUUID()}});
+  assert.equal(absent.status,404);
+  // The read-only doctor and the delivery report are the same handlers the CLI and the start use.
+  const doctor=await execute({id:'doctor.report'});
+  assert.equal(doctor.status,200);
+  assert.equal((await doctor.json()).result.readOnly,true);
+  const reconciliation=await execute({id:'delivery.reconciliation.report'});
+  assert.equal(reconciliation.status,200);
+  assert.equal((await reconciliation.json()).result.readOnly,true);
+  // An envelope field the route does not accept is an invalid request, in this application's words.
+  assert.equal((await execute({id:'doctor.report',params:{},scope:{projectId:project.id},extra:true})).status,422);
+ }finally{await app.close();store.close();await rm(root,{recursive:true,force:true});}
+ // Without a durable control store the instance can really only run the read-only doctor, and says so.
+ const bare=await mkdtemp(join(tmpdir(),'dashboard-actions-bare-'));
+ const bareSecurity=localConfig('http://127.0.0.1:0');
+ const bareApp=await createApp({dataRoot:bare,browseRoots:[],security:bareSecurity});
+ await listen(bareApp,bareSecurity);
+ try{
+  const bareToken={'x-dashboard-token':bareSecurity.token},bareWrites={...bareToken,'content-type':'application/json',origin:bareSecurity.origin};
+  const listed=await (await fetch(bareSecurity.origin+'/api/actions',{headers:bareToken})).json();
+  assert.deepEqual(listed.actions.map((action:any)=>action.id),['doctor.report'],'an action whose capability is absent is not offered');
+  assert.equal((await fetch(bareSecurity.origin+'/api/actions/execute',{method:'POST',headers:bareWrites,body:JSON.stringify({id:'session.create',params:{name:'x'},scope:{projectId:randomUUID()}})})).status,503);
+  assert.equal((await fetch(bareSecurity.origin+'/api/actions/activity?projectId='+randomUUID(),{headers:bareToken})).status,503,'the projection refuses without a durable store rather than guessing');
+  assert.equal((await fetch(bareSecurity.origin+'/api/actions/execute',{method:'POST',headers:bareWrites,body:JSON.stringify({id:'doctor.report'})})).status,200);
+ }finally{await bareApp.close();await rm(bare,{recursive:true,force:true});}
+});
+
+test('the queue routes are owner-only, revision-checked and precise, and never dispatch where the instance cannot',async()=>{
+ const root=await mkdtemp(join(tmpdir(),'dashboard-queue-api-'));
+ const data=join(root,'data');await mkdir(data,{recursive:true,mode:0o700});
+ const store=new ControlStore(data);
+ const security=localConfig('http://127.0.0.1:0');
+ const app=await createApp({dataRoot:data,browseRoots:[],security,control:store});
+ await listen(app,security);
+ const url=security.origin,token={'x-dashboard-token':security.token},writes={...token,'content-type':'application/json',origin:url};
+ const post=(p:string,body:unknown)=>fetch(url+p,{method:'POST',headers:writes,body:JSON.stringify(body)});
+ const read=(p:string)=>fetch(url+p,{headers:token});
+ try{
+  const project=await (await post('/api/projects',{name:'Queue',managed:true,confirm:true})).json();
+  const session=(await (await post('/api/sessions',{projectId:project.id,name:'Queue session'})).json()).session;
+  const base='/api/sessions/'+session.id+'/queue';
+  // Owner-only like every other route, behind the unchanged Host check, with the same origin
+  // enforcement for the writes; the read is a GET and an unknown operation is not a route at all.
+  assert.equal((await fetch(url+base+'?projectId='+project.id)).status,401,'the queue is behind owner auth');
+  const wrongHost=await new Promise<number>((ok,fail)=>{const req=request({host:'127.0.0.1',port:new URL(url).port,path:base+'?projectId='+project.id,headers:{host:'evil.example','x-dashboard-token':security.token}},res=>{res.resume();ok(res.statusCode??0);});req.on('error',fail);req.end();});
+  assert.equal(wrongHost,403,'the unchanged Host check applies to the queue');
+  assert.equal((await fetch(url+base+'/append',{method:'POST',headers:{...token,'content-type':'application/json',origin:'https://evil.example'},body:'{}'})).status,403,'a queue write needs the canonical origin');
+  assert.equal((await post(base,{})).status,405,'the queue read is a GET only');
+  assert.equal((await read(base+'/append?projectId='+project.id)).status,405,'a queue write is a POST only');
+  assert.equal((await read(base)).status,422,'projectId is required');
+  assert.equal((await read(base+'?projectId=../../etc')).status,422,'a project id that is not one is an invalid request');
+  assert.equal((await read(base+'?projectId='+randomUUID())).status,404,'an unregistered project is not a queue scope');
+  assert.equal((await read('/api/sessions/'+randomUUID()+'/queue?projectId='+project.id)).status,404,'an unknown session has no queue');
+  assert.equal((await read(base+'/dance?projectId='+project.id)).status,404,'an operation that does not exist is not a route');
+  // The read: the queue with its revision and the bounds this build enforces, and no path in it.
+  const empty=await (await read(base+'?projectId='+project.id)).json();
+  assert.deepEqual([empty.readOnly,empty.projectId,empty.sessionId,empty.revision,empty.entries],[true,project.id,session.id,0,[]]);
+  assert.deepEqual(empty.limits,{entries:50,text:2000,imagesPerEntry:6,bytes:65536});
+  assert.ok(!JSON.stringify(empty).includes(data),'the payload carries no filesystem path');
+  // An entry with neither text nor an image, an unknown field, and an image the media store does not
+  // hold: each refused in this application's own words, before anything is written.
+  const nothing=await post(base+'/append',{projectId:project.id,revision:0});
+  assert.equal(nothing.status,422);assert.match((await nothing.json()).error,/needs text or an image/);
+  const extra=await post(base+'/append',{projectId:project.id,revision:0,text:'x',colour:'red'});
+  assert.equal(extra.status,422);assert.match((await extra.json()).error,/does not accept/);
+  const unknownImage=await post(base+'/append',{projectId:project.id,revision:0,images:['a'.repeat(64)]});
+  assert.equal(unknownImage.status,422);assert.equal((await unknownImage.json()).code,'unknown-media');
+  assert.equal((await post(base+'/append',{projectId:project.id,revision:0,images:['../../etc/passwd']})).status,422,'an image reference is a media id, never a path');
+  assert.equal((await (await read(base+'?projectId='+project.id)).json()).revision,0,'a refused append wrote nothing');
+  // One real append, and the revision it raises.
+  const appended=await post(base+'/append',{projectId:project.id,revision:0,text:'the first queued input'});
+  assert.equal(appended.status,200);
+  const appendedBody=await appended.json();
+  assert.deepEqual([appendedBody.outcome,appendedBody.queue.revision,appendedBody.entry.state,appendedBody.changed,appendedBody.removed],['appended',1,'queued',true,0]);
+  const entryId=appendedBody.entry.id as string;
+  // A stale revision is a conflict, not a silent overwrite, and the record keeps the text it had.
+  const stale=await post(base+'/append',{projectId:project.id,revision:0,text:'written over a change nobody saw'});
+  assert.equal(stale.status,409);assert.match((await stale.json()).error,/is at revision 1, not 0/);
+  assert.deepEqual((await (await read(base+'?projectId='+project.id)).json()).entries.map((entry:any)=>entry.text),['the first queued input']);
+  // Editing, a position outside the queue, and a reorder that moves nothing.
+  const edited=await post(base+'/edit',{projectId:project.id,revision:1,entryId,text:'the first queued input, edited'});
+  assert.equal(edited.status,200);assert.equal((await edited.json()).entry.text,'the first queued input, edited');
+  const outside=await post(base+'/reorder',{projectId:project.id,revision:2,entryId,position:4});
+  assert.equal(outside.status,422);assert.match((await outside.json()).error,/outside the queue/);
+  const unmoved=await (await post(base+'/reorder',{projectId:project.id,revision:2,entryId,position:0})).json();
+  assert.deepEqual([unmoved.outcome,unmoved.changed,unmoved.queue.revision],['unchanged',false,2],'moving an entry to its own position writes nothing and raises no revision');
+  // A dispatcher that cannot dispatch refuses before claiming, and an entry that is not claimed can
+  // be neither submitted, released nor reconciled: every one of those keeps its own status.
+  const noDispatch=await post(base+'/claim',{projectId:project.id,owner:'dispatcher-1'});
+  assert.equal(noDispatch.status,503);assert.match((await noDispatch.json()).error,/Agents are disabled on this instance/);
+  assert.equal((await (await read(base+'?projectId='+project.id)).json()).revision,2,'a refused claim claimed no revision');
+  assert.equal((await post(base+'/submit',{projectId:project.id,entryId,owner:'dispatcher-1'})).status,409);
+  assert.equal((await post(base+'/release',{projectId:project.id,entryId,owner:'dispatcher-1'})).status,409);
+  assert.equal((await post(base+'/reconcile',{projectId:project.id,entryId})).status,409);
+  assert.equal((await post(base+'/claim',{projectId:project.id,owner:'dispatcher-1',extra:true})).status,422);
+  assert.equal((await post(base+'/edit',{projectId:project.id,revision:2,entryId:randomUUID(),text:'x'})).status,404,'an entry the queue does not hold is not found');
+  // Cancelling, clearing nothing, and removing what is left.
+  const cancelled=await (await post(base+'/cancel',{projectId:project.id,revision:2,entryId})).json();
+  assert.deepEqual([cancelled.entry.state,cancelled.queue.revision],['cancelled',3]);
+  const cleared=await (await post(base+'/clear',{projectId:project.id,revision:3})).json();
+  assert.deepEqual([cleared.outcome,cleared.changed,cleared.removed],['unchanged',false,0],'a cancelled entry is neither settled nor failed, so clearing it is not what clear does');
+  const removed=await (await post(base+'/remove',{projectId:project.id,revision:3,entryId})).json();
+  assert.deepEqual([removed.outcome,removed.removed,removed.queue.entries.length],['removed',1,0]);
+  assert.equal((await post(base+'/remove',{projectId:project.id,revision:4,entryId})).status,404,'removing an entry twice is not found');
+  // The same queue operations are offered by the one command surface, for the same session.
+  const listed=await (await read('/api/actions?projectId='+project.id+'&sessionId='+session.id)).json();
+  assert.deepEqual(listed.actions.map((action:any)=>action.id).filter((id:string)=>id.startsWith('queue.')).sort(),ACTION_IDS.filter(id=>id.startsWith('queue.')).sort());
+  // A queue action keeps the queue's own status through the registry too: a stale revision is a conflict.
+  const executed=await post('/api/actions/execute',{id:'queue.append',params:{revision:3,text:'a stale append'},scope:{projectId:project.id,sessionId:session.id}});
+  assert.equal(executed.status,409);assert.match((await executed.json()).error,/is at revision 4, not 3/);
+ }finally{await app.close();store.close();await rm(root,{recursive:true,force:true});}
+});
+
+test('a claimed input is never cancelled into invisibility, and a reorder never skips one in flight',async()=>{
+ const root=await mkdtemp(join(tmpdir(),'dashboard-queue-order-'));
+ const data=join(root,'data');await mkdir(data,{recursive:true,mode:0o700});
+ const store=new ControlStore(data);
+ const security=localConfig('http://127.0.0.1:0');
+ // Dispatch is enabled, so a claim really happens; no submission is made, so no harness work is asked for.
+ const app=await createApp({dataRoot:data,browseRoots:[],security,control:store,agents:'on',agentPauseMs:100});
+ await listen(app,security);
+ const url=security.origin,token={'x-dashboard-token':security.token},writes={...token,'content-type':'application/json',origin:url};
+ const post=(p:string,body:unknown)=>fetch(url+p,{method:'POST',headers:writes,body:JSON.stringify(body)});
+ const read=(p:string)=>fetch(url+p,{headers:token});
+ try{
+  const project=await (await post('/api/projects',{name:'Queue order',managed:true,confirm:true})).json();
+  const session=(await (await post('/api/sessions',{projectId:project.id,name:'Queue order session'})).json()).session;
+  const base='/api/sessions/'+session.id+'/queue';
+  const first=await (await post(base+'/append',{projectId:project.id,revision:0,text:'the input a dispatcher holds'})).json();
+  const second=await (await post(base+'/append',{projectId:project.id,revision:1,text:'the later input'})).json();
+  const claim=await post(base+'/claim',{projectId:project.id,owner:'dispatcher-1'});
+  assert.equal(claim.status,200,'a dispatcher that can dispatch claims the head');
+  assert.equal((await claim.json()).entry.claim.requestId,'queue:'+first.entry.id,'the claim records the stable identity it authorises');
+  // Cancelling a claimed entry is refused with the reason: a submission of it may be in flight, so a
+  // cancel here could withdraw an input the durable transcript already holds.
+  const cancelClaimed=await post(base+'/cancel',{projectId:project.id,revision:3,entryId:first.entry.id});
+  assert.equal(cancelClaimed.status,409);
+  const cancelClaimedRefusal=await cancelClaimed.json();
+  assert.match(cancelClaimedRefusal.error,/may be in flight under the identity queue:/);
+  assert.match(cancelClaimedRefusal.error,/release the claim first/);
+  // A reorder that would move the later input ahead of the entry in flight is refused, and the
+  // refusal names the entry that is the queue's effective head.
+  const skip=await post(base+'/reorder',{projectId:project.id,revision:3,entryId:second.entry.id,position:0});
+  assert.equal(skip.status,409);
+  assert.match((await skip.json()).error,/effective head until it settles or is explicitly reconciled/);
+  const after=await (await read(base+'?projectId='+project.id)).json();
+  assert.deepEqual([after.revision,after.entries.map((entry:any)=>[entry.id,entry.state])],[3,[[first.entry.id,'claimed'],[second.entry.id,'queued']]],'both refusals left the record exactly as it was');
+  // Releasing gives the entry back, and only then can the owner withdraw it.
+  const released=await post(base+'/release',{projectId:project.id,entryId:first.entry.id,owner:'dispatcher-1'});
+  assert.equal(released.status,200);
+  const cancelled=await (await post(base+'/cancel',{projectId:project.id,revision:4,entryId:first.entry.id})).json();
+  assert.deepEqual([cancelled.entry.state,cancelled.entry.claim,cancelled.queue.revision],['cancelled',null,5]);
+ }finally{await app.close();store.close();await rm(root,{recursive:true,force:true});}
+});
+
+test('the live projection reports the durable run state and distinguishes none, unavailable and failed',async()=>{
+ const root=await mkdtemp(join(tmpdir(),'dashboard-live-activity-'));
+ const data=join(root,'data');await mkdir(data,{recursive:true,mode:0o700});
+ const store=new ControlStore(data);
+ const security=localConfig('http://127.0.0.1:0');
+ const app=await createApp({dataRoot:data,browseRoots:[],security,control:store,agents:'on',agentPauseMs:100});
+ await listen(app,security);
+ const url=security.origin,token={'x-dashboard-token':security.token},writes={...token,'content-type':'application/json',origin:url};
+ try{
+  const project=await (await fetch(url+'/api/projects',{method:'POST',headers:writes,body:JSON.stringify({name:'Activity',managed:true,confirm:true})})).json();
+  const session=(await (await fetch(url+'/api/sessions',{method:'POST',headers:writes,body:JSON.stringify({projectId:project.id,name:'Live session'})})).json()).session;
+  // A session with no durable lifecycle row is reported as that absence, never as the state 'idle'
+  // the store happens to read at: the state is null, the reason is named and revision 0 is the
+  // revision a first write would claim.
+  const first=await (await fetch(url+'/api/actions/activity?projectId='+project.id,{headers:token})).json();
+  assert.equal(first.readOnly,true);
+  assert.deepEqual(first.sessions.map((entry:any)=>[entry.sessionId,entry.run.recorded,entry.run.state,entry.run.absenceReason,entry.run.revision]),[[session.id,false,null,LIVE_RUN_REASONS.noRecord,0]]);
+  assert.equal(first.sessions[0].run.absenceDetail,LIVE_RUN_DETAILS.noRecord);
+  assert.deepEqual([first.sessions[0].run.activityAt,first.sessions[0].run.updatedAt],[null,null],'no instant is invented for a row that does not exist');
+  assert.equal(first.sessions[0].run.state,null,'an absent row is never reported as idle');
+  const lifecycle=new SessionLifecycleStore(store);
+  lifecycle.markRunning({projectId:project.id,sessionId:session.id,requestId:'live-request'});
+  lifecycle.markSettled({projectId:project.id,sessionId:session.id,outcome:'failed',reason:'the generation failed'});
+  const failed=await (await fetch(url+'/api/actions/activity?projectId='+project.id,{headers:token})).json();
+  // A written state is read back as the fact it is, with no absence reason.
+  assert.deepEqual(failed.sessions.map((entry:any)=>[entry.run.recorded,entry.run.state,entry.run.attempt,entry.run.reason,entry.run.absenceReason]),[[true,'failed',1,'the generation failed',null]]);
+  // The harness really reports the conversation and its view carries no tool activity yet: 'none yet',
+  // which is a different answer from 'unavailable' and from 'failed to read'.
+  assert.deepEqual([failed.harness.state,failed.harness.reason],['none',LIVE_TOOL_REASONS.noToolActivity]);
+  assert.equal(failed.harness.source,'harness-conversation-view');
+  assert.equal(failed.harness.working,false);
+  assert.deepEqual(failed.harness.invocations,[]);
+  assert.ok(!JSON.stringify(failed).includes(data),'the projection never carries a filesystem path');
+  assert.ok(!JSON.stringify(failed).includes(root));
+
+  // What the palette really does, end to end over these routes: read the revision from the live
+  // projection, then execute the lifecycle action with exactly that value. A write at that revision
+  // succeeds; the revision a client used to assume is refused as the conflict it always was.
+  lifecycle.markRunning({projectId:project.id,sessionId:session.id,requestId:'palette-request'});
+  const projected=await (await fetch(url+'/api/actions/activity?projectId='+project.id,{headers:token})).json();
+  const running=projected.sessions.find((entry:any)=>entry.sessionId===session.id);
+  assert.deepEqual([running.run.recorded,running.run.state,running.run.revision],[true,'running',3],'the projection reports the durable revision, above zero');
+  const executed=await fetch(url+'/api/actions/execute',{method:'POST',headers:writes,body:JSON.stringify({id:'session.lifecycle.pause',params:{revision:running.run.revision,reason:'paused from the palette'},scope:{projectId:project.id,sessionId:session.id}})});
+  assert.equal(executed.status,200,'a lifecycle write at the revision the projection reports succeeds');
+  const executedBody=await executed.json();
+  assert.deepEqual([executedBody.result.record.state,executedBody.result.record.revision,executedBody.result.cancelled],['paused',running.run.revision+1,true]);
+  const assumed=await fetch(url+'/api/actions/execute',{method:'POST',headers:writes,body:JSON.stringify({id:'session.lifecycle.pause',params:{revision:0,reason:'assumed'},scope:{projectId:project.id,sessionId:session.id}})});
+  assert.equal(assumed.status,409,'the revision a client would have assumed is still refused as a conflict');
+  assert.match((await assumed.json()).error,/is at lifecycle revision \d+, not 0/);
+  const afterPause=await (await fetch(url+'/api/actions/activity?projectId='+project.id,{headers:token})).json();
+  assert.equal(afterPause.sessions.find((entry:any)=>entry.sessionId===session.id).run.state,'paused','the projection reads the write back');
+  // A project the registry does not know, and a projection with no project at all.
+  assert.equal((await fetch(url+'/api/actions/activity?projectId='+randomUUID(),{headers:token})).status,404);
+  assert.equal((await fetch(url+'/api/actions/activity',{headers:token})).status,422);
+  assert.equal((await fetch(url+'/api/actions/activity?projectId=../../etc',{headers:token})).status,422,'a scope that is not an identifier is an invalid request');
+ }finally{await app.close();store.close();await rm(root,{recursive:true,force:true});}
+ // An instance with the harness off says so by name instead of reporting an empty list as "none".
+ const off=await mkdtemp(join(tmpdir(),'dashboard-live-off-'));
+ const offData=join(off,'data');await mkdir(offData,{recursive:true,mode:0o700});
+ const offStore=new ControlStore(offData);
+ const offSecurity=localConfig('http://127.0.0.1:0');
+ const offApp=await createApp({dataRoot:offData,browseRoots:[],security:offSecurity,control:offStore});
+ await listen(offApp,offSecurity);
+ try{
+  const offUrl=offSecurity.origin,offToken={'x-dashboard-token':offSecurity.token},offWrites={...offToken,'content-type':'application/json',origin:offUrl};
+  const offProject=await (await fetch(offUrl+'/api/projects',{method:'POST',headers:offWrites,body:JSON.stringify({name:'No harness',managed:true,confirm:true})})).json();
+  const unavailable=await (await fetch(offUrl+'/api/actions/activity?projectId='+offProject.id,{headers:offToken})).json();
+  assert.deepEqual([unavailable.harness.state,unavailable.harness.reason,unavailable.harness.source],['unavailable','agents-disabled-on-this-instance',null]);
+  assert.deepEqual(unavailable.harness.invocations,[]);
+ }finally{await offApp.close();offStore.close();await rm(off,{recursive:true,force:true});}
 });
