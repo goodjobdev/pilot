@@ -12,11 +12,15 @@ import { DeliveryLedger } from '../../src/server/state/delivery';
 import { SessionRegistry, createSessionResourcePort, migrateLegacyConversations } from '../../src/server/state/session-registry';
 import { SessionLifecycleService, SessionLifecycleStore, adoptRunningSessions, type SessionLifecycleActionResult, type SessionLifecyclePort } from '../../src/server/state/session-lifecycle';
 import { QueueStore, type QueueResult, type QueueSubmissionRecord } from '../../src/server/state/queue-store';
+import { RunnerBroker, createProjectWorkspaceResolver, type RunnerExecution, type RunnerExecutionRequest, type RunnerPort, type RunnerSettleResult } from '../../src/server/state/runner-broker';
+import { AcceptanceStore, type AcceptanceResult, type EvidenceResult, type ProjectAcceptanceView } from '../../src/server/state/acceptance-store';
+import { RunnerError, type RunnerContainment, type RunnerJobRecord, type RunnerView } from '../../src/shared/runner';
 import { ActionError, ActionRegistry, actionHandlerIds, assertActionRegistryConsistent, assertHandlerSet, liveActivity, normaliseActionScope, type ActionEnvironment, type ActionScope } from '../../src/server/state/action-registry';
 import { ACTION_DESCRIPTORS, ACTION_IDS, ACTION_PRECONDITION_CODES, ACTION_REVISION_SOURCES, LIVE_RUN_DETAILS, LIVE_RUN_REASONS, LIVE_TOOL_DETAILS, LIVE_TOOL_REASONS, LIVE_TOOL_SOURCE, type ActionDescriptor, type ActionId, type ActionPreconditionCode } from '../../src/shared/actions';
 import { SessionError, type SessionRecord } from '../../src/shared/sessions';
 import { SessionLifecycleError } from '../../src/shared/session-lifecycle';
 import { ApprovalError } from '../../src/shared/approvals';
+import { AcceptanceError, agentPolicyRule, type AcceptancePolicy } from '../../src/shared/acceptance';
 import { QUEUE_MAX_ENTRIES, queueRequestId, type QueueView } from '../../src/shared/queue';
 import { QueueError } from '../../src/shared/queue';
 import { emptyBoard, newTask, type Project } from '../../src/shared/model';
@@ -34,20 +38,51 @@ import type { AgentEntry, AgentView } from '../../src/shared/agent';
 
 type Port = SessionLifecyclePort & { readonly calls: string[]; refusal: Error | null };
 
+/** The deterministic instant every synthetic execution in this file reports. */
+const RUNNER_AT = Date.parse('2025-01-01T00:00:00.000Z');
+
+type RunnerPortStub = {
+  calls: string[]; executions: number; containment: RunnerContainment; establishRefusal: Error | null;
+  behaviour: (input: RunnerExecutionRequest) => Promise<RunnerExecution>; clock: { now: number };
+};
+
 type Fixture = {
   root: string; workspaces: string; data: string;
   project: Project; taskId: string;
   store: ControlStore; sessions: SessionRegistry; lifecycleStore: SessionLifecycleStore;
   lifecycle: SessionLifecycleService; approvals: ApprovalStore; ledger: DeliveryLedger; port: Port;
   queue: QueueStore; queueClock: { now: number }; queueLedger: Map<string, QueueSubmissionRecord>; queueCalls: string[];
+  runner: RunnerBroker; runnerWorkspace: string; runnerPort: RunnerPortStub; acceptance: AcceptanceStore;
   environment: ActionEnvironment; actions: ActionRegistry;
   cleanup(): Promise<void>;
 };
+
+/** The containment every required property of a job is checked against, as a port would report it. */
+function containment(overrides: Partial<RunnerContainment> = {}): RunnerContainment {
+  return Object.freeze({
+    runtime: 'fake-runtime', image: 'pilot-runner:test', network: 'none', rootFilesystem: 'read-only' as const,
+    user: '10001:10001', capabilities: 'none', noNewPrivileges: true, dockerSocket: false,
+    mounts: Object.freeze(['workspace']) as readonly string[],
+    maxMemoryBytes: 1024 * 1024 * 1024, maxCpus: 2, maxPids: 128, maxWallClockMs: 300_000,
+    ...overrides
+  });
+}
+/** One scripted execution. No container is started anywhere in this suite and no runtime is contacted. */
+function runnerExecution(overrides: Partial<RunnerExecution> = {}): RunnerExecution {
+  return Object.freeze({
+    exitCode: 0, stdout: 'ok\n', stderr: '', stdoutBytes: 3, stderrBytes: 0,
+    stdoutTruncated: false, stderrTruncated: false, timedOut: false, durationMs: 4,
+    startedAt: new Date(RUNNER_AT).toISOString(), endedAt: new Date(RUNNER_AT + 4).toISOString(),
+    ...overrides
+  });
+}
 
 async function fixture(): Promise<Fixture> {
   const root = await mkdtemp(join(tmpdir(), 'pilot-actions-'));
   const workspaces = join(root, 'workspaces'), projectPath = join(workspaces, 'project'), data = join(root, 'data');
   await mkdir(join(projectPath, 'docs', 'spec'), { recursive: true, mode: 0o755 });
+  const runnerWorkspace = join(projectPath, 'ws');
+  await mkdir(runnerWorkspace, { recursive: true, mode: 0o755 });
   await mkdir(data, { recursive: true, mode: 0o700 });
   const store = new ControlStore(data), boards = new BoardStore(data), docs = new DocStore();
   const project: Project = { id: randomUUID(), name: 'Registry workspace', path: projectPath, managed: false, repository: '', created: new Date().toISOString() };
@@ -92,9 +127,35 @@ async function fixture(): Promise<Fixture> {
     },
     async lookup({ requestId }) { queueCalls.push('lookup:' + requestId); return queueLedger.get(requestId) ?? null; }
   }, { clock: () => new Date(queueClock.now) });
+  // The coding runner's port is synthetic: it reports the documented containment and returns a
+  // scripted execution, so the registry's runner actions are reachable without a container.
+  const runnerPort: RunnerPortStub = {
+    calls: [], executions: 0, containment: containment(), establishRefusal: null,
+    behaviour: async () => runnerExecution(), clock: { now: RUNNER_AT }
+  };
+  const runnerPortImpl: RunnerPort = {
+    async establish() {
+      runnerPort.calls.push('establish');
+      if (runnerPort.establishRefusal) throw runnerPort.establishRefusal;
+      return runnerPort.containment;
+    },
+    async execute(input) {
+      runnerPort.calls.push('execute:' + input.job.id);
+      runnerPort.executions += 1;
+      return runnerPort.behaviour(input);
+    }
+  };
+  const runner = new RunnerBroker(store, runnerPortImpl, {
+    workspace: createProjectWorkspaceResolver({ projectRoot: (id) => (id === project.id ? projectPath : undefined) }),
+    projectKnown: (id) => id === project.id,
+    clock: () => new Date(runnerPort.clock.now)
+  });
+  // The acceptance record: the durable policy, the frozen completion records and their Markdown
+  // renderings, written into this disposable project folder and nowhere else.
+  const acceptance = new AcceptanceStore(store, { projectRoot: (id) => (id === project.id ? projectPath : undefined) });
   const environment: ActionEnvironment = {
     control: {
-      sessions, lifecycle, approvals, ledger, queue,
+      sessions, lifecycle, approvals, ledger, queue, runner, acceptance,
       // An attached image id resolves to the stored facts the queue records; an id the media store
       // does not hold is refused, which the HTTP tests drive against the real media store.
       media: { resolve: async (ids) => Object.freeze(ids.map((id) => Object.freeze({ id, mimeType: 'image/png' as const, bytes: 64, width: 8, height: 8 }))) },
@@ -110,7 +171,8 @@ async function fixture(): Promise<Fixture> {
     agents: { enabled: true, read: async () => view() }
   };
   return {
-    root, workspaces, data, project, taskId, store, sessions, lifecycleStore, lifecycle, approvals, ledger, port, queue, queueClock, queueLedger, queueCalls, environment,
+    root, workspaces, data, project, taskId, store, sessions, lifecycleStore, lifecycle, approvals, ledger, port, queue, queueClock, queueLedger, queueCalls,
+    runner, runnerWorkspace, runnerPort, acceptance, environment,
     actions: new ActionRegistry(environment),
     cleanup: async () => { store.close(); await rm(root, { recursive: true, force: true }); }
   };
@@ -300,6 +362,68 @@ test('every declared action is reachable and really acts through its own handler
     const removed = await drive('queue.remove', { revision: third.record.revision, entryId: third.entry!.id }, queueScope) as QueueResult;
     assert.deepEqual([removed.outcome, removed.removed, removed.record.entries.length], ['removed', 1, 1]);
 
+    // The bounded coding runner: submitted, read, claimed, run and settled, all through the registry
+    // and all against a synthetic port. No container is started and no runtime is contacted.
+    const queuedJob = await drive('runner.submit', { recipe: 'noop-probe', workspace: 'ws' }, scopeOf(f)) as RunnerJobRecord;
+    assert.deepEqual([queuedJob.state, queuedJob.revision, queuedJob.workspace], ['pending', 1, 'ws']);
+    assert.equal(queuedJob.limits.timeoutMs > 0, true, 'an absent limits field takes the documented default');
+    const jobList = await drive('runner.read', {}, scopeOf(f)) as RunnerView;
+    assert.deepEqual([jobList.readOnly, jobList.jobs.map((job) => job.id)], [true, [queuedJob.id]]);
+    assert.deepEqual(jobList.recipes, ['test-run', 'noop-probe'], 'the allowlist is what the owner reads');
+    const claimedJob = await drive('runner.claim', { owner: 'registry-runner' }, scopeOf(f)) as RunnerJobRecord;
+    assert.deepEqual([claimedJob.state, claimedJob.claim!.owner], ['claimed', 'registry-runner']);
+    assert.ok(f.runnerPort.calls.includes('establish'), 'the handler asked for containment before it claimed the job');
+    const ranJob = await drive('runner.run', { jobId: queuedJob.id, owner: 'registry-runner' }, scopeOf(f)) as RunnerJobRecord;
+    assert.deepEqual([ranJob.state, ranJob.result!.outcome, ranJob.result!.exitCode], ['settled', 'succeeded', 0]);
+    assert.deepEqual(ranJob.result!.commands, [{ recipe: 'noop-probe', argv: ['/bin/echo', 'pilot-runner-probe'] }], 'the result records the allowlist own command');
+    assert.equal(f.runnerPort.executions, 1, 'the handler really ran the job, once');
+    const settledJob = await drive('runner.settle', { jobId: queuedJob.id }, scopeOf(f)) as RunnerSettleResult;
+    assert.deepEqual([settledJob.outcome, settledJob.changed, settledJob.record.state], ['unchanged', false, 'settled']);
+
+    // The acceptance record: one completion record frozen and rendered to Markdown, the policy read in
+    // force, one owner policy update, and one agent acceptance under the rule that permits it. The
+    // record's counts are read from its own recorded output, and its output is the real summary shape
+    // this repository's own test runner prints.
+    const evidenceRequest = {
+      sessionId: created.id,
+      subject: { kind: 'session' as const, id: created.id },
+      artifact: { revision: 'a'.repeat(64), commit: null },
+      commands: ['pnpm test'],
+      diff: { files: 3, linesAdded: 42, linesRemoved: 7, text: '--- a/x\n+++ b/x\n-1\n+2\n', reference: null },
+      tests: [{ command: 'pnpm test', outcome: 'passed' as const, output: 'TAP version 13\n# tests 2\n# pass 2\n# fail 0\n# skipped 0', counts: { passed: 2, failed: 0, skipped: 0 } }],
+      review: null,
+      producedAt: new Date(Date.now() - 60_000).toISOString()
+    };
+    const recordedEvidence = await drive('acceptance.evidence.record', { evidence: evidenceRequest }, scopeOf(f)) as EvidenceResult;
+    assert.deepEqual(
+      [recordedEvidence.written, recordedEvidence.evidence.markdown.state, recordedEvidence.evidence.record.tests[0].counts, recordedEvidence.evidence.record.frozen],
+      [true, 'current', { passed: 2, failed: 0, skipped: 0 }, true]
+    );
+    const acceptanceView = await drive('acceptance.read', {}, scopeOf(f)) as ProjectAcceptanceView;
+    assert.deepEqual(
+      [acceptanceView.readOnly, acceptanceView.evidence.length, acceptanceView.policy.mode, acceptanceView.policy.recorded, acceptanceView.policy.revision],
+      [true, 1, 'owner-only', false, 0],
+      'the policy in force on an instance that never wrote one is the documented default'
+    );
+    const updatedPolicy = await drive('acceptance.policy.update', {
+      revision: acceptanceView.policy.revision,
+      policy: { mode: 'agent-may-accept', actionClasses: { commit: 'full-auto', push: 'ask', deploy: 'ask', spend: 'ask', provision: 'ask', publish: 'ask' } },
+      actor: { kind: 'owner', identity: 'registry-owner' }
+    }, {}) as AcceptancePolicy;
+    assert.deepEqual([updatedPolicy.mode, updatedPolicy.revision, updatedPolicy.actionClasses.commit, updatedPolicy.updatedBy], ['agent-may-accept', 1, 'full-auto', 'registry-owner']);
+    const acceptedEvidence = await drive('acceptance.accept', {
+      request: {
+        evidenceId: recordedEvidence.evidence.record.id,
+        artifact: { revision: 'a'.repeat(64), commit: null },
+        actionClass: 'commit',
+        actor: { kind: 'agent', identity: 'registry-worker' }
+      }
+    }, scopeOf(f)) as AcceptanceResult;
+    assert.deepEqual(
+      [acceptedEvidence.acceptance.acceptedBy.kind, acceptedEvidence.acceptance.acceptedBy.identity, acceptedEvidence.acceptance.acceptedBy.policyRule, acceptedEvidence.acceptance.singleUse],
+      ['agent', 'registry-worker', agentPolicyRule('commit'), true]
+    );
+
     const distinct = [...new Set(exercised)].sort();
     assert.deepEqual(distinct, [...ACTION_IDS].sort(), 'every declared action was driven through the registry');
     assert.ok(exercised.length >= distinct.length, 'a driven action was recorded');
@@ -399,6 +523,30 @@ test('an unknown id and an action this instance cannot perform are both refused 
     assert.match(unavailable, /the durable control store is not open on this instance/);
     const projection = await refusal(liveActivity(bare, { projectId: f.project.id }));
     assert.ok(projection instanceof ActionError && projection.code === 'UNAVAILABLE');
+  } finally { await f.cleanup(); }
+});
+
+test('the coding runner is disabled by default, so its actions are absent from the registry rather than failing', async () => {
+  const f = await fixture();
+  try {
+    // The same instance with the runner absent: a disabled capability is not offered at all, and asking
+    // for one anyway is refused with the named reason rather than attempted.
+    const withoutRunner: ActionEnvironment = { ...f.environment, control: { ...f.environment.control!, runner: undefined } };
+    const registry = new ActionRegistry(withoutRunner);
+    const offered = registry.list({ projectId: f.project.id }).actions.map((descriptor) => descriptor.id);
+    assert.deepEqual(offered.filter((id) => id.startsWith('runner.')), [], 'a disabled runner offers no coding action');
+    assert.deepEqual(
+      offered,
+      ACTION_DESCRIPTORS.filter((descriptor) => !descriptor.requires.includes('session') && !descriptor.id.startsWith('runner.')).map((descriptor) => descriptor.id),
+      'and every other capability is offered exactly as before'
+    );
+    for (const id of ACTION_IDS.filter((candidate) => candidate.startsWith('runner.'))) {
+      const message = await actionRefusal(registry.run(id, {}, { projectId: f.project.id }), 'UNAVAILABLE');
+      assert.match(message, /the coding runner is not enabled on this instance/);
+    }
+    // The switch is the only thing that changes it: the same fixture with the runner present offers
+    // every one of the five actions, and the handlers behind them really act.
+    assert.deepEqual(f.actions.list({ projectId: f.project.id }).actions.map((descriptor) => descriptor.id).filter((id) => id.startsWith('runner.')).length, 5);
   } finally { await f.cleanup(); }
 });
 
@@ -523,8 +671,105 @@ test('every declared precondition matches a refusal the handlers really produce'
     assert.ok(error instanceof QueueError && error.code === 'ILLEGAL' && /expired at .* the queue never submits on an expired lease/.test(error.message)); covered.add('LEASE_LIVE');
     assert.equal(f.queue.read(f.project.id, session.id).entries[0].state, 'claimed', 'a refused submission changed nothing');
 
+    // The coding runner's own preconditions, each a refusal its handler really produces.
+    const runnerScope = scopeOf(f);
+    // RECIPE_ALLOWED: the recipe is a name from the fixed allowlist, enforced by the published schema
+    // before the handler runs, so no command line is ever composed from caller text.
+    error = await refusal(f.actions.run('runner.submit', { recipe: 'rm -rf /', workspace: 'ws' }, runnerScope));
+    assert.ok(error instanceof ActionError && error.code === 'INVALID' && /the recipe field/.test(error.message)); covered.add('RECIPE_ALLOWED');
+    // WORKSPACE_IN_ROOT: a reference that escapes the project root, or names a symlink, is refused.
+    error = await refusal(f.actions.run('runner.submit', { recipe: 'test-run', workspace: '../outside' }, runnerScope));
+    assert.ok(error instanceof RunnerError && error.code === 'OUTSIDE_ROOT' && /relative path inside the registered project root/.test(error.message)); covered.add('WORKSPACE_IN_ROOT');
+    // LIMITS_BOUNDED: a limit this build cannot enforce is refused rather than reduced.
+    error = await refusal(f.actions.run('runner.submit', { recipe: 'test-run', workspace: 'ws', limits: { memoryBytes: 64 * 1024 * 1024 * 1024 } }, runnerScope));
+    assert.ok(error instanceof RunnerError && error.code === 'INVALID' && /memoryBytes must be a whole number from/.test(error.message)); covered.add('LIMITS_BOUNDED');
+    // JOB_EXISTS: an unknown job is refused as not found.
+    error = await refusal(f.actions.run('runner.run', { jobId: randomUUID(), owner: 'registry-runner' }, runnerScope));
+    assert.ok(error instanceof RunnerError && error.code === 'NOT_FOUND'); covered.add('JOB_EXISTS');
+    // JOB_CLAIMABLE: a job whose claim is live is never stolen, and a running job is never claimed.
+    const claimable = await f.actions.run('runner.submit', { recipe: 'noop-probe', workspace: 'ws' }, runnerScope) as RunnerJobRecord;
+    await f.actions.run('runner.claim', { owner: 'precondition-runner' }, runnerScope);
+    error = await refusal(f.actions.run('runner.claim', { owner: 'another-runner' }, runnerScope));
+    assert.ok(error instanceof RunnerError && error.code === 'CONFLICT' && /a live claim is never stolen/.test(error.message)); covered.add('JOB_CLAIMABLE');
+    assert.equal(f.runner.read(f.project.id).jobs.find((job) => job.id === claimable.id)!.state, 'claimed', 'a refused claim wrote nothing');
+    // RUNNER_ENABLED: an instance whose containment cannot be established refuses before the claim is
+    // written, so the job is left unclaimed and nothing is executed anywhere.
+    f.runnerPort.containment = containment({ network: 'bridge', dockerSocket: true });
+    error = await refusal(f.actions.run('runner.claim', { owner: 'precondition-runner' }, runnerScope));
+    assert.ok(error instanceof RunnerError && error.code === 'UNAVAILABLE' && /no-network/.test(error.message) && /no-docker-socket/.test(error.message)); covered.add('RUNNER_ENABLED');
+    assert.equal(f.runnerPort.executions, 0, 'a refused containment ran nothing anywhere');
+    f.runnerPort.containment = containment();
+    f.runnerPort.establishRefusal = new RunnerError('The container runtime did not answer, so no job can be contained.', 'UNAVAILABLE');
+    error = await refusal(f.actions.run('runner.claim', { owner: 'precondition-runner' }, runnerScope));
+    assert.ok(error instanceof RunnerError && error.code === 'UNAVAILABLE'); covered.add('RUNNER_ENABLED');
+    f.runnerPort.establishRefusal = null;
+    assert.equal(f.runnerPort.executions, 0, 'a runner that cannot contain a job executes nothing');
+
+    // The acceptance record's own preconditions, each a refusal its handler really produces.
+    const acceptanceScope = scopeOf(f);
+    const artifact = { revision: 'f'.repeat(64), commit: null };
+    const acceptanceEvidence = (over: Record<string, unknown> = {}) => ({
+      sessionId: session.id,
+      subject: { kind: 'session', id: session.id },
+      artifact,
+      commands: ['pnpm test'],
+      diff: { files: 1, linesAdded: 2, linesRemoved: 1, text: '--- a/x\n+++ b/x\n-1\n+2\n', reference: null },
+      tests: [{ command: 'pnpm test', outcome: 'passed', output: '# tests 2\n# pass 2\n# fail 0\n# skipped 0', counts: { passed: 2, failed: 0, skipped: 0 } }],
+      review: null,
+      producedAt: new Date(Date.now() - 60_000).toISOString(),
+      ...over
+    });
+    // SESSION_EXISTS: a record that names a session this project does not have is refused before anything is written.
+    error = await refusal(f.actions.run('acceptance.evidence.record', { evidence: acceptanceEvidence({ sessionId: randomUUID(), subject: { kind: 'session', id: randomUUID() } }) }, acceptanceScope));
+    assert.ok(error instanceof SessionError && error.code === 'NOT_FOUND');
+    // EVIDENCE_SOURCE_READABLE: a claimed count with no recorded output to check it against.
+    error = await refusal(f.actions.run('acceptance.evidence.record', { evidence: acceptanceEvidence({ tests: [{ command: 'pnpm test', outcome: 'passed', output: null, counts: { passed: 2, failed: 0, skipped: 0 } }] }) }, acceptanceScope));
+    assert.ok(error instanceof AcceptanceError && error.code === 'INVALID' && /with no recorded output to check them against/.test(error.message)); covered.add('EVIDENCE_SOURCE_READABLE');
+    // EVIDENCE_HONEST: a claimed count that contradicts the record's own output.
+    error = await refusal(f.actions.run('acceptance.evidence.record', { evidence: acceptanceEvidence({ tests: [{ command: 'pnpm test', outcome: 'passed', output: '# tests 2\n# pass 1\n# fail 1\n# skipped 0', counts: { passed: 2, failed: 0, skipped: 0 } }] }) }, acceptanceScope));
+    assert.ok(error instanceof AcceptanceError && error.code === 'INVALID' && /but its recorded output reports/.test(error.message)); covered.add('EVIDENCE_HONEST');
+    // EVIDENCE_HONEST: an outcome that contradicts the counts its own recorded output carries — and a
+    // not-run command whose output carries counts no run of it produced — are refusals too.
+    error = await refusal(f.actions.run('acceptance.evidence.record', { evidence: acceptanceEvidence({ tests: [{ command: 'pnpm test', outcome: 'passed', output: '# tests 2\n# pass 1\n# fail 1\n# skipped 0', counts: null }] }) }, acceptanceScope));
+    assert.ok(error instanceof AcceptanceError && error.code === 'INVALID' && /records .pnpm test. as passed, but its own recorded output reports 1 failed/.test(error.message));
+    error = await refusal(f.actions.run('acceptance.evidence.record', { evidence: acceptanceEvidence({ tests: [{ command: 'pnpm test', outcome: 'failed', output: '# tests 2\n# pass 2\n# fail 0\n# skipped 0', counts: null }] }) }, acceptanceScope));
+    assert.ok(error instanceof AcceptanceError && error.code === 'INVALID' && /records .pnpm test. as failed, but its own recorded output reports no failure/.test(error.message));
+    // DIFF_BOUNDED: a diff that is neither inlined nor referenced, and one over the inline bound.
+    error = await refusal(f.actions.run('acceptance.evidence.record', { evidence: acceptanceEvidence({ diff: { files: 1, linesAdded: 2, linesRemoved: 1, text: null, reference: null } }) }, acceptanceScope));
+    assert.ok(error instanceof AcceptanceError && error.code === 'INVALID' && /neither inlined nor referenced/.test(error.message)); covered.add('DIFF_BOUNDED');
+    assert.equal((await f.actions.run('acceptance.read', {}, acceptanceScope) as ProjectAcceptanceView).evidence.length, 0, 'every refused record wrote nothing');
+    // EVIDENCE_EXISTS: an acceptance of a record this project does not hold.
+    error = await refusal(f.actions.run('acceptance.accept', { request: { evidenceId: 'ev-' + '0'.repeat(64), artifact: { revision: artifact.revision, commit: null }, actionClass: 'commit', actor: { kind: 'agent', identity: 'precondition-worker' } } }, acceptanceScope));
+    assert.ok(error instanceof AcceptanceError && error.code === 'NOT_FOUND'); covered.add('EVIDENCE_EXISTS');
+    const evidenceRecord = await f.actions.run('acceptance.evidence.record', { evidence: acceptanceEvidence() }, acceptanceScope) as EvidenceResult;
+    const acceptRequest = (over: Record<string, unknown> = {}) => ({
+      evidenceId: evidenceRecord.evidence.record.id, artifact: { revision: artifact.revision, commit: null }, actionClass: 'commit',
+      actor: { kind: 'agent', identity: 'precondition-worker' }, ...over
+    });
+    // ACCEPTOR_PERMITTED: the default policy is owner-only, so an agent acceptance is refused outright.
+    error = await refusal(f.actions.run('acceptance.accept', { request: acceptRequest() }, acceptanceScope));
+    assert.ok(error instanceof AcceptanceError && error.code === 'NOT_PERMITTED' && /policy is owner-only/.test(error.message)); covered.add('ACCEPTOR_PERMITTED');
+    // POLICY_OWNER_ONLY: an agent may not set the policy that decides what an agent may accept.
+    error = await refusal(f.actions.run('acceptance.policy.update', { revision: 0, policy: { mode: 'agent-may-accept', actionClasses: { commit: 'full-auto', push: 'ask', deploy: 'ask', spend: 'ask', provision: 'ask', publish: 'ask' } }, actor: { kind: 'agent', identity: 'precondition-worker' } }, {}));
+    assert.ok(error instanceof AcceptanceError && error.code === 'NOT_PERMITTED' && /changeable only by the owner/.test(error.message)); covered.add('POLICY_OWNER_ONLY');
+    assert.equal((await f.actions.run('acceptance.read', {}, acceptanceScope) as ProjectAcceptanceView).policy.recorded, false, 'a refused policy update wrote no policy');
+    // ACTION_CLASS_DECIDED: agent-may-accept with the class set to ask needs the owner's decision.
+    await f.actions.run('acceptance.policy.update', { revision: 0, policy: { mode: 'agent-may-accept', actionClasses: { commit: 'ask', push: 'ask', deploy: 'ask', spend: 'ask', provision: 'ask', publish: 'ask' } }, actor: { kind: 'owner', identity: 'precondition-owner' } }, {});
+    error = await refusal(f.actions.run('acceptance.accept', { request: acceptRequest() }, acceptanceScope));
+    assert.ok(error instanceof AcceptanceError && error.code === 'NOT_PERMITTED' && /asks the owner to decide a commit/.test(error.message)); covered.add('ACTION_CLASS_DECIDED');
+    // ARTIFACT_UNCHANGED: the artifact the request names is not the one the evidence was produced from.
+    await f.actions.run('acceptance.policy.update', { revision: 1, policy: { mode: 'agent-may-accept', actionClasses: { commit: 'full-auto', push: 'ask', deploy: 'ask', spend: 'ask', provision: 'ask', publish: 'ask' } }, actor: { kind: 'owner', identity: 'precondition-owner' } }, {});
+    error = await refusal(f.actions.run('acceptance.accept', { request: acceptRequest({ artifact: { revision: '9'.repeat(64), commit: null } }) }, acceptanceScope));
+    assert.ok(error instanceof AcceptanceError && error.code === 'ARTIFACT_CHANGED' && /has changed since this evidence was produced/.test(error.message)); covered.add('ARTIFACT_UNCHANGED');
+    // ARTIFACT_NOT_ACCEPTED: an acceptance is single use, and the second one names the first.
+    const acceptedOnce = await f.actions.run('acceptance.accept', { request: acceptRequest() }, acceptanceScope) as AcceptanceResult;
+    assert.deepEqual([acceptedOnce.acceptance.acceptedBy.policyRule, acceptedOnce.acceptance.policy.classDecision], [agentPolicyRule('commit'), 'full-auto']);
+    error = await refusal(f.actions.run('acceptance.accept', { request: acceptRequest({ actor: { kind: 'owner', identity: 'precondition-owner' } }) }, acceptanceScope));
+    assert.ok(error instanceof AcceptanceError && error.code === 'ALREADY_ACCEPTED' && /an acceptance is single use/.test(error.message)); covered.add('ARTIFACT_NOT_ACCEPTED');
+
     // The limits this test does not drive, and why. A new code cannot be added without a decision.
     const undriven: Partial<Record<ActionPreconditionCode, string>> = {
+      RUNNER_JOB_LIMIT: 'the 50-job bound belongs to the runner broker, which drives it in runner-broker.test.ts; driving it here would write 50 jobs to prove a bound this registry only repeats',
       SESSION_LIMIT: 'the 200-session bound belongs to the session registry, which drives it in session-registry.test.ts; driving it here would write 200 records to prove a bound this registry only repeats',
       LINK_LIMIT: 'the 32-link bound belongs to the session registry, which drives it in session-registry.test.ts',
       QUEUE_BOUNDED: 'the queue bound is driven in queue.test.ts, where filling a queue to its documented maximum and to its byte bound belongs; driving it here would append 50 entries to prove a bound this registry only repeats'

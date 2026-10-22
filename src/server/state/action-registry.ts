@@ -2,6 +2,7 @@ import { z } from 'zod';
 import { MEDIA_ID_PATTERN } from '../../shared/images';
 import { QUEUE_MAX_IMAGES_PER_ENTRY, QUEUE_MAX_TEXT_LENGTH, queueView, type QueueImageRef } from '../../shared/queue';
 import { SESSION_MAX_LINKS, SESSION_NAME_PATTERN } from '../../shared/sessions';
+import { RUNNER_MAX_WORKSPACE_LENGTH, RUNNER_RECIPES } from '../../shared/runner';
 import { SESSION_LIFECYCLE_REASON_MAX_LENGTH, type SessionLifecycleAction, type SessionLifecycleRecord } from '../../shared/session-lifecycle';
 import {
   ACTION_DESCRIPTORS, ACTION_IDS, ACTION_PARAM_TYPES, ACTION_REVISION_SOURCES, ACTION_SCOPE_DIMENSIONS, ACTION_SURFACES, LIVE_ACTIVITY_MAX_SESSIONS, LIVE_ACTIVITY_MAX_TOOL_EVENTS,
@@ -15,6 +16,8 @@ import type { SessionLifecycleService } from './session-lifecycle';
 import type { ApprovalStore } from './approval-store';
 import type { DeliveryLedger } from './delivery';
 import type { QueueImageResolver, QueueStore } from './queue-store';
+import type { RunnerBroker } from './runner-broker';
+import type { AcceptanceStore } from './acceptance-store';
 
 /**
  * The server half of the command registry: the one place an action id is bound to the handler that
@@ -72,6 +75,18 @@ export type ActionControl = {
   /** The durable queue of pending inputs, and the one resolver that turns an attached image id into its stored facts. */
   readonly queue: QueueStore;
   readonly media: QueueImageResolver;
+  /**
+   * The bounded coding runner, or undefined when this instance has it disabled. It is absent rather
+   * than present-and-failing: with it absent the runner actions are not offered at all, and asking for
+   * one anyway is refused as unavailable.
+   */
+  readonly runner?: RunnerBroker;
+  /**
+   * The acceptance record and its policy, or undefined when this instance has no such store. It is
+   * absent rather than present-and-failing: with it absent the acceptance actions are not offered at
+   * all, and asking for one anyway is refused as unavailable.
+   */
+  readonly acceptance?: AcceptanceStore;
   /** The legacy-conversation migration, planned (dryRun true) or applied (false). */
   readonly migrate: (dryRun: boolean) => Promise<SessionMigrationReport>;
 };
@@ -119,7 +134,22 @@ const PARAM_VALIDATORS: Readonly<Record<ActionParamType, z.ZodTypeAny>> = Object
   instant: z.string().min(1).max(40),
   'queue-text': z.string().min(1).max(QUEUE_MAX_TEXT_LENGTH).regex(reasonText, 'text must be printable characters'),
   'queue-images': z.array(z.string().regex(MEDIA_ID_PATTERN, 'an image reference is the hex media id of the stored bytes')).max(QUEUE_MAX_IMAGES_PER_ENTRY),
-  'queue-position': z.number().int().nonnegative()
+  'queue-position': z.number().int().nonnegative(),
+  // A recipe is a name from the fixed allowlist, and nothing else: the registry refuses an unknown one
+  // before the handler is reached, so no command line is ever composed from caller text.
+  'runner-recipe': z.enum(RUNNER_RECIPES),
+  // The shape of a workspace reference only; the real containment check is the filesystem one the
+  // broker performs against the registered project root.
+  'runner-workspace': z.string().min(1).max(RUNNER_MAX_WORKSPACE_LENGTH).regex(reasonText, 'a workspace reference must be printable text'),
+  // Bounded by the coding job model, which is the only thing that knows the documented bounds.
+  'runner-limits': z.unknown(),
+  // The four acceptance payloads are parsed strictly by the acceptance model, which owns the honesty
+  // rules (a claimed count is checked against the recorded output). The registry deliberately does
+  // not restate those rules, so a claim cannot be admitted by a shape check alone.
+  'acceptance-evidence': z.unknown(),
+  'acceptance-request': z.unknown(),
+  'acceptance-policy': z.unknown(),
+  'acceptance-actor': z.unknown()
 });
 
 /** A ZodError becomes this application's own words, never the schema library's raw message. */
@@ -224,6 +254,38 @@ function buildHandlers(environment: ActionEnvironment): Readonly<Record<ActionId
    */
   const queueImages = async (durable: ActionControl, images: unknown): Promise<readonly QueueImageRef[]> =>
     images === undefined || images === null ? Object.freeze([]) : durable.media.resolve(images as readonly string[]);
+  /**
+   * The runner actions share one shape: the project scope must name a project, and this instance must
+   * really have the runner. The handler never runs anything itself — it hands the call to the broker,
+   * whose only execution path is the containment-checked port.
+   */
+  const runnerScope = (scope: ActionScope): { runner: RunnerBroker; projectId: string } => {
+    const durable = control();
+    if (!durable.runner) throw new ActionError('The coding runner is not enabled on this instance, so it offers no coding jobs', 'UNAVAILABLE');
+    return { runner: durable.runner, projectId: projectOf(scope) };
+  };
+  /**
+   * The acceptance actions share one shape: the project scope must name a project and this instance
+   * must really have the acceptance store. The handler never reinterprets a payload — the store and
+   * the acceptance model own every rule — it only reads the one field it needs to check the session
+   * the record names, and leaves the rest of the payload to the store's own strict validation.
+   */
+  const acceptanceStore = (): AcceptanceStore => {
+    const durable = control();
+    if (!durable.acceptance) throw new ActionError('The acceptance store is not open on this instance, so it records no completion evidence', 'UNAVAILABLE');
+    return durable.acceptance;
+  };
+  const acceptanceScope = (scope: ActionScope): { acceptance: AcceptanceStore; projectId: string; durable: ActionControl } => {
+    const durable = control();
+    return { acceptance: acceptanceStore(), projectId: projectOf(scope), durable };
+  };
+  /** The session a completion record claims, read only when it is already a well-formed identifier. */
+  const claimedSession = (evidence: unknown): string | null => {
+    if (typeof evidence !== 'object' || evidence === null || Array.isArray(evidence)) return null;
+    const candidate = (evidence as Record<string, unknown>).sessionId;
+    if (typeof candidate !== 'string' || candidate.length > 160 || !identifierRule.test(candidate)) return null;
+    return candidate;
+  };
   return {
     'session.lifecycle.reconnect': lifecycle('reconnect'),
     'session.lifecycle.resume': lifecycle('resume'),
@@ -309,7 +371,45 @@ function buildHandlers(environment: ActionEnvironment): Readonly<Record<ActionId
     'queue.reconcile': async (params: Record<string, unknown>, scope: ActionScope) => {
       const { durable, projectId, sessionId } = queueSession(scope);
       return durable.queue.reconcile({ projectId, sessionId, entryId: params.entryId });
-    }
+    },
+    'runner.read': async (_params: Record<string, unknown>, scope: ActionScope) => {
+      const { runner, projectId } = runnerScope(scope);
+      return runner.read(projectId);
+    },
+    'runner.submit': async (params: Record<string, unknown>, scope: ActionScope) => {
+      const { runner, projectId } = runnerScope(scope);
+      return runner.submit({ projectId, recipe: params.recipe, workspace: params.workspace, limits: params.limits });
+    },
+    'runner.claim': async (params: Record<string, unknown>, scope: ActionScope) => {
+      const { runner, projectId } = runnerScope(scope);
+      return runner.claim({ projectId, owner: params.owner });
+    },
+    'runner.run': async (params: Record<string, unknown>, scope: ActionScope) => {
+      const { runner, projectId } = runnerScope(scope);
+      return runner.run({ projectId, jobId: params.jobId, owner: params.owner });
+    },
+    'runner.settle': async (params: Record<string, unknown>, scope: ActionScope) => {
+      const { runner, projectId } = runnerScope(scope);
+      return runner.settle({ projectId, jobId: params.jobId });
+    },
+    'acceptance.read': async (_params: Record<string, unknown>, scope: ActionScope) => {
+      const { acceptance, projectId } = acceptanceScope(scope);
+      return acceptance.readProject({ projectId });
+    },
+    'acceptance.evidence.record': async (params: Record<string, unknown>, scope: ActionScope) => {
+      const { acceptance, projectId, durable } = acceptanceScope(scope);
+      // The session the record names must be a live session of that project, read before anything is
+      // written; the store's validator owns the rest of the payload, including whether the session
+      // field was well formed at all.
+      const sessionId = claimedSession(params.evidence);
+      if (sessionId !== null) durable.sessions.read(projectId, sessionId);
+      return acceptance.recordEvidence({ projectId, evidence: params.evidence });
+    },
+    'acceptance.accept': async (params: Record<string, unknown>, scope: ActionScope) => {
+      const { acceptance, projectId } = acceptanceScope(scope);
+      return acceptance.accept({ projectId, request: params.request });
+    },
+    'acceptance.policy.update': async (params: Record<string, unknown>) => acceptanceStore().updatePolicy(params)
   };
 }
 
@@ -326,6 +426,18 @@ export function assertHandlerSet(environment: ActionEnvironment): void {
 
 /** The actions that need the durable control store: everything except the read-only doctor. */
 const CONTROL_BACKED: ReadonlySet<string> = new Set(ACTION_IDS.filter((id) => id !== 'doctor.report'));
+/**
+ * The actions that need the bounded coding runner, which is **disabled by default** behind an explicit
+ * environment switch. With it disabled the actions are absent from the offered registry rather than
+ * present-and-failing, and asking for one anyway is refused with the named reason.
+ */
+const RUNNER_ACTIONS: ReadonlySet<string> = new Set(ACTION_IDS.filter((id) => id.startsWith('runner.')));
+/**
+ * The actions that need the durable acceptance store, which an instance only has when it has a
+ * control store and knows its projects' roots. Absent, the actions are not offered rather than
+ * present-and-failing, exactly as the coding runner's are.
+ */
+const ACCEPTANCE_ACTIONS: ReadonlySet<string> = new Set(ACTION_IDS.filter((id) => id.startsWith('acceptance.')));
 
 /**
  * Normalises and validates a requested scope: an omitted dimension stays omitted, an identifier that
@@ -371,6 +483,10 @@ export class ActionRegistry {
   availability(descriptor: ActionDescriptor): { readonly available: boolean; readonly reason: string | null } {
     if (CONTROL_BACKED.has(descriptor.id) && !this.environment.control)
       return Object.freeze({ available: false, reason: 'the durable control store is not open on this instance' });
+    if (RUNNER_ACTIONS.has(descriptor.id) && !this.environment.control?.runner)
+      return Object.freeze({ available: false, reason: 'the coding runner is not enabled on this instance' });
+    if (ACCEPTANCE_ACTIONS.has(descriptor.id) && !this.environment.control?.acceptance)
+      return Object.freeze({ available: false, reason: 'the acceptance store is not open on this instance' });
     return Object.freeze({ available: true, reason: null });
   }
 

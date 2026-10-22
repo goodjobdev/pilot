@@ -56,7 +56,14 @@ export const ACTION_PARAM_TYPES = [
   'instant',
   'queue-text',
   'queue-images',
-  'queue-position'
+  'queue-position',
+  'runner-recipe',
+  'runner-workspace',
+  'runner-limits',
+  'acceptance-evidence',
+  'acceptance-request',
+  'acceptance-policy',
+  'acceptance-actor'
 ] as const;
 export type ActionParamType = (typeof ACTION_PARAM_TYPES)[number];
 
@@ -66,7 +73,7 @@ export type ActionParamType = (typeof ACTION_PARAM_TYPES)[number];
  * carries it and a client pre-fills exactly that value — or asks for it when the read is not
  * available — instead of assuming a number the server will refuse.
  */
-export const ACTION_REVISION_SOURCES = ['session-lifecycle-revision', 'session-record-revision', 'queue-revision'] as const;
+export const ACTION_REVISION_SOURCES = ['session-lifecycle-revision', 'session-record-revision', 'queue-revision', 'acceptance-policy-revision'] as const;
 export type ActionRevisionSource = (typeof ACTION_REVISION_SOURCES)[number];
 
 /** One declared parameter: what it is called, which rule it obeys, and whether it must be present. */
@@ -140,7 +147,16 @@ export const ACTION_IDS = [
   'queue.claim',
   'queue.release',
   'queue.submit',
-  'queue.reconcile'
+  'queue.reconcile',
+  'runner.read',
+  'runner.submit',
+  'runner.claim',
+  'runner.run',
+  'runner.settle',
+  'acceptance.read',
+  'acceptance.evidence.record',
+  'acceptance.accept',
+  'acceptance.policy.update'
 ] as const;
 export type ActionId = (typeof ACTION_IDS)[number];
 
@@ -184,7 +200,23 @@ export const ACTION_PRECONDITION_CODES = [
   'HEAD_CLAIMABLE',
   'CLAIM_OWNED',
   'LEASE_LIVE',
-  'QUEUE_BOUNDED'
+  'QUEUE_BOUNDED',
+  'RUNNER_ENABLED',
+  'RECIPE_ALLOWED',
+  'WORKSPACE_IN_ROOT',
+  'LIMITS_BOUNDED',
+  'RUNNER_JOB_LIMIT',
+  'JOB_EXISTS',
+  'JOB_CLAIMABLE',
+  'EVIDENCE_SOURCE_READABLE',
+  'EVIDENCE_HONEST',
+  'DIFF_BOUNDED',
+  'EVIDENCE_EXISTS',
+  'ARTIFACT_UNCHANGED',
+  'ARTIFACT_NOT_ACCEPTED',
+  'ACCEPTOR_PERMITTED',
+  'ACTION_CLASS_DECIDED',
+  'POLICY_OWNER_ONLY'
 ] as const;
 export type ActionPreconditionCode = (typeof ACTION_PRECONDITION_CODES)[number];
 
@@ -286,11 +318,53 @@ const queueImagesParameter: ActionParameter = Object.freeze({
   required: false,
   description: 'up to 6 stored image ids (the hex media id of the bytes, as the media route reports it); each is resolved against the media store and an unknown id is refused, so a reference is never a path and never an unverified claim'
 });
+const runnerJobParameter: ActionParameter = Object.freeze({
+  name: 'jobId',
+  type: 'identifier' as const,
+  required: true,
+  description: 'the stable id of one coding job, 1-160 characters starting alphanumeric from A-Za-z0-9._:-; read it from the job list (GET /api/projects/<id>/runner/jobs) or from the job a claim returned'
+});
 const queuePositionParameter: ActionParameter = Object.freeze({
   name: 'position',
   type: 'queue-position' as const,
   required: true,
   description: 'the position the entry moves to: a whole number inside the queue (0 to the number of entries minus one)'
+});
+
+const acceptanceEvidenceParameter: ActionParameter = Object.freeze({
+  name: 'evidence',
+  type: 'acceptance-evidence' as const,
+  required: true,
+  description: 'the completion record: subject {kind: job|session, id}, artifact {revision, commit or null}, the commands run, diff {files, linesAdded, linesRemoved, text or null, reference or null}, tests [{command, outcome, output or null, counts or null}], an optional review and producedAt; the counts a record carries are read from its own recorded output',
+  validatedBy: 'the acceptance model (src/shared/acceptance.ts)'
+});
+const acceptanceRequestParameter: ActionParameter = Object.freeze({
+  name: 'request',
+  type: 'acceptance-request' as const,
+  required: true,
+  description: 'the acceptance: evidenceId, the exact artifact {revision, commit or null} it accepts, actionClass (commit, push, deploy, spend, provision, publish) and the actor {kind: owner|agent, identity}',
+  validatedBy: 'the acceptance model (src/shared/acceptance.ts)'
+});
+const acceptancePolicyParameter: ActionParameter = Object.freeze({
+  name: 'policy',
+  type: 'acceptance-policy' as const,
+  required: true,
+  description: 'the new policy: mode (owner-only or agent-may-accept) and actionClasses, with one of ask or full-auto for each of commit, push, deploy, spend, provision and publish',
+  validatedBy: 'the acceptance model (src/shared/acceptance.ts)'
+});
+const acceptanceActorParameter: ActionParameter = Object.freeze({
+  name: 'actor',
+  type: 'acceptance-actor' as const,
+  required: true,
+  description: 'who is changing the policy: kind (owner or agent) and identity; only an owner may change it',
+  validatedBy: 'the acceptance model (src/shared/acceptance.ts)'
+});
+const acceptancePolicyRevisionParameter: ActionParameter = Object.freeze({
+  name: 'revision',
+  type: 'revision' as const,
+  required: true,
+  revisionSource: 'acceptance-policy-revision' as const,
+  description: 'the policy revision the caller read; a stale one is refused as a conflict and writes nothing. Read it from the policy in force (GET /api/acceptance/policy), which reports its revision'
 });
 
 function describe(value: Omit<ActionDescriptor, 'surfaces'> & { readonly surfaces?: readonly ActionSurface[] }): ActionDescriptor {
@@ -302,7 +376,8 @@ function describe(value: Omit<ActionDescriptor, 'surfaces'> & { readonly surface
 
 /**
  * The registry itself. Ordering is deliberate and stable: lifecycle actions, session records, the
- * migration, approvals, then the two read-only reports.
+ * migration, approvals, the two read-only reports, the queue, the bounded coding runner, then the
+ * acceptance record.
  */
 export const ACTION_DESCRIPTORS: readonly ActionDescriptor[] = Object.freeze([
   describe({
@@ -727,6 +802,152 @@ export const ACTION_DESCRIPTORS: readonly ActionDescriptor[] = Object.freeze([
     noops: Object.freeze(['a reconciliation always answers: an entry the transcript cannot be matched against becomes a named operator-attention state rather than a refusal, and nothing is re-sent']),
     writes: true,
     effect: 'reads what the durable transcript holds for the entry\'s stable request identity and writes settled on a match, or a named operator-attention state on an absence, a mismatch or an unreadable transcript; it never re-sends and never overwrites the transcript'
+  }),
+  describe({
+    id: 'runner.read' as const,
+    label: 'Read the coding jobs',
+    description: 'Read one project\'s bounded coding jobs, with the recipe allowlist and the limits this build enforces.',
+    requires: projectScope,
+    parameters: Object.freeze([]),
+    preconditions: [
+      Object.freeze({ code: 'PROJECT_REGISTERED' as const, description: 'the project scope names a registered project; an unknown one is refused as not found' })
+    ],
+    noops: Object.freeze(['a project with no coding jobs reads as an empty list at the documented bounds: that is the project\'s runner state, not an absence of one']),
+    writes: false,
+    effect: 'reads the bounded coding jobs of one project, oldest first, with the recipe allowlist and the limits this build enforces; it runs nothing and claims nothing'
+  }),
+  describe({
+    id: 'runner.submit' as const,
+    label: 'Submit a coding job',
+    description: 'Submit one bounded coding job: a fixed recipe, a contained workspace and stated limits.',
+    requires: projectScope,
+    parameters: Object.freeze([
+      Object.freeze({ name: 'recipe', type: 'runner-recipe' as const, required: true, description: 'one recipe from the fixed allowlist (test-run, noop-probe); it is a name for one constant command line, and a caller supplies no argument, no shell text and no environment' }),
+      Object.freeze({ name: 'workspace', type: 'runner-workspace' as const, required: true, description: 'a relative path inside the registered project root (for example . or packages/api); an absolute path, a parent segment or a symlink is refused, and the directory must exist' }),
+      Object.freeze({ name: 'limits', type: 'runner-limits' as const, required: false, description: 'optional bounded limits: timeoutMs (100-300000), outputBytes (256-8192), memoryBytes (16MiB-1GiB), cpus (1-2) and pids (8-128); an absent field takes the documented default and a value outside its bound is refused rather than reduced', validatedBy: 'the coding job model (src/shared/runner.ts)' })
+    ]),
+    preconditions: [
+      Object.freeze({ code: 'PROJECT_REGISTERED' as const, description: 'the project scope names a registered project, so the job has an approved root to resolve its workspace in' }),
+      Object.freeze({ code: 'RECIPE_ALLOWED' as const, description: 'the recipe is one of the fixed allowlist; an unknown one is refused and no command line is composed at all' }),
+      Object.freeze({ code: 'WORKSPACE_IN_ROOT' as const, description: 'the workspace reference is a relative path that resolves to an existing directory inside the registered project root, with no symlink in it; anything else is refused rather than resolved and rewritten' }),
+      Object.freeze({ code: 'LIMITS_BOUNDED' as const, description: 'every limit is inside the documented bounds; a limit this build cannot enforce is refused, never quietly reduced' }),
+      Object.freeze({ code: 'RUNNER_JOB_LIMIT' as const, description: 'the project holds fewer than the documented maximum of 50 coding jobs' })
+    ],
+    noops: Object.freeze([]),
+    writes: true,
+    effect: 'writes one pending coding job holding the recipe, the contained workspace reference and the bounded limits; it starts no container and runs nothing'
+  }),
+  describe({
+    id: 'runner.claim' as const,
+    label: 'Claim the next coding job',
+    description: 'Claim the oldest unclaimed job for one named owner, with a lease, and start nothing.',
+    requires: projectScope,
+    parameters: sessionParameters([queueOwnerParameter]),
+    preconditions: [
+      Object.freeze({ code: 'PROJECT_REGISTERED' as const, description: 'the project scope names a registered project' }),
+      Object.freeze({ code: 'JOB_CLAIMABLE' as const, description: 'the oldest job that is not terminal is pending, or is claimed with an expired lease and so is reclaimable; a claim whose lease is live is never stolen, and a running, settled or attention job is never claimed' }),
+      Object.freeze({ code: 'RUNNER_ENABLED' as const, description: 'this instance can contain a job: the container properties are established before the claim is written, so an instance that cannot contain a job leaves it unclaimed rather than claiming work it cannot run' })
+    ],
+    noops: Object.freeze([]),
+    writes: true,
+    effect: 'writes the claim and its lease on the oldest unclaimed job and starts no container; a job that is merely claimed has provably not run, because a run writes the running state first'
+  }),
+  describe({
+    id: 'runner.run' as const,
+    label: 'Run a claimed coding job',
+    description: 'Run one claimed job in a contained container, collect its bounded result and settle it.',
+    requires: projectScope,
+    parameters: sessionParameters([runnerJobParameter, queueOwnerParameter]),
+    preconditions: [
+      Object.freeze({ code: 'PROJECT_REGISTERED' as const, description: 'the project scope names a registered project' }),
+      Object.freeze({ code: 'JOB_EXISTS' as const, description: 'the job id names a job of that project; an unknown one is refused as not found' }),
+      Object.freeze({ code: 'TRANSITION_LEGAL' as const, description: 'the job is claimed, so it can run; a pending, running, settled or attention job is refused, and a settled or attention job is never run again' }),
+      Object.freeze({ code: 'CLAIM_OWNED' as const, description: 'the caller holds the job\'s claim; another owner\'s claim is never run by this one' }),
+      Object.freeze({ code: 'LEASE_LIVE' as const, description: 'the claim has not expired; the runner never runs on an expired lease, because the job may already belong to another owner by then' }),
+      Object.freeze({ code: 'WORKSPACE_IN_ROOT' as const, description: 'the workspace is resolved again at the moment it is mounted, so a reference that stopped being contained is refused rather than mounted' }),
+      Object.freeze({ code: 'RUNNER_ENABLED' as const, description: 'the container properties are established and exact before the running state is written; when they cannot be, nothing is run — there is no fallback to this process, the application container or the host' }),
+      Object.freeze({ code: 'LIMITS_BOUNDED' as const, description: 'the runtime reports it can enforce the job\'s limits; when it cannot, nothing is run and the job is left exactly as it is' })
+    ],
+    noops: Object.freeze([]),
+    writes: true,
+    effect: 'writes the running state, runs the job in one container with no network, a read-only root, a non-root user, no capabilities and hard limits, then writes the bounded result and settles the job; a conflict on the running write executes nothing'
+  }),
+  describe({
+    id: 'runner.settle' as const,
+    label: 'Settle a coding job',
+    description: 'Settle one job from its durable record, or name why it needs an operator.',
+    requires: projectScope,
+    parameters: sessionParameters([runnerJobParameter]),
+    preconditions: [
+      Object.freeze({ code: 'PROJECT_REGISTERED' as const, description: 'the project scope names a registered project' }),
+      Object.freeze({ code: 'JOB_EXISTS' as const, description: 'the job id names a job of that project' }),
+      Object.freeze({ code: 'TRANSITION_LEGAL' as const, description: 'the job is claimed or running, so it can be settled; a pending job has not been claimed and has nothing to settle, and a settled or attention job is a no-op' })
+    ],
+    noops: Object.freeze(['settling a job that is already settled or awaiting an operator returns the record unchanged at its own revision, and settling a running job with no recorded result always answers with the named operator-attention state rather than a refusal']),
+    writes: true,
+    effect: 'settles one job from what the durable record proves — the recorded result when there is one, and otherwise the named operator-attention state — and executes nothing at all'
+  }),
+  describe({
+    id: 'acceptance.read' as const,
+    label: 'Read the completion records',
+    description: 'Read the acceptance policy in force and one project\'s completion records with their acceptances.',
+    requires: projectScope,
+    parameters: Object.freeze([]),
+    preconditions: [
+      Object.freeze({ code: 'PROJECT_REGISTERED' as const, description: 'the project scope names a registered project; an unknown one is refused as not found' })
+    ],
+    noops: Object.freeze(['a project with no completion record and no written policy reads as an empty list of evidence with the documented default policy (owner-only, every class asking) at revision 0; that is the project\'s acceptance state, not an absence of one']),
+    writes: false,
+    effect: 'reads the acceptance policy in force and the project\'s completion records in order, each with the state of its durable Markdown file and the acceptance it holds; it records and accepts nothing'
+  }),
+  describe({
+    id: 'acceptance.evidence.record' as const,
+    label: 'Record completion evidence',
+    description: 'Record one unit of work\'s completion evidence, freeze it and write its Markdown record.',
+    requires: projectScope,
+    parameters: Object.freeze([acceptanceEvidenceParameter]),
+    preconditions: [
+      Object.freeze({ code: 'PROJECT_REGISTERED' as const, description: 'the project scope names a registered project, so the record has a root to be written in' }),
+      Object.freeze({ code: 'SESSION_EXISTS' as const, description: 'when the record names a session, that session is a live session of that project; an unknown one is refused as not found' }),
+      Object.freeze({ code: 'EVIDENCE_SOURCE_READABLE' as const, description: 'a claimed count has a recorded output to be checked against: the output is present and inside the documented byte bound. An output that is absent or carries no count line is stored as a named absence instead, never assumed good' }),
+      Object.freeze({ code: 'EVIDENCE_HONEST' as const, description: 'the evidence agrees with what it records: every result names a command the record says was run, no claimed count contradicts the count lines of its own recorded output, no result claims a pass or fail count for a command it also says was not run, the outcome agrees with the counts that same output carries (passed beside a failure, and failed beside a run with no failure, are refused), and a not-run command stores the named absence command-not-run instead of counts no run of it produced' }),
+      Object.freeze({ code: 'DIFF_BOUNDED' as const, description: 'the diff carries a complete summary and the full diff either inlined inside the documented byte bound or referenced by a contained relative reference; an inlined diff over the bound or a diff with neither is refused' })
+    ],
+    noops: Object.freeze(['recording the same evidence again is the same record — its identity is derived from the canonical request — and it rewrites that record\'s Markdown so a file a crash never wrote is repaired']),
+    writes: true,
+    effect: 'validates and freezes one completion record (the work it belongs to, the exact revision it was produced from, the commands, the diff summary with the full diff referenced or inlined, the test evidence with the counts read from its own output, and the review verdict when there is one), writes it once in the durable store and renders it to Markdown inside the project'
+  }),
+  describe({
+    id: 'acceptance.accept' as const,
+    label: 'Accept an artifact',
+    description: 'Accept one artifact exactly once, under the acceptance policy in force.',
+    requires: projectScope,
+    parameters: Object.freeze([acceptanceRequestParameter]),
+    preconditions: [
+      Object.freeze({ code: 'PROJECT_REGISTERED' as const, description: 'the project scope names a registered project' }),
+      Object.freeze({ code: 'EVIDENCE_EXISTS' as const, description: 'the evidence id names a completion record of that project; an unknown one is refused as not found, and there is nothing to bind an acceptance to' }),
+      Object.freeze({ code: 'ARTIFACT_UNCHANGED' as const, description: 'the artifact identity the request accepts is the exact revision (and commit) the evidence was produced from; an artifact that has changed since the evidence was produced is refused and needs new evidence' }),
+      Object.freeze({ code: 'ARTIFACT_NOT_ACCEPTED' as const, description: 'the artifact has not already been accepted: an acceptance is single use, and a second one — in this process, from another handle, or after a crash and reopen — is refused and names the acceptance that already exists' }),
+      Object.freeze({ code: 'ACCEPTOR_PERMITTED' as const, description: 'the policy mode permits this accepting identity: under owner-only an agent acceptance is refused outright, and the owner accepts instead' }),
+      Object.freeze({ code: 'ACTION_CLASS_DECIDED' as const, description: 'the action class is decided for this accepting identity: the owner may always decide, and an agent only where the policy sets that class to full-auto; a class set to ask needs the owner\'s decision' })
+    ],
+    noops: Object.freeze([]),
+    writes: true,
+    effect: 'writes one durable, single-use acceptance that names the exact artifact identity it accepted, the identity the request declares as accepting it (an owner identity, or an agent identity with the policy rule that permitted it), the policy revision and class decision in force, and when; it then rewrites the evidence\'s Markdown record so the repository copy carries the verdict, and reports the state of that file as it is read back, so a render that could not be written is reported as the file\'s own state rather than as a refusal after the decision is durable. It commits, pushes, deploys, spends, provisions and publishes nothing'
+  }),
+  describe({
+    id: 'acceptance.policy.update' as const,
+    label: 'Update the acceptance policy',
+    description: 'Set the acceptance mode and the per-action-class ask-or-full-auto decision. Owner only.',
+    requires: noScope,
+    parameters: Object.freeze([acceptancePolicyRevisionParameter, acceptancePolicyParameter, acceptanceActorParameter]),
+    preconditions: [
+      Object.freeze({ code: 'REVISION_MATCHES' as const, description: 'the revision the caller read is the policy revision in force; a stale one is refused as a conflict and writes nothing' }),
+      Object.freeze({ code: 'POLICY_OWNER_ONLY' as const, description: 'the actor is the owner; an agent identity is refused, because the policy that decides what an agent may accept is not something an agent may set' })
+    ],
+    noops: Object.freeze([]),
+    writes: true,
+    effect: 'writes the next revision of the acceptance policy — the mode and one ask-or-full-auto decision per action class — and reports the policy now in force'
   })
 ]);
 

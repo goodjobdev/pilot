@@ -15,8 +15,21 @@ import type { AlertPayload } from '../../src/server/alerts';
 import { observeStorageSchema } from '../../src/server/release';
 import { newTask } from '../../src/shared/model';
 import { ACTION_DESCRIPTORS, ACTION_IDS, LIVE_RUN_DETAILS, LIVE_RUN_REASONS, LIVE_TOOL_REASONS } from '../../src/shared/actions';
+import { RunnerError, type RunnerContainment } from '../../src/shared/runner';
+import type { RunnerExecution, RunnerExecutionRequest, RunnerPort } from '../../src/server/state/runner-broker';
 
 const listen=(app:Awaited<ReturnType<typeof createApp>>,security:ReturnType<typeof localConfig>)=>new Promise<void>(ok=>app.server.listen(0,'127.0.0.1',()=>{security.origin='http://127.0.0.1:'+(app.server.address() as any).port;ok();}));
+/**
+ * The coding runner is disabled on every instance unless it is enabled explicitly, so its five actions
+ * are absent from the offered registry rather than listed and failing. These helpers describe that
+ * default without weakening the assertions about everything else the registry offers.
+ */
+const RUNNER_ACTION_IDS:readonly string[]=ACTION_IDS.filter(id=>id.startsWith('runner.'));
+const withoutRunner=<T extends {readonly id:string}>(descriptors:readonly T[])=>descriptors.filter(descriptor=>!RUNNER_ACTION_IDS.includes(descriptor.id));
+/** The containment every required property is checked against, as an injected port would report it. */
+const containment=(overrides:Partial<RunnerContainment>={}):RunnerContainment=>Object.freeze({runtime:'fake-runtime',image:'pilot-runner:test',network:'none',rootFilesystem:'read-only' as const,user:'10001:10001',capabilities:'none',noNewPrivileges:true,dockerSocket:false,mounts:Object.freeze(['workspace']) as readonly string[],maxMemoryBytes:1024*1024*1024,maxCpus:2,maxPids:128,maxWallClockMs:300_000,...overrides});
+/** One scripted execution: no container is started and no container runtime is contacted in this suite. */
+const execution=(overrides:Partial<RunnerExecution>={}):RunnerExecution=>Object.freeze({exitCode:0,stdout:'probe\n',stderr:'',stdoutBytes:6,stderrBytes:0,stdoutTruncated:false,stderrTruncated:false,timedOut:false,durationMs:3,startedAt:new Date(1700000000000).toISOString(),endedAt:new Date(1700000000003).toISOString(),...overrides});
 const hostProbe=(port:string,host:string):Promise<number>=>new Promise((ok,fail)=>{const req=request({host:'127.0.0.1',port,path:'/readyz',headers:{host}},res=>{res.resume();ok(res.statusCode??0);});req.on('error',fail);req.end();});
 test('API authentication, origin, content type and project isolation',async()=>{
  const security=localConfig('http://127.0.0.1:0'),app=await createApp({dataRoot:await mkdtemp(join(tmpdir(),'dashboard-api-')),browseRoots:[],security});
@@ -652,9 +665,11 @@ test('the command registry is owner-only, lists only what this instance implemen
   assert.equal((await read('/api/actions/execute')).status,405,'executing is a POST only');
   assert.equal((await post('/api/actions/activity',{})).status,405);
 
-  // Only implemented actions, and only ones this scope can use: the ids are exactly the registry's.
-  const globalIds=ACTION_DESCRIPTORS.filter(descriptor=>descriptor.requires.length===0).map(descriptor=>descriptor.id);
-  const scopedIds=ACTION_DESCRIPTORS.map(descriptor=>descriptor.id);
+  // Only implemented actions, and only ones this scope can use: the ids are exactly the registry's,
+  // minus the coding runner's, which this instance has disabled.
+  const globalIds=withoutRunner(ACTION_DESCRIPTORS.filter(descriptor=>descriptor.requires.length===0)).map(descriptor=>descriptor.id);
+  const scopedIds=withoutRunner(ACTION_DESCRIPTORS).map(descriptor=>descriptor.id);
+  assert.deepEqual(scopedIds.filter(id=>RUNNER_ACTION_IDS.includes(id)),[],'a disabled coding runner is absent from the registry');
   const unscoped=await (await read('/api/actions')).json();
   assert.equal(unscoped.readOnly,true);
   assert.deepEqual(unscoped.scope,{projectId:null,sessionId:null});
@@ -664,12 +679,19 @@ test('the command registry is owner-only, lists only what this instance implemen
   // registry declares what the capability needs, and the handler stays the authority on existence.
   const unregistered=await read('/api/actions?projectId='+randomUUID());
   assert.equal(unregistered.status,200,'a project scope is answered whether or not the project exists');
-  assert.deepEqual((await unregistered.json()).actions.map((action:any)=>action.id),ACTION_DESCRIPTORS.filter(descriptor=>!descriptor.requires.includes('session')).map(descriptor=>descriptor.id));
+  assert.deepEqual((await unregistered.json()).actions.map((action:any)=>action.id),withoutRunner(ACTION_DESCRIPTORS.filter(descriptor=>!descriptor.requires.includes('session'))).map(descriptor=>descriptor.id));
   assert.equal((await execute({id:'session.create',params:{name:'Orphan'},scope:{projectId:randomUUID()}})).status,404,'the handler is the authority on whether the project exists');
 
   const project=await (await post('/api/projects',{name:'Actions',managed:true,confirm:true})).json();
   const projectActions=await (await read('/api/actions?projectId='+project.id)).json();
-  assert.deepEqual(projectActions.actions.map((action:any)=>action.id),ACTION_DESCRIPTORS.filter(descriptor=>!descriptor.requires.includes('session')).map(descriptor=>descriptor.id),'a project scope adds the project-scoped actions');
+  assert.deepEqual(projectActions.actions.map((action:any)=>action.id),withoutRunner(ACTION_DESCRIPTORS.filter(descriptor=>!descriptor.requires.includes('session'))).map(descriptor=>descriptor.id),'a project scope adds the project-scoped actions');
+  // Asking for a disabled capability is a named refusal, not an attempt: the runner is not offered and
+  // not silently attempted either.
+  const runnerRefusal=await execute({id:'runner.submit',params:{recipe:'noop-probe',workspace:'.'},scope:{projectId:project.id}});
+  assert.equal(runnerRefusal.status,503);
+  const runnerBody=await runnerRefusal.json();
+  assert.equal(runnerBody.code,'UNAVAILABLE');
+  assert.match(runnerBody.error,/the coding runner is not enabled on this instance/);
   const session=(await (await post('/api/sessions',{projectId:project.id,name:'Registry session'})).json()).session;
   const full=await (await read('/api/actions?projectId='+project.id+'&sessionId='+session.id)).json();
   assert.deepEqual(full.actions.map((action:any)=>action.id),scopedIds,'one project and one session satisfy every declared scope');
@@ -942,4 +964,234 @@ test('the live projection reports the durable run state and distinguishes none, 
   assert.deepEqual([unavailable.harness.state,unavailable.harness.reason,unavailable.harness.source],['unavailable','agents-disabled-on-this-instance',null]);
   assert.deepEqual(unavailable.harness.invocations,[]);
  }finally{await offApp.close();offStore.close();await rm(off,{recursive:true,force:true});}
+});
+test('the coding runner routes are owner-only, are enabled explicitly, and refuse a job this instance cannot contain',async()=>{
+ const root=await mkdtemp(join(tmpdir(),'dashboard-runner-api-'));
+ const data=join(root,'data');await mkdir(data,{recursive:true,mode:0o700});
+ const store=new ControlStore(data);
+ const security=localConfig('http://127.0.0.1:0');
+ // The port is injected, so this suite never starts a container and never contacts a container
+ // runtime. It reports the documented containment and one scripted execution.
+ const calls:string[]=[];let executions=0;let contained=containment();
+ const port:RunnerPort={
+  async establish(){calls.push('establish');return contained;},
+  async execute(input:RunnerExecutionRequest){calls.push('execute:'+input.job.recipe);executions+=1;return execution();}
+ };
+ const app=await createApp({dataRoot:data,browseRoots:[],security,control:store,runner:{enabled:true,port}});
+ await listen(app,security);
+ const url=security.origin,token={'x-dashboard-token':security.token},writes={...token,'content-type':'application/json',origin:url};
+ const post=(p:string,body:unknown)=>fetch(url+p,{method:'POST',headers:writes,body:JSON.stringify(body)});
+ const read=(p:string)=>fetch(url+p,{headers:token});
+ try{
+  const project=await (await post('/api/projects',{name:'Runner',managed:true,confirm:true})).json();
+  const base='/api/projects/'+project.id+'/runner/jobs';
+  // Owner-only, behind the unchanged Host check, with the same origin enforcement for writes.
+  assert.equal((await fetch(url+base)).status,401,'the job list is behind owner auth');
+  assert.equal((await fetch(url+base,{method:'POST',headers:{'content-type':'application/json',origin:url},body:JSON.stringify({recipe:'noop-probe',workspace:'.'})})).status,401,'submitting is behind owner auth');
+  assert.equal((await fetch(url+base,{method:'POST',headers:{...token,'content-type':'application/json',origin:'https://evil.example'},body:'{}'})).status,403,'submitting is a write and needs the canonical origin');
+  const wrongHost=await new Promise<number>((ok,fail)=>{const req=request({host:'127.0.0.1',port:new URL(url).port,path:base,headers:{host:'evil.example','x-dashboard-token':security.token}},res=>{res.resume();ok(res.statusCode??0);});req.on('error',fail);req.end();});
+  assert.equal(wrongHost,403,'the unchanged Host check applies to the runner routes');
+  // Enabled explicitly, the runner offers its five actions for this scope — and only because it is on.
+  const listed=await (await read('/api/actions?projectId='+project.id)).json();
+  assert.deepEqual(listed.actions.map((action:any)=>action.id).filter((id:string)=>id.startsWith('runner.')).sort(),[...RUNNER_ACTION_IDS].sort());
+  // A workspace outside the registered root, an unknown recipe, an unknown field, an oversized limit
+  // and a workspace that does not exist each fail closed with their own status and no record written.
+  assert.equal((await post(base,{recipe:'test-run',workspace:'../outside'})).status,403);
+  assert.equal((await post(base,{recipe:'test-run',workspace:'/etc'})).status,403);
+  assert.equal((await post(base,{recipe:'rm -rf /',workspace:'.'})).status,422);
+  assert.equal((await post(base,{recipe:'noop-probe',workspace:'.',surprise:true})).status,422);
+  assert.equal((await post(base,{recipe:'noop-probe',workspace:'.',limits:{cpus:99}})).status,422);
+  assert.equal((await post(base,{recipe:'noop-probe',workspace:'nope'})).status,404);
+  assert.deepEqual((await (await read(base)).json()).jobs,[],'a refused submission wrote nothing');
+  // A real submission, then the documented lifecycle.
+  const submitted=await post(base,{recipe:'noop-probe',workspace:'.',limits:{timeoutMs:5000}});
+  assert.equal(submitted.status,201);
+  const job=(await submitted.json()).job;
+  assert.deepEqual([job.state,job.revision,job.workspace,job.limits.timeoutMs],['pending',1,'.',5000]);
+  assert.ok(!JSON.stringify(job).includes(data),'no stored field carries a filesystem path');
+  assert.deepEqual((await (await read(base)).json()).jobs.map((candidate:any)=>candidate.id),[job.id]);
+  // Containment is established before the claim is written: an instance that cannot contain a job
+  // leaves the job unclaimed and executes nothing, anywhere.
+  contained=containment({network:'bridge',dockerSocket:true});
+  const refused=await post(base+'/claim',{owner:'api-dispatcher'});
+  assert.equal(refused.status,503);
+  const refusedBody=await refused.json();
+  assert.match(refusedBody.error,/no-network/);
+  assert.match(refusedBody.error,/there is no fallback/i);
+  assert.equal(executions,0,'a refused containment executed nothing');
+  assert.equal((await (await read(base)).json()).jobs[0].state,'pending','the job is left unclaimed');
+  contained=containment();
+  assert.equal((await post(base+'/claim',{owner:'api-dispatcher'})).status,200);
+  // Only the owner of the claim may run it, and a settled job is never run again.
+  assert.equal((await post(base+'/'+job.id+'/run',{owner:'someone-else'})).status,409);
+  assert.equal(executions,0,'a foreign claim ran nothing');
+  const ran=await post(base+'/'+job.id+'/run',{owner:'api-dispatcher'});
+  assert.equal(ran.status,200);
+  const ranJob=(await ran.json()).job;
+  assert.deepEqual([ranJob.state,ranJob.result.outcome,ranJob.result.exitCode,ranJob.result.stdout],['settled','succeeded',0,'probe\n']);
+  assert.deepEqual(ranJob.result.commands,[{recipe:'noop-probe',argv:['/bin/echo','pilot-runner-probe']}]);
+  assert.equal(executions,1,'the job ran exactly once');
+  assert.equal((await post(base+'/'+job.id+'/run',{owner:'api-dispatcher'})).status,409,'a settled job is never run again');
+  const settled=await post(base+'/'+job.id+'/settle',{});
+  assert.equal(settled.status,200);
+  assert.equal((await settled.json()).outcome,'unchanged');
+  assert.equal((await post(base+'/'+randomUUID()+'/run',{owner:'api-dispatcher'})).status,404);
+  assert.equal((await post(base+'/claim',{owner:'api-dispatcher'})).status,409,'nothing is left to claim');
+  assert.equal((await read(base+'/'+job.id+'/run')).status,405,'a run is a POST');
+  assert.equal((await read('/api/projects/'+randomUUID()+'/runner/jobs')).status,404,'an unregistered project is not found');
+  assert.equal((await read(base)).status,200);
+  assert.equal(executions,1,'no other route ran the job');
+  assert.ok(calls.includes('establish'),'containment was established before every claim and run');
+ }finally{await app.close();store.close();await rm(root,{recursive:true,force:true});}
+});
+test('the acceptance routes are owner-only, refuse an agent acceptance under owner-only, and write the Markdown record',async()=>{
+ const root=await mkdtemp(join(tmpdir(),'dashboard-acceptance-api-'));
+ const data=join(root,'data');await mkdir(data,{recursive:true,mode:0o700});
+ const store=new ControlStore(data);
+ const security=localConfig('http://127.0.0.1:0');
+ const app=await createApp({dataRoot:data,browseRoots:[],security,control:store});
+ await listen(app,security);
+ const url=security.origin,token={'x-dashboard-token':security.token},writes={...token,'content-type':'application/json',origin:url};
+ const post=(p:string,body:unknown)=>fetch(url+p,{method:'POST',headers:writes,body:JSON.stringify(body)});
+ const read=(p:string)=>fetch(url+p,{headers:token});
+ try{
+  const project=await (await post('/api/projects',{name:'Acceptance',managed:true,confirm:true})).json();
+  const session=(await (await post('/api/sessions',{projectId:project.id,name:'Acceptance session'})).json()).session;
+  const artifact={revision:'a'.repeat(64),commit:null};
+  const evidence={sessionId:session.id,subject:{kind:'session',id:session.id},artifact,commands:['pnpm test'],diff:{files:3,linesAdded:42,linesRemoved:7,text:'--- a/x\n+++ b/x\n-1\n+2\n',reference:null},tests:[{command:'pnpm test',outcome:'passed',output:'# tests 12\n# pass 12\n# fail 0\n# skipped 0',counts:{passed:12,failed:0,skipped:0}}],review:null,producedAt:new Date(Date.now()-60_000).toISOString()};
+
+  // Owner-only, behind the unchanged Host check, with the same origin enforcement for the writes.
+  assert.equal((await fetch(url+'/api/acceptance?projectId='+project.id)).status,401,'the record is behind owner auth');
+  assert.equal((await fetch(url+'/api/acceptance/policy')).status,401,'the policy is behind owner auth');
+  assert.equal((await fetch(url+'/api/acceptance/evidence',{method:'POST',headers:{...token,'content-type':'application/json',origin:'https://evil.example'},body:'{}'})).status,403,'recording evidence is a write and needs the canonical origin');
+  const wrongHost=await new Promise<number>((ok,fail)=>{const req=request({host:'127.0.0.1',port:new URL(url).port,path:'/api/acceptance/policy',headers:{host:'evil.example','x-dashboard-token':security.token}},res=>{res.resume();ok(res.statusCode??0);});req.on('error',fail);req.end();});
+  assert.equal(wrongHost,403,'the unchanged Host check applies to the acceptance routes');
+  assert.equal((await read('/api/acceptance')).status,422,'a read names the project it is about');
+  assert.equal((await read('/api/acceptance?projectId='+randomUUID())).status,404,'an unregistered project is not found');
+  assert.equal((await read('/api/acceptance/evidence')).status,405,'recording evidence is a POST');
+  assert.equal((await post('/api/acceptance/accept',{projectId:project.id,request:{}})).status,422,'an unparseable acceptance is an invalid request');
+
+  // The policy before anything is written is the documented default, and it says so.
+  const initial=(await (await read('/api/acceptance/policy')).json()).policy;
+  assert.deepEqual([initial.mode,initial.revision,initial.recorded,initial.updatedBy,initial.absenceReason,Object.values(initial.actionClasses)],['owner-only',0,false,null,'no-policy-recorded-yet',['ask','ask','ask','ask','ask','ask']]);
+  assert.deepEqual((await (await read('/api/acceptance?projectId='+project.id)).json()).evidence,[],'a project with no completion record reads as an empty list');
+
+  // One real completion record: its counts are read from its own output, and its Markdown is written.
+  const recorded=await post('/api/acceptance/evidence',{projectId:project.id,evidence});
+  assert.equal(recorded.status,201);
+  const recordedBody=await recorded.json();
+  const record=recordedBody.evidence.record;
+  assert.deepEqual([recordedBody.written,recordedBody.evidence.markdown.state,recordedBody.evidence.markdown.path],[true,'current','docs/acceptance/'+record.id+'.md']);
+  assert.deepEqual([record.artifact.revision,record.artifact.commit,record.frozen,record.tests[0].counts,record.subject],[artifact.revision,null,true,{passed:12,failed:0,skipped:0},{kind:'session',id:session.id}]);
+  assert.ok(!JSON.stringify(record).includes(project.path)&&!JSON.stringify(record).includes(data),'no stored field carries a filesystem path');
+  const written=await readFile(join(project.path,'docs','acceptance',record.id+'.md'),'utf8');
+  assert.ok(written.includes('# Completion record '+record.id),'the durable Markdown record names the record');
+  assert.ok(written.includes('- Counts (read from the recorded output): 12 passed, 0 failed, 0 skipped'),'the Markdown record carries the counts read from the output');
+  assert.ok(written.includes('No acceptance is recorded for this evidence.'));
+  // A claim that contradicts the recorded output is refused, and nothing is written.
+  const contradictory=await post('/api/acceptance/evidence',{projectId:project.id,evidence:{...evidence,tests:[{command:'pnpm test',outcome:'passed',output:'# tests 12\n# pass 11\n# fail 1\n# skipped 0',counts:{passed:12,failed:0,skipped:0}}]}});
+  assert.equal(contradictory.status,422);
+  assert.match((await contradictory.json()).error,/but its recorded output reports 11 passed, 1 failed and 0 skipped/);
+  assert.equal((await (await read('/api/acceptance?projectId='+project.id)).json()).evidence.length,1,'a refused record wrote nothing');
+
+  // Under the default owner-only policy an agent acceptance is refused outright, and nothing is written.
+  const agentRefused=await post('/api/acceptance/accept',{projectId:project.id,request:{evidenceId:record.id,artifact,actionClass:'commit'},actor:{kind:'agent',identity:'api-worker'}});
+  assert.equal(agentRefused.status,403);
+  assert.match((await agentRefused.json()).error,/The acceptance policy is owner-only, so an acceptance by agent api-worker is refused outright/);
+  assert.equal((await (await read('/api/acceptance?projectId='+project.id)).json()).evidence[0].acceptance,null,'the refusal recorded no acceptance');
+
+  // The owner sets the policy, and then the agent may accept the class set to full-auto.
+  const updated=await post('/api/acceptance/policy',{revision:0,policy:{mode:'agent-may-accept',actionClasses:{commit:'full-auto',push:'ask',deploy:'ask',spend:'ask',provision:'ask',publish:'ask'}}});
+  assert.equal(updated.status,200);
+  const updatedPolicy=(await updated.json()).policy;
+  assert.deepEqual([updatedPolicy.mode,updatedPolicy.revision,updatedPolicy.updatedBy],['agent-may-accept',1,'local'],'the policy records the authenticated owner as the one who changed it');
+  const accepted=await post('/api/acceptance/accept',{projectId:project.id,request:{evidenceId:record.id,artifact,actionClass:'commit'},actor:{kind:'agent',identity:'api-worker'}});
+  assert.equal(accepted.status,200);
+  const acceptedBody=await accepted.json();
+  assert.deepEqual([acceptedBody.acceptance.acceptedBy.kind,acceptedBody.acceptance.acceptedBy.policyRule,acceptedBody.acceptance.policy.mode,acceptedBody.acceptance.singleUse],['agent','agent-may-accept:commit=full-auto','agent-may-accept',true]);
+  const acceptedMarkdown=await readFile(join(project.path,'docs','acceptance',record.id+'.md'),'utf8');
+  assert.ok(acceptedMarkdown.includes('agent-may-accept:commit=full-auto'),'the Markdown record carries the rule that permitted the acceptance');
+  assert.match(acceptedMarkdown,/- Accepted by: agent .api-worker. at \d{4}-/,'and who accepted it');
+  assert.ok(!acceptedMarkdown.includes('No acceptance is recorded for this evidence.'));
+  // A second acceptance of the same artifact is single use, whether it is an agent or the owner.
+  const second=await post('/api/acceptance/accept',{projectId:project.id,request:{evidenceId:record.id,artifact,actionClass:'commit'}});
+  assert.equal(second.status,409,'the second acceptance is refused, even though this one names no actor and so is the owner');
+  assert.match((await second.json()).error,/already accepted at .* by agent .api-worker.; an acceptance is single use/);
+  // An artifact that has moved since the evidence was produced is refused before any acceptance.
+  const moved=await post('/api/acceptance/accept',{projectId:project.id,request:{evidenceId:record.id,artifact:{revision:'b'.repeat(64),commit:null},actionClass:'commit'}});
+  assert.equal(moved.status,409);
+  assert.match((await moved.json()).error,/The artifact has changed since this evidence was produced/);
+  // A stale policy revision is a conflict that writes nothing.
+  const stale=await post('/api/acceptance/policy',{revision:0,policy:{mode:'owner-only',actionClasses:{commit:'ask',push:'ask',deploy:'ask',spend:'ask',provision:'ask',publish:'ask'}}});
+  assert.equal(stale.status,409);
+  assert.match((await stale.json()).error,/at revision 1, not 0/);
+  // The read reports the record with its acceptance and the policy in force, and no path.
+  const view=await (await read('/api/acceptance?projectId='+project.id)).json();
+  assert.deepEqual([view.readOnly,view.projectId,view.evidence.length,view.policy.revision,view.evidence[0].acceptance.acceptedBy.identity,view.truncated],[true,project.id,1,1,'api-worker',false]);
+  assert.ok(!JSON.stringify(view).includes(data)&&!JSON.stringify(view).includes(root),'the view leaks no filesystem path');
+  // The same capability through the command registry keeps its own statuses.
+  const viaRegistry=await post('/api/actions/execute',{id:'acceptance.read',params:{},scope:{projectId:project.id}});
+  assert.equal(viaRegistry.status,200);
+  assert.equal((await viaRegistry.json()).result.evidence.length,1);
+  const registryRefusal=await post('/api/actions/execute',{id:'acceptance.accept',params:{request:{evidenceId:'ev-'+'0'.repeat(64),artifact,actionClass:'commit',actor:{kind:'owner',identity:'local'}}},scope:{projectId:project.id}});
+  assert.equal(registryRefusal.status,404);
+  assert.ok(!JSON.stringify(await registryRefusal.json()).includes(project.path),'a registry refusal is path-free');
+ }finally{await app.close();store.close();await rm(root,{recursive:true,force:true});}
+});
+test('the accept route records the declared actor whatever shape declares it, refuses a disagreement, and refuses an agent the policy forbids',async()=>{
+ const root=await mkdtemp(join(tmpdir(),'dashboard-acceptance-actor-'));
+ const data=join(root,'data');await mkdir(data,{recursive:true,mode:0o700});
+ const store=new ControlStore(data);
+ const security=localConfig('http://127.0.0.1:0');
+ const app=await createApp({dataRoot:data,browseRoots:[],security,control:store});
+ await listen(app,security);
+ const url=security.origin,token={'x-dashboard-token':security.token},writes={...token,'content-type':'application/json',origin:url};
+ const post=(p:string,body:unknown)=>fetch(url+p,{method:'POST',headers:writes,body:JSON.stringify(body)});
+ const read=(p:string)=>fetch(url+p,{headers:token});
+ try{
+  const project=await (await post('/api/projects',{name:'Acceptance actors',managed:true,confirm:true})).json();
+  const session=(await (await post('/api/sessions',{projectId:project.id,name:'Actor session'})).json()).session;
+  // Two units of work: one answers the permitted case, the other pins the refusals.
+  const firstArtifact={revision:'a'.repeat(64),commit:null},secondArtifact={revision:'b'.repeat(64),commit:null};
+  const evidenceFor=(artifact:{revision:string;commit:null})=>({sessionId:session.id,subject:{kind:'session',id:session.id},artifact,commands:['pnpm test'],diff:{files:3,linesAdded:42,linesRemoved:7,text:'--- a/x\n+++ b/x\n-1\n+2\n',reference:null},tests:[{command:'pnpm test',outcome:'passed',output:'# tests 12\n# pass 12\n# fail 0\n# skipped 0',counts:{passed:12,failed:0,skipped:0}}],review:null,producedAt:new Date(Date.now()-60_000).toISOString()});
+  const recordFor=async(artifact:{revision:string;commit:null})=>{const body=await (await post('/api/acceptance/evidence',{projectId:project.id,evidence:evidenceFor(artifact)})).json();return body.evidence.record as {id:string};};
+  const first=await recordFor(firstArtifact),second=await recordFor(secondArtifact);
+  const acceptanceOf=async(evidenceId:string)=>{const view=await (await read('/api/acceptance?projectId='+project.id)).json() as {evidence:{record:{id:string};acceptance:unknown}[]};const entry=view.evidence.find(candidate=>candidate.record.id===evidenceId);assert.ok(entry,'the project view holds the record it just answered with');return entry.acceptance;};
+
+  // The registry publishes the actor INSIDE the request, and the palette sends it that way. Under the
+  // default owner-only policy that body must be refused as the agent it declares — never quietly
+  // recorded as the owner's permitted acceptance.
+  const nestedRefused=await post('/api/acceptance/accept',{projectId:project.id,request:{evidenceId:first.id,artifact:firstArtifact,actionClass:'commit',actor:{kind:'agent',identity:'nested-worker'}}});
+  assert.equal(nestedRefused.status,403,'an agent the owner-only policy forbids is refused, however its actor is declared');
+  assert.match((await nestedRefused.json()).error,/The acceptance policy is owner-only, so an acceptance by agent nested-worker is refused outright/);
+  assert.equal(await acceptanceOf(first.id),null,'the refusal recorded no acceptance');
+
+  // A body that declares two different actors is refused rather than one of them being chosen for it.
+  const disagreeing=await post('/api/acceptance/accept',{projectId:project.id,request:{evidenceId:first.id,artifact:firstArtifact,actionClass:'commit',actor:{kind:'agent',identity:'nested-worker'}},actor:{kind:'owner',identity:'local'}});
+  assert.equal(disagreeing.status,422,'which identity is accepting must not be ambiguous');
+  const disagreeingBody=await disagreeing.json();
+  assert.match(disagreeingBody.error,/declares agent .nested-worker. inside the request and owner .local. beside it/);
+  assert.ok(!JSON.stringify(disagreeingBody).includes(project.path),'the refusal is path-free');
+  assert.equal(await acceptanceOf(first.id),null,'the disagreement recorded no acceptance');
+
+  // The owner opens the class, and then the registry-shaped body is accepted as the agent it declares.
+  const policy=await post('/api/acceptance/policy',{revision:0,policy:{mode:'agent-may-accept',actionClasses:{commit:'full-auto',push:'ask',deploy:'ask',spend:'ask',provision:'ask',publish:'ask'}}});
+  assert.equal(policy.status,200);
+  const nestedAccepted=await post('/api/acceptance/accept',{projectId:project.id,request:{evidenceId:first.id,artifact:firstArtifact,actionClass:'commit',actor:{kind:'agent',identity:'nested-worker'}}});
+  assert.equal(nestedAccepted.status,200);
+  const acceptedBody=await nestedAccepted.json();
+  assert.deepEqual(
+   [acceptedBody.acceptance.acceptedBy.kind,acceptedBody.acceptance.acceptedBy.identity,acceptedBody.acceptance.acceptedBy.policyRule,acceptedBody.acceptance.policy.classDecision],
+   ['agent','nested-worker','agent-may-accept:commit=full-auto','full-auto'],
+   'the agent acceptance records the rule that permitted it, not an owner acceptance'
+  );
+  assert.ok((await readFile(join(project.path,'docs','acceptance',first.id+'.md'),'utf8')).includes('- Accepted by: agent `nested-worker` at '),'the Markdown record carries the agent the body declared');
+
+  // Declaring the same actor in both places is one identity rather than a disagreement, and is accepted.
+  const agreeing=await post('/api/acceptance/accept',{projectId:project.id,request:{evidenceId:second.id,artifact:secondArtifact,actionClass:'commit',actor:{kind:'agent',identity:'nested-worker'}},actor:{kind:'agent',identity:'nested-worker'}});
+  assert.equal(agreeing.status,200);
+  const agreeingBody=await agreeing.json();
+  assert.deepEqual([agreeingBody.acceptance.acceptedBy.kind,agreeingBody.acceptance.acceptedBy.identity],['agent','nested-worker']);
+  assert.equal((await acceptanceOf(second.id) as {acceptedBy:{kind:string}}).acceptedBy.kind,'agent');
+ }finally{await app.close();store.close();await rm(root,{recursive:true,force:true});}
 });

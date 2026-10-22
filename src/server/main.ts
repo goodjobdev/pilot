@@ -28,6 +28,10 @@ import { DeliveryError,DeliveryLedger,type DeliveryReconciliation } from './stat
 import { SessionRegistry,createSessionResourcePort,legacyConversationPort,migrateLegacyConversations,type LegacyConversationPort } from './state/session-registry';
 import { SessionLifecycleStore,SessionLifecycleService,adoptRunningSessions } from './state/session-lifecycle';
 import { QueueStore,type QueueImageResolver,type QueueResult } from './state/queue-store';
+import { RunnerBroker,createProjectWorkspaceResolver,dockerRunnerPort,type RunnerPort } from './state/runner-broker';
+import { RunnerError } from '../shared/runner';
+import { AcceptanceError, parseAcceptanceActor, type AcceptanceActor } from '../shared/acceptance';
+import { AcceptanceStore } from './state/acceptance-store';
 import { ActionError,ActionRegistry,liveActivity,normaliseActionScope,type ActionEnvironment } from './state/action-registry';
 import { ApprovalError } from '../shared/approvals';
 import { SessionError } from '../shared/sessions';
@@ -42,7 +46,7 @@ import { QueueError, queueView, type QueueImageRef } from '../shared/queue';
  * constructs createApp directly falls back to a read-only observation of the data root.
  */
 export interface ReadinessOptions {readonly releaseId:string;readonly schemaId:string;readonly manifestValid?:boolean;readonly lockHeld?:()=>boolean;readonly observeSchema?:()=>StorageSchemaObservation}
-export interface AppOptions {dataRoot:string;browseRoots:string[];security:SecurityConfig;allowedHosts?:readonly string[];clientRoot?:string;registry?:string;agents?:'on'|'off';agentPauseMs?:number;alertTransport?:AlertTransport;alertSubject?:string;alertCooldownMs?:number;readiness?:ReadinessOptions;control?:ControlStore}
+export interface AppOptions {dataRoot:string;browseRoots:string[];security:SecurityConfig;allowedHosts?:readonly string[];clientRoot?:string;registry?:string;agents?:'on'|'off';agentPauseMs?:number;alertTransport?:AlertTransport;alertSubject?:string;alertCooldownMs?:number;readiness?:ReadinessOptions;control?:ControlStore;runner?:{readonly enabled?:boolean;readonly port?:RunnerPort}}
 /**
  * Approvals answer with a status that says what happened: an invalid request is 422, an approval
  * outside the caller's scope is 403, a missing one is 404, a storage fault is 500, and every
@@ -104,6 +108,37 @@ function queueImageIds(value:unknown):readonly string[] {
 export function queueHttpStatus(code:QueueError['code']):number {
   if(code==='INVALID')return 422;
   if(code==='NOT_FOUND')return 404;
+  if(code==='CORRUPT'||code==='STORAGE')return 500;
+  return 409;
+}
+/**
+ * Coding jobs answer with the status that says what happened: a malformed request, an unknown recipe,
+ * a workspace outside the project root or limits this build cannot enforce are 422, a missing project
+ * or job is 404, a workspace outside the approved root is 403, a live claim, an expired lease and a
+ * terminal job are 409 with the precise, path-free reason, a runner this instance cannot contain a job
+ * with is 503, and a storage or corruption fault is 500. A refusal is always path-free: the runtime's
+ * own error is logged on the server and never repeated in a response.
+ */
+/**
+ * Acceptance answers with the status that says what happened: a malformed request, a claim that
+ * contradicts its own recorded output, an outcome that contradicts the counts its own output carries,
+ * or two declared accepting actors that disagree are 422, a missing record is 404, an identity the policy does
+ * not permit is 403, a stale policy revision, a second acceptance of one artifact and an artifact
+ * that has changed since its evidence was produced are all 409 with the precise, path-free reason,
+ * and a storage or corruption fault is 500.
+ */
+export function acceptanceHttpStatus(code:AcceptanceError['code']):number {
+  if(code==='INVALID')return 422;
+  if(code==='NOT_FOUND')return 404;
+  if(code==='NOT_PERMITTED')return 403;
+  if(code==='CORRUPT'||code==='STORAGE')return 500;
+  return 409;
+}
+export function runnerHttpStatus(code:RunnerError['code']):number {
+  if(code==='INVALID')return 422;
+  if(code==='NOT_FOUND')return 404;
+  if(code==='OUTSIDE_ROOT')return 403;
+  if(code==='UNAVAILABLE')return 503;
   if(code==='CORRUPT'||code==='STORAGE')return 500;
   return 409;
 }
@@ -459,6 +494,58 @@ export async function createApp(options:AppOptions){
       return {requestId,entryId,submissionId:submission.submissionId,acceptedAt:new Date().toISOString()};
     }
   }):undefined;
+  /**
+   * The bounded coding runner: one typed job per submission, run in a container created from
+   * deploy/runner/Dockerfile, under the documented containment. It is **disabled by default** behind
+   * an explicit switch (DASHBOARD_RUNNER=on), and while it is disabled its actions are absent from the
+   * offered registry rather than present-and-failing.
+   *
+   * - `createProjectWorkspaceResolver` turns a job's relative workspace reference into the one host
+   *   path a container may see, and refuses anything that is not an existing directory inside the
+   *   registered project's own root with no symlink in it.
+   * - `dockerRunnerPort` is the only execution path this build ships: it builds one `docker run`
+   *   command line with no network, a read-only root filesystem, a non-root user, all capabilities
+   *   dropped, no-new-privileges, no runtime socket, exactly one mount and hard limits. It refuses
+   *   every job when the runtime or the image is missing, and there is no fallback anywhere in this
+   *   build to running a job in this process, in the application container or on the host.
+   * - An injected port is for tests only: the unit suite never starts a container.
+   */
+  const runnerEnabled=options.runner?.enabled??process.env.DASHBOARD_RUNNER==='on';
+  const runner=options.control&&runnerEnabled?new RunnerBroker(options.control,options.runner?.port??dockerRunnerPort({image:process.env.DASHBOARD_RUNNER_IMAGE,docker:process.env.DASHBOARD_RUNNER_DOCKER}),{
+    workspace:createProjectWorkspaceResolver({projectRoot:projectId=>catalog.projects.find(candidate=>candidate.id===projectId)?.path}),
+    projectKnown:projectId=>catalog.projects.some(candidate=>candidate.id===projectId)
+  }):undefined;
+  if(runnerEnabled&&!options.control)console.error('The coding runner is enabled but no durable control store is open, so no job can be submitted; nothing was started.');
+  if(runner&&options.runner?.port===undefined&&!(process.env.DASHBOARD_RUNNER_IMAGE??'').trim())console.error('The coding runner is enabled but DASHBOARD_RUNNER_IMAGE is not set, so every job will be refused until it names the image built from deploy/runner/Dockerfile.');
+  /**
+   * The start-time reconciliation of the coding runner: a job a previous process left running is
+   * settled from what the durable record proves — its recorded result when there is one, and otherwise
+   * the named operator-attention state — deterministically and idempotently, before anything listens.
+   * It never re-runs a job, and a failure to reconcile is reported rather than stopping the process.
+   */
+  /**
+   * The acceptance record: the durable policy, one frozen completion record per unit of work with
+   * its Markdown rendering written inside the project, and the single-use, revision-bound acceptance
+   * of an artifact. It is a decision ledger and a record: it commits, pushes, deploys, spends,
+   * provisions and publishes nothing.
+   *
+   * - `projectRoot` resolves the registered project's own root, which is the only place the Markdown
+   *   record is written (through the same contained-path helper and atomic write every other
+   *   repository write uses); a project it cannot resolve is refused before anything is recorded.
+   * - An owner acceptance made through the owner-authenticated routes uses the authenticated owner
+   *   identity; an agent acceptance declares its own identity, and the policy decides whether it may
+   *   accept. `docs/ACCEPTANCE.md` states exactly what that does and does not prove.
+   */
+  const ownerActor:AcceptanceActor=Object.freeze({kind:'owner' as const,identity:options.security.mode==='hosted'?(options.security.owner??'owner'):'local'});
+  const acceptance=options.control?new AcceptanceStore(options.control,{
+    projectRoot:(projectId:string)=>catalog.projects.find(candidate=>candidate.id===projectId)?.path
+  }):undefined;
+  if(runner) {
+    try {
+      const reconciliation=await runner.reconcile();
+      if(reconciliation.settled+reconciliation.attention+reconciliation.unchanged>0)console.log('Coding runner reconciliation: '+JSON.stringify(reconciliation));
+    } catch(error) {console.error('The coding runner could not be reconciled (nothing was re-run): '+(error as Error).message);}
+  }
   // The command registry: one typed action per capability this build really has, with the handler
   // that owns it. It is assembled here, from the stores the process already holds, so an action
   // whose capability this instance lacks (no durable control store) is reported as unavailable and
@@ -466,7 +553,7 @@ export async function createApp(options:AppOptions){
   // publishes; the two report actions read only.
   const actionEnvironment:ActionEnvironment={
     control:sessions&&lifecycle&&lifecycleService&&approvals&&ledger&&queueStore?{
-      sessions,lifecycle:lifecycleService,approvals,ledger,queue:queueStore,media:queueImages,
+      sessions,lifecycle:lifecycleService,approvals,ledger,queue:queueStore,media:queueImages,runner,acceptance,
       // Whether the store really holds a lifecycle row for one session, read-only. The projection
       // needs it because the lifecycle store answers an unwritten session with its initial record,
       // and that must not be reported as the state it reads at.
@@ -731,7 +818,101 @@ export async function createApp(options:AppOptions){
             if(error instanceof SessionError)throw new HttpError(sessionHttpStatus(error.code),error.message);
             if(error instanceof SessionLifecycleError)throw new HttpError(lifecycleHttpStatus(error.code),error.message);
             if(error instanceof ApprovalError)throw new HttpError(approvalHttpStatus(error.code),error.message);
+            if(error instanceof AcceptanceError)throw new HttpError(acceptanceHttpStatus(error.code),error.message);
             if(error instanceof QueueError)throw new HttpError(queueHttpStatus(error.code),error.message);
+            throw error;
+          }
+        }
+        // The bounded coding runner: one read route, one submission and the three lifecycle
+        // operations. Owner-only like every other route, behind the same Host check, with the same
+        // origin/CSRF enforcement for writes. While the runner is disabled these routes refuse with a
+        // named reason — and while it is disabled its actions are absent from the registry, rather than
+        // listed and failing.
+        const runnerJobs=path.match(/^\/api\/projects\/([a-f0-9-]{36})\/runner\/jobs$/);
+        const runnerClaim=path.match(/^\/api\/projects\/([a-f0-9-]{36})\/runner\/jobs\/claim$/);
+        const runnerJob=path.match(/^\/api\/projects\/([a-f0-9-]{36})\/runner\/jobs\/([A-Za-z0-9][A-Za-z0-9._:-]{0,159})\/(run|settle)$/);
+        if(runnerJobs||runnerClaim||runnerJob){
+          if(!runner)throw new HttpError(503,'The coding runner is disabled on this instance: set DASHBOARD_RUNNER=on and point DASHBOARD_RUNNER_IMAGE at the image built from deploy/runner/Dockerfile before any job can be submitted');
+          const projectId=(runnerJobs??runnerClaim??runnerJob)![1];
+          catalog.get(projectId);
+          try{
+            if(runnerJobs&&req.method==='GET'){json(runner.read(projectId));return;}
+            if(runnerJobs&&req.method==='POST'){
+              const body=parseBody(z.strictObject({recipe:z.unknown(),workspace:z.unknown(),limits:z.unknown().optional()}),payload,'The coding job request');
+              json({job:await runner.submit({projectId,recipe:body.recipe,workspace:body.workspace,limits:body.limits})},201);return;
+            }
+            if(runnerClaim&&req.method==='POST'){
+              const body=parseBody(z.strictObject({owner:z.unknown()}),payload,'The coding job claim');
+              json({job:await runner.claim({projectId,owner:body.owner})});return;
+            }
+            if(runnerJob&&req.method==='POST'){
+              const jobId=runnerJob[2];
+              if(runnerJob[3]==='run'){
+                const body=parseBody(z.strictObject({owner:z.unknown()}),payload,'The coding job run');
+                json({job:await runner.run({projectId,jobId,owner:body.owner})});return;
+              }
+              const settled=await runner.settle({projectId,jobId});
+              json({job:settled.record,outcome:settled.outcome,changed:settled.changed});return;
+            }
+            throw new HttpError(405,'Method not allowed');
+          }catch(error){
+            if(error instanceof RunnerError)throw new HttpError(runnerHttpStatus(error.code),error.message);
+            throw error;
+          }
+        }
+        // The acceptance record: the policy in force, one project's completion records with their
+        // Markdown state and their acceptances, one recorded completion record, one acceptance and one
+        // policy change. Owner-only like every other route, behind the unchanged Host check, with the
+        // same origin/CSRF enforcement for the three writes. The policy write always acts as the
+        // authenticated owner, because only an owner may set it. The acceptance records the actor the
+        // body **declares** — beside the request or inside it — and the authenticated owner only when
+        // the body declares none; see the accept branch below. The completion record is written to
+        // Markdown inside the project the scope names.
+        if(path==='/api/acceptance'||path==='/api/acceptance/policy'||path==='/api/acceptance/evidence'||path==='/api/acceptance/accept'){
+          if(!acceptance)throw new HttpError(503,'Acceptance is unavailable: no durable control store is open on this instance');
+          try{
+            const projectScope=()=>{const projectId=url.searchParams.get('projectId');if(projectId===null)throw new HttpError(422,'projectId is required');catalog.get(projectId);return projectId;};
+            if(path==='/api/acceptance'){
+              if(req.method!=='GET')throw new HttpError(405,'Method not allowed');
+              json(await acceptance.readProject({projectId:projectScope()}));return;
+            }
+            if(path==='/api/acceptance/policy'){
+              if(req.method==='GET'){json({policy:acceptance.readPolicy()});return;}
+              if(req.method!=='POST')throw new HttpError(405,'Method not allowed');
+              const body=parseBody(z.strictObject({revision:z.unknown(),policy:z.unknown()}),payload,'The acceptance policy request');
+              json({policy:acceptance.updatePolicy({revision:body.revision,policy:body.policy,actor:ownerActor})});return;
+            }
+            if(req.method!=='POST')throw new HttpError(405,'Method not allowed');
+            if(path==='/api/acceptance/evidence'){
+              const body=parseBody(z.strictObject({projectId:z.unknown(),evidence:z.unknown()}),payload,'The completion record request');
+              catalog.get(String(body.projectId));
+              const recorded=await acceptance.recordEvidence({projectId:body.projectId,evidence:body.evidence});
+              json({evidence:recorded.evidence,written:recorded.written},201);return;
+            }
+            // The accepting identity is **declared**, never assumed. A caller may declare it beside the
+            // request (this route's own documented form) or inside it (the shape the registry publishes
+            // and the palette sends); both are honoured, and a body that carries both and disagrees is
+            // refused as an invalid request rather than silently overriding one of them. Only a body
+            // that declares no actor at all is recorded as the authenticated owner.
+            const body=parseBody(z.strictObject({projectId:z.unknown(),request:z.unknown(),actor:z.unknown().optional()}),payload,'The acceptance request');
+            catalog.get(String(body.projectId));
+            const plain=(value:unknown):Record<string,unknown>|null=>value!==null&&typeof value==='object'&&!Array.isArray(value)?value as Record<string,unknown>:null;
+            const requestBody=plain(body.request);
+            const declared=requestBody===null?undefined:requestBody.actor;
+            let accepting:unknown;
+            if(declared!==undefined&&body.actor!==undefined){
+              const inside=parseAcceptanceActor(declared,'the actor declared inside the request');
+              const beside=parseAcceptanceActor(body.actor,'the actor declared beside the request');
+              if(inside.kind!==beside.kind||inside.identity!==beside.identity)
+                throw new HttpError(422,'Which identity is accepting is ambiguous: this body declares '+inside.kind+' `'+inside.identity+'` inside the request and '+beside.kind+' `'+beside.identity+'` beside it. Send one of them, or the same value in both.');
+              accepting=inside;
+            } else if(declared!==undefined)accepting=declared;
+            else if(body.actor!==undefined)accepting=body.actor;
+            else accepting=ownerActor;
+            const request=requestBody===null?body.request:{...requestBody,actor:accepting};
+            json(await acceptance.accept({projectId:body.projectId,request}));return;
+          }catch(error){
+            if(error instanceof AcceptanceError)throw new HttpError(acceptanceHttpStatus(error.code),error.message);
             throw error;
           }
         }
@@ -892,7 +1073,7 @@ export async function createApp(options:AppOptions){
     }
   });
   server.requestTimeout=30000;server.headersTimeout=10000;
-  return {server,catalog,boards,docs,agents,alerts,providers,repositories,sessions,lifecycle,actions,media,queue:queueStore,close:async()=>{
+  return {server,catalog,boards,docs,agents,alerts,providers,repositories,sessions,lifecycle,actions,media,queue:queueStore,runner,acceptance,close:async()=>{
     // A server that never opened reports ERR_SERVER_NOT_RUNNING, which means "already closed", not
     // "close failed". A failed start (for example a port already in use) must still drain and
     // release the lock that this same start created, and must report the original failure instead.
