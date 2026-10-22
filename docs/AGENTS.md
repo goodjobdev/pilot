@@ -17,7 +17,7 @@ durable half is `src/server/state/agent-store.ts`, the capability `file_edit` go
 | `description` | Up to 400 characters of printable text. May be empty. |
 | `enabled` | Whether the agent is in force at all. A disabled agent grants nothing. |
 | `model` | `{provider, modelId}`, and it must be **one of the models this instance really offers**. A model outside that set is refused, so an agent can never declare a model that cannot run here. |
-| `workspace` | `{projectId, subpath}`. The project must be registered, and the subpath is relative inside that project's own root: an absolute path, a backslash, an empty, current or parent segment is refused rather than normalised. |
+| `workspace` | `{scope, subpath}`, where `scope` is one of two explicit shapes: `{kind:'all'}` (every registered project) or `{kind:'projects', projectIds}` (an explicit, non-empty set). Every named project must be registered, and the subpath is relative inside **each** allowed project's own root: an absolute path, a backslash, an empty, current or parent segment is refused rather than normalised. An empty set is refused, never widened to `all`, and a duplicate project id is refused. |
 | `budgets` | `maxRequests`, `maxOutputTokens` and `maxJobsPerHour`, each `null` or a whole number inside its documented bound. A value outside its bound is refused, never reduced. |
 | `scopes` | The allowlist: a subset of the closed vocabulary below, canonicalised into the vocabulary's own order. |
 | `revision` | The optimistic-concurrency token. Every change is one revision, and a stale revision is a conflict that writes nothing. |
@@ -60,8 +60,9 @@ the acceptance record name; nothing in the vocabulary is a label with nothing be
 
 ## Default deny, and exactly where it is enforced
 
-**An agent has only what its allowlist names.** `authorizeToolUse` is the one function that decides,
-and it decides two things:
+**An agent has only what its allowlist names, in only the projects its project scope names.**
+`authorizeToolUse` decides the scopes, and the dispatch path decides the projects; together they are
+default-deny on both axes. `authorizeToolUse` decides two things:
 
 - a tool this build declares **no** scope for is refused for every agent, so a tool added later is
   unreachable until it is named in `AGENT_TOOL_SCOPES` and granted;
@@ -70,15 +71,47 @@ and it decides two things:
 
 Enforcement happens in the **authoritative dispatch path**, never in the interface:
 
-1. **The offered tool list is filtered.** When a project's harness is opened, the scopes in force are
-   read and only the permitted tools are enabled for that conversation, so the model is not offered a
-   tool its scopes forbid.
-2. **Every tool call is re-checked server-side.** A `beforeTool` hook on the durable harness's own
-   tool task reads the scopes **again on every call** — model-issued and nested — and refuses a tool the
-   scopes forbid with a precise reason, *before the call's intent is recorded*. A call the scopes forbid
-   therefore produces **no side effect at all**, however it was crafted: a scope revoked after the
-   offered list was built is still refused, because the re-check is the authority and the offered list
-   is a courtesy.
+1. **The offered tool list is filtered.** When a project's harness is opened, the scopes in force for
+   its root session are read and only the permitted tools are enabled for that conversation, so the
+   model is not offered a tool its scopes forbid.
+2. **Every tool call is re-checked server-side, per session.** A `beforeTool` hook on the durable
+   harness's own tool task reads the **session's** authority **again on every call** — model-issued and
+   nested — and refuses, with a precise reason, *before the call's intent is recorded*: first a tool the
+   scopes forbid, then a call that would act on a project outside the authority's own project set. A
+   forbidden call therefore produces **no side effect at all**, however it was crafted: a scope revoked,
+   a binding changed, or a project removed from the set after the offered list was built is still
+   refused, because the re-check is the authority and the offered list is a courtesy.
+
+The **project set** is enforced against the project the harness acts on, so a session bound to a
+multi-project agent works in any project the agent allows and is refused — server-side, with no side
+effect — in one it does not. Enforcement follows the target, never the agent's name.
+
+## Binding a session to an agent
+
+The scopes above are per **record**, but a dispatch happens in a **session**, so the two are joined by
+a durable **session binding**:
+
+| Field | Meaning |
+|---|---|
+| `projectId`, `sessionId` | The session the binding governs. The root conversation's id is the legacy named session's id, so binding that session governs a project's default conversation. |
+| `agentId` | The agent whose scopes and project set govern the session — or `null` for a deliberate **unbind**. |
+| `revision` | The optimistic-concurrency token; a stale binding write is a conflict that writes nothing. |
+| `boundBy`, `boundAt` | Who bound it and when: the binding's own audit row, beside every other durable write. |
+
+The semantics are explicit and fail closed:
+
+- **No binding record at all** — the session is unmanaged, and the project-level rule that predates the
+  binding still applies: the scopes of the enabled agents whose project scope allows the project.
+- **A binding naming no agent (an unbind)** — an empty allowlist, so **every tool is refused**, with the
+  named reason. This is deliberate, never the result of an accident.
+- **A binding naming a disabled or archived agent** — the same refusal, naming that agent.
+- **A binding naming a live agent** — exactly that agent's scopes and project set are in force.
+
+The binding is read **per session, on every tool call**, so a binding or a scope change takes effect at
+the next dispatch with **no restart**. It is written through `POST /api/sessions/:id/agent` and read
+through the matching `GET`; the session bar in the Agents view is the owner's way to choose or change
+the agent, and it shows the agent and the scopes actually in effect, including the empty case, rather
+than leaving "no privileges" a mystery.
 
 The management view (`AgentManager.svelte`) reads the same records and sends the same authenticated
 requests as everything else. **It is not the enforcement point**: it can be bypassed entirely with a
@@ -104,6 +137,22 @@ Three refusals are explicit, and none of them is merely a hidden button:
 
 Every change is recorded durably, with the actor, the action and the instant, in the audit row beside
 the record; `agent.read` serves that trail and the view renders it.
+
+## Answering, dismissing and the composer
+
+Two distinct owner decisions resolve an agent's question, and they mean different things:
+
+- **Answering** (`POST /api/projects/:id/agents/answer`) records the answer in the delivery ledger,
+  writes it to the transcript and sends it to the agent. A question can be answered exactly once.
+- **Dismissing** (`POST /api/projects/:id/agents/dismiss`) carries a **reason** and is recorded as its
+  own durable transcript entry — who dismissed it, when and why — then the agent is **told** the
+  question was dismissed rather than silently ignored, so a resumed run sees the decision instead of
+  re-asking. A dismissed question cannot be answered afterwards and does not reappear as open.
+
+The composer in the Agents view is a single surface: **Enter sends**, **Shift+Enter (and Cmd/Ctrl+Enter)
+inserts a newline**, an in-progress IME composition is never interrupted, and typing `/` opens the
+**slash** list of registry actions (`docs/ACTIONS.md`, *Surfaces*). The behaviour of every other editor
+and dialog is unchanged.
 
 ## The bounded file-edit capability
 
@@ -143,10 +192,13 @@ Two modes, and **the mode in force is read from the acceptance policy rather tha
   agent state keeps it for the life of that conversation. The authoritative check is the per-call
   re-check, so a scope change takes effect at dispatch immediately; the offered list is rebuilt the next
   time the project's harness is opened.
-- **One conversation per project.** This build has no per-session agent binding, so the scopes in force
-  for a project are those of the **enabled** agents whose workspace names it. When more than one enabled
-  agent names the same project, only the scopes **every one of them allows** are in force — the safe
-  direction, never a widening. Binding one conversation to exactly one agent is follow-up work.
+- **A session's binding is per session.** The scopes in force for a session are its bound agent's, or
+  — for an unmanaged session — the project-level rule described above. When more than one enabled agent
+  allows a project, only the scopes **every one of them allows** are in force, the safe direction, never
+  a widening.
+- **The project scope is a set of project ids, or every project.** A tool call against a project outside
+  the authority's set is refused at dispatch; the refusal names the project's id, never a filesystem
+  path.
 - **The mode switch is the acceptance policy's mode.** This build reuses that one owner-set switch rather
   than adding a second, dedicated file-edit class; a dedicated class is follow-up work.
 - **The budgets are declarations.** They are validated and recorded, and the interface shows them, but

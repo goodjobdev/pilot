@@ -5,7 +5,7 @@ import { BACKGROUND_CONTEXT } from '@earendil-works/chord/context';
 import { createModels } from '@earendil-works/pi-ai/models';
 import { createAssistantMessageEventStream } from '@earendil-works/pi-ai/utils/event-stream';
 import { fauxAssistantMessage, fauxProvider, fauxToolCall, type FauxProviderHandle, type FauxResponseFactory } from '@earendil-works/pi-ai/providers/faux';
-import { Harness, ToolTask, createRegistry, defineExtension, defineTool, hook, section } from '@earendil-works/pi-durable';
+import { Harness, ToolTask, ROOT_CONVERSATION_ID, createRegistry, defineExtension, defineTool, hook, section } from '@earendil-works/pi-durable';
 import type { ConversationId, EntryId, Extension } from '@earendil-works/pi-durable';
 import { openNodeSqliteStorage } from '@earendil-works/pi-durable/storage/sqlite/node';
 import { Type } from 'typebox';
@@ -22,6 +22,26 @@ import type { ModelChoice } from '../../shared/settings';
 export type AgentInputMode = 'followUp' | 'steer' | 'reject';
 /** One stored image attached to an input, as base64 and its sniffed type. */
 export interface AgentImage { readonly mimeType: string; readonly data: string }
+/** The provider-reported cache counters, per model, taken from the same `pi.usage` projection the view uses. */
+export interface AgentUsageDetail {
+  readonly input: number;
+  readonly output: number;
+  readonly cacheRead: number;
+  readonly cacheWrite: number;
+  readonly totalTokens: number;
+  /** Reasoning tokens when the provider reports them; null is a named absence, not a zero. */
+  readonly reasoning: number | null;
+  readonly cost: number;
+  readonly models: readonly { readonly provider: string; readonly modelId: string; readonly input: number; readonly output: number; readonly cacheRead: number; readonly cacheWrite: number; readonly totalTokens: number; readonly cost: number }[];
+}
+/** One dismissed question, keyed by question id on the shaped view. */
+export interface AgentDismissal { readonly reason: string; readonly dismissedAt: number | null; readonly dismissedBy: string }
+/**
+ * The shaped view the harness serves: the shared AgentView plus the two things the shared pure module
+ * cannot carry — the per-model usage detail the owner asked for, and the questions the owner
+ * dismissed (a dismissal is neither an answer nor an absence, so it is a named state of its own).
+ */
+export type AgentSessionView = AgentView & { readonly usageDetail: AgentUsageDetail; readonly dismissals: Readonly<Record<string, AgentDismissal>> };
 /** What the model a submission would run under accepts. */
 export interface AgentVision { readonly provider: string; readonly modelId: string; readonly acceptsImages: boolean }
 const uuidPattern = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
@@ -41,6 +61,42 @@ interface HostedAgent {
   conversation: Awaited<ReturnType<Harness['root']>>;
   provider: FauxProviderHandle;
   close(): Promise<void>;
+}
+
+/**
+ * The provider-reported usage detail for one conversation, read from the same `pi.usage` document the
+ * shared projection reads. Cache counters and reasoning tokens are carried only where the provider
+ * reported them: an absent counter is null, never a fabricated zero.
+ */
+function usageDetailFrom(value: unknown): AgentUsageDetail {
+  const state = (value ?? {}) as { docs?: Record<string, unknown> };
+  const usage = (state.docs?.['pi.usage'] ?? {}) as { models?: Record<string, { input?: unknown; output?: unknown; cacheRead?: unknown; cacheWrite?: unknown; reasoning?: unknown; totalTokens?: unknown; cost?: { total?: unknown } }> };
+  const models = Object.entries(usage.models ?? {}).map(([key, totals]) => {
+    const slash = key.indexOf('/');
+    return {
+      provider: slash >= 0 ? key.slice(0, slash) : key,
+      modelId: slash >= 0 ? key.slice(slash + 1) : '',
+      input: Number(totals?.input ?? 0),
+      output: Number(totals?.output ?? 0),
+      cacheRead: Number(totals?.cacheRead ?? 0),
+      cacheWrite: Number(totals?.cacheWrite ?? 0),
+      totalTokens: Number(totals?.totalTokens ?? 0),
+      cost: Number(totals?.cost?.total ?? 0)
+    };
+  });
+  let reasoning: number | null = null;
+  for (const totals of Object.values(usage.models ?? {})) if (typeof totals?.reasoning === 'number') reasoning = (reasoning ?? 0) + totals.reasoning;
+  const sum = (pick: (entry: AgentUsageDetail['models'][number]) => number) => models.reduce((total, entry) => total + pick(entry), 0);
+  return Object.freeze({
+    input: sum((entry) => entry.input),
+    output: sum((entry) => entry.output),
+    cacheRead: sum((entry) => entry.cacheRead),
+    cacheWrite: sum((entry) => entry.cacheWrite),
+    totalTokens: sum((entry) => entry.totalTokens),
+    reasoning,
+    cost: sum((entry) => entry.cost),
+    models: Object.freeze(models.map((entry) => Object.freeze(entry)))
+  });
 }
 
 function pause(ms: number, signal?: AbortSignal): Promise<void> {
@@ -304,21 +360,37 @@ function permittedTools(extensions: readonly Extension[], scopes: readonly Agent
  * at all, however the call was crafted. Its section tells the model what its allowlist holds, so a
  * well-behaved model never attempts what would be refused.
  */
-function privilegeExtension(project: Project, authorityOf: () => Promise<DispatchAuthority>) {
+function privilegeExtension(project: Project, authorityOf: (sessionId: string) => Promise<DispatchAuthority>) {
   return defineExtension({
     name: 'agent-privileges',
-    sections: [section('agent-privileges', async () => {
-      const authority = await authorityOf();
-      if (authority.scopes === null) return undefined;
-      return authority.scopes.length === 0
-        ? 'This dispatch runs as an agent whose scope allowlist is empty, so every tool is refused at dispatch. Do not attempt one.'
-        : 'This dispatch runs as an agent. Its privilege scopes are: ' + authority.scopes.join(', ') + '. A tool outside them is refused at dispatch with no effect, so do not attempt one.';
+    sections: [section('agent-privileges', async (input) => {
+      // The authority is resolved for the very conversation this request belongs to, so the section
+      // tells the model exactly which session's allowlist and project scope govern it.
+      const authority = await authorityOf(String(input.conversationId));
+      if (authority.scopes === null)
+        return 'No agent is bound to this session, so the owner\u2019s own dispatch is in force: no agent allowlist narrows these tools. Bind an agent to a session to run it under an explicit allowlist.';
+      if (authority.scopes.length === 0)
+        return 'This dispatch has no privilege scopes in force, so every tool is refused at dispatch. ' + (authority.emptyReason ?? 'No agent is bound.') + ' Do not attempt one.';
+      const scopeLine = 'This dispatch runs as an agent' + (authority.agentId === null ? '' : ' (' + authority.agentId + ')') + '. Its privilege scopes are: ' + authority.scopes.join(', ') + '. A tool outside them is refused at dispatch with no effect, so do not attempt one.';
+      const projectLine = authority.projects === null ? '' : ' Its project scope is the explicit set ' + authority.projects.join(', ') + ', so a call that acts on any other project is refused at dispatch with no effect.';
+      return scopeLine + projectLine;
     }, { tag: false })],
     hooks: [hook(ToolTask, {
-      beforeTool: async (call) => {
-        const authority = await authorityOf();
+      beforeTool: async (call, api) => {
+        // The per-call authority: a binding or scope change takes effect at the next tool call with
+        // no restart, because this reads the durable record rather than anything captured earlier.
+        const authority = await authorityOf(String(api.conversationId));
+        // The explicit empty allowlist is reported first, so "no privileges" always names its reason
+        // (no agent bound, or the bound agent not in force) rather than a narrower project message.
+        if (authority.scopes !== null && authority.scopes.length === 0)
+          return { block: (authority.emptyReason ?? 'No agent is bound to this session, so it has no privilege scopes.') + ' The tool ' + call.name + ' is refused at dispatch with no effect.' };
+        // The project scope is enforced against the project this harness acts on: even a permitted
+        // tool is refused when the call would act on a project outside the authority's set.
+        if (authority.projects !== null && !authority.projects.includes(project.id))
+          return { block: 'The project ' + project.id + ' is outside this dispatch\u2019s project scope (' + (authority.projects.length ? authority.projects.join(', ') : 'no project is allowed') + '), so the tool ' + call.name + ' is refused at dispatch with no effect. Widen the agent\u2019s project scope to use it here.' };
         const verdict = authorizeToolUse({ scopes: authority.scopes, tool: call.name });
-        return verdict.permitted ? undefined : { block: verdict.reason };
+        if (verdict.permitted) return undefined;
+        return { block: authority.emptyReason === null ? verdict.reason : verdict.reason + ' ' + authority.emptyReason };
       }
     })]
   });
@@ -332,7 +404,7 @@ function privilegeExtension(project: Project, authorityOf: () => Promise<Dispatc
  * the project's connected worktree and nothing else — the size caps, the atomic write, and the mode,
  * which comes from the acceptance policy rather than being assumed.
  */
-function fileEditExtension(project: Project, capability: FileEditCapability, authorityOf: () => Promise<DispatchAuthority>) {
+function fileEditExtension(project: Project, capability: FileEditCapability, authorityOf: (sessionId: string) => Promise<DispatchAuthority>) {
   return defineExtension({
     name: 'file-edit',
     sections: [section('file-edit-protocol', () => 'Use file_edit to propose or apply one bounded change to a file inside this project\u2019s connected worktree. The path is relative and must stay inside it. In propose-only mode the change and its diff are recorded and no file is written.', { tag: false })],
@@ -344,8 +416,8 @@ function fileEditExtension(project: Project, capability: FileEditCapability, aut
         content: Type.String({ maxLength: FILE_EDIT_MAX_FILE_BYTES, description: 'The full text the file would hold' })
       }),
       replay: 'unsafe',
-      execute: async (args) => {
-        const authority = await authorityOf();
+      execute: async (args, api) => {
+        const authority = await authorityOf(String(api.conversationId));
         const outcome = await capability.edit({
           projectId: project.id,
           agentId: authority.agentId,
@@ -398,10 +470,15 @@ export class HarnessHost {
    * on every call, so a change to an agent's allowlist takes effect immediately; with no port, the
    * owner's own dispatch is in force and nothing is narrowed.
    */
-  private async dispatchAuthority(project: Project): Promise<DispatchAuthority> {
-    if (!this.options.privileges) return Object.freeze({ agentId: null, scopes: null });
-    const authority = await this.options.privileges.authority({ projectId: project.id });
-    return Object.freeze({ agentId: authority.agentId ?? null, scopes: authority.scopes ?? null });
+  /**
+   * The authority in force for one session of this project, resolved from the durable binding on
+   * every call. `authority(projectId, sessionId)` is the per-session read; a port that only knows
+   * the project is still honoured (it is handed the project and the harness's own root session id).
+   */
+  private async dispatchAuthority(project: Project, sessionId: string): Promise<DispatchAuthority> {
+    if (!this.options.privileges) return Object.freeze({ agentId: null, scopes: null, projects: null, emptyReason: null });
+    const authority = await this.options.privileges.authority({ projectId: project.id, sessionId });
+    return Object.freeze({ agentId: authority.agentId ?? null, scopes: authority.scopes ?? null, projects: authority.projects ?? null, emptyReason: authority.emptyReason ?? null });
   }
   /**
    * The models this instance really offers: the deterministic scripted stand-in it always has, and
@@ -480,8 +557,12 @@ export class HarnessHost {
       // ones, and again on every call by the privilege hook, which is the authority. Nothing about
       // the owner's own dispatch changes: with no privilege port the authority is null and every
       // installed tool is offered exactly as before.
-      const authority = await this.dispatchAuthority(project);
-      const authorityOf = () => this.dispatchAuthority(project);
+      // The per-session authority. The root conversation's id *is* the legacy named session's id,
+      // so the binding the owner set for that session governs this project's default conversation;
+      // a fork's child conversation resolves its own session's binding by the same read.
+      const rootSessionId = String(ROOT_CONVERSATION_ID);
+      const authority = await this.dispatchAuthority(project, rootSessionId);
+      const authorityOf = (sessionId: string) => this.dispatchAuthority(project, sessionId);
       const privileges = privilegeExtension(project, authorityOf);
       const extensions: Extension[] = [question, notes, privileges];
       const registry = createRegistry();
@@ -563,11 +644,33 @@ export class HarnessHost {
     this.hosted.set(project.id, pending);
     try { return await pending; } catch (error) { this.hosted.delete(project.id); throw error; }
   }
-  private shape(hosted: HostedAgent, value: unknown, conversationId?: ConversationId): AgentView {
+  private shape(hosted: HostedAgent, value: unknown, conversationId?: ConversationId): AgentSessionView {
     const view = agentViewFrom(value);
-    return { ...view, conversationId: String(conversationId ?? hosted.conversation.id), model: view.model ?? { provider: hosted.provider.provider.id, modelId: hosted.provider.getModel().id } };
+    return {
+      ...view,
+      conversationId: String(conversationId ?? hosted.conversation.id),
+      model: view.model ?? { provider: hosted.provider.provider.id, modelId: hosted.provider.getModel().id },
+      usageDetail: usageDetailFrom(value),
+      dismissals: this.dismissalsOf(view)
+    };
   }
-  async view(project: Project): Promise<AgentView> {
+  /** The questions this conversation's transcript records as dismissed, keyed by question id. */
+  private dismissalsOf(view: AgentView): Readonly<Record<string, AgentDismissal>> {
+    const dismissals: Record<string, AgentDismissal> = {};
+    for (const entry of view.entries) {
+      if (entry.rawKind !== 'app.question.dismissed') continue;
+      const data = entry.data ?? {};
+      const id = typeof data.questionId === 'string' ? data.questionId : null;
+      if (id === null) continue;
+      dismissals[id] = Object.freeze({
+        reason: typeof data.reason === 'string' ? data.reason : '',
+        dismissedAt: typeof data.dismissedAt === 'number' ? data.dismissedAt : entry.at,
+        dismissedBy: typeof data.dismissedBy === 'string' ? data.dismissedBy : 'owner'
+      });
+    }
+    return Object.freeze(dismissals);
+  }
+  async view(project: Project): Promise<AgentSessionView> {
     this.assertEnabled();
     const hosted = await this.open(project);
     const state = await hosted.conversation.viewState(BACKGROUND_CONTEXT);
@@ -583,7 +686,7 @@ export class HarnessHost {
    * forked conversation itself. Reading it attaches the conversation exactly as `view` does, and it
    * writes no record of its own.
    */
-  async sessionView(project: Project, sessionId: string): Promise<AgentView | null> {
+  async sessionView(project: Project, sessionId: string): Promise<AgentSessionView | null> {
     this.assertEnabled();
     const id = conversationIdOf(sessionId);
     if (id === null) return null;
@@ -674,7 +777,7 @@ export class HarnessHost {
   }
 
   /** Subscribes to committed view changes; the callback runs once immediately. */
-  async subscribe(project: Project, listener: (view: AgentView) => void): Promise<() => Promise<void>> {
+  async subscribe(project: Project, listener: (view: AgentSessionView) => void): Promise<() => Promise<void>> {
     this.assertEnabled();
     const hosted = await this.open(project);
     const state = await hosted.conversation.viewState(BACKGROUND_CONTEXT);
@@ -724,7 +827,41 @@ export class HarnessHost {
     const question = view.questions.find(candidate => candidate.id === questionId);
     if (!question) throw new HttpError(404, 'Unknown question');
     if (question.answer) throw new HttpError(409, 'This question has already been answered');
+    if (this.dismissalsOf(view)[questionId] !== undefined) throw new HttpError(409, 'This question was dismissed by the owner, so it cannot be answered; ask a fresh question instead');
     return question;
+  }
+  /**
+   * Dismisses one open question with a reason, which is deliberately **not** an answer.
+   *
+   * The order mirrors `answer`: the dismissal is written to the transcript as its own durable entry
+   * (who dismissed it, when and why), then the agent is told the question was dismissed rather than
+   * silently ignored, so a resumed run sees the decision instead of re-asking. Both carry a request
+   * id derived from the question, so a retry collapses onto the one dismissal. An answered question
+   * and a question this conversation never asked are both refused.
+   */
+  async dismissQuestion(project: Project, input: { questionId: string; reason: string; dismissedBy?: string }): Promise<{ submissionId: string | null }> {
+    this.assertEnabled();
+    const reason = input.reason.trim();
+    if (reason === '') throw new HttpError(422, 'Enter a reason for dismissing this question');
+    if (reason.length > 400) throw new HttpError(413, 'The dismissal reason is too long');
+    return this.serial('agent:' + project.id, async () => {
+      const hosted = await this.open(project);
+      const sessionId = String(hosted.conversation.id);
+      const question = await this.openQuestion(hosted, input.questionId);
+      const dismissedAt = Date.now();
+      const dismissedBy = (input.dismissedBy ?? 'owner').slice(0, 160);
+      await hosted.conversation.submit({ type: 'write', entry: { kind: 'app.question.dismissed', data: { questionId: question.id, reason, dismissedBy, dismissedAt } }, requestId: 'dismiss:' + question.id }, BACKGROUND_CONTEXT);
+      // Telling the agent is a second, best-effort step: the transcript entry above is the durable
+      // record, and a delivery that fails leaves the dismissal visible rather than hiding it.
+      let submissionId: string | null = null;
+      try {
+        const submission = await hosted.conversation.submit({ type: 'input', content: 'The owner dismissed your question' + (question.text ? ' ("' + question.text + '")' : '') + ' for this reason: ' + reason + '. Do not proceed with it; wait for a new instruction.', requestId: 'dismiss-input:' + question.id }, BACKGROUND_CONTEXT);
+        submissionId = String(submission.id);
+      } catch (error) {
+        console.error('The dismissal of question ' + question.id + ' was recorded but could not be delivered to the agent: ' + (error as Error).message);
+      }
+      return { submissionId };
+    });
   }
   /**
    * Answers an open question exactly once.

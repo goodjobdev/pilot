@@ -41,7 +41,7 @@ import { FileEditTool, FileEditError, type FileEditMode } from './state/file-edi
 import { AgentError, agentScopeVocabulary } from '../shared/agent-registry';
 import { ActionError,ActionRegistry,liveActivity,normaliseActionScope,type ActionEnvironment } from './state/action-registry';
 import { ApprovalError } from '../shared/approvals';
-import { SessionError } from '../shared/sessions';
+import { SessionError,legacySessionName } from '../shared/sessions';
 import { SessionLifecycleError } from '../shared/session-lifecycle';
 import { emptyBoard } from '../shared/model';
 import { serializeBoard } from '../shared/markdown';
@@ -452,7 +452,11 @@ export async function createApp(options:AppOptions){
     // The authoritative dispatch path reads this on every tool call, so an agent's scopes are
     // re-checked server-side however a call was crafted. With no registry open, the owner's own
     // dispatch is in force and nothing is narrowed.
-    privileges:{authority:async({projectId})=>agentHolder.store?agentHolder.store.authority(projectId):Object.freeze({agentId:null,scopes:null})},
+    // Read **per session**, on every tool call: the session id is the conversation the call belongs
+    // to, and its durable binding (written through this same store) decides the authority, so a
+    // binding or scope change takes effect at the next dispatch with no restart. With no registry
+    // open, the owner's own dispatch is in force and nothing is narrowed.
+    privileges:{authority:async({projectId,sessionId})=>agentHolder.store?agentHolder.store.authorityForSession({projectId,sessionId:sessionId??''}):Object.freeze({agentId:null,scopes:null,projects:null,emptyReason:null})},
     fileEdit,
     onEvent:event=>{
       // A question is notified by the ledger's own outbox step, which tags the notification by the
@@ -701,6 +705,25 @@ export async function createApp(options:AppOptions){
     projectKnown:(projectId)=>catalog.projects.some(candidate=>candidate.id===projectId)
   }):undefined;
   agentHolder.store=agentStore;
+  /**
+   * One session as the overview list reports it: the durable record plus the agent binding, the
+   * lifecycle state it reads at and the linked work the record holds. Pure reads of existing stores:
+   * nothing here opens a harness, writes a row or sends anything.
+   */
+  const sessionOverview=(record:{readonly projectId:string;readonly id:string;readonly name:string;readonly revision:number;readonly model:unknown;readonly links:unknown;readonly createdAt:string;readonly updatedAt:string})=>{
+    const binding=agentStore?.binding(record.projectId,record.id)??null;
+    let state:string|null=null,stateRevision:number|null=null,attempt:number|null=null,reason:string|null=null,activityAt:string|null=null;
+    if(lifecycleService!==undefined){
+      try{const read=lifecycleService.read(record.projectId,record.id);state=read.state;stateRevision=read.revision;attempt=read.attempt;reason=read.reason;activityAt=read.activityAt;}
+      catch{/* an unreadable lifecycle row is a named absence below, never a failed overview */}
+    }
+    return {
+      id:record.id,name:record.name,revision:record.revision,model:record.model,links:record.links,
+      createdAt:record.createdAt,updatedAt:record.updatedAt,
+      agent:{id:binding?.agentId??null,revision:binding?.revision??0,boundAt:binding?.boundAt??null,boundBy:binding?.boundBy??null},
+      lifecycle:{recorded:lifecycle?.has(record.projectId,record.id)??false,state,revision:stateRevision,attempt,reason,activityAt}
+    };
+  };
   // The one owner switch that decides the file-edit mode: the acceptance policy in force. The
   // documented default is owner-only, which is propose-only; only agent-may-accept permits auto-apply.
   fileEditModeHolder.mode=()=>acceptance!==undefined&&acceptance.readPolicy().mode==='agent-may-accept'?'auto-apply':'propose-only';
@@ -854,7 +877,11 @@ export async function createApp(options:AppOptions){
           if(!sessions)throw new HttpError(503,'Sessions are unavailable: no durable control store is open');
           try {
             if(path==='/api/sessions'){
-              if(req.method==='GET'){json({sessions:sessions.list(url.searchParams.get('projectId'))});return;}
+              // The listing is the session overview the owner asked for: the record plus, for each
+              // session, the durable agent binding, the lifecycle state it reads at, and the linked
+              // work the record already holds. Every field is a read of an existing store; nothing
+              // here opens a harness or writes anything.
+              if(req.method==='GET'){json({sessions:sessions.list(url.searchParams.get('projectId')).map(record=>sessionOverview(record))});return;}
               if(req.method==='POST'){json({session:await sessions.create(payload)},201);return;}
               throw new HttpError(405,'Method not allowed');
             }
@@ -863,12 +890,39 @@ export async function createApp(options:AppOptions){
               const data=z.strictObject({dryRun:z.boolean().default(false)}).parse(payload);
               json(await migrateLegacyConversations({registry:sessions,legacy,dryRun:data.dryRun}));return;
             }
-            const sessionRoute=path.match(/^\/api\/sessions\/([A-Za-z0-9][A-Za-z0-9._:-]{0,159})(?:\/(rename|link|unlink))?$/);
+            const sessionRoute=path.match(/^\/api\/sessions\/([A-Za-z0-9][A-Za-z0-9._:-]{0,159})(?:\/(rename|link|unlink|agent))?$/);
             if(sessionRoute){
               const action=sessionRoute[2];
               if(action===undefined){
                 if(req.method!=='GET')throw new HttpError(405,'Method not allowed');
                 json({session:sessions.read(url.searchParams.get('projectId'),sessionRoute[1])});return;
+              }
+              // The per-session agent binding: the one owner action that joins an agent record to a
+              // session. A read reports the binding, the authority it puts in force and the live
+              // agents to choose from; a write is revision-checked, durable and in the audit trail.
+              if(action==='agent'){
+                if(!agentStore)throw new HttpError(503,'The agent registry is unavailable: no durable control store is open on this instance');
+                const identity=sessionRoute[1];
+                if(req.method==='GET'){
+                  const projectId=url.searchParams.get('projectId');
+                  if(projectId===null)throw new HttpError(422,'projectId is required');
+                  const project=catalog.get(projectId);
+                  json({projectId:project.id,sessionId:identity,binding:agentStore.binding(projectId,identity),authority:agentStore.authorityForSession({projectId,sessionId:identity}),agents:agentStore.live()});return;
+                }
+                if(req.method!=='POST')throw new HttpError(405,'Method not allowed');
+                const bound=parseBody(z.strictObject({projectId:z.unknown(),revision:z.unknown(),agentId:z.unknown(),actor:z.unknown()}),payload,'The session binding request');
+                const project=catalog.get(String(bound.projectId));
+                // The running conversation of a project is Pi's reserved root conversation, which the
+                // legacy migration adopts as a named session only when its SQLite file already exists at
+                // start. A session that exists only as a live conversation is therefore adopted here, so
+                // the conversation the owner is looking at is bindable and appears in the session list.
+                if(!sessions.has(project.id,identity)&&agents.enabled&&await agents.hasSession(project,identity)){
+                  try{await sessions.adopt({projectId:project.id,sessionId:identity,name:legacySessionName(project.name)});}
+                  catch(error){if(!(error instanceof SessionError&&error.code==='DUPLICATE_NAME'))throw error;await sessions.adopt({projectId:project.id,sessionId:identity,name:'Conversation '+identity});}
+                }
+                sessions.read(project.id,identity);
+                const binding=agentStore.bindSession({projectId:project.id,sessionId:identity,revision:bound.revision,agentId:bound.agentId,actor:bound.actor});
+                json({binding,authority:agentStore.authorityForSession({projectId:project.id,sessionId:identity})});return;
               }
               if(req.method!=='POST')throw new HttpError(405,'Method not allowed');
               const identity=sessionRoute[1];
@@ -945,6 +999,7 @@ export async function createApp(options:AppOptions){
             if(error instanceof SessionError)throw new HttpError(sessionHttpStatus(error.code),error.message);
             if(error instanceof SessionLifecycleError)throw new HttpError(lifecycleHttpStatus(error.code),error.message);
             if(error instanceof QueueError)throw new HttpError(queueHttpStatus(error.code),error.message);
+            if(error instanceof AgentError)throw new HttpError(agentHttpStatus(error.code),error.message);
             throw error;
           }
         }
@@ -1203,7 +1258,7 @@ export async function createApp(options:AppOptions){
           if(req.method==='GET'){json(await catalog.list());return;}
           if(req.method==='POST'){json(await catalog.register(payload),201);return;}
         }
-        const agentsRoute=path.match(/^\/api\/projects\/([a-f0-9-]{36})\/agents(?:\/(stream|input|abort|answer|model|media))?$/);
+        const agentsRoute=path.match(/^\/api\/projects\/([a-f0-9-]{36})\/agents(?:\/(stream|input|abort|answer|dismiss|model|media))?$/);
         if(agentsRoute){
           const p=catalog.get(agentsRoute[1]);
           if(!agents.enabled){
@@ -1258,6 +1313,13 @@ export async function createApp(options:AppOptions){
           if(agentsRoute[2]==='answer'&&req.method==='POST'){
             const data=z.strictObject({questionId:z.string().min(1).max(100),text:z.string().min(1).max(4000)}).parse(payload);
             json(await agents.answer(p,data));return;
+          }
+          if(agentsRoute[2]==='dismiss'&&req.method==='POST'){
+            // A dismissal is deliberately distinct from an answer: it carries a reason, is recorded as
+            // its own durable transcript entry (who, when, why), and tells the agent the question was
+            // dismissed rather than silently ignored.
+            const data=z.strictObject({questionId:z.string().min(1).max(100),reason:z.string().min(1).max(400)}).parse(payload);
+            json(await agents.dismissQuestion(p,{...data,dismissedBy:subject||'owner'}));return;
           }
           if(agentsRoute[2]==='abort'&&req.method==='POST'){await agents.abort(p);json({ok:true});return;}
           if(agentsRoute[2]==='stream'&&req.method==='GET'){

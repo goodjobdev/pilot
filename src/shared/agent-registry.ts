@@ -113,8 +113,29 @@ export type AgentActorKind = (typeof AGENT_ACTOR_KINDS)[number];
 export type AgentActor = { readonly kind: AgentActorKind; readonly identity: string };
 
 export type AgentModelChoice = { readonly provider: string; readonly modelId: string };
-/** A project id plus an optional subpath inside that project's own root. An empty subpath is the root. */
-export type AgentWorkspaceScope = { readonly projectId: string; readonly subpath: string };
+/** One instance cannot name an unbounded set of projects in a workspace scope. */
+export const AGENT_PROJECT_SET_MAX = 100;
+/**
+ * The projects an agent may work in. The shape is deliberate and closed:
+ *
+ * - `{ kind: 'all' }` is every registered project, and it is only ever the result of an explicit
+ *   owner choice. It is never implied by an empty set.
+ * - `{ kind: 'projects', projectIds }` names one or more project ids explicitly. An empty set is
+ *   refused rather than widened to 'all', which is what keeps the decision default-deny.
+ */
+export type AgentProjectScope =
+  | { readonly kind: 'all' }
+  | { readonly kind: 'projects'; readonly projectIds: readonly string[] };
+/** A project scope plus an optional subpath applied inside each allowed project's own root. */
+export type AgentWorkspaceScope = { readonly scope: AgentProjectScope; readonly subpath: string };
+/** Whether a project scope allows one project. An 'all' scope allows every project. */
+export function projectScopeAllows(scope: AgentProjectScope, projectId: string): boolean {
+  return scope.kind === 'all' || scope.projectIds.includes(projectId);
+}
+/** The projects a scope permits, as a set (`null` is 'all projects'). */
+export function projectScopeSet(scope: AgentProjectScope): readonly string[] | null {
+  return scope.kind === 'all' ? null : scope.projectIds;
+}
 export type AgentBudgets = { readonly maxRequests: number | null; readonly maxOutputTokens: number | null; readonly maxJobsPerHour: number | null };
 
 /** The stored record. 'revision' is the optimistic-concurrency token a change sends back. */
@@ -245,13 +266,28 @@ export function parseAgentModel(value: unknown, label = 'model'): AgentModelChoi
  * project exists at all is the store's business, not this parser's.
  */
 export function parseAgentWorkspace(value: unknown, label = 'workspace'): AgentWorkspaceScope {
+  // Backward compatibility: a workspace written or sent in the older single-project shape
+  // (`{projectId, subpath}`) is normalised into a one-project set rather than refused. An unknown
+  // shape is still refused by the strict union below, so the decision stays closed either way.
+  const plain = value !== null && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null;
+  const candidate = plain !== null && plain.scope === undefined && plain.projectId !== undefined
+    ? { scope: { kind: 'projects', projectIds: [plain.projectId] }, subpath: plain.subpath }
+    : value;
   const parsed = parseStrict(
     z.strictObject({
-      projectId: z.string().regex(AGENT_ID_PATTERN, 'a project id must be 1-160 characters from A-Za-z0-9._:-'),
+      scope: z.discriminatedUnion('kind', [
+        z.strictObject({ kind: z.literal('all') }),
+        z.strictObject({
+          kind: z.literal('projects'),
+          projectIds: z.array(z.string().regex(AGENT_ID_PATTERN, 'a project id must be 1-160 characters from A-Za-z0-9._:-'))
+            .min(1, { message: 'a project set must name at least one project; an empty set is refused rather than widened to all projects' })
+            .max(AGENT_PROJECT_SET_MAX, { message: 'a project set may name at most ' + AGENT_PROJECT_SET_MAX + ' projects' })
+        })
+      ]),
       subpath: z.string().max(AGENT_WORKSPACE_SUBPATH_MAX_LENGTH).regex(emptyOrTextPattern, 'a subpath must be printable text, and an empty one is the project root')
     }),
-    value,
-    label + ' (requires projectId and subpath; an empty subpath is the project root)'
+    candidate,
+    label + ' (requires scope {kind:\'all\'} or {kind:\'projects\', projectIds} and subpath; an empty subpath is each allowed project\u2019s root)'
   );
   const subpath = parsed.subpath;
   if (subpath !== '') {
@@ -261,7 +297,27 @@ export function parseAgentWorkspace(value: unknown, label = 'workspace'): AgentW
     if (segments.some((segment) => segment === '' || segment === '.' || segment === '..'))
       throw new AgentError(label + ' is invalid: a subpath must be a relative path with no empty, current or parent segment', 'INVALID');
   }
-  return Object.freeze({ projectId: parsed.projectId, subpath }) as AgentWorkspaceScope;
+  if (parsed.scope.kind === 'all') return Object.freeze({ scope: Object.freeze({ kind: 'all' as const }) as AgentProjectScope, subpath }) as AgentWorkspaceScope;
+  const ids = parsed.scope.projectIds;
+  const unique = new Set(ids);
+  if (unique.size !== ids.length) throw new AgentError(label + ' is invalid: the project set repeats a project id; each project is named at most once', 'INVALID');
+  return Object.freeze({ scope: Object.freeze({ kind: 'projects' as const, projectIds: Object.freeze([...unique].sort()) }) as AgentProjectScope, subpath }) as AgentWorkspaceScope;
+}
+/**
+ * Materializes a workspace read back from storage. The multi-project shape is the only one written
+ * now; a record written before this shape existed (a single `projectId` beside its subpath) is
+ * normalised into a one-project set rather than being reported as corruption.
+ */
+export function materializeStoredWorkspace(value: unknown, code: AgentErrorCode = 'INVALID'): AgentWorkspaceScope {
+  const plain = value !== null && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null;
+  const legacy = plain !== null && plain.scope === undefined && plain.projectId !== undefined
+    ? { scope: { kind: 'projects', projectIds: [plain.projectId] }, subpath: plain.subpath }
+    : value;
+  try { return parseAgentWorkspace(legacy); }
+  catch (error) {
+    if (error instanceof AgentError) throw new AgentError(error.message, code);
+    throw error;
+  }
 }
 /** Every budget field is either null (no budget) or a whole number inside its documented bound. */
 export function parseAgentBudgets(value: unknown, label = 'budgets'): AgentBudgets {
@@ -348,7 +404,9 @@ const recordSchema = z.strictObject({
   enabled: z.boolean(),
   archived: z.boolean(),
   model: modelSchema,
-  workspace: z.strictObject({ projectId: z.string().regex(AGENT_ID_PATTERN), subpath: z.string().max(AGENT_WORKSPACE_SUBPATH_MAX_LENGTH) }),
+  // The workspace is materialized below, so a record written in the older single-project shape is
+  // normalised rather than reported as corruption.
+  workspace: z.unknown(),
   budgets: budgetsSchema,
   scopes: z.array(scopeSchema).max(AGENT_MAX_SCOPES),
   revision: z.number().int().positive(),
@@ -373,7 +431,7 @@ export function validateAgentRecord(value: unknown, code: AgentErrorCode = 'INVA
     enabled: parsed.enabled,
     archived: parsed.archived,
     model: Object.freeze({ provider: parsed.model.provider, modelId: parsed.model.modelId }) as AgentModelChoice,
-    workspace: Object.freeze({ projectId: parsed.workspace.projectId, subpath: parsed.workspace.subpath }) as AgentWorkspaceScope,
+    workspace: materializeStoredWorkspace(parsed.workspace, code),
     budgets: Object.freeze({ maxRequests: parsed.budgets.maxRequests, maxOutputTokens: parsed.budgets.maxOutputTokens, maxJobsPerHour: parsed.budgets.maxJobsPerHour }) as AgentBudgets,
     scopes,
     revision: parsed.revision,
@@ -524,23 +582,95 @@ export type AgentAuditEntry = {
   readonly changedAt: string;
 };
 
-/** What governs one project's dispatch: the agent bound to it, and the scopes in force. */
+/* --------------------------------------------------------------------------------------------- *
+ * The session binding: which agent record governs one named session's dispatch.
+ * --------------------------------------------------------------------------------------------- */
+
+export const AGENT_BINDING_VERSION = 1 as const;
+
+/**
+ * The durable record that binds one named session to one agent, or explicitly to no agent.
+ *
+ * It is the missing link the owner reported: an agent's scopes are per **record**, and a dispatch
+ * happens in a **session**, so without this record the two can never be joined. The binding is
+ * revision-checked (a stale write is refused and changes nothing), it is recorded in the audit trail
+ * via its own outbox row (who bound it, when), and one write is one control-store operation, so it
+ * lives inside the same transaction guarantees as every other durable record.
+ *
+ * `agentId === null` is a deliberate **unbind**: the session has no agent, so it has an empty
+ * allowlist and every tool is refused (fail closed), with the named reason reported to the owner.
+ * A session with no binding record at all is deliberately different: it is unmanaged, so the
+ * project-level rule that was in force before this record existed still applies.
+ */
+export type AgentBinding = {
+  readonly version: 1;
+  readonly projectId: string;
+  readonly sessionId: string;
+  readonly agentId: string | null;
+  readonly revision: number;
+  readonly boundBy: AgentActor;
+  readonly boundAt: string;
+};
+
+const bindingSchema = z.strictObject({
+  version: z.literal(AGENT_BINDING_VERSION),
+  projectId: z.string().regex(AGENT_ID_PATTERN, 'a project id must be 1-160 characters from A-Za-z0-9._:-'),
+  sessionId: z.string().regex(AGENT_ID_PATTERN, 'a session id must be 1-160 characters from A-Za-z0-9._:-'),
+  agentId: z.string().regex(AGENT_ID_PATTERN, 'an agent id must be 1-160 characters from A-Za-z0-9._:-').nullable(),
+  revision: z.number().int().positive(),
+  boundBy: actorSchema,
+  boundAt: z.string().datetime()
+});
+
+/** Validates one stored binding: strict fields, a positive revision and a readable instant. */
+export function validateAgentBinding(value: unknown, code: AgentErrorCode = 'INVALID'): AgentBinding {
+  const parsed = parseStrict(bindingSchema, value, 'agent binding (requires version, projectId, sessionId, agentId, revision, boundBy and boundAt)', code);
+  const binding: AgentBinding = Object.freeze({
+    version: AGENT_BINDING_VERSION,
+    projectId: parsed.projectId,
+    sessionId: parsed.sessionId,
+    agentId: parsed.agentId,
+    revision: parsed.revision,
+    boundBy: Object.freeze({ kind: parsed.boundBy.kind, identity: parsed.boundBy.identity }) as AgentActor,
+    boundAt: parsed.boundAt
+  });
+  let encoded: string;
+  try { encoded = boundedJson(binding); }
+  catch (error) { throw new AgentError('The agent binding is not bounded JSON data: ' + (error as Error).message, code); }
+  if (byteLength(encoded) > AGENT_MAX_RECORD_BYTES) throw new AgentError('The agent binding exceeds ' + AGENT_MAX_RECORD_BYTES + ' bytes', code);
+  return binding;
+}
+
+/** What governs one session's dispatch: the agent bound to it, and the scopes in force. */
 export type DispatchAuthority = {
   /** The agent whose scopes govern this dispatch, or null when the owner's own dispatch is in force. */
   readonly agentId: string | null;
   /** The scopes in force: null means the owner (unrestricted), an empty list means an agent allowed nothing. */
   readonly scopes: readonly AgentScope[] | null;
+  /**
+   * The projects this authority may act in: null means every project (the owner, or an agent whose
+   * project scope is 'all'), a list is the explicit set. Enforcement follows this set: a tool call
+   * against a project outside it is refused server-side even when the tool is otherwise permitted.
+   */
+  readonly projects: readonly string[] | null;
+  /**
+   * A named explanation when the scopes are an explicit empty list — no agent is bound, or the bound
+   * agent is disabled or archived. Null when scopes are non-empty or the owner's own dispatch is in
+   * force. This is what makes "no privileges" a stated fact rather than a silent refusal.
+   */
+  readonly emptyReason: string | null;
 };
 
 /**
- * Where the agent harness learns the privilege scopes in force.
+ * Where the agent harness learns the privilege scopes in force for one session.
  *
- * It is read **on every tool call**, so a scope change takes effect at dispatch immediately, and it is
- * read once when a project's harness is opened, so the tools the model is offered are the permitted
- * ones. Nothing else consults it: the interface reads records, never authority.
+ * It is read **per session, on every tool call**, so a binding or scope change takes effect at the
+ * next dispatch with no restart, and it is read once when a project's harness is opened, so the tools
+ * the model is offered are the permitted ones for that session. `sessionId` is optional so a caller
+ * that only knows the project can still ask; the harness always supplies it.
  */
 export interface AgentPrivilegePort {
-  authority(input: { readonly projectId: string }): Promise<DispatchAuthority>;
+  authority(input: { readonly projectId: string; readonly sessionId?: string }): Promise<DispatchAuthority>;
 }
 
 /** Whether a record may be dispatched into at all: an archived or disabled agent is never in force. */

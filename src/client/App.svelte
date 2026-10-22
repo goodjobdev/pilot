@@ -40,7 +40,7 @@
  let inbox=$state<{path:string;line:number;text:string;anchor:string|null;id:string}[]>([]),focusAnchor=$state<string|null>(null),inboxMenu=$state<HTMLDivElement>();
  let agentQuestions=$state<{id:string;text:string}[]>([]);
  let alertState=$state<AlertState>('off'),alertBusy=$state(false),alertMessage=$state('');
- let sessionExpired=$state(false),providersOpen=$state(false),connectionOpen=$state(false),agentManagerOpen=$state(false);
+ let sessionExpired=$state(false),providersOpen=$state(false),connectionOpen=$state(false),agentManagerOpen=$state(false),agentsVersion=$state(0);
  let docPathSet=$derived(new Set(docs.map(d=>d.path)));
  let shell=$state<HTMLDivElement>();
  let unlinked=$derived(snapshot?snapshot.board.tasks.filter(t=>t.scope==='active'&&!t.archived&&specState(t,docPathSet)==='unlinked').length:0);
@@ -327,7 +327,7 @@
   {/if}
  </section>
  {:else if view==='Agents'}
- <AgentsView projectId={project.id} onerror={(message)=>error=message} onquestions={()=>void loadInbox()}/>
+ <AgentsView projectId={project.id} {agentsVersion} onerror={(message)=>error=message} onquestions={()=>void loadInbox()}/>
  {:else}
  <div class="view-content">
  {#if loading}<div class="empty"><p>Loading board…</p></div>
@@ -360,6 +360,6 @@
 {#if importing&&project}<ImportReview projectId={project.id} onclose={()=>importing=false} onapplied={imported}/>{/if}
 {#if adding}<AddProjectDialog onclose={()=>adding=false} oncreated={created}/>{/if}
 {#if providersOpen}<ProviderSettings onclose={()=>providersOpen=false}/>{/if}
-{#if agentManagerOpen}<AgentManager onclose={()=>agentManagerOpen=false} onchanged={()=>{const id=project?.id;if(id)void loadInbox();}}/>{/if}
+{#if agentManagerOpen}<AgentManager onclose={()=>agentManagerOpen=false} onchanged={()=>{agentsVersion+=1;const id=project?.id;if(id)void loadInbox();}}/>{/if}
 {#if connectionOpen&&project}<ProjectConnection {project} onclose={()=>connectionOpen=false} onconnected={()=>void connected()}/>{/if}
 {#if paletteOpen}<ActionPalette projectId={project?.id??null} onclose={()=>paletteOpen=false}/>{/if}

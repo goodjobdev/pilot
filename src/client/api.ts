@@ -57,11 +57,28 @@ export interface AgentRegistryView{agents:AgentRecord[];scopes:AgentScopeOption[
 export interface AgentDetailView{agent:AgentRecord;history:AgentAuditEntry[]}
 /** The actor a change is made by. The interface always declares the owner: it is the authenticated session. */
 export interface AgentActorBody{kind:'owner'|'agent';identity:string}
+/** The projects an agent may act in: every project explicitly, or a named set (never an empty one). */
+export type AgentProjectScopeBody = {kind:'all'} | {kind:'projects';projectIds:string[]};
 export interface AgentDraftBody{
   name:string;description:string;enabled:boolean;model:AgentModelChoice;
-  workspace:{projectId:string;subpath:string};
+  workspace:{scope:AgentProjectScopeBody;subpath:string};
   budgets:{maxRequests:number|null;maxOutputTokens:number|null;maxJobsPerHour:number|null};
   scopes:string[];
+}
+/** One session as the overview list reports it: the record plus its agent binding, lifecycle and links. */
+export interface SessionOverview{
+  id:string;name:string;revision:number;model:{provider:string;modelId:string}|null;
+  links:{kind:string;taskId?:string;path?:string;anchor?:string|null}[];
+  createdAt:string;updatedAt:string;
+  agent:{id:string|null;revision:number;boundAt:string|null;boundBy:{kind:string;identity:string}|null};
+  lifecycle:{recorded:boolean;state:string|null;revision:number|null;attempt:number|null;reason:string|null;activityAt:string|null};
+}
+/** The binding read: the durable record, the authority it puts in force and the live agents to choose from. */
+export interface SessionBindingView{
+  projectId:string;sessionId:string;
+  binding:{version:number;projectId:string;sessionId:string;agentId:string|null;revision:number;boundBy:{kind:string;identity:string};boundAt:string}|null;
+  authority:{agentId:string|null;scopes:string[]|null;projects:string[]|null;emptyReason:string|null};
+  agents:AgentRecord[];
 }
 /** One recorded file edit, as the read side reports it, with the diff that proves it. */
 export interface FileEditRecordView{
@@ -104,7 +121,14 @@ export const api={
    * The command registry, its live read-only projection and one action's execution. The registry is
    * the only source of what the palette may offer: nothing in the client hardcodes a capability.
    */
-  sessions:(projectId:string)=>request<{sessions:{id:string;name:string;revision:number}[]}>('/sessions?projectId='+encodeURIComponent(projectId)),
+  sessions:(projectId:string)=>request<{sessions:SessionOverview[]}>('/sessions?projectId='+encodeURIComponent(projectId)),
+  /** Create one named session for a project; the server validates the name and reports per-field refusals. */
+  createSession:(body:{projectId:string;name:string})=>request<{session:SessionOverview}>('/sessions','POST',body),
+  /** The per-session agent binding: read the binding and its authority, or write one revision of it. */
+  sessionBinding:(projectId:string,sessionId:string)=>request<SessionBindingView>('/sessions/'+encodeURIComponent(sessionId)+'/agent?projectId='+encodeURIComponent(projectId)),
+  bindSession:(projectId:string,sessionId:string,body:{revision:number;agentId:string|null;actor:AgentActorBody})=>request<{binding:SessionBindingView['binding'];authority:SessionBindingView['authority']}>('/sessions/'+encodeURIComponent(sessionId)+'/agent','POST',{projectId,...body}),
+  /** A dismissal carries a reason and is recorded as its own durable entry, distinct from an answer. */
+  dismissQuestion:(projectId:string,body:{questionId:string;reason:string})=>request<{submissionId:string|null}>('/projects/'+projectId+'/agents/dismiss','POST',body),
   actions:(scope:ActionScope={})=>{
     const query=new URLSearchParams();
     if(scope.projectId)query.set('projectId',scope.projectId);

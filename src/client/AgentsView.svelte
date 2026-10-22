@@ -6,7 +6,10 @@
  import Icon from './Icon.svelte';
  import {request} from './api';
  import {modelKey,type ProviderSettings} from '../shared/settings';
- let { projectId,onerror,onquestions }:{ projectId:string; onerror:(message:string)=>void; onquestions?:()=>void }=$props();
+ import type {ActionDescriptor} from '../shared/actions';
+ import {slashMatches} from './slash';
+ import SessionBar from './SessionBar.svelte';
+ let { projectId,onerror,onquestions,agentsVersion=0 }:{ projectId:string; onerror:(message:string)=>void; onquestions?:()=>void; agentsVersion?:number }=$props();
  let view=$state<AgentView|null>(null),enabled=$state(true),status=$state('Connecting…'),draft=$state(''),sending=$state(false),problem=$state('');
  let answers=$state<Record<string,string>>({}),answering=$state('');
  // The images attached to the next message, and the one way the composer's upload path is fed.
@@ -72,7 +75,8 @@
  // list never count a question that has just been answered.
  let notified=$state<number|null>(null);
  $effect(()=>{
-   const open=(view?.questions??[]).filter(question=>!question.answer).length;
+   const dismissed=(view as unknown as {dismissals?:Record<string,unknown>})?.dismissals??{};
+   const open=(view?.questions??[]).filter(question=>!question.answer&&!(question.id in dismissed)).length;
    if(notified===open)return;
    notified=open;
    onquestions?.();
@@ -105,8 +109,61 @@
    catch(e){problem=(e as Error).message;}
  }
  const working=$derived(view?.working??false);
+
+ /**
+  * The slash command surface: the same typed action registry the palette uses.
+  *
+  * The composer never hardcodes a command. It asks the server for the actions this scope may use and
+  * offers the slash-eligible ones (see src/client/slash.ts); the chosen action runs through the same
+  * /api/actions/execute path the palette calls, in this project's and session's own scope.
+  */
+ let actions=$state<ActionDescriptor[]>([]);
+ let slashResult=$state(''),slashRefusal=$state('');
+ const slashPicks=$derived(slashMatches(actions,draft));
+ let slashHighlight=$state(0);
+ $effect(()=>{void view?.conversationId;void projectId;void loadActions();});
+ async function loadActions(){
+   try{actions=(await api.actions({projectId,...(view?.conversationId?{sessionId:view.conversationId}:{})})).actions;}
+   catch{actions=[];}
+ }
+ async function runSlash(action:ActionDescriptor){
+   slashRefusal='';slashResult='';
+   try{
+     const executed=await api.runAction(action.id,{scope:{projectId,...(view?.conversationId?{sessionId:view.conversationId}:{})}});
+     slashResult='Ran '+executed.action+': '+JSON.stringify(executed.result).slice(0,300);
+     draft='';
+   }catch(error){slashRefusal=(error as Error).message;}
+ }
+ /**
+  * Enter sends; Shift+Enter (and Cmd/Ctrl+Enter) insert a newline. An IME composition is never
+  * interrupted, so a candidate-selection Enter is left to the input method. While the slash list is
+  * open, Enter chooses the highlighted action instead — the list is a command surface, not a send.
+  */
+ function composerKey(event:KeyboardEvent){
+   if((event as unknown as {isComposing?:boolean}).isComposing||event.keyCode===229)return;
+   const picks=slashPicks;
+   if(picks){
+     if(event.key==='ArrowDown'){event.preventDefault();slashHighlight=(slashHighlight+1)%Math.max(picks.length,1);return;}
+     if(event.key==='ArrowUp'){event.preventDefault();slashHighlight=(slashHighlight-1+picks.length)%Math.max(picks.length,1);return;}
+     if(event.key==='Enter'&&!event.shiftKey&&!event.metaKey&&!event.ctrlKey){event.preventDefault();const pick=picks[slashHighlight];if(pick)void runSlash(pick);return;}
+   }
+   if(event.key==='Enter'&&!event.shiftKey&&!event.metaKey&&!event.ctrlKey){event.preventDefault();void send('followUp');}
+ }
+
+ /** The dismissed-question markers the harness attaches to the shaped view, keyed by question id. */
+ const dismissals=$derived(((view as unknown as {dismissals?:Record<string,{reason:string;dismissedAt:number|null;dismissedBy:string}>})?.dismissals)??{});
+ let dismissOpen=$state<string|null>(null),dismissReason=$state(''),dismissing=$state('');
+ async function dismiss(questionId:string){
+   const reason=dismissReason.trim();
+   if(reason===''){problem='Enter a reason for dismissing this question.';return;}
+   dismissing=questionId;problem='';
+   try{await api.dismissQuestion(projectId,{questionId,reason});dismissOpen=null;dismissReason='';}
+   catch(e){problem=(e as Error).message;}
+   finally{dismissing='';}
+ }
 </script>
 <section class="agents">
+ {#if view?.conversationId}<SessionBar {projectId} sessionId={view.conversationId} {view} {agentsVersion} onerror={(message)=>onerror(message)}/>{/if}
  <header class="agents-head">
   <div>
    <span class="eyebrow">{!view?.model||view.model.provider==='faux'?'SCRIPTED TEST PROVIDER':'MODEL PROVIDER'}</span>
@@ -128,6 +185,12 @@
  <section class="agent-questions" aria-label="Questions for me">
   <span class="popover-heading">QUESTIONS FOR ME</span>
   {#each view.questions as question (question.id)}
+  {#if dismissals[question.id]}
+  <article class="agent-question dismissed" id={'question-'+question.id}>
+   <p>{question.text}</p>
+   <p class="agent-answer"><span class="pill">dismissed</span>{dismissals[question.id].reason}<small> — {dismissals[question.id].dismissedBy}</small></p>
+  </article>
+  {:else}
   <article class="agent-question" class:answered={Boolean(question.answer)} id={'question-'+question.id}>
    <p>{question.text}</p>
    {#if question.answer}
@@ -136,9 +199,17 @@
    <div class="row">
     <input aria-label={'Answer to: '+question.text} value={answers[question.id]??''} placeholder="Your answer" oninput={(event)=>answers={...answers,[question.id]:(event.currentTarget as HTMLInputElement).value}}>
     <button class="primary compact-button" aria-label="Send answer" disabled={answering===question.id||(answers[question.id]??'').trim()===''} onclick={()=>void answer(question.id)}>Answer once</button>
+    <button class="compact-button" aria-label={'Dismiss question: '+question.text} onclick={()=>{dismissOpen=dismissOpen===question.id?null:question.id;dismissReason='';}}>Dismiss…</button>
+   </div>
+   {#if dismissOpen===question.id}
+   <div class="row">
+    <input aria-label={'Dismissal reason for: '+question.text} value={dismissReason} placeholder="Why are you dismissing this?" oninput={(event)=>dismissReason=(event.currentTarget as HTMLInputElement).value}>
+    <button class="danger-command compact-button" aria-label="Confirm dismissal" disabled={dismissing===question.id||dismissReason.trim()===''} onclick={()=>void dismiss(question.id)}>Record dismissal</button>
    </div>
    {/if}
+   {/if}
   </article>
+  {/if}
   {/each}
  </section>
  {/if}
@@ -166,7 +237,18 @@
  <div class="agent-composer" onpaste={(event)=>composerEvent(event)} ondrop={(event)=>composerEvent(event)}
       ondragover={(event)=>{event.preventDefault();composerDragging=true;}} ondragleave={()=>composerDragging=false}>
   <ImageComposer projectId={projectId} bind:items={media} dragging={composerDragging} handle={(composer)=>{composerApi=composer;}}/>
-  <label>Message the agent<textarea aria-label="Message the agent" bind:value={draft} placeholder="Ask for something, or include [pause] to hold the run open while you steer or stop it."></textarea></label>
+  {#if slashPicks}
+  <div class="slash-list" aria-label="Slash commands">
+   <span class="popover-heading">SLASH COMMANDS — from the action registry</span>
+   {#if slashPicks.length===0}<p class="muted">No registry action matches. Type a message, or / to list commands.</p>{/if}
+   {#each slashPicks as action,index (action.id)}
+   <button class="slash-row" class:highlighted={index===slashHighlight} aria-label={'Run '+action.label} onclick={()=>void runSlash(action)}><code>/{action.id}</code><span>{action.label}</span></button>
+   {/each}
+  </div>
+  {/if}
+  <label>Message the agent<textarea aria-label="Message the agent" bind:value={draft} onkeydown={(event)=>composerKey(event)} placeholder="Ask for something, type / for commands, or include [pause]. Enter sends; Shift+Enter adds a newline."></textarea></label>
+  {#if slashRefusal}<p class="error" role="alert">{slashRefusal}</p>{/if}
+  {#if slashResult}<p class="agent-status" role="status">{slashResult}</p>{/if}
   <div class="row">
    <button class="primary compact-button" aria-label="Send message" disabled={sending||uploadingImages||(draft.trim()===''&&readyImages.length===0)} title={uploadingImages?'An image is still uploading: the message is held until it is stored':undefined} onclick={()=>void send('followUp')}><Icon name="arrow" size={14}/><span>{working?'Queue follow-up':'Send'}</span></button>
    <button class="compact-button" aria-label="Steer the run" disabled={sending||uploadingImages||!working||(draft.trim()===''&&readyImages.length===0)} title={uploadingImages?'An image is still uploading: the message is held until it is stored':undefined} onclick={()=>void send('steer')}>Steer current run</button>
@@ -206,4 +288,9 @@
  .agent-composer textarea{min-height:80px;font:12px/1.6 var(--mono)}
  .agent-status{color:var(--muted)}
  .agent-upload-state{color:var(--accent)}
+ .agent-question.dismissed{opacity:.7;border-left:2px solid var(--danger)}
+ .slash-list{border:1px solid var(--line);border-radius:5px;background:var(--bg);padding:8px 10px;margin-bottom:8px;max-height:24dvh;overflow:auto;display:flex;flex-direction:column;gap:4px}
+ .slash-row{display:flex;gap:8px;align-items:baseline;text-align:left;background:none;border:1px solid transparent;border-radius:4px;padding:5px 6px}
+ .slash-row.highlighted{border-color:color-mix(in srgb,var(--accent) 30%,var(--line));background:var(--raised)}
+ .slash-row code{font:9px var(--mono);color:var(--accent)}
 </style>

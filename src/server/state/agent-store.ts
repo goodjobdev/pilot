@@ -3,8 +3,8 @@ import type { ControlScope, OperationRecord, OutboxRecord } from '../../shared/c
 import { ControlStore, ControlStoreError } from './control-store';
 import {
   AGENT_MAX_AGENTS, AgentError, buildAgentRecord, decideScopeChange, parseAgentActor, parseAgentDraft, parseAgentIdentifier,
-  parseAgentPatch, scopesInForceFor, validateAgentRecord,
-  type AgentActor, type AgentAuditEntry, type AgentDraft, type AgentPatch, type AgentRecord, type AgentScope
+  parseAgentPatch, scopesInForceFor, validateAgentBinding, validateAgentRecord, agentInForce, projectScopeAllows, projectScopeSet,
+  type AgentActor, type AgentAuditEntry, type AgentBinding, type AgentDraft, type AgentPatch, type AgentRecord, type AgentScope
 } from '../../shared/agent-registry';
 
 /**
@@ -35,6 +35,9 @@ import {
 /** The durable operation and outbox kinds this registry owns. Nothing else is ever reported. */
 const OPERATION_KIND = 'agent.record';
 const OUTBOX_KIND = 'agent.registry';
+/** The durable kinds the session-binding half of this registry owns. Nothing else is ever reported. */
+const BINDING_OPERATION_KIND = 'agent.binding';
+const BINDING_OUTBOX_KIND = 'agent.binding';
 /**
  * The control store scopes operations by project and session, while the agent registry is a
  * deployment-level list. The storage bucket is therefore a bucket, never the authority: an agent's own
@@ -92,19 +95,110 @@ export class AgentStore {
     this.require(id);
     return Object.freeze(this.recordsFor(id).map((entry) => entry.audit));
   }
-  /** The agents whose workspace names this project, live or archived. */
+  /** The agents whose project scope allows this project, live or archived. */
   forProject(projectId: unknown): readonly AgentRecord[] {
     const id = parseAgentIdentifier(projectId, 'projectId');
-    return Object.freeze(this.records().filter((record) => record.workspace.projectId === id));
+    return Object.freeze(this.records().filter((record) => projectScopeAllows(record.workspace.scope, id)));
   }
   /**
    * The scopes in force for one project's dispatch. 'null' means no agent is bound to it, so the
    * owner's own dispatch is in force and nothing is narrowed.
    */
   authority(projectId: unknown): { readonly agentId: string | null; readonly scopes: readonly AgentScope[] | null } {
-    const bound = this.forProject(projectId).filter((record) => record.enabled && !record.archived);
+    const id = parseAgentIdentifier(projectId, 'projectId');
+    const bound = this.forProject(id).filter((record) => record.enabled && !record.archived);
     const scopes = scopesInForceFor(bound);
     return Object.freeze({ agentId: scopes === null ? null : (bound.length === 1 ? bound[0].id : null), scopes });
+  }
+  /**
+   * The projects in force for one project's dispatch, as the intersection of every bound agent's own
+   * project scope. Null means every project (no agent bound, or every bound agent allows all).
+   */
+  private projectsInForce(projectId: string): readonly string[] | null {
+    const bound = this.forProject(projectId).filter((record) => record.enabled && !record.archived);
+    const constrained = bound.map((record) => projectScopeSet(record.workspace.scope)).filter((set): set is readonly string[] => set !== null);
+    return constrained.length === 0 ? null : constrained.reduce((left, right) => left.filter((project) => right.includes(project)));
+  }
+
+  /* ----------------------------------------------------------------------------------------- *
+   * Session bindings: which agent governs one named session's dispatch.
+   * ----------------------------------------------------------------------------------------- */
+
+  /** The durable binding of one session, or null when it is unmanaged. Read-only. */
+  binding(projectId: unknown, sessionId: unknown): AgentBinding | null {
+    const project = parseAgentIdentifier(projectId, 'projectId');
+    const session = parseAgentIdentifier(sessionId, 'sessionId');
+    const rows = this.rows('SELECT id FROM operations WHERE project_id=? AND session_id=? AND kind=? ORDER BY rowid', [project, session, BINDING_OPERATION_KIND]);
+    let latest: AgentBinding | null = null;
+    for (const row of rows) {
+      const binding = this.decodeBinding(String(row.id), { projectId: project, sessionId: session });
+      if (latest === null || binding.revision > latest.revision) latest = binding;
+      else if (binding.revision === latest.revision) throw storage('Corrupt agent binding storage: two bindings of session ' + session + ' share revision ' + binding.revision);
+    }
+    return latest;
+  }
+
+  /** Every session binding of one project, oldest first, ties broken by session id. Read-only. */
+  bindingsFor(projectId: unknown): readonly AgentBinding[] {
+    const project = parseAgentIdentifier(projectId, 'projectId');
+    const rows = this.rows('SELECT id,session_id FROM operations WHERE project_id=? AND kind=? ORDER BY rowid', [project, BINDING_OPERATION_KIND]);
+    const latest = new Map<string, AgentBinding>();
+    for (const row of rows) {
+      const session = String(row.session_id);
+      const binding = this.decodeBinding(String(row.id), { projectId: project, sessionId: session });
+      const previous = latest.get(session);
+      if (previous === undefined || binding.revision > previous.revision) latest.set(session, binding);
+      else if (binding.revision === previous.revision) throw storage('Corrupt agent binding storage: two bindings of session ' + session + ' share revision ' + binding.revision);
+    }
+    return Object.freeze([...latest.values()].sort((left, right) => left.sessionId.localeCompare(right.sessionId)));
+  }
+
+  /**
+   * Binds one session to one agent record, or explicitly to no agent (`agentId === null`).
+   *
+   * A stale revision is refused and writes nothing; a named agent that is not recorded is refused by
+   * name; the write is one control-store operation whose key is derived from the revision it
+   * produces, so two concurrent writers at one revision cannot both win. The actor and instant are
+   * recorded in the outbox beside the binding: the audit trail names who bound it and when.
+   */
+  bindSession(input: unknown): AgentBinding {
+    const data = requireObject(input, 'session binding request (requires projectId, sessionId, revision, agentId and actor)');
+    const projectId = parseAgentIdentifier(data.projectId, 'projectId');
+    const sessionId = parseAgentIdentifier(data.sessionId, 'sessionId');
+    const revision = requireRevision(data.revision);
+    const actor = parseAgentActor(data.actor);
+    const agentId = data.agentId === null ? null : parseAgentIdentifier(data.agentId, 'agentId');
+    if (agentId !== null) this.require(agentId);
+    const current = this.binding(projectId, sessionId);
+    if ((current?.revision ?? 0) !== revision)
+      throw new AgentError('Session ' + sessionId + ' is at binding revision ' + (current?.revision ?? 0) + ', not ' + revision + '; the binding wrote nothing and is unchanged', 'CONFLICT');
+    const binding = validateAgentBinding({
+      version: 1, projectId, sessionId, agentId, revision: revision + 1, boundBy: actor, boundAt: this.now()
+    });
+    return this.writeBinding(binding);
+  }
+
+  /**
+   * The authority in force for one session.
+   *
+   * - A session with no binding record is **unmanaged**: the project-level rule that predates this
+   *   record still applies (an agent whose workspace names the project, when exactly one is enabled).
+   * - A binding naming no agent is an explicit unbind: an empty allowlist, so every tool is refused
+   *   with the named reason.
+   * - A binding naming a disabled or archived agent refuses the same way, naming that agent.
+   * - A binding naming a live agent puts exactly that agent's allowlist in force.
+   */
+  authorityForSession(input: { readonly projectId: string; readonly sessionId: string }): { readonly agentId: string | null; readonly scopes: readonly AgentScope[] | null; readonly projects: readonly string[] | null; readonly emptyReason: string | null } {
+    const projectId = parseAgentIdentifier(input.projectId, 'projectId');
+    const sessionId = parseAgentIdentifier(input.sessionId, 'sessionId');
+    const binding = this.binding(projectId, sessionId);
+    if (binding === null) { const legacy = this.authority(projectId); return Object.freeze({ agentId: legacy.agentId, scopes: legacy.scopes, projects: this.projectsInForce(projectId), emptyReason: null }); }
+    if (binding.agentId === null)
+      return Object.freeze({ agentId: null, scopes: Object.freeze([]) as readonly AgentScope[], projects: Object.freeze([]) as readonly string[], emptyReason: 'No agent is bound to this session, so it has an empty privilege allowlist and every tool is refused. Bind an agent to grant tools.' });
+    const record = this.require(binding.agentId);
+    if (!agentInForce(record))
+      return Object.freeze({ agentId: record.id, scopes: Object.freeze([]) as readonly AgentScope[], projects: Object.freeze([]) as readonly string[], emptyReason: 'The agent bound to this session (' + record.name + ', ' + record.id + ') is ' + (record.archived ? 'archived' : 'disabled') + ', so it is not in force and every tool is refused. Enable or re-bind an agent.' });
+    return Object.freeze({ agentId: record.id, scopes: record.scopes, projects: projectScopeSet(record.workspace.scope), emptyReason: null });
   }
 
   /**
@@ -212,11 +306,14 @@ export class AgentStore {
     );
   }
   private assertWorkspace(draft: AgentDraft): void {
-    if (this.options.projectKnown(draft.workspace.projectId)) return;
-    throw new AgentError(
-      'Project ' + draft.workspace.projectId + ' is not registered on this instance, so the agent has no workspace to work in',
-      'WORKSPACE_NOT_IN_PROJECT'
-    );
+    if (draft.workspace.scope.kind === 'all') return;
+    for (const projectId of draft.workspace.scope.projectIds) {
+      if (this.options.projectKnown(projectId)) continue;
+      throw new AgentError(
+        'Project ' + projectId + ' is not registered on this instance, so the agent cannot be scoped to it',
+        'WORKSPACE_NOT_IN_PROJECT'
+      );
+    }
   }
   private assertNameFree(records: readonly AgentRecord[], name: string, exceptId: string | null): void {
     const clash = records.find((record) => !record.archived && record.id !== exceptId && record.name === name);
@@ -247,6 +344,47 @@ export class AgentStore {
       throw storage('The durable store refused the agent write: ' + (error as Error).message);
     }
     return record;
+  }
+  /** The one binding write path: a strict record, one admission, and the store's own conflict verdict. */
+  private writeBinding(binding: AgentBinding): AgentBinding {
+    try {
+      this.store.admit({
+        scope: { projectId: binding.projectId, sessionId: binding.sessionId },
+        idempotencyKey: 'binding.r' + binding.revision,
+        kind: BINDING_OPERATION_KIND,
+        input: binding,
+        outbox: { kind: BINDING_OUTBOX_KIND, payload: { version: 1, projectId: binding.projectId, sessionId: binding.sessionId, agentId: binding.agentId, revision: binding.revision, changedBy: binding.boundBy, changedAt: binding.boundAt } }
+      });
+    } catch (error) {
+      if (error instanceof ControlStoreError && error.code === 'CONFLICT')
+        throw new AgentError('The binding of session ' + binding.sessionId + ' at revision ' + binding.revision + ' was already written with different content (' + error.message + '); it is unchanged', 'CONFLICT');
+      throw storage('The durable store refused the binding write: ' + (error as Error).message);
+    }
+    return binding;
+  }
+  /** One binding operation row as a record, through the store's own validated getters. */
+  private decodeBinding(operationId: string, scope: ControlScope): AgentBinding {
+    let operation: OperationRecord;
+    try {
+      operation = this.store.getOperation(operationId, scope);
+    } catch (error) {
+      throw storage('The durable store could not read binding operation ' + operationId + ': ' + (error as Error).message);
+    }
+    if (operation.kind !== BINDING_OPERATION_KIND) throw storage('Agent binding storage holds an unexpected operation kind');
+    let binding: AgentBinding;
+    try {
+      binding = validateAgentBinding(operation.input, 'CORRUPT');
+    } catch (error) {
+      throw corrupt('A stored agent binding is corrupt: ' + (error as Error).message);
+    }
+    if (binding.projectId !== scope.projectId || binding.sessionId !== scope.sessionId) throw storage('A stored agent binding is outside its own scope');
+    const outbox = this.outboxFor(operation.id, scope);
+    if (outbox.kind !== BINDING_OUTBOX_KIND) throw storage('Agent binding storage holds an unexpected outbox kind');
+    if (outbox.state !== 'pending') throw storage('An agent binding outbox must stay pending for the life of the record');
+    const payload = outbox.payload as { version?: unknown; sessionId?: unknown; revision?: unknown } | null;
+    if (!payload || typeof payload !== 'object' || payload.version !== 1 || payload.sessionId !== binding.sessionId || payload.revision !== binding.revision)
+      throw storage('The stored agent binding outbox payload does not describe its record');
+    return binding;
   }
   /** Every stored revision of every agent, oldest first, each decoded through the store's own getters. */
   private records(): AgentRecord[] {

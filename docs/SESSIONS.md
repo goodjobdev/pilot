@@ -128,7 +128,9 @@ fields that change.
 
 | Method and path | Body | Answer |
 |---|---|---|
-| `GET /api/sessions?projectId=` | — | `{sessions: [...]}`, oldest first. `422` without a `projectId`; there is no unscoped listing, and a project with no sessions lists none |
+| `GET /api/sessions?projectId=` | — | `{sessions: [...]}`, oldest first. Each entry is the record plus the **session overview**: the durable agent binding (`agent`), the lifecycle state it reads at (`lifecycle`), the linked work (`links`) and the last activity (`updatedAt`). `422` without a `projectId`; there is no unscoped listing, and a project with no sessions lists none |
+| `GET /api/sessions/:id/agent?projectId=` | — | `{projectId, sessionId, binding, authority, agents}`: the durable binding (or `null`), the authority it puts in force (`agentId`, `scopes`, `projects`, `emptyReason`) and the live agents to choose from |
+| `POST /api/sessions/:id/agent` | `projectId`, `revision`, `agentId` (a string, or `null` to unbind), `actor` | `{binding, authority}`. Revision-checked like every other session write; a stale revision is `409` and writes nothing; an unknown agent is `404`. A session that exists only as a live conversation is adopted first, so the conversation the owner is in is bindable and appears in the list |
 | `GET /api/sessions/:id?projectId=` | — | `{session}`, with its links |
 | `POST /api/sessions` | `projectId`, `name`, optional `model`, optional `links` | `201` and `{session}`; `404` when the project is not registered, because a session is never created for a project that does not exist |
 | `POST /api/sessions/:id/rename` | `projectId`, `name`, `revision` | `{session}` |
@@ -145,6 +147,34 @@ and `503` when the instance has no durable control store open.
 A refusal never contains a filesystem path: every message names ids, kinds and rules, and nothing
 else. A session that the owner reads back does carry the workspace path the owner linked, because
 that path *is* the link.
+
+## Binding a session to an agent
+
+A session may be **bound to an agent record** (`docs/AGENTS.md`), which is what puts an explicit
+privilege allowlist and project set in force for that session's dispatch. The binding is a durable,
+revision-checked record with its own audit row (who bound it, when). The semantics, and the explicit
+empty case, are stated in `docs/AGENTS.md`; the read is `GET /api/sessions/:id/agent` and the write
+`POST /api/sessions/:id/agent`. A session with **no binding** is unmanaged and falls back to the
+project-level rule; a session **unbound** (`agentId: null`) has no privileges at all, with a named
+reason, rather than a silent refusal. The binding is read on every tool call, so a change takes effect
+at the next dispatch with no restart.
+
+## Where the owner manages sessions
+
+The **Agents** view carries a session bar above the transcript:
+
+- it shows the **current session** and lets the owner **choose or change its agent** (including
+  "No agent", the explicit unbound state) and see the **agent and scopes actually in effect**,
+  including the empty case, in the server's own words;
+- **New session** creates a named session for the project with per-field validation (a name outside
+  the rule is refused beside the field);
+- **Sessions** lists every named session with its agent bound, lifecycle state, last activity and
+  linked work, and lets the owner open one;
+- **Session details** surfaces what the owner expects from Pi for the current session: the effective
+  model, the lifecycle state, the agent and scopes in force, the tokens in and out, the provider's
+  cache counters and the cost where the provider reports one. A fact the harness does not report is
+  shown as a **named absence** ("not reported"), never as a fabricated zero. The counters come from
+  the same usage projection the transcript header already reads.
 
 ## Failure semantics
 

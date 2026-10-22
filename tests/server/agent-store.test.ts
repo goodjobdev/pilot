@@ -8,7 +8,7 @@ import { ControlStore } from '../../src/server/state/control-store';
 import { AgentStore } from '../../src/server/state/agent-store';
 import {
   AGENT_BUDGET_BOUNDS, AGENT_SCOPES, AGENT_SCOPE_DESCRIPTIONS, AGENT_TOOL_SCOPES, AgentError, agentScopeVocabulary,
-  authorizeToolUse, decideScopeChange, parseAgentBudgets, parseAgentScopes, parseAgentWorkspace, scopesInForceFor,
+  authorizeToolUse, decideScopeChange, parseAgentBudgets, parseAgentScopes, parseAgentWorkspace, projectScopeAllows, scopesInForceFor,
   type AgentActor, type AgentDraft, type AgentRecord, type AgentScope
 } from '../../src/shared/agent-registry';
 
@@ -38,7 +38,7 @@ async function fixture() {
       description: 'Reviews what landed overnight.',
       enabled: true,
       model: { provider: 'scripted', modelId: 'scripted-1' },
-      workspace: { projectId, subpath: '' },
+      workspace: { scope: { kind: 'projects', projectIds: [projectId] }, subpath: '' },
       budgets: { maxRequests: 20, maxOutputTokens: 4096, maxJobsPerHour: 4 },
       scopes: ['read_notes', 'ask_question'],
       ...over
@@ -129,7 +129,7 @@ test('a duplicate live name, a model this instance does not offer and an unregis
     const model = await refused(() => f.agents.create({ draft: f.draft({ name: 'Other', model: { provider: 'scripted', modelId: 'not-offered' } }), actor: OWNER }), 'MODEL_NOT_OFFERED');
     assert.match(model, /not one this instance offers/);
     // A workspace that names a project this instance does not know is refused.
-    const workspace = await refused(() => f.agents.create({ draft: f.draft({ name: 'Other', workspace: { projectId: randomUUID(), subpath: '' } }), actor: OWNER }), 'WORKSPACE_NOT_IN_PROJECT');
+    const workspace = await refused(() => f.agents.create({ draft: f.draft({ name: 'Other', workspace: { scope: { kind: 'projects', projectIds: [randomUUID()] }, subpath: '' } }), actor: OWNER }), 'WORKSPACE_NOT_IN_PROJECT');
     assert.match(workspace, /is not registered on this instance/);
     // Neither refusal wrote anything: the registry still holds exactly one agent.
     assert.equal(f.agents.list().length, 1);
@@ -140,12 +140,12 @@ test('a subpath that could escape the project root and a budget outside its boun
   const f = await fixture();
   try {
     for (const subpath of ['../outside', '/etc', 'a/../../b', 'a\\b', 'a//b', '.', './a', 'a/./b']) {
-      const message = await refused(() => parseAgentWorkspace({ projectId: f.projectId, subpath }), 'INVALID');
+      const message = await refused(() => parseAgentWorkspace({ scope: { kind: 'projects', projectIds: [f.projectId] }, subpath }), 'INVALID');
       assert.match(message, /workspace is invalid/, subpath);
     }
-    // A legal relative subpath is accepted, and so is the empty one.
-    assert.equal(parseAgentWorkspace({ projectId: f.projectId, subpath: 'packages/api' }).subpath, 'packages/api');
-    assert.equal(parseAgentWorkspace({ projectId: f.projectId, subpath: '' }).subpath, '');
+    // A legal relative subpath is accepted, and so is the empty one, inside every allowed project.
+    assert.equal(parseAgentWorkspace({ scope: { kind: 'all' }, subpath: 'packages/api' }).subpath, 'packages/api');
+    assert.equal(parseAgentWorkspace({ scope: { kind: 'projects', projectIds: [f.projectId] }, subpath: '' }).subpath, '');
     // Every budget field is bounded, and a value outside its bound is refused rather than reduced.
     assert.throws(() => parseAgentBudgets({ maxRequests: 0, maxOutputTokens: null, maxJobsPerHour: null }), (error: Error) => error instanceof AgentError && error.code === 'BUDGET_OUT_OF_BOUNDS');
     assert.throws(() => parseAgentBudgets({ maxRequests: AGENT_BUDGET_BOUNDS.maxRequests.max + 1, maxOutputTokens: null, maxJobsPerHour: null }), (error: Error) => error instanceof AgentError && error.code === 'BUDGET_OUT_OF_BOUNDS');
@@ -259,7 +259,7 @@ test('when more than one enabled agent names one project, only the scopes every 
   const record = (id: string, scopes: AgentScope[], enabled = true, archived = false): AgentRecord => ({
     version: 1, id, name: id, description: '', enabled, archived,
     model: { provider: 'scripted', modelId: 'scripted-1' },
-    workspace: { projectId: 'project', subpath: '' },
+    workspace: { scope: { kind: 'projects', projectIds: ['project'] }, subpath: '' },
     budgets: { maxRequests: null, maxOutputTokens: null, maxJobsPerHour: null },
     scopes, revision: 1, createdAt: new Date(0).toISOString(), updatedAt: new Date(0).toISOString(),
     updatedBy: { kind: 'owner', identity: 'owner' }
@@ -272,6 +272,84 @@ test('when more than one enabled agent names one project, only the scopes every 
   // Two agents: only the intersection is in force, which is the safe direction and never a widening.
   assert.deepEqual(scopesInForceFor([record('a', ['read_notes', 'record_note']), record('b', ['read_notes'])]), ['read_notes']);
   assert.deepEqual(scopesInForceFor([record('a', ['read_notes']), record('b', ['record_note'])]), [], 'nothing is shared, so nothing is in force');
+});
+
+test('a project scope of two projects acts in both, is refused in a third, and an all-projects choice, an empty set, an unknown id and a duplicate each fail the way the rule says', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pilot-agents-scope-'));
+  const store = new ControlStore(root);
+  const p1 = randomUUID(), p2 = randomUUID(), p3 = randomUUID();
+  const agents = new AgentStore(store, { models: () => OFFERED, projectKnown: (id) => id === p1 || id === p2 });
+  const draft = (over: Partial<AgentDraft> = {}): AgentDraft => ({
+    name: 'Multi', description: '', enabled: true, model: { provider: 'scripted', modelId: 'scripted-1' },
+    workspace: { scope: { kind: 'projects', projectIds: [p2, p1] }, subpath: '' },
+    budgets: { maxRequests: null, maxOutputTokens: null, maxJobsPerHour: null }, scopes: ['read_notes'], ...over
+  });
+  try {
+    const two = agents.create({ draft: draft(), actor: OWNER });
+    // The stored set is canonical (sorted), and the agent is in force in each allowed project only.
+    assert.deepEqual([...(two.workspace.scope as { projectIds: readonly string[] }).projectIds], [p1, p2].sort());
+    assert.ok(agents.forProject(p1).some((record) => record.id === two.id));
+    assert.ok(agents.forProject(p2).some((record) => record.id === two.id));
+    assert.equal(agents.forProject(p3).length, 0, 'a project outside the set is not in force');
+    assert.equal(projectScopeAllows(two.workspace.scope, p1), true);
+    assert.equal(projectScopeAllows(two.workspace.scope, p3), false);
+
+    // ALL is a deliberate, explicit choice and allows every project, including one never named.
+    const all = agents.create({ draft: draft({ name: 'Everywhere', workspace: { scope: { kind: 'all' }, subpath: '' } }), actor: OWNER });
+    assert.equal(projectScopeAllows(all.workspace.scope, p3), true);
+    assert.equal(all.workspace.scope.kind, 'all');
+
+    // An empty set is refused rather than silently widened to all projects.
+    const empty = await refused(() => agents.create({ draft: draft({ name: 'Empty', workspace: { scope: { kind: 'projects', projectIds: [] }, subpath: '' } }), actor: OWNER }), 'INVALID');
+    assert.match(empty, /at least one project/);
+    // An unknown project id is refused, and the reason names the offending id, never a path.
+    const unknown = await refused(() => agents.create({ draft: draft({ name: 'Unknown', workspace: { scope: { kind: 'projects', projectIds: [p3] }, subpath: '' } }), actor: OWNER }), 'WORKSPACE_NOT_IN_PROJECT');
+    assert.match(unknown, new RegExp(p3));
+    assert.ok(!unknown.includes('/'), 'the refusal names no filesystem path');
+    // A duplicate id is refused rather than deduplicated.
+    const duplicate = await refused(() => parseAgentWorkspace({ scope: { kind: 'projects', projectIds: [p1, p1] }, subpath: '' }), 'INVALID');
+    assert.match(duplicate, /repeats a project id/);
+    // A shape that is neither 'all' nor 'projects' fails closed. The older single-project shape is
+    // accepted for backward compatibility and normalised into a one-project set.
+    assert.throws(() => parseAgentWorkspace({ scope: { kind: 'some' }, subpath: '' }), (error: Error) => error instanceof AgentError);
+    assert.deepEqual([...(parseAgentWorkspace({ projectId: p1, subpath: '' }).scope as { projectIds: readonly string[] }).projectIds], [p1]);
+    assert.equal(agents.list().length, 2, 'no refused creation wrote anything');
+  } finally { store.close(); await rm(root, { recursive: true, force: true }); }
+});
+
+test('a session binding is revision-checked and durable, and the same session with the agent unbound has no privileges', async () => {
+  const f = await fixture();
+  try {
+    const agent = f.agents.create({ draft: f.draft({ scopes: ['read_notes', 'record_note'] }), actor: OWNER });
+    // Revision 0 is "no binding yet"; the write produces revision 1.
+    const bound = f.agents.bindSession({ projectId: f.projectId, sessionId: '1', revision: 0, agentId: agent.id, actor: OWNER });
+    assert.equal(bound.revision, 1);
+    assert.deepEqual(bound.boundBy, OWNER);
+    assert.ok(Number.isFinite(Date.parse(bound.boundAt)), 'the binding records when it was made');
+    // The authority now follows the bound agent: its scopes and its project scope.
+    assert.deepEqual(f.agents.authorityForSession({ projectId: f.projectId, sessionId: '1' }), { agentId: agent.id, scopes: ['read_notes', 'record_note'], projects: [f.projectId], emptyReason: null });
+    // A stale revision writes nothing.
+    const stale = await refused(() => f.agents.bindSession({ projectId: f.projectId, sessionId: '1', revision: 0, agentId: null, actor: OWNER }), 'CONFLICT');
+    assert.match(stale, /binding revision 1, not 0/);
+
+    // Unbinding the same session is an explicit empty allowlist: every tool is refused, with a reason.
+    const unbound = f.agents.bindSession({ projectId: f.projectId, sessionId: '1', revision: 1, agentId: null, actor: OWNER });
+    assert.equal(unbound.agentId, null);
+    const authority = f.agents.authorityForSession({ projectId: f.projectId, sessionId: '1' });
+    assert.equal(authority.agentId, null);
+    assert.deepEqual([...authority.scopes!], []);
+    assert.match(authority.emptyReason ?? '', /No agent is bound to this session/);
+
+    // The binding is durable across a new store handle on the same data root.
+    const reopened = new AgentStore(f.store, { models: () => OFFERED, projectKnown: () => true });
+    assert.deepEqual(reopened.binding(f.projectId, '1')?.revision, 2);
+    assert.equal(reopened.binding(f.projectId, '1')?.agentId, null);
+    // One binding operation per revision, with its own outbox row as the audit evidence.
+    const rows = f.store.db.prepare("SELECT count(*) AS n FROM operations WHERE kind='agent.binding'").get() as { n: number };
+    assert.equal(rows.n, 2);
+    const outboxes = f.store.db.prepare("SELECT count(*) AS n FROM outboxes WHERE kind='agent.binding'").get() as { n: number };
+    assert.equal(outboxes.n, 2);
+  } finally { await f.cleanup(); }
 });
 
 test('the scope list is canonical, bounded and duplicate-free, and an oversize registry is refused', async () => {

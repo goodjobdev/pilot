@@ -352,7 +352,7 @@ async function privilegeInstance(root:string,scopes:readonly string[]){
  const agent=created.agentStore!.create({draft:{
    name:'Scope fixture',description:'A bounded agent.',enabled:true,
    model:{provider:offered.provider,modelId:offered.modelId},
-   workspace:{projectId:project.id,subpath:''},
+   workspace:{scope:{kind:'projects',projectIds:[project.id]},subpath:''},
    budgets:{maxRequests:null,maxOutputTokens:null,maxJobsPerHour:null},
    scopes:scopes as never
  },actor:{kind:'owner',identity:'local'}});
@@ -423,6 +423,103 @@ test('an agent is offered only the tools its scopes name, and a call to a tool i
  * selected, and again at dispatch, against the model the submission will actually run under. A
  * client-side hint is not enough, and a refusal is never a silent drop.
  */
+/**
+ * The missing link the owner reported: a **session** bound to an **agent**.
+ *
+ * Before this round the authority was resolved per project and nothing bound a running conversation
+ * to a chosen agent, so a session reported "no privileges". These tests prove the wire end to end: a
+ * bound session uses its agent's scopes, the same session unbound refuses every tool with a named
+ * reason and no side effect, a rebind takes effect at the next dispatch without a restart, and the
+ * binding is durable across a restart. No model is called: the scripted provider drives the calls.
+ */
+test('a session bound to an agent uses its scopes, the same session unbound refuses with a reason and writes nothing, and the rebind takes effect at the next dispatch',async()=>{
+  const root=await mkdtemp(join(tmpdir(),'dashboard-agents-binding-'));
+  const app=await privilegeInstance(root,['read_notes','record_note']);
+  const bind=(revision:number,agentId:string|null)=>app.created.agentStore!.bindSession({projectId:app.project.id,sessionId:'1',revision,agentId,actor:{kind:'owner',identity:'local'}});
+  try{
+    // Bind the project's root conversation (session '1' is Pi's reserved root) to this agent.
+    bind(0,app.agent.id);
+    // Opening the conversation reads the binding, so the agent's tools are offered.
+    await app.view();
+    assert.equal((await app.send({text:'[note the bound session may write this]',mode:'followUp'})).status,200);
+    await waitFor(async()=>{const ok=await stat(app.notesFile).then(()=>true).catch(()=>false);return ok?true:undefined;});
+    assert.match(await readFile(app.notesFile,'utf8'),/the bound session may write this/,'a bound session really used its agent\u2019s scope');
+
+    // Unbind the very same session: it now has no agent, so a tool call is refused with the reason.
+    // The tool differs (read_notes) only because the scripted provider never repeats a call it has
+    // already made in one conversation; the point proven is the authority, not the tool.
+    bind(1,null);
+    const before=await readFile(app.notesFile,'utf8');
+    assert.equal((await app.send({text:'[read-notes]',mode:'followUp'})).status,200);
+    const refused=await transcriptText(app);
+    assert.match(refused,/blocked/i,'the refusal is reported in the transcript');
+    assert.match(refused,/No agent is bound to this session/,'the refusal names why there are no privileges');
+    assert.equal(await readFile(app.notesFile,'utf8'),before,'an unbound session wrote nothing');
+  }finally{await app.created.close();app.store.close();}
+});
+
+test('a session binding is durable across a restart and still governs the dispatch after it',async()=>{
+  const root=await mkdtemp(join(tmpdir(),'dashboard-agents-binding-restart-'));
+  const first=await privilegeInstance(root,['read_notes','record_note']);
+  let projectId='',agentId='';
+  try{
+    projectId=first.project.id;agentId=first.agent.id;
+    first.created.agentStore!.bindSession({projectId,sessionId:'1',revision:0,agentId,actor:{kind:'owner',identity:'local'}});
+    assert.equal((await first.send({text:'[note before the restart]',mode:'followUp'})).status,200);
+    await waitFor(async()=>{const ok=await stat(first.notesFile).then(()=>true).catch(()=>false);return ok?true:undefined;});
+  }finally{await first.created.close();first.store.close();}
+
+  // A second process on the same data root: no agent is recreated, so this reads the binding back.
+  const security=localConfig('http://127.0.0.1:0');
+  const store=new ControlStore(root);
+  const created=await createApp({dataRoot:root,browseRoots:[],security,agents:'on',agentPauseMs:150,control:store});
+  await new Promise<void>(ok=>created.server.listen(0,'127.0.0.1',ok));
+  security.origin='http://127.0.0.1:'+(created.server.address() as {port:number}).port;
+  const token={'x-dashboard-token':security.token};
+  const writes={...token,'content-type':'application/json',origin:security.origin};
+  try{
+    const project=(await (await fetch(security.origin+'/api/projects',{headers:token})).json() as {id:string;path:string}[]).find(candidate=>candidate.id===projectId)!;
+    assert.deepEqual(created.agentStore!.binding(projectId,'1')?.agentId,agentId,'the binding survived the restart');
+    const base=security.origin+'/api/projects/'+projectId+'/agents';
+    await fetch(base,{headers:token});
+    // read_notes is never repeated by the scripted provider, so it really runs under the restored
+    // binding and returns the note the first process wrote.
+    assert.equal((await fetch(base+'/input',{method:'POST',headers:writes,body:JSON.stringify({text:'[read-notes]',mode:'followUp'})})).status,200);
+    await waitFor(async()=>{const v=await (await fetch(base,{headers:token})).json() as {view:{working:boolean;entries:{kind:string;text:string}[]}};return v.view.working?undefined:v;});
+    const view=await (await fetch(base,{headers:token})).json() as {view:{entries:{kind:string;text:string}[]}};
+    assert.ok(view.view.entries.some(entry=>entry.text.includes('before the restart')),'the restored binding still governs the dispatch');
+  }finally{await created.close();store.close();}
+});
+
+test('a session bound to a multi-project agent acts in the projects it names and is refused in one it does not, with no side effect',async()=>{
+  const root=await mkdtemp(join(tmpdir(),'dashboard-agents-multiproject-'));
+  const app=await privilegeInstance(root,['read_notes','record_note']);
+  try{
+    // A second registered project the narrow agent never names.
+    const second=await (await fetch(app.security.origin+'/api/projects',{method:'POST',headers:app.writes,body:JSON.stringify({name:'Elsewhere fixture',managed:true,confirm:true})})).json() as {id:string;path:string};
+    const offered=app.created.agents.offeredModels()[0];
+    const draftFor=(name:string,ids:string[])=>app.created.agentStore!.create({draft:{name,description:'',enabled:true,model:{provider:offered.provider,modelId:offered.modelId},workspace:{scope:{kind:'projects',projectIds:ids},subpath:''},budgets:{maxRequests:null,maxOutputTokens:null,maxJobsPerHour:null},scopes:['read_notes','record_note']},actor:{kind:'owner',identity:'local'}});
+    const both=draftFor('Two projects',[app.project.id,second.id]);
+
+    // Bound to the two-project agent: it may act in this project.
+    app.created.agentStore!.bindSession({projectId:app.project.id,sessionId:'1',revision:0,agentId:both.id,actor:{kind:'owner',identity:'local'}});
+    await app.view();
+    assert.equal((await app.send({text:'[note inside the allowed project]',mode:'followUp'})).status,200);
+    await waitFor(async()=>{const ok=await stat(app.notesFile).then(()=>true).catch(()=>false);return ok?true:undefined;});
+    assert.match(await readFile(app.notesFile,'utf8'),/inside the allowed project/);
+
+    // Rebind to an agent that does not name this project: a call is refused by the project scope,
+    // with no effect. read_notes is used because the scripted provider never repeats record_note.
+    const elsewhere=draftFor('Elsewhere only',[second.id]);
+    app.created.agentStore!.bindSession({projectId:app.project.id,sessionId:'1',revision:1,agentId:elsewhere.id,actor:{kind:'owner',identity:'local'}});
+    const before=await readFile(app.notesFile,'utf8');
+    assert.equal((await app.send({text:'[read-notes]',mode:'followUp'})).status,200);
+    const refused=await transcriptText(app);
+    assert.match(refused,/outside this dispatch.s project scope/,'the refusal names the project scope');
+    assert.equal(await readFile(app.notesFile,'utf8'),before,'a refused call wrote nothing');
+  }finally{await app.created.close();app.store.close();}
+});
+
 test('an image is refused at admission and again at dispatch when the model cannot take it',async()=>{
   const root=await mkdtemp(join(tmpdir(),'dashboard-agents-vision-'));
   const app=await instance('on',root,200);

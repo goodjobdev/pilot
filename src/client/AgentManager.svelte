@@ -28,7 +28,30 @@
  let actorKind=$state<'owner'|'agent'>('owner'),actorIdentity=$state('local');
 
  function blank():AgentDraftBody{
-  return {name:'',description:'',enabled:true,model:{provider:'',modelId:''},workspace:{projectId:'',subpath:''},budgets:{maxRequests:null,maxOutputTokens:null,maxJobsPerHour:null},scopes:[]};
+  return {name:'',description:'',enabled:true,model:{provider:'',modelId:''},workspace:{scope:{kind:'projects',projectIds:[]},subpath:''},budgets:{maxRequests:null,maxOutputTokens:null,maxJobsPerHour:null},scopes:[]};
+ }
+ /** The first project the workspace names, or the workspace's own ledger project, for the file-edit read. */
+ function workspaceProject():string{return draft.workspace.scope.kind==='projects'?draft.workspace.scope.projectIds[0]??'':projects[0]?.id??'';}
+ /** Whether the workspace allows a project. 'all' allows every project. */
+ function allowsProject(id:string):boolean{return draft.workspace.scope.kind==='all'||draft.workspace.scope.projectIds.includes(id);}
+ function setAllProjects(on:boolean){
+  draft={...draft,workspace:{...draft.workspace,scope:on?{kind:'all' as const}:{kind:'projects' as const,projectIds:[]}}};
+ }
+ function toggleProject(id:string,on:boolean){
+  if(draft.workspace.scope.kind!=='projects')return;
+  const current=draft.workspace.scope.projectIds;
+  const next=on?[...current,id]:current.filter(candidate=>candidate!==id);
+  draft={...draft,workspace:{...draft.workspace,scope:{kind:'projects' as const,projectIds:next}}};
+ }
+ /** A record's workspace as an editable draft (the stored project list is readonly; the draft's is not). */
+ function draftWorkspace(workspace:AgentRecord['workspace']):AgentDraftBody['workspace']{
+  return {scope:workspace.scope.kind==='all'?{kind:'all'}:{kind:'projects',projectIds:[...workspace.scope.projectIds]},subpath:workspace.subpath};
+ }
+ /** The owner-visible summary of an agent's project scope: every project, or the names it names. */
+ function projectSummary(agent:AgentRecord):string{
+  if(agent.workspace.scope.kind==='all')return 'all projects';
+  const names=agent.workspace.scope.projectIds.map(id=>projects.find(project=>project.id===id)?.name??id);
+  return names.length?names.join(', '):'no projects';
  }
  /** The field a server refusal names, so the error lands beside the input that caused it. */
  const FIELDS=['name','description','enabled','model','workspace','budgets','scopes','agentId','revision','patch','draft','actor','request'];
@@ -57,7 +80,7 @@
   try{
    registry=await api.agentRegistry();
    projects=await api.projects();
-   if(!draft.workspace.projectId)draft={...draft,workspace:{projectId:projects[0]?.id??'',subpath:''}};
+   if(draft.workspace.scope.kind==='projects'&&draft.workspace.scope.projectIds.length===0&&projects[0])draft={...draft,workspace:{...draft.workspace,scope:{kind:'projects' as const,projectIds:[projects[0].id]}}};
    if(!draft.model.provider&&registry.models.length)draft={...draft,model:{...registry.models[0]}};
    if(selected)await loadOne(selected);
    else if(!creating)selectFirst();
@@ -70,21 +93,21 @@
  async function select(id:string){
   creating=false;selected=id;fieldErrors={};problem='';message='';
   const record=registry?.agents.find(agent=>agent.id===id);
-  if(record)draft={name:record.name,description:record.description,enabled:record.enabled,model:{...record.model},workspace:{...record.workspace},budgets:{...record.budgets},scopes:[...record.scopes]};
+  if(record)draft={name:record.name,description:record.description,enabled:record.enabled,model:{...record.model},workspace:draftWorkspace(record.workspace),budgets:{...record.budgets},scopes:[...record.scopes]};
   await loadOne(id);
  }
  async function loadOne(id:string){
   try{
    const detail=await api.agent(id);
    // The server is the authority: the form shows the record it just read back, never the draft alone.
-   draft={name:detail.agent.name,description:detail.agent.description,enabled:detail.agent.enabled,model:{...detail.agent.model},workspace:{...detail.agent.workspace},budgets:{...detail.agent.budgets},scopes:[...detail.agent.scopes]};
+   draft={name:detail.agent.name,description:detail.agent.description,enabled:detail.agent.enabled,model:{...detail.agent.model},workspace:draftWorkspace(detail.agent.workspace),budgets:{...detail.agent.budgets},scopes:[...detail.agent.scopes]};
    registry=registry?{...registry,agents:registry.agents.map(agent=>agent.id===id?detail.agent:agent)}:registry;
   }catch(e){problem=(e as Error).message;}
  }
  function startCreate(){
   creating=true;selected=null;fieldErrors={};problem='';message='';
   draft=blank();
-  draft={...draft,workspace:{projectId:projects[0]?.id??'',subpath:''},model:registry?.models[0]?{...registry.models[0]}:{provider:'',modelId:''}};
+  draft={...draft,workspace:{scope:projects[0]?{kind:'projects' as const,projectIds:[projects[0].id]}:{kind:'projects' as const,projectIds:[]},subpath:''},model:registry?.models[0]?{...registry.models[0]}:{provider:'',modelId:''}};
  }
  function toggleScope(scope:string,on:boolean){
   draft={...draft,scopes:on?[...draft.scopes,scope]:draft.scopes.filter(candidate=>candidate!==scope)};
@@ -113,7 +136,7 @@
     await load();
     message='Saved '+updated.agent.name+' at revision '+updated.agent.revision+'.';
    }
-   onchanged?.(draft.workspace.projectId);
+   onchanged?.(workspaceProject());
   }catch(e){report(e);}
   finally{busy=false;}
  }
@@ -150,7 +173,7 @@
   if(!projectId||!registry?.fileEdit.enabled)return;
   try{ledger=await api.fileEdits(projectId);}catch{ledger=null;}
  }
- $effect(()=>{const projectId=draft.workspace.projectId;if(registry?.fileEdit.enabled)void loadLedger(projectId);});
+ $effect(()=>{const projectId=workspaceProject();if(registry?.fileEdit.enabled)void loadLedger(projectId);});
  const summary=(agent:AgentRecord)=>agent.scopes.length?agent.scopes.join(', '):'no scopes';
 </script>
 <dialog bind:this={dialog} oncancel={onclose} class="agent-manager">
@@ -171,6 +194,7 @@
    <button class="agent-row" class:active={selected===agent.id&&!creating} aria-pressed={selected===agent.id&&!creating} onclick={()=>void select(agent.id)}>
     <span class="agent-name">{agent.name}</span>
     <span class="agent-scopes">{summary(agent)}</span>
+    <span class="agent-scopes">projects: {projectSummary(agent)}</span>
     <span class="pills">
      {#if agent.archived}<span class="pill">archived</span>{:else if agent.enabled}<span class="pill on">enabled</span>{:else}<span class="pill">disabled</span>{/if}
      <span class="pill">r{agent.revision}</span>
@@ -192,10 +216,17 @@
      {#each registry.models as model (model.provider+'/'+model.modelId)}<option value={model.provider+'/'+model.modelId}>{model.provider} / {model.modelId}</option>{/each}
     </select></label>
     {#if fieldErrors.model}<small class="field-error" role="alert">{fieldErrors.model}</small>{/if}
-    <label>Workspace project<select aria-label="Agent workspace project" value={draft.workspace.projectId} onchange={e=>draft={...draft,workspace:{...draft.workspace,projectId:e.currentTarget.value}}}>
-     {#each projects as project (project.id)}<option value={project.id}>{project.name}</option>{/each}
-    </select></label>
-    <label>Subpath inside that project<input aria-label="Agent workspace subpath" bind:value={draft.workspace.subpath} placeholder="empty is the project root" spellcheck="false"></label>
+    <span class="popover-heading">PROJECT SCOPE</span>
+    <small class="muted">Where this agent may act. A call that acts on a project outside this scope is refused server-side, even when the tool is otherwise permitted.</small>
+    <label class="row"><input type="checkbox" aria-label="All projects" checked={draft.workspace.scope.kind==='all'} onchange={e=>setAllProjects(e.currentTarget.checked)}>All projects</label>
+    {#if draft.workspace.scope.kind!=='all'}
+    <div class="scopes" aria-label="Allowed projects">
+     {#each projects as project (project.id)}
+     <label class="scope"><input type="checkbox" aria-label={'Project '+project.name} checked={allowsProject(project.id)} onchange={e=>toggleProject(project.id,e.currentTarget.checked)}><span><strong>{project.name}</strong></span></label>
+     {/each}
+    </div>
+    {/if}
+    <label>Subpath inside each project<input aria-label="Agent workspace subpath" bind:value={draft.workspace.subpath} placeholder="empty is each project root" spellcheck="false"></label>
     {#if fieldErrors.workspace}<small class="field-error" role="alert">{fieldErrors.workspace}</small>{/if}
     <div class="budgets">
      <label>Max requests<input aria-label="Agent max requests" value={draft.budgets.maxRequests??''} inputmode="numeric" oninput={e=>budget('maxRequests',e.currentTarget.value)}></label>

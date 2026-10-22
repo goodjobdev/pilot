@@ -28,8 +28,9 @@ follow-up work, and until it is done, these surfaces keep their own handlers:
   represented by a placeholder — and their buttons are not part of this command surface. (The queue's
   own dispatch *is* a declared action, `queue.submit`; the shell's
   `/api/projects/:id/agents/input` route keeps its own handler. See *Queued inputs*.)
-- **A slash surface or a per-action button.** Neither exists yet, so nothing declares one (see
-  *Surfaces*).
+- **A per-action button.** None exists yet, so nothing declares one (see *Surfaces*). (The composer's
+  slash surface described below is implemented, but it is driven by the registry rather than by a
+  declared `'slash'` surface in this build — see *Surfaces*.)
 
 So: every action the palette offers is declared exactly once and has a handler; several older routes
 and several shell controls still use their own handlers; and no button or shortcut is claimed to
@@ -367,7 +368,7 @@ refused as not found).
 
 **`agent.create`** — `AGENT_SCOPE_KNOWN` (every scope is one of the closed vocabulary and none is
 repeated), `AGENT_MODEL_OFFERED` (the declared model is one this instance really offers), `AGENT_WORKSPACE_IN_PROJECT`
-(the workspace names a registered project, with a subpath that cannot escape its root), `AGENT_BUDGETS_BOUNDED`
+(the project scope is `{kind:'all'}` or a non-empty, duplicate-free set of registered project ids, with a subpath that cannot escape any allowed root), `AGENT_BUDGETS_BOUNDED`
 (every budget is null or inside its documented bound), `AGENT_NAME_UNIQUE` (no live agent already carries
 this name), `AGENT_CHANGE_PERMITTED` (the owner may create any agent, and an agent may not create one at
 all).
@@ -471,10 +472,25 @@ may accept is not something an agent may set).
 
 ## Surfaces
 
-The closed set of surfaces is `slash`, `palette`, `button`. In this build only the **palette**
-exists, so every action declares `['palette']` and nothing declares a surface that is not
-implemented. A slash-command surface or a per-action button can be added later; when it is, the
-action that it really offers declares it.
+The closed set of surfaces is `slash`, `palette`, `button`. In this build the **palette** is the
+only declared surface, so every action declares `['palette']` and nothing declares a surface that is
+not declared by the registry.
+
+The composer nonetheless offers a **slash surface**, and it is driven by this same registry rather
+than by a second list:
+
+- the composer asks `/api/actions` for the actions the current project and session scope may use and
+  offers the ones whose declared `surfaces` include `'slash'`; because this build declares none, the
+  documented fallback is **every action the server offered in scope**, which is still the registry's
+  own list. When a later build adds `'slash'` to an action, the composer picks it up with no client
+  change. See `src/client/slash.ts`.
+- typing `/` opens the list; the text after `/` filters it by the descriptor's `id` and `label`;
+  the chosen action runs through the same `/api/actions/execute` path the palette calls, in the
+  composer's own scope, and the server's own result or refusal is shown in its own words.
+- only implemented actions appear, because only implemented actions are in the registry at all.
+
+A per-action **button** surface can be added later; when it is, the action that it really offers
+declares it.
 
 ## What is deliberately absent
 

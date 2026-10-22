@@ -1396,7 +1396,7 @@ test('the agent registry routes are owner-only, strict, governance-checked, and 
 
   const project=await (await post('/api/projects',{name:'Agents API',managed:true,confirm:true})).json();
   const offered=app.agents.offeredModels()[0];
-  const draft=(over:Record<string,unknown>={})=>({name:'API worker',description:'',enabled:true,model:{provider:offered.provider,modelId:offered.modelId},workspace:{projectId:project.id,subpath:''},budgets:{maxRequests:null,maxOutputTokens:null,maxJobsPerHour:null},scopes:['read_notes'],...over});
+  const draft=(over:Record<string,unknown>={})=>({name:'API worker',description:'',enabled:true,model:{provider:offered.provider,modelId:offered.modelId},workspace:{scope:{kind:'projects',projectIds:[project.id]},subpath:''},budgets:{maxRequests:null,maxOutputTokens:null,maxJobsPerHour:null},scopes:['read_notes'],...over});
   const actor={kind:'owner',identity:'local'};
   const created=await post('/api/agents',{draft:draft(),actor});
   assert.equal(created.status,201);
@@ -1411,7 +1411,7 @@ test('the agent registry routes are owner-only, strict, governance-checked, and 
   const badModel=await post('/api/agents',{draft:draft({name:'Other',model:{provider:'scripted',modelId:'nope'}}),actor});
   assert.equal(badModel.status,422);
   assert.match((await badModel.json()).error,/not one this instance offers/);
-  const badSubpath=await post('/api/agents',{draft:draft({name:'Other',workspace:{projectId:project.id,subpath:'../escape'}}),actor});
+  const badSubpath=await post('/api/agents',{draft:draft({name:'Other',workspace:{scope:{kind:'projects',projectIds:[project.id]},subpath:'../escape'}}),actor});
   assert.equal(badSubpath.status,422);
   assert.match((await badSubpath.json()).error,/a subpath must be a relative path with no empty, current or parent segment/);
   const duplicate=await post('/api/agents',{draft:draft(),actor});
@@ -1448,6 +1448,53 @@ test('the agent registry routes are owner-only, strict, governance-checked, and 
   const viaAction=await (await post('/api/actions/execute',{id:'agent.list',params:{}})).json();
   assert.equal(viaAction.result.agents.length,1);
   assert.equal(viaAction.result.fileEdit.enabled,false);
+ }finally{await app.close();store.close();await rm(root,{recursive:true,force:true});}
+});
+
+test('the session agent binding is owner-only, revision-checked and reported with the authority it puts in force',async()=>{
+ const security=localConfig('http://127.0.0.1:0');
+ const root=await mkdtemp(join(tmpdir(),'dashboard-session-binding-api-'));
+ const store=new ControlStore(root);
+ const app=await createApp({dataRoot:root,browseRoots:[],security,agents:'on',control:store});
+ await listen(app,security);
+ try{
+  const url=security.origin,token={'x-dashboard-token':security.token},writes={...token,'content-type':'application/json',origin:url};
+  const post=async(path:string,body:unknown)=>fetch(url+path,{method:'POST',headers:writes,body:JSON.stringify(body)});
+  const read=async(path:string)=>fetch(url+path,{headers:token});
+  const project=await (await post('/api/projects',{name:'Binding API',managed:true,confirm:true})).json();
+  const session=await (await post('/api/sessions',{projectId:project.id,name:'Binding session'})).json();
+  const base='/api/sessions/'+session.session.id+'/agent?projectId='+project.id;
+  const offered=app.agents.offeredModels()[0];
+  const agent=await (await post('/api/agents',{draft:{name:'Binder',description:'',enabled:true,model:{provider:offered.provider,modelId:offered.modelId},workspace:{scope:{kind:'projects',projectIds:[project.id]},subpath:''},budgets:{maxRequests:null,maxOutputTokens:null,maxJobsPerHour:null},scopes:['read_notes']},actor:{kind:'owner',identity:'local'}})).json();
+  // Auth and origin apply to the binding route like every other write.
+  assert.equal((await fetch(url+'/api/sessions/'+session.session.id+'/agent?projectId='+project.id)).status,401);
+  assert.equal((await fetch(url+'/api/sessions/'+session.session.id+'/agent',{method:'POST',headers:{...token,'content-type':'application/json',origin:'https://evil.example'},body:'{}'})).status,403);
+  // The read reports no binding yet, but the project-level rule that predates it is still in force.
+  const before=await (await read(base)).json();
+  assert.equal(before.binding,null);
+  assert.equal(before.authority.agentId,agent.agent.id);
+  // Binding revision 0 produces revision 1; the authority follows the bound agent.
+  const bound=await (await post('/api/sessions/'+session.session.id+'/agent',{projectId:project.id,revision:0,agentId:agent.agent.id,actor:{kind:'owner',identity:'local'}})).json();
+  assert.deepEqual([bound.binding.revision,bound.binding.agentId],[1,agent.agent.id]);
+  assert.deepEqual(bound.authority.scopes,['read_notes']);
+  // Unbinding the same session is an explicit empty allowlist with a named reason.
+  const unbound=await (await post('/api/sessions/'+session.session.id+'/agent',{projectId:project.id,revision:1,agentId:null,actor:{kind:'owner',identity:'local'}})).json();
+  assert.equal(unbound.binding.agentId,null);
+  assert.deepEqual(unbound.authority.scopes,[]);
+  assert.match(unbound.authority.emptyReason,/No agent is bound to this session/);
+  // A stale revision writes nothing, and an unknown agent is refused as not found.
+  const stale=await post('/api/sessions/'+session.session.id+'/agent',{projectId:project.id,revision:1,agentId:agent.agent.id,actor:{kind:'owner',identity:'local'}});
+  assert.equal(stale.status,409);
+  const unknown=await post('/api/sessions/'+session.session.id+'/agent',{projectId:project.id,revision:2,agentId:randomUUID(),actor:{kind:'owner',identity:'local'}});
+  assert.equal(unknown.status,404);
+  // The session overview reports the durable binding, so the list can show it without a second read.
+  const listed=await (await read('/api/sessions?projectId='+project.id)).json();
+  const overview=listed.sessions.find((entry:any)=>entry.id===session.session.id);
+  assert.deepEqual([overview.agent.revision,overview.lifecycle.recorded,overview.lifecycle.state],[2,false,'idle']);
+  // The dismissal route is owner-only and validates its body before anything is opened.
+  assert.equal((await fetch(url+'/api/projects/'+project.id+'/agents/dismiss',{method:'POST',headers:writes,body:JSON.stringify({questionId:'x'})})).status,400);
+  assert.equal((await fetch(url+'/api/projects/'+project.id+'/agents/dismiss',{method:'POST',headers:{...token,'content-type':'application/json',origin:'https://evil.example'},body:'{}'})).status,403);
+  assert.equal((await fetch(url+'/api/projects/'+project.id+'/agents/dismiss')).status,401);
  }finally{await app.close();store.close();await rm(root,{recursive:true,force:true});}
 });
 
