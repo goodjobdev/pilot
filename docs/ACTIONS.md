@@ -69,13 +69,15 @@ and asking for such an action anyway is refused with a precise reason rather tha
 
 ## The implemented actions
 
-Forty actions exist in this build. Nothing else is declared, and none of them commits, pushes,
+Forty-seven actions exist in this build. Nothing else is declared, and none of them commits, pushes,
 deploys, spends, provisions or publishes.
 
 Five of them are the **bounded coding runner**, and they are **disabled by default** behind an explicit
 environment switch (`docs/RUNNER.md`). A capability this instance lacks is not offered: with the runner
 disabled its five actions are absent from the list below and from `/api/actions`, rather than present
-and failing, and asking for one anyway is refused with the named reason.
+and failing, and asking for one anyway is refused with the named reason. The same rule applies to the
+two **bounded file-edit** actions, which are disabled by default behind their own explicit switch, and
+to the five **agent registry** actions, which need a durable control store.
 
 ### Session lifecycle — scope: `project` + `session`
 
@@ -211,6 +213,41 @@ is not an action of this registry in this build: the guarded dispatch lives in t
 owner surface offers creation, listing, resume and discard. See `docs/FORKS.md` for the model, the
 bounds and the honest limits.
 
+### The agent registry and its privilege scopes — scope: none
+
+An **agent** is a durable, revision-checked record with an explicit scope allowlist; see
+`docs/AGENTS.md` for the model, the closed vocabulary and the governance rules. These five actions
+create, read, change and archive one, and the enforcement the allowlist drives happens at **dispatch**,
+not through any of them.
+
+| id | effect | writes |
+|---|---|---|
+| `agent.list` | reads every agent with its revision and allowlist, the closed vocabulary with each description, the models this instance offers and the file-edit switch | no |
+| `agent.read` | reads one agent and its durable audit trail: who changed it, what changed and when | no |
+| `agent.create` | writes revision 1 of one agent from a validated draft | yes |
+| `agent.update` | writes the next revision of one agent under a revision check | yes |
+| `agent.archive` | closes one agent so it is never in force again, keeping every field it held | yes |
+
+None of the five commits, pushes, deploys, spends, provisions or publishes, and none of them changes
+what any running generation may do: an allowlist is read by the dispatch path on every tool call, and a
+change takes effect there rather than here.
+
+### The bounded file-edit capability — scope: `project`
+
+Two actions expose the capability the `file_edit` scope governs. Both are **disabled by default**
+behind an explicit environment switch, and while it is disabled they are **absent from the list below
+and from `/api/actions`** rather than present and failing, exactly as the coding runner's are.
+
+| id | effect | writes |
+|---|---|---|
+| `file-edit.read` | reads one project's proposed and applied changes, each with its diff, beside the mode in force | no |
+| `file-edit.write` | records one bounded change inside the project's connected repository worktree, and writes the file only where the acceptance policy permits | yes |
+
+`file-edit.write` in **propose-only** mode records the change and its diff and writes **no file at
+all**; in **auto-apply** it writes the file atomically. The mode in force comes from the acceptance
+policy rather than from an assumption. Neither action commits, pushes, deploys, spends, provisions or
+publishes, and neither ever edits outside the connected worktree. See `docs/AGENTS.md`.
+
 ## Preconditions, action by action
 
 Every code below is from the closed vocabulary. A request that trips one of them changes nothing.
@@ -321,6 +358,42 @@ dirty worktree becomes the named operator-attention state `worktree-dirty` and i
 it is), `TRANSITION_LEGAL`. A worktree git will not remove or cannot report becomes
 `worktree-remove-refused` or `worktree-unreadable`; nothing is ever forced implicitly. No-op:
 discarding a fork whose worktree is already gone completes the discard and removes nothing.
+
+**`agent.list`** — no precondition beyond the schema. No-op: a registry with no agent reads as an
+empty list beside the full scope vocabulary.
+
+**`agent.read`** — `AGENT_EXISTS` (the id names an agent this registry holds; an unknown one is
+refused as not found).
+
+**`agent.create`** — `AGENT_SCOPE_KNOWN` (every scope is one of the closed vocabulary and none is
+repeated), `AGENT_MODEL_OFFERED` (the declared model is one this instance really offers), `AGENT_WORKSPACE_IN_PROJECT`
+(the workspace names a registered project, with a subpath that cannot escape its root), `AGENT_BUDGETS_BOUNDED`
+(every budget is null or inside its documented bound), `AGENT_NAME_UNIQUE` (no live agent already carries
+this name), `AGENT_CHANGE_PERMITTED` (the owner may create any agent, and an agent may not create one at
+all).
+
+**`agent.update`** — `AGENT_EXISTS`, `REVISION_MATCHES` (a stale revision is a conflict that writes
+nothing), `AGENT_SCOPE_KNOWN`, `AGENT_MODEL_OFFERED`, `AGENT_WORKSPACE_IN_PROJECT`, `AGENT_BUDGETS_BOUNDED`,
+`AGENT_NAME_UNIQUE`, `AGENT_CHANGE_PERMITTED` (the owner may change any scope; an agent may neither edit
+its own record nor give another agent a scope it does not hold itself — checked against the allowlist the
+change would leave in force, so widening in two steps is refused at the step that widens). An archived
+agent is refused as a conflict: it is never changed again.
+
+**`agent.archive`** — `AGENT_EXISTS`, `REVISION_MATCHES`, `AGENT_CHANGE_PERMITTED`. Archiving an
+archived agent is a conflict.
+
+**`file-edit.read`** — `PROJECT_REGISTERED`, `FILE_EDIT_ENABLED`. No-op: a project with no recorded
+change reads as an empty list at the documented bounds.
+
+**`file-edit.write`** — `PROJECT_REGISTERED` (with its own folder, which is the connected repository
+worktree the change is contained to), `FILE_EDIT_ENABLED`, `FILE_EDIT_MODE_PERMITTED` (propose-only is
+always permitted; auto-apply is refused while the acceptance policy in force is propose-only, because the
+mode comes from that policy rather than being assumed), `FILE_EDIT_PATH_IN_WORKTREE` (relative, no
+absolute prefix, no backslash, no empty, current or parent segment, no symlink at any component, no
+generated or app-managed directory, and nowhere near the data root), `FILE_EDIT_BOUNDED` (the change,
+and the file it would replace, are inside the documented byte cap; an oversize change is refused rather
+than truncated). No-op: the same change recorded again is the same record, and it writes no second record
+and no second file.
 
 **`queue.read`** — `SESSION_EXISTS`. No-op: a session whose queue was never written reads at
 revision 0 with no entries, which is the queue itself rather than an absence of one.
@@ -497,6 +570,13 @@ nothing is attached at all.
 | `/api/projects/:id/forks` | POST | creates one fork: `{ "parentSessionId": "...", "baseCommit": "<40 hex>", "cutoffEntryId": n, "target": "..." }`. The parent session is named in the body because the fork is created *from* it; a 201 means the fork really exists, and a 200 with `created: false` carries the named operator-attention state instead. |
 | `/api/projects/:id/forks/:childSessionId/resume` | POST | lifts the pause on one fork: `{ "revision": n }`. The child session in the path **is** the fork's identity, so a caller addresses a fork and never a path. |
 | `/api/projects/:id/forks/:childSessionId/discard` | POST | removes one fork's worktree and closes it: `{ "revision": n, "force": false }`. The worktree is the one the durable record carries, re-checked against the designated fork root; without `force` a dirty worktree is never removed. |
+| `/api/agents` | GET | the agent registry: every agent with its revision and allowlist, the closed scope vocabulary with each description, the models this instance offers and the file-edit switch with the mode in force. Read-only. |
+| `/api/agents` | POST | creates one agent: `{ "draft": { ... }, "actor": { "kind": "owner", "identity": "..." } }`. A 201 carries the record at revision 1. |
+| `/api/agents/:id` | GET | one agent and its durable audit trail: who changed it, what changed and when. Read-only. |
+| `/api/agents/:id/update` | POST | writes the next revision of one agent: `{ "revision": n, "patch": { ... }, "actor": { ... } }`. |
+| `/api/agents/:id/archive` | POST | closes one agent so it is never in force again: `{ "revision": n, "actor": { ... } }`. |
+| `/api/projects/:id/file-edits` | GET | one project's proposed and applied file edits, each with its diff, beside the mode in force. Read-only, and refused (503) while the capability is disabled. |
+| `/api/projects/:id/file-edits` | POST | records one bounded change: `{ "request": { "agentId": null, "path": "...", "content": "...", "mode": "propose-only" }, "actor": { ... } }`. The path must stay inside the project's connected repository worktree; `written` in the answer says whether a file was really written. |
 
 All three sit behind the same owner-only authentication as every other route, behind the unchanged
 Host check, and the write carries the same origin and CSRF enforcement. The scope may be supplied in
@@ -548,6 +628,15 @@ never ambiguous and a declared agent is never silently recorded as the owner. Th
 Markdown is written inside the project the scope names, and the state the answer reports is the file
 read back rather than assumed.
 
+The agent routes and the file-edit routes are the same shape as the rest: they call the same store
+methods the `agent.*` and `file-edit.*` handlers call, so the two cannot disagree about what an
+operation does. The registry route is the one the management view reads, and it serves the vocabulary,
+the offered models and the projects so the view offers exactly what the server would accept. The
+management view is **not** the enforcement point: it can be bypassed with a direct request, and the
+allowlist is enforced at dispatch. While the bounded file-edit capability is disabled the routes refuse
+with a named reason (503) and the actions are absent from the registry rather than listed and failing.
+See `docs/AGENTS.md`.
+
 ## The palette
 
 The palette is opened with **⌘K** (or **Ctrl K**) from the shell, or from *Board actions →
@@ -573,6 +662,34 @@ parameters and preconditions. Nothing in the client lists a capability of its ow
 
 ## Tests
 
+- `tests/server/agent-store.test.ts` — the agent registry itself, over a disposable root and its
+  own control store: the closed scope vocabulary with one description per scope; **default deny**, with
+  a tool this build declares no scope for refused for every agent; strict validation refusing an unknown
+  field, an unknown scope, a repeated scope and a malformed actor; a duplicate live name, a model this
+  instance does not offer and an unregistered workspace each refused with nothing written; a subpath that
+  could escape the project root and a budget outside its bound refused rather than normalised or
+  reduced; **an agent may not widen its own scopes, may not create another agent, and may not give
+  another agent a scope it does not hold itself**, while the owner may widen to any scope; one operation
+  per revision with a stale revision refused and the durable audit trail naming who changed what and
+  when; archiving closing an agent, freeing its name and taking it out of force; and the scopes in force
+  for a project when more than one enabled agent names it.
+- `tests/server/file-edit-tool.test.ts` — the bounded file-edit capability, over a disposable root,
+  its own worktree and its own data root: **propose-only records the change and its diff and writes no
+  file at all**; auto-apply writes the file and records the same diff, and an explicit auto-apply is
+  refused while the acceptance policy in force is propose-only; traversal, an absolute path, a
+  backslash, an empty, current or parent segment, **a symlink at a parent or a final component** and a
+  generated directory are each refused with nothing written; an oversize change and a file already over
+  the cap are refused rather than truncated; a project with no connected worktree is refused; the tool
+  is disabled by default and refuses everything while recording nothing; the diff is deterministic,
+  bounded and states its own truncation; and every recorded change is one durable operation with the
+  actor it names.
+- `tests/browser/agent-manager.spec.ts` — the management view: it is reachable from the existing
+  navigation, creates an agent with two assigned scopes beside their descriptions, shows the enabled
+  state and the scope summary in the list, confirms through the registry route that the record is
+  durable, and shows the server's own refusal **beside the field it names** when a duplicate live name
+  is submitted — with the registry still holding exactly one agent. It also shows the honest note that
+  the bounded file-edit capability is disabled on that instance.
+
 - `tests/server/action-registry.test.ts` — the registry and its handlers are the same closed set;
   every declared action is driven through the registry and really acts; the published schema rejects
   an unknown field and enforces every required parameter; every revision parameter declares the read
@@ -583,9 +700,10 @@ parameters and preconditions. Nothing in the client lists a capability of its ow
   revision parameter declares the queue read it comes from, and a claim is refused before the instance
   that cannot dispatch is asked to; the live projection distinguishes `none`, `no-conversation`,
   `unavailable` and `failed`, reports a session with no lifecycle row as an absence rather than as
-  `idle`, never invents an entry and declares exactly the contract fields; and all four `fork.*`
+  `idle`, never invents an entry and declares exactly the contract fields; all four `fork.*`
   actions are driven through the registry against synthetic ports, with a paused child refusing a
-  dispatch the port never sees.
+  dispatch the port never sees; and all seven new actions are driven through the registry, with the
+  eleven new precondition codes each matching a refusal a handler really produces.
 - `tests/server/http.test.ts` — the routes are owner-only, behind the Host check and the origin
   check; the registry lists only what the instance implements; executing a real action really writes;
   an unknown id and a scope violation are both refused; the projection is path-free and names an

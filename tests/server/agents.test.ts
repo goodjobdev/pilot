@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp,stat } from 'node:fs/promises';
+import { mkdtemp,readFile,stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createApp } from '../../src/server/main';
@@ -329,6 +329,94 @@ test('a notification that reached no device is not a delivery, and the next star
   }finally{await second.created.close();second.store.close();}
 });
 
+
+/**
+ * Per-agent privilege scopes, enforced at dispatch.
+ *
+ * The scope decision is made server-side, on every tool call, by the authoritative dispatch path —
+ * never by the interface and never by hiding a tool. The two tests below prove both halves: a tool
+ * the scopes forbid is refused with a precise reason and writes nothing, and the refusal is the
+ * scope's rather than the tool's, because granting the scope makes the very same call succeed.
+ */
+async function privilegeInstance(root:string,scopes:readonly string[]){
+ const security=localConfig('http://127.0.0.1:0');
+ const store=new ControlStore(root);
+ const created=await createApp({dataRoot:root,browseRoots:[],security,agents:'on',agentPauseMs:150,control:store});
+ await new Promise<void>(ok=>created.server.listen(0,'127.0.0.1',ok));
+ security.origin='http://127.0.0.1:'+(created.server.address() as {port:number}).port;
+ const token={'x-dashboard-token':security.token};
+ const writes={...token,'content-type':'application/json',origin:security.origin};
+ const listed=await (await fetch(security.origin+'/api/projects',{headers:token})).json() as {id:string;path:string}[];
+ const project=listed[0]??await (await fetch(security.origin+'/api/projects',{method:'POST',headers:writes,body:JSON.stringify({name:'Privileges',managed:true,confirm:true})})).json() as {id:string;path:string};
+ const offered=created.agents.offeredModels()[0];
+ const agent=created.agentStore!.create({draft:{
+   name:'Scope fixture',description:'A bounded agent.',enabled:true,
+   model:{provider:offered.provider,modelId:offered.modelId},
+   workspace:{projectId:project.id,subpath:''},
+   budgets:{maxRequests:null,maxOutputTokens:null,maxJobsPerHour:null},
+   scopes:scopes as never
+ },actor:{kind:'owner',identity:'local'}});
+ const base=security.origin+'/api/projects/'+project.id+'/agents';
+ const view=async()=>(await (await fetch(base,{headers:token})).json()) as {enabled:boolean;view:any};
+ const send=async(body:unknown)=>fetch(base+'/input',{method:'POST',headers:writes,body:JSON.stringify(body)});
+ const notesFile=join(project.path,'docs','notes.md');
+ return {created,security,token,writes,project,agent,base,view,send,store,notesFile};
+}
+/** The text every entry of a settled conversation carries, tool results included. */
+const transcriptText=async(app:{view:()=>Promise<{view:any}>})=>{
+ const settled=await waitFor(async()=>{const v=await app.view();return v.view.working?undefined:v;});
+ return (settled.view.entries as {kind:string;text:string}[]).map(entry=>entry.kind+': '+entry.text).join('\n');
+};
+
+test('a tool the scopes forbid is refused at dispatch with a precise reason and writes nothing',async()=>{
+ const root=await mkdtemp(join(tmpdir(),'dashboard-agents-scopes-'));
+ // The agent holds read_notes and record_note, so the harness is opened with both enabled.
+ const app=await privilegeInstance(root,['read_notes','record_note']);
+ try{
+   // Opening the conversation is what builds the offered tool list from the scopes in force.
+   await app.view();
+   // The scope is revoked after the offered list was built, so the tool is still offered to the model:
+   // this is the directly-crafted request, and the dispatch path re-reads the scopes and refuses it.
+   app.created.agentStore!.update({agentId:app.agent.id,revision:app.agent.revision,patch:{scopes:['read_notes']},actor:{kind:'owner',identity:'local'}});
+   assert.equal((await app.send({text:'[note this must never be written]',mode:'followUp'})).status,200);
+   const refusedText=await transcriptText(app);
+   assert.match(refusedText,/Tool call blocked/,'the refusal is reported in the transcript, not merely absent');
+   assert.match(refusedText,/The record_note scope is not in this agent\u2019s allowlist/,'the refusal names the scope that was missing');
+   assert.match(refusedText,/Append one line/,'the refusal says what granting it would allow');
+   assert.equal(await stat(app.notesFile).then(()=>true).catch(()=>false),false,'a refused tool call wrote nothing at all');
+ }finally{await app.created.close();app.store.close();}
+});
+
+test('the very same call succeeds when the scope is held, so the refusal was the scope rather than the tool',async()=>{
+ const root=await mkdtemp(join(tmpdir(),'dashboard-agents-granted-'));
+ const app=await privilegeInstance(root,['read_notes','record_note']);
+ try{
+   await app.view();
+   assert.equal((await app.send({text:'[note this one is allowed]',mode:'followUp'})).status,200);
+   await waitFor(async()=>{const ok=await stat(app.notesFile).then(()=>true).catch(()=>false);return ok?true:undefined;});
+   assert.match(await readFile(app.notesFile,'utf8'),/this one is allowed/,'a permitted call really wrote the note');
+   assert.doesNotMatch(await readFile(app.notesFile,'utf8'),/must never be written/,'the refused text left no trace');
+ }finally{await app.created.close();app.store.close();}
+});
+
+test('an agent is offered only the tools its scopes name, and a call to a tool it was never offered is refused',async()=>{
+ const root=await mkdtemp(join(tmpdir(),'dashboard-agents-exposure-'));
+ // This agent holds read_notes and nothing else, so record_note is never offered to the model.
+ const app=await privilegeInstance(root,['read_notes']);
+ try{
+   await app.view();
+   assert.equal((await app.send({text:'[note a tool this agent was never offered]',mode:'followUp'})).status,200);
+   const text=await transcriptText(app);
+   // The call is refused by the dispatch path, with no effect: the model attempted a tool the agent
+   // was never granted, and the refusal is reported rather than silently swallowed.
+   assert.match(text,/not available|blocked|refused/i,text);
+   assert.equal(await stat(app.notesFile).then(()=>true).catch(()=>false),false,'a refused call wrote nothing at all');
+   // The permitted tool still works, so the refusal is about the scope and not about the harness.
+   assert.equal((await app.send({text:'[read-notes]',mode:'followUp'})).status,200);
+   const after=await transcriptText(app);
+   assert.match(after,/No notes yet/,'the permitted read_notes tool really ran');
+ }finally{await app.created.close();app.store.close();}
+});
 
 /**
  * Vision checks are enforced server-side, twice: at admission, against the model the session has

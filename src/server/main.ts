@@ -34,6 +34,9 @@ import { AcceptanceError, parseAcceptanceActor, type AcceptanceActor } from '../
 import { AcceptanceStore } from './state/acceptance-store';
 import { FORK_ROOT_DIRECTORY, ForkStore, createForkWorktreePort, type ForkTranscriptPort } from './state/fork-store';
 import { FORK_MAX_ENTRY_SCAN, ForkError } from '../shared/forks';
+import { AgentStore } from './state/agent-store';
+import { FileEditTool, FileEditError, type FileEditMode } from './state/file-edit-tool';
+import { AgentError, agentScopeVocabulary } from '../shared/agent-registry';
 import { ActionError,ActionRegistry,liveActivity,normaliseActionScope,type ActionEnvironment } from './state/action-registry';
 import { ApprovalError } from '../shared/approvals';
 import { SessionError } from '../shared/sessions';
@@ -48,7 +51,7 @@ import { QueueError, queueView, type QueueImageRef } from '../shared/queue';
  * constructs createApp directly falls back to a read-only observation of the data root.
  */
 export interface ReadinessOptions {readonly releaseId:string;readonly schemaId:string;readonly manifestValid?:boolean;readonly lockHeld?:()=>boolean;readonly observeSchema?:()=>StorageSchemaObservation}
-export interface AppOptions {dataRoot:string;browseRoots:string[];security:SecurityConfig;allowedHosts?:readonly string[];clientRoot?:string;registry?:string;agents?:'on'|'off';agentPauseMs?:number;alertTransport?:AlertTransport;alertSubject?:string;alertCooldownMs?:number;readiness?:ReadinessOptions;control?:ControlStore;runner?:{readonly enabled?:boolean;readonly port?:RunnerPort}}
+export interface AppOptions {dataRoot:string;browseRoots:string[];security:SecurityConfig;allowedHosts?:readonly string[];clientRoot?:string;registry?:string;agents?:'on'|'off';agentPauseMs?:number;alertTransport?:AlertTransport;alertSubject?:string;alertCooldownMs?:number;readiness?:ReadinessOptions;control?:ControlStore;runner?:{readonly enabled?:boolean;readonly port?:RunnerPort};fileEdit?:{readonly enabled?:boolean}}
 /**
  * Approvals answer with a status that says what happened: an invalid request is 422, an approval
  * outside the caller's scope is 403, a missing one is 404, a storage fault is 500, and every
@@ -159,6 +162,27 @@ export function lifecycleHttpStatus(code:SessionLifecycleError['code']):number {
  * storage or corruption fault is 500. Every refusal is path-free: a git error names a path, so it is
  * logged and never repeated in a response.
  */
+/**
+ * The agent registry's own refusals, each mapped to one HTTP status. A duplicate name and a stale
+ * revision are conflicts; a governance refusal is a permission refusal; an unknown agent is not found.
+ */
+export function agentHttpStatus(code:AgentError['code']):number {
+  if(code==='NOT_FOUND')return 404;
+  if(code==='DUPLICATE_NAME'||code==='CONFLICT')return 409;
+  if(code==='NOT_PERMITTED')return 403;
+  if(code==='CORRUPT'||code==='STORAGE')return 500;
+  return 422;
+}
+/** The bounded file-edit capability's own refusals. An escape from the worktree is a permission refusal. */
+export function fileEditHttpStatus(code:FileEditError['code']):number {
+  if(code==='NOT_FOUND')return 404;
+  if(code==='NOT_PERMITTED'||code==='OUTSIDE_WORKTREE')return 403;
+  if(code==='BOUNDED')return 413;
+  if(code==='UNAVAILABLE')return 503;
+  if(code==='CONFLICT')return 409;
+  if(code==='CORRUPT'||code==='STORAGE')return 500;
+  return 422;
+}
 export function forkHttpStatus(code:ForkError['code']):number {
   if(code==='INVALID')return 422;
   if(code==='NOT_FOUND')return 404;
@@ -367,11 +391,30 @@ export async function createApp(options:AppOptions){
     began:({projectId,sessionId,requestId})=>{if(sessionHolder.sessions?.has(projectId,sessionId))lifecycle.markRunning({projectId,sessionId,requestId});},
     settled:({projectId,sessionId,outcome})=>{if(sessionHolder.sessions?.has(projectId,sessionId))lifecycle.markSettled({projectId,sessionId,outcome});}
   }:undefined;
+  // The agent registry, the privilege scopes in force and the bounded file-edit capability. The
+  // registry is deployment-level state over the same control store; the harness is created before it,
+  // so the two holders below are read at call time rather than captured at construction.
+  const agentHolder:{store?:AgentStore}={};
+  const fileEditModeHolder:{mode:()=>FileEditMode}={mode:()=>'propose-only'};
+  const fileEditEnabled=options.fileEdit?.enabled??process.env.DASHBOARD_FILE_EDIT==='on';
+  const fileEdit=options.control&&fileEditEnabled?new FileEditTool(options.control,{
+    enabled:true,
+    // The connected repository worktree is the registered project's own folder and nothing else.
+    projectRoot:(projectId:string)=>catalog.projects.find(candidate=>candidate.id===projectId)?.path,
+    dataRoot:options.dataRoot,
+    // The mode comes from the acceptance policy in force, never from an assumption.
+    policy:{mode:()=>fileEditModeHolder.mode()}
+  }):undefined;
   // The agent harness is the only execution surface. It is off unless the instance enables it explicitly.
   const agents=new HarnessHost({
     dataRoot:options.dataRoot,providers,delivery,lifecycle:lifecycleHooks,
     enabled:(options.agents??(process.env.DASHBOARD_AGENTS==='on'?'on':'off'))==='on',
     pauseMs:options.agentPauseMs??Number(process.env.DASHBOARD_AGENT_PAUSE_MS??2500),
+    // The authoritative dispatch path reads this on every tool call, so an agent's scopes are
+    // re-checked server-side however a call was crafted. With no registry open, the owner's own
+    // dispatch is in force and nothing is narrowed.
+    privileges:{authority:async({projectId})=>agentHolder.store?agentHolder.store.authority(projectId):Object.freeze({agentId:null,scopes:null})},
+    fileEdit,
     onEvent:event=>{
       // A question is notified by the ledger's own outbox step, which tags the notification by the
       // question id so a later re-send collapses onto the same one. Without a ledger the plain alert
@@ -608,6 +651,20 @@ export async function createApp(options:AppOptions){
   const acceptance=options.control?new AcceptanceStore(options.control,{
     projectRoot:(projectId:string)=>catalog.projects.find(candidate=>candidate.id===projectId)?.path
   }):undefined;
+  /**
+   * The agent registry: a durable, revision-checked record per agent, with an explicit scope
+   * allowlist, a declared model this instance really offers, a workspace scope inside a registered
+   * project, bounded budgets, and the governance rule that refuses an agent widening its own scopes.
+   * It introduces no persistence of its own: one control-store operation per record revision.
+   */
+  const agentStore=options.control?new AgentStore(options.control,{
+    models:()=>agents.offeredModels(),
+    projectKnown:(projectId)=>catalog.projects.some(candidate=>candidate.id===projectId)
+  }):undefined;
+  agentHolder.store=agentStore;
+  // The one owner switch that decides the file-edit mode: the acceptance policy in force. The
+  // documented default is owner-only, which is propose-only; only agent-may-accept permits auto-apply.
+  fileEditModeHolder.mode=()=>acceptance!==undefined&&acceptance.readPolicy().mode==='agent-may-accept'?'auto-apply':'propose-only';
   if(runner) {
     try {
       const reconciliation=await runner.reconcile();
@@ -620,8 +677,8 @@ export async function createApp(options:AppOptions){
   // is never offered. Nothing in the registry commits, pushes, deploys, spends, provisions or
   // publishes; the two report actions read only.
   const actionEnvironment:ActionEnvironment={
-    control:sessions&&lifecycle&&lifecycleService&&approvals&&ledger&&queueStore?{
-      sessions,lifecycle:lifecycleService,approvals,ledger,queue:queueStore,media:queueImages,runner,acceptance,forks,
+    control:sessions&&lifecycle&&lifecycleService&&approvals&&ledger&&queueStore&&agentStore?{
+      sessions,lifecycle:lifecycleService,approvals,ledger,queue:queueStore,media:queueImages,runner,acceptance,forks,agents:agentStore,fileEdit,
       // Whether the store really holds a lifecycle row for one session, read-only. The projection
       // needs it because the lifecycle store answers an unwritten session with its initial record,
       // and that must not be reported as the state it reads at.
@@ -894,6 +951,8 @@ export async function createApp(options:AppOptions){
             if(error instanceof ApprovalError)throw new HttpError(approvalHttpStatus(error.code),error.message);
             if(error instanceof AcceptanceError)throw new HttpError(acceptanceHttpStatus(error.code),error.message);
             if(error instanceof QueueError)throw new HttpError(queueHttpStatus(error.code),error.message);
+            if(error instanceof AgentError)throw new HttpError(agentHttpStatus(error.code),error.message);
+            if(error instanceof FileEditError)throw new HttpError(fileEditHttpStatus(error.code),error.message);
             throw error;
           }
         }
@@ -1025,6 +1084,70 @@ export async function createApp(options:AppOptions){
           }catch(error){
             if(error instanceof ForkError)throw new HttpError(forkHttpStatus(error.code),error.message);
             if(error instanceof SessionError)throw new HttpError(sessionHttpStatus(error.code),error.message);
+            throw error;
+          }
+        }
+        // The agent registry: the list, one record with its durable audit trail, one creation, one
+        // change and one archive. Owner-only like every other route, behind the unchanged Host check,
+        // with the same origin/CSRF enforcement for writes. Governance is enforced by the store, not
+        // by this route or by the interface: the owner may change any scope, and an agent may not
+        // create an agent, edit its own record or widen another agent beyond the scopes it holds.
+        if(path==='/api/agents'||path.startsWith('/api/agents/')){
+          if(!agentStore)throw new HttpError(503,'The agent registry is unavailable: no durable control store is open on this instance');
+          try{
+            if(path==='/api/agents'){
+              if(req.method==='GET'){json({agents:agentStore.list(),scopes:agentScopeVocabulary(),models:agentStore.offeredModels(),fileEdit:{enabled:fileEdit!==undefined&&fileEdit.enabled,mode:fileEdit===undefined||!fileEdit.enabled?null:await fileEdit.mode()}});return;}
+              if(req.method==='POST'){
+                const body=parseBody(z.strictObject({draft:z.unknown(),actor:z.unknown()}),payload,'The agent request');
+                json({agent:agentStore.create({draft:body.draft,actor:body.actor})},201);return;
+              }
+              throw new HttpError(405,'Method not allowed');
+            }
+            const agentRoute=path.match(/^\/api\/agents\/([A-Za-z0-9][A-Za-z0-9._:-]{0,159})(?:\/(update|archive))?$/);
+            if(!agentRoute)throw new HttpError(404,'Unknown API route');
+            const agentId=agentRoute[1];
+            if(agentRoute[2]===undefined){
+              if(req.method!=='GET')throw new HttpError(405,'Method not allowed');
+              json({agent:agentStore.read(agentId),history:agentStore.history(agentId)});return;
+            }
+            if(req.method!=='POST')throw new HttpError(405,'Method not allowed');
+            if(agentRoute[2]==='update'){
+              const body=parseBody(z.strictObject({revision:z.unknown(),patch:z.unknown(),actor:z.unknown()}),payload,'The agent change request');
+              json({agent:agentStore.update({agentId,revision:body.revision,patch:body.patch,actor:body.actor})});return;
+            }
+            const body=parseBody(z.strictObject({revision:z.unknown(),actor:z.unknown()}),payload,'The agent archive request');
+            json({agent:agentStore.archive({agentId,revision:body.revision,actor:body.actor})});return;
+          }catch(error){
+            if(error instanceof AgentError)throw new HttpError(agentHttpStatus(error.code),error.message);
+            throw error;
+          }
+        }
+        // The bounded file-edit capability: one read of the recorded changes and one propose-or-apply
+        // write, contained to the project's connected repository worktree. Owner-only like every other
+        // route, behind the unchanged Host check, with the same origin/CSRF enforcement for the write.
+        // While the capability is disabled this route refuses with a named reason, and while it is
+        // disabled its actions are absent from the registry rather than listed and failing.
+        const fileEditRoute=path.match(/^\/api\/projects\/([a-f0-9-]{36})\/file-edits$/);
+        if(fileEditRoute){
+          if(!fileEdit)throw new HttpError(503,'The bounded file-edit capability is disabled on this instance: set DASHBOARD_FILE_EDIT=on before a file is proposed or written');
+          catalog.get(fileEditRoute[1]);
+          try{
+            if(req.method==='GET'){json(await fileEdit.view(fileEditRoute[1]));return;}
+            if(req.method!=='POST')throw new HttpError(405,'Method not allowed');
+            const body=parseBody(z.strictObject({request:z.unknown(),actor:z.unknown()}),payload,'The file-edit request');
+            const request=body.request as {agentId?:unknown;path?:unknown;content?:unknown;mode?:unknown};
+            const actor=body.actor as {kind:'owner'|'agent';identity:string};
+            const outcome=await fileEdit.edit({
+              projectId:fileEditRoute[1],
+              agentId:(request.agentId??null) as string|null,
+              path:request.path as string,
+              content:request.content as string,
+              mode:(request.mode??null) as FileEditMode|null,
+              actor
+            });
+            json({edit:outcome.record,written:outcome.written},201);return;
+          }catch(error){
+            if(error instanceof FileEditError)throw new HttpError(fileEditHttpStatus(error.code),error.message);
             throw error;
           }
         }
@@ -1185,7 +1308,7 @@ export async function createApp(options:AppOptions){
     }
   });
   server.requestTimeout=30000;server.headersTimeout=10000;
-  return {server,catalog,boards,docs,agents,alerts,providers,repositories,sessions,lifecycle,actions,media,queue:queueStore,runner,acceptance,forks,close:async()=>{
+  return {server,catalog,boards,docs,agents,alerts,providers,repositories,sessions,lifecycle,actions,media,queue:queueStore,runner,acceptance,forks,agentStore,fileEdit,close:async()=>{
     // A server that never opened reports ERR_SERVER_NOT_RUNNING, which means "already closed", not
     // "close failed". A failed start (for example a port already in use) must still drain and
     // release the lock that this same start created, and must report the original failure instead.

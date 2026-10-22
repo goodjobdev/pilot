@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir,mkdtemp,readFile,readdir,realpath,rm,stat,writeFile } from 'node:fs/promises';
+import { mkdir,mkdtemp,readFile,readdir,realpath,rm,stat,symlink,writeFile } from 'node:fs/promises';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { tmpdir } from 'node:os';
@@ -17,6 +17,8 @@ import type { AlertPayload } from '../../src/server/alerts';
 import { observeStorageSchema } from '../../src/server/release';
 import { newTask } from '../../src/shared/model';
 import { ACTION_DESCRIPTORS, ACTION_IDS, LIVE_RUN_DETAILS, LIVE_RUN_REASONS, LIVE_TOOL_REASONS } from '../../src/shared/actions';
+import { AGENT_SCOPES } from '../../src/shared/agent-registry';
+import { FILE_EDIT_MAX_FILE_BYTES } from '../../src/server/state/file-edit-tool';
 import { RunnerError, type RunnerContainment } from '../../src/shared/runner';
 import type { RunnerExecution, RunnerExecutionRequest, RunnerPort } from '../../src/server/state/runner-broker';
 
@@ -34,7 +36,14 @@ const RUNNER_ACTION_IDS:readonly string[]=ACTION_IDS.filter(id=>id.startsWith('r
  * an instance that really has the harness, in the fork test below.
  */
 const FORK_ACTION_IDS:readonly string[]=ACTION_IDS.filter(id=>id.startsWith('fork.'));
-const withoutRunner=<T extends {readonly id:string}>(descriptors:readonly T[])=>descriptors.filter(descriptor=>!RUNNER_ACTION_IDS.includes(descriptor.id)&&!FORK_ACTION_IDS.includes(descriptor.id));
+/**
+ * The bounded file-edit capability is disabled on every instance unless it is enabled explicitly, so
+ * its two actions are absent from the offered registry rather than listed and failing — exactly as
+ * the disabled coding runner's are. The routes themselves are driven against an instance that really
+ * has the capability, in the file-edit test below.
+ */
+const FILE_EDIT_ACTION_IDS:readonly string[]=ACTION_IDS.filter(id=>id.startsWith('file-edit.'));
+const withoutRunner=<T extends {readonly id:string}>(descriptors:readonly T[])=>descriptors.filter(descriptor=>!RUNNER_ACTION_IDS.includes(descriptor.id)&&!FORK_ACTION_IDS.includes(descriptor.id)&&!FILE_EDIT_ACTION_IDS.includes(descriptor.id));
 /** The containment every required property is checked against, as an injected port would report it. */
 const containment=(overrides:Partial<RunnerContainment>={}):RunnerContainment=>Object.freeze({runtime:'fake-runtime',image:'pilot-runner:test',network:'none',rootFilesystem:'read-only' as const,user:'10001:10001',capabilities:'none',noNewPrivileges:true,dockerSocket:false,mounts:Object.freeze(['workspace']) as readonly string[],maxMemoryBytes:1024*1024*1024,maxCpus:2,maxPids:128,maxWallClockMs:300_000,...overrides});
 /** One scripted execution: no container is started and no container runtime is contacted in this suite. */
@@ -1350,4 +1359,185 @@ test('the fork routes are owner-only, branch a real repository at a cutoff and n
   assert.equal((await viaRegistry.json()).action,'fork.create');
   assert.equal((await post(forks,{parentSessionId:parent.id,baseCommit,cutoffEntryId:0})).status,422,'a cutoff of zero is not an entry of any transcript');
  }finally{await app.close();store.close();await rm(root,{recursive:true,force:true});}
+});
+
+
+/**
+ * The agent registry routes and the bounded file-edit routes: owner-only, behind the unchanged Host
+ * check, with the same origin/CSRF enforcement for writes, and with every refusal the server's own
+ * words rather than a generic failure. Nothing here calls a model and nothing spends anything.
+ */
+test('the agent registry routes are owner-only, strict, governance-checked, and record who changed what',async()=>{
+ const security=localConfig('http://127.0.0.1:0');
+ const root=await mkdtemp(join(tmpdir(),'dashboard-agents-api-'));
+ const store=new ControlStore(root);
+ const app=await createApp({dataRoot:root,browseRoots:[],security,control:store});
+ await listen(app,security);
+ try{
+  const url=security.origin,token={'x-dashboard-token':security.token},writes={...token,'content-type':'application/json',origin:url};
+  const post=async(path:string,body:unknown)=>fetch(url+path,{method:'POST',headers:writes,body:JSON.stringify(body)});
+  const read=async(path:string)=>fetch(url+path,{headers:token});
+  // Owner-only, with the unchanged Host check and the same origin enforcement for writes.
+  assert.equal((await fetch(url+'/api/agents')).status,401,'the registry is behind owner auth');
+  assert.equal((await fetch(url+'/api/agents',{method:'POST',headers:{...token,'content-type':'application/json',origin:'https://evil.example'},body:'{}'})).status,403);
+  const wrongHost=await new Promise<number>((ok,fail)=>{const req=request({host:'127.0.0.1',port:new URL(url).port,path:'/api/agents',headers:{host:'evil.example','x-dashboard-token':security.token}},res=>{res.resume();ok(res.statusCode??0);});req.on('error',fail);req.end();});
+  assert.equal(wrongHost,403,'the unchanged Host check applies to the registry');
+  // The closed vocabulary is served with one description per scope, and the file-edit switch with the
+  // mode the acceptance policy puts in force. The capability is disabled by default.
+  const listed=await (await read('/api/agents')).json();
+  assert.deepEqual(listed.scopes.map((entry:any)=>entry.scope),[...AGENT_SCOPES]);
+  for(const entry of listed.scopes)assert.ok(entry.description.length>10,entry.scope+' carries a description');
+  assert.deepEqual(listed.fileEdit,{enabled:false,mode:null},'the bounded file-edit capability is disabled by default');
+  assert.deepEqual(listed.agents,[]);
+  // The models this instance really offers are served beside the vocabulary, so the interface offers
+  // exactly the list the server would accept rather than a second, drifting one.
+  assert.ok(Array.isArray(listed.models));
+  for(const model of listed.models)assert.equal(typeof model.provider,'string');
+
+  const project=await (await post('/api/projects',{name:'Agents API',managed:true,confirm:true})).json();
+  const offered=app.agents.offeredModels()[0];
+  const draft=(over:Record<string,unknown>={})=>({name:'API worker',description:'',enabled:true,model:{provider:offered.provider,modelId:offered.modelId},workspace:{projectId:project.id,subpath:''},budgets:{maxRequests:null,maxOutputTokens:null,maxJobsPerHour:null},scopes:['read_notes'],...over});
+  const actor={kind:'owner',identity:'local'};
+  const created=await post('/api/agents',{draft:draft(),actor});
+  assert.equal(created.status,201);
+  const agent=(await created.json()).agent;
+  assert.deepEqual([agent.revision,agent.enabled,[...agent.scopes]],[1,true,['read_notes']]);
+  const one=await (await read('/api/agents/'+agent.id)).json();
+  assert.deepEqual([one.agent.id,one.history.map((entry:any)=>entry.action)],[agent.id,['created']]);
+  // Each refusal is the server's own per-field words, not a generic failure.
+  const badScope=await post('/api/agents',{draft:draft({name:'Other',scopes:['sudo']}),actor});
+  assert.equal(badScope.status,422);
+  assert.match((await badScope.json()).error,/a scope must be one of the closed vocabulary/);
+  const badModel=await post('/api/agents',{draft:draft({name:'Other',model:{provider:'scripted',modelId:'nope'}}),actor});
+  assert.equal(badModel.status,422);
+  assert.match((await badModel.json()).error,/not one this instance offers/);
+  const badSubpath=await post('/api/agents',{draft:draft({name:'Other',workspace:{projectId:project.id,subpath:'../escape'}}),actor});
+  assert.equal(badSubpath.status,422);
+  assert.match((await badSubpath.json()).error,/a subpath must be a relative path with no empty, current or parent segment/);
+  const duplicate=await post('/api/agents',{draft:draft(),actor});
+  assert.equal(duplicate.status,409);
+  assert.match((await duplicate.json()).error,/already named API worker/);
+  assert.equal((await (await read('/api/agents')).json()).agents.length,1,'every refused creation wrote nothing');
+  // A change is revision-checked, and the audit trail names who changed what and when.
+  const stale=await post('/api/agents/'+agent.id+'/update',{revision:99,patch:{name:'Renamed'},actor});
+  assert.equal(stale.status,409);
+  assert.match((await stale.json()).error,/is at revision 1, not 99/);
+  const changed=await post('/api/agents/'+agent.id+'/update',{revision:agent.revision,patch:{name:'Renamed',enabled:false},actor:{kind:'owner',identity:'second'}});
+  assert.equal(changed.status,200);
+  const renamed=(await changed.json()).agent;
+  assert.deepEqual([renamed.revision,renamed.name,renamed.enabled,renamed.updatedBy.identity],[2,'Renamed',false,'second']);
+  // Governance: an agent may not edit its own record, and the refusal is the rule's own.
+  const selfEdit=await post('/api/agents/'+agent.id+'/update',{revision:renamed.revision,patch:{scopes:['read_notes','file_edit']},actor:{kind:'agent',identity:agent.id}});
+  assert.equal(selfEdit.status,403);
+  assert.match((await selfEdit.json()).error,/may not edit its own record/);
+  const wider=await post('/api/agents',{draft:draft({name:'Wider'}),actor:{kind:'agent',identity:agent.id}});
+  assert.equal(wider.status,403);
+  assert.match((await wider.json()).error,/may not create another agent/);
+  // Archiving closes it, and the audit trail is durable and complete.
+  const archived=await post('/api/agents/'+agent.id+'/archive',{revision:renamed.revision,actor});
+  assert.equal(archived.status,200);
+  assert.equal((await archived.json()).agent.archived,true);
+  const history=await (await read('/api/agents/'+agent.id)).json();
+  assert.deepEqual(history.history.map((entry:any)=>[entry.revision,entry.action,entry.changedBy.identity]),[[1,'created','local'],[2,'updated','second'],[3,'archived','local']]);
+  for(const entry of history.history)assert.ok(Number.isFinite(Date.parse(entry.changedAt)),'every audit entry carries an instant');
+  // An unknown agent, and an unknown route under the registry prefix, are both refused as not found.
+  assert.equal((await read('/api/agents/'+randomUUID())).status,404);
+  assert.equal((await read('/api/agents/'+randomUUID()+'/nonsense')).status,404);
+  assert.equal((await post('/api/agents/'+randomUUID()+'/archive',{revision:1,actor})).status,404);
+  // The typed actions reach the same registry, and the same record.
+  const viaAction=await (await post('/api/actions/execute',{id:'agent.list',params:{}})).json();
+  assert.equal(viaAction.result.agents.length,1);
+  assert.equal(viaAction.result.fileEdit.enabled,false);
+ }finally{await app.close();store.close();await rm(root,{recursive:true,force:true});}
+});
+
+test('the file-edit routes are owner-only, disabled by default, and contained to the connected worktree when enabled',async()=>{
+ const security=localConfig('http://127.0.0.1:0');
+ const root=await mkdtemp(join(tmpdir(),'dashboard-file-edit-api-'));
+ const store=new ControlStore(root);
+ const app=await createApp({dataRoot:root,browseRoots:[],security,control:store,fileEdit:{enabled:true}});
+ await listen(app,security);
+ try{
+  const url=security.origin,token={'x-dashboard-token':security.token},writes={...token,'content-type':'application/json',origin:url};
+  const post=async(path:string,body:unknown)=>fetch(url+path,{method:'POST',headers:writes,body:JSON.stringify(body)});
+  const read=async(path:string)=>fetch(url+path,{headers:token});
+  const project=await (await post('/api/projects',{name:'Edits',managed:true,confirm:true})).json();
+  const base='/api/projects/'+project.id+'/file-edits';
+  const actor={kind:'owner',identity:'local'};
+  assert.equal((await fetch(url+base)).status,401,'the file-edit routes are behind owner auth');
+  assert.equal((await fetch(url+base,{method:'POST',headers:{...token,'content-type':'application/json',origin:'https://evil.example'},body:'{}'})).status,403);
+  assert.equal((await read('/api/projects/'+randomUUID()+'/file-edits')).status,404,'an unknown project is refused before anything is read');
+  // The mode in force is read from the acceptance policy, whose documented default is owner-only, so
+  // the default mode is propose-only rather than an assumption.
+  const before=await (await read(base)).json();
+  assert.deepEqual([before.enabled,before.mode,before.edits.length],[true,'propose-only',0]);
+  // A propose-only write records the change and its diff and writes no file at all.
+  const proposed=await post(base,{request:{agentId:null,path:'src/probe.ts',content:'export const one = 1;\n'},actor});
+  assert.equal(proposed.status,201);
+  const proposal=await proposed.json();
+  assert.deepEqual([proposal.written,proposal.edit.applied,proposal.edit.path],[false,false,'src/probe.ts']);
+  assert.match(proposal.edit.diff,/\+export const one = 1;/);
+  assert.equal(await exists(join(project.path,'src','probe.ts')),false,'a propose-only write wrote no file');
+  // A traversal, an absolute path, a symlink escape and an oversize change are each refused with
+  // nothing written, and each refusal is precise.
+  for(const path of ['../outside.txt','/etc/passwd','src/../../outside.txt','node_modules/thing.js']){
+    const refused=await post(base,{request:{agentId:null,path,content:'x'},actor});
+    assert.equal(refused.status,403,path);
+    assert.match((await refused.json()).error,/refused|generated or app-managed/);
+  }
+  await symlink(join(root,'outside'),join(project.path,'escape'));
+  const throughSymlink=await post(base,{request:{agentId:null,path:'escape/secret.txt',content:'x'},actor});
+  assert.equal(throughSymlink.status,403);
+  assert.equal(await exists(join(root,'outside','secret.txt')),false,'nothing was written through the symlink');
+  const oversize=await post(base,{request:{agentId:null,path:'src/big.ts',content:'x'.repeat(FILE_EDIT_MAX_FILE_BYTES+1)},actor});
+  assert.equal(oversize.status,413);
+  assert.match((await oversize.json()).error,/over the 262144-byte cap/);
+  // Auto-apply is refused while the acceptance policy in force is propose-only.
+  const auto=await post(base,{request:{agentId:null,path:'src/probe.ts',content:'export const two = 2;\n',mode:'auto-apply'},actor});
+  assert.equal(auto.status,403);
+  assert.match((await auto.json()).error,/Auto-apply is not the mode in force/);
+  assert.equal((await (await read(base)).json()).edits.length,1,'every refused write recorded nothing');
+  // The owner switch is the acceptance policy: with it set to agent-may-accept, auto-apply is permitted
+  // and the file is really written atomically.
+  const policy=await (await read('/api/acceptance/policy')).json();
+  const updated=await post('/api/acceptance/policy',{revision:policy.policy.revision,policy:{mode:'agent-may-accept',actionClasses:{commit:'full-auto',push:'ask',deploy:'ask',spend:'ask',provision:'ask',publish:'ask'}}});
+  assert.equal(updated.status,200);
+  const applied=await post(base,{request:{agentId:null,path:'src/probe.ts',content:'export const two = 2;\n',mode:'auto-apply'},actor});
+  assert.equal(applied.status,201);
+  assert.equal((await applied.json()).written,true);
+  assert.equal(await readFile(join(project.path,'src','probe.ts'),'utf8'),'export const two = 2;\n');
+  // The read side reports both records with their diffs, and the mode now in force.
+  const after=await (await read(base)).json();
+  assert.deepEqual([after.mode,after.edits.length],[ 'auto-apply',2]);
+  assert.equal(after.edits[1].applied,true);
+  // The typed actions reach the same capability and the same ledger.
+  const viaAction=await (await post('/api/actions/execute',{id:'file-edit.read',params:{},scope:{projectId:project.id}})).json();
+  assert.deepEqual([viaAction.result.mode,viaAction.result.edits.length],['auto-apply',2]);
+  const viaWrite=await post('/api/actions/execute',{id:'file-edit.write',params:{request:{agentId:null,path:'src/third.ts',content:'three\n'},actor},scope:{projectId:project.id}});
+  assert.equal(viaWrite.status,200);
+  // The action reads the same mode in force, which the owner switch has now set to auto-apply.
+  assert.equal((await viaWrite.json()).result.written,true);
+  assert.equal(await readFile(join(project.path,'src','third.ts'),'utf8'),'three\n');
+ }finally{await app.close();store.close();await rm(root,{recursive:true,force:true});}
+
+ // An instance without the capability refuses with a named reason, and its actions are absent from the
+ // offered registry rather than listed and failing.
+ const offRoot=await mkdtemp(join(tmpdir(),'dashboard-file-edit-off-'));
+ const offStore=new ControlStore(offRoot);
+ const offSecurity=localConfig('http://127.0.0.1:0');
+ const off=await createApp({dataRoot:offRoot,browseRoots:[],security:offSecurity,control:offStore});
+ await listen(off,offSecurity);
+ try{
+  const offToken={'x-dashboard-token':offSecurity.token};
+  const offWrites={...offToken,'content-type':'application/json',origin:offSecurity.origin};
+  const offProject=await (await fetch(offSecurity.origin+'/api/projects',{method:'POST',headers:offWrites,body:JSON.stringify({name:'No edits',managed:true,confirm:true})})).json();
+  const refusal=await fetch(offSecurity.origin+'/api/projects/'+offProject.id+'/file-edits',{headers:offToken});
+  assert.equal(refusal.status,503);
+  assert.match((await refusal.json()).error,/file-edit capability is disabled on this instance/);
+  const actions=await (await fetch(offSecurity.origin+'/api/actions?projectId='+offProject.id,{headers:offToken})).json();
+  assert.deepEqual(actions.actions.filter((action:any)=>action.id.startsWith('file-edit.')),[],'a disabled capability offers no file-edit action');
+  const asking=await fetch(offSecurity.origin+'/api/actions/execute',{method:'POST',headers:offWrites,body:JSON.stringify({id:'file-edit.read',params:{},scope:{projectId:offProject.id}})});
+  assert.equal(asking.status,503);
+  assert.match((await asking.json()).error,/file-edit capability is disabled on this instance/);
+ }finally{await off.close();offStore.close();await rm(offRoot,{recursive:true,force:true});}
 });

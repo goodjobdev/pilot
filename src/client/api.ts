@@ -2,6 +2,7 @@ import type { Board,Operation,Project,Snapshot } from '../shared/model';
 import type { DocEntry,DocSnapshot } from '../shared/docs';
 import type { AgentView } from '../shared/agent';
 import type { ActionDescriptor,LiveActivity } from '../shared/actions';
+import type { AgentAuditEntry,AgentModelChoice,AgentRecord } from '../shared/agent-registry';
 import type { MediaView } from '../shared/images';
 const token=document.querySelector<HTMLMetaElement>('meta[name="dashboard-token"]')?.content??'';
 let csrf='';
@@ -49,6 +50,29 @@ export type ActionScope={projectId?:string;sessionId?:string};
 export interface ActionListView{readOnly:true;scope:{projectId:string|null;sessionId:string|null};actions:ActionDescriptor[]}
 /** One execution: the id that ran and the handler's own result. */
 export interface ActionExecution{action:string;result:unknown}
+/** One scope of the closed vocabulary, with the one line that describes what granting it would allow. */
+export interface AgentScopeOption{scope:string;description:string}
+/** The registry as the server offers it: every agent, the vocabulary, the offered models and the switch. */
+export interface AgentRegistryView{agents:AgentRecord[];scopes:AgentScopeOption[];models:AgentModelChoice[];fileEdit:{enabled:boolean;mode:string|null}}
+export interface AgentDetailView{agent:AgentRecord;history:AgentAuditEntry[]}
+/** The actor a change is made by. The interface always declares the owner: it is the authenticated session. */
+export interface AgentActorBody{kind:'owner'|'agent';identity:string}
+export interface AgentDraftBody{
+  name:string;description:string;enabled:boolean;model:AgentModelChoice;
+  workspace:{projectId:string;subpath:string};
+  budgets:{maxRequests:number|null;maxOutputTokens:number|null;maxJobsPerHour:number|null};
+  scopes:string[];
+}
+/** One recorded file edit, as the read side reports it, with the diff that proves it. */
+export interface FileEditRecordView{
+  id:string;projectId:string;agentId:string|null;path:string;mode:'propose-only'|'auto-apply';
+  applied:boolean;created:boolean;bytes:number;diff:string;diffBytes:number;diffTruncated:boolean;
+  createdAt:string;changedBy:{kind:'owner'|'agent';identity:string};
+}
+export interface FileEditLedgerView{
+  readOnly:true;projectId:string;enabled:boolean;mode:'propose-only'|'auto-apply';
+  limits:{fileBytes:number;diffBytes:number;edits:number};edits:FileEditRecordView[];truncated:boolean;
+}
 export const api={
   projects:()=>request<Project[]>('/projects'),
   register:(data:unknown)=>request<Project>('/projects','POST',data),
@@ -89,6 +113,19 @@ export const api={
     return request<ActionListView>('/actions'+(suffix?'?'+suffix:''));
   },
   actionActivity:(projectId:string)=>request<LiveActivity>('/actions/activity?projectId='+encodeURIComponent(projectId)),
+  /**
+   * The agent registry and the bounded file-edit ledger. The interface reads and writes the same
+   * authenticated routes as everything else and is never the enforcement point: every rule — the
+   * closed vocabulary, the offered model, the workspace scope, the budgets and the governance
+   * decision — is decided by the server, and a refusal arrives with the server's own words.
+   */
+  agentRegistry:()=>request<AgentRegistryView>('/agents'),
+  agent:(id:string)=>request<AgentDetailView>('/agents/'+encodeURIComponent(id)),
+  createAgent:(body:{draft:AgentDraftBody;actor:AgentActorBody})=>request<{agent:AgentRecord}>('/agents','POST',body),
+  updateAgent:(id:string,body:{revision:number;patch:Partial<AgentDraftBody>;actor:AgentActorBody})=>request<{agent:AgentRecord}>('/agents/'+encodeURIComponent(id)+'/update','POST',body),
+  archiveAgent:(id:string,body:{revision:number;actor:AgentActorBody})=>request<{agent:AgentRecord}>('/agents/'+encodeURIComponent(id)+'/archive','POST',body),
+  fileEdits:(projectId:string)=>request<FileEditLedgerView>('/projects/'+projectId+'/file-edits'),
+  writeFileEdit:(projectId:string,body:{request:{agentId:string|null;path:string;content:string;mode?:'propose-only'|'auto-apply'};actor:AgentActorBody})=>request<{edit:FileEditRecordView;written:boolean}>('/projects/'+projectId+'/file-edits','POST',body),
   runAction:(id:string,body:{params?:Record<string,unknown>;scope?:ActionScope}={})=>request<ActionExecution>('/actions/execute','POST',{id,...body}),
 };
 export function assetUrl(id:string,path:string){return '/api/projects/'+id+'/docs/asset?path='+encodeURIComponent(path);}

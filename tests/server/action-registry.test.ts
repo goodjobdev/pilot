@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { mkdir, mkdtemp, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { BoardStore, HttpError } from '../../src/server/board-store';
@@ -16,6 +16,9 @@ import { RunnerBroker, createProjectWorkspaceResolver, type RunnerExecution, typ
 import { AcceptanceStore, type AcceptanceResult, type EvidenceResult, type ProjectAcceptanceView } from '../../src/server/state/acceptance-store';
 import { ForkStore, type ForkCreationResult, type ForkTranscriptPort, type ForkWorktreePort } from '../../src/server/state/fork-store';
 import { FORK_MAX_FORKS, ForkError, type ForkActionResult, type ForkView } from '../../src/shared/forks';
+import { AgentStore } from '../../src/server/state/agent-store';
+import { FILE_EDIT_MAX_FILE_BYTES, FileEditTool, FileEditError, type FileEditCapability, type FileEditView } from '../../src/server/state/file-edit-tool';
+import { AGENT_SCOPES, AgentError, type AgentRecord, type AgentScope } from '../../src/shared/agent-registry';
 import { RunnerError, type RunnerContainment, type RunnerJobRecord, type RunnerView } from '../../src/shared/runner';
 import { ActionError, ActionRegistry, actionHandlerIds, assertActionRegistryConsistent, assertHandlerSet, liveActivity, normaliseActionScope, type ActionEnvironment, type ActionScope } from '../../src/server/state/action-registry';
 import { ACTION_DESCRIPTORS, ACTION_IDS, ACTION_PRECONDITION_CODES, ACTION_REVISION_SOURCES, LIVE_RUN_DETAILS, LIVE_RUN_REASONS, LIVE_TOOL_DETAILS, LIVE_TOOL_REASONS, LIVE_TOOL_SOURCE, type ActionDescriptor, type ActionId, type ActionPreconditionCode } from '../../src/shared/actions';
@@ -40,6 +43,8 @@ import type { AgentEntry, AgentView } from '../../src/shared/agent';
 
 type Port = SessionLifecyclePort & { readonly calls: string[]; refusal: Error | null };
 
+const exists = async (path: string): Promise<boolean> => stat(path).then(() => true).catch(() => false);
+
 /** The deterministic instant every synthetic execution in this file reports. */
 const RUNNER_AT = Date.parse('2025-01-01T00:00:00.000Z');
 
@@ -56,6 +61,7 @@ type Fixture = {
   queue: QueueStore; queueClock: { now: number }; queueLedger: Map<string, QueueSubmissionRecord>; queueCalls: string[];
   runner: RunnerBroker; runnerWorkspace: string; runnerPort: RunnerPortStub; acceptance: AcceptanceStore;
   forks: ForkStore; forkCalls: string[]; forkWorktree: { state: 'clean' | 'dirty' | 'absent'; createFails: boolean; commitRefused: boolean };
+  agents: AgentStore; fileEdit: FileEditTool; fileEditMode: { mode: 'propose-only' | 'auto-apply' };
   environment: ActionEnvironment; actions: ActionRegistry;
   cleanup(): Promise<void>;
 };
@@ -183,9 +189,23 @@ async function fixture(): Promise<Fixture> {
     transcripts: forkTranscripts,
     sessions
   });
+  // The agent registry and the bounded file-edit capability: both over the same disposable control
+  // store, with a synthetic offered-model list and this fixture's own project folder as the connected
+  // worktree. No harness is opened and no model call is made anywhere in this suite.
+  const agents = new AgentStore(store, {
+    models: () => [{ provider: 'scripted', modelId: 'scripted-1' }],
+    projectKnown: (id) => id === project.id
+  });
+  const fileEditMode = { mode: 'propose-only' as 'propose-only' | 'auto-apply' };
+  const fileEdit = new FileEditTool(store, {
+    enabled: true,
+    projectRoot: (id) => (id === project.id ? projectPath : undefined),
+    dataRoot: data,
+    policy: { mode: () => fileEditMode.mode }
+  });
   const environment: ActionEnvironment = {
     control: {
-      sessions, lifecycle, approvals, ledger, queue, runner, acceptance, forks,
+      sessions, lifecycle, approvals, ledger, queue, runner, acceptance, forks, agents, fileEdit,
       // An attached image id resolves to the stored facts the queue records; an id the media store
       // does not hold is refused, which the HTTP tests drive against the real media store.
       media: { resolve: async (ids) => Object.freeze(ids.map((id) => Object.freeze({ id, mimeType: 'image/png' as const, bytes: 64, width: 8, height: 8 }))) },
@@ -202,7 +222,7 @@ async function fixture(): Promise<Fixture> {
   };
   return {
     root, workspaces, data, project, taskId, store, sessions, lifecycleStore, lifecycle, approvals, ledger, port, queue, queueClock, queueLedger, queueCalls,
-    runner, runnerWorkspace, runnerPort, acceptance, forks, forkCalls, forkWorktree, environment,
+    runner, runnerWorkspace, runnerPort, acceptance, forks, forkCalls, forkWorktree, agents, fileEdit, fileEditMode, environment,
     actions: new ActionRegistry(environment),
     cleanup: async () => { store.close(); await rm(root, { recursive: true, force: true }); }
   };
@@ -477,6 +497,31 @@ test('every declared action is reachable and really acts through its own handler
     const discarded = await drive('fork.discard', { revision: resumedFork.fork.revision }, scopeOf(f, forked.fork.childSessionId)) as ForkActionResult;
     assert.deepEqual([discarded.outcome, discarded.removed, discarded.fork.state], ['discarded', true, 'discarded']);
     assert.ok(f.forkCalls.includes('remove:plain'), 'a clean worktree is removed without a force');
+
+    // The agent registry: one creation, one read with its durable audit trail, one change and one
+    // archive, all through their own handlers. The record really is written.
+    const listed = await drive('agent.list', {}, {}) as { readOnly: boolean; agents: AgentRecord[]; scopes: { scope: AgentScope; description: string }[]; fileEdit: { enabled: boolean; mode: string | null } };
+    assert.deepEqual([listed.readOnly, listed.agents.length, listed.scopes.length, listed.fileEdit.enabled], [true, 0, AGENT_SCOPES.length, true]);
+    const agent = (await drive('agent.create', { draft: { name: 'Registry worker', description: 'Driven through the registry.', enabled: true, model: { provider: 'scripted', modelId: 'scripted-1' }, workspace: { projectId: f.project.id, subpath: '' }, budgets: { maxRequests: 10, maxOutputTokens: 2048, maxJobsPerHour: 2 }, scopes: ['read_notes', 'record_note'] }, actor: { kind: 'owner', identity: 'owner' } }, {}) as { agent: AgentRecord }).agent;
+    assert.deepEqual([agent.revision, agent.enabled, [...agent.scopes]], [1, true, ['read_notes', 'record_note']]);
+    assert.equal(f.agents.read(agent.id).id, agent.id, 'creating an agent really wrote it');
+    const readAgent = await drive('agent.read', { agentId: agent.id }, {}) as { agent: AgentRecord; history: { action: string }[] };
+    assert.deepEqual([readAgent.agent.id, readAgent.history.map((entry) => entry.action)], [agent.id, ['created']]);
+    const changed = (await drive('agent.update', { agentId: agent.id, revision: agent.revision, patch: { name: 'Registry worker two', scopes: ['read_notes'] }, actor: { kind: 'owner', identity: 'owner' } }, {}) as { agent: AgentRecord }).agent;
+    assert.deepEqual([changed.revision, changed.name, [...changed.scopes]], [2, 'Registry worker two', ['read_notes']]);
+    const archived = (await drive('agent.archive', { agentId: agent.id, revision: changed.revision, actor: { kind: 'owner', identity: 'owner' } }, {}) as { agent: AgentRecord }).agent;
+    assert.deepEqual([archived.archived, archived.revision], [true, 3]);
+
+    // The bounded file-edit capability: the read side, and one propose-only write that records its diff
+    // and writes no file at all.
+    const beforeEdit = await drive('file-edit.read', {}, scopeOf(f)) as FileEditView;
+    assert.deepEqual([beforeEdit.readOnly, beforeEdit.enabled, beforeEdit.mode, beforeEdit.edits.length], [true, true, 'propose-only', 0]);
+    const proposed = await drive('file-edit.write', { request: { agentId: null, path: 'ws/probe.txt', content: 'one\ntwo\n' }, actor: { kind: 'owner', identity: 'owner' } }, scopeOf(f)) as { record: { diff: string; applied: boolean; path: string }; written: boolean };
+    assert.deepEqual([proposed.written, proposed.record.applied, proposed.record.path], [false, false, 'ws/probe.txt']);
+    assert.match(proposed.record.diff, /\+one/);
+    const afterEdit = await drive('file-edit.read', {}, scopeOf(f)) as FileEditView;
+    assert.deepEqual([afterEdit.edits.length, afterEdit.edits[0].diff === proposed.record.diff], [1, true]);
+    assert.equal(await exists(join(f.workspaces, 'project', 'ws', 'probe.txt')), false, 'a propose-only write wrote no file at all');
 
     const distinct = [...new Set(exercised)].sort();
     assert.deepEqual(distinct, [...ACTION_IDS].sort(), 'every declared action was driven through the registry');
@@ -857,7 +902,63 @@ test('every declared precondition matches a refusal the handlers really produce'
     error = await refusal(f.actions.run('fork.create', { baseCommit: 'c'.repeat(40), cutoffEntryId: 2 }, forkScope));
     assert.ok(error instanceof ForkError && error.code === 'BOUNDED'); covered.add('FORK_LIMIT');
 
+    // The agent registry's own preconditions, each a refusal its handler really produces.
+    const agentDraft = (over: Record<string, unknown> = {}) => ({
+      name: 'Precondition agent', description: '', enabled: true,
+      model: { provider: 'scripted', modelId: 'scripted-1' },
+      workspace: { projectId: f.project.id, subpath: '' },
+      budgets: { maxRequests: null, maxOutputTokens: null, maxJobsPerHour: null },
+      scopes: ['read_notes'],
+      ...over
+    });
+    // AGENT_EXISTS: an agent this registry does not hold is refused as not found.
+    error = await refusal(f.actions.run('agent.read', { agentId: randomUUID() }, {}));
+    assert.ok(error instanceof AgentError && error.code === 'NOT_FOUND'); covered.add('AGENT_EXISTS');
+    // AGENT_SCOPE_KNOWN: a scope outside the closed vocabulary is refused rather than dropped.
+    error = await refusal(f.actions.run('agent.create', { draft: agentDraft({ scopes: ['read_notes', 'root'] }), actor: { kind: 'owner', identity: 'owner' } }, {}));
+    assert.ok(error instanceof AgentError && error.code === 'SCOPE_UNKNOWN'); covered.add('AGENT_SCOPE_KNOWN');
+    // AGENT_MODEL_OFFERED: a model this instance does not offer is refused.
+    error = await refusal(f.actions.run('agent.create', { draft: agentDraft({ model: { provider: 'scripted', modelId: 'unoffered' } }), actor: { kind: 'owner', identity: 'owner' } }, {}));
+    assert.ok(error instanceof AgentError && error.code === 'MODEL_NOT_OFFERED'); covered.add('AGENT_MODEL_OFFERED');
+    // AGENT_WORKSPACE_IN_PROJECT: a workspace naming a project this instance does not know is refused.
+    error = await refusal(f.actions.run('agent.create', { draft: agentDraft({ workspace: { projectId: randomUUID(), subpath: '' } }), actor: { kind: 'owner', identity: 'owner' } }, {}));
+    assert.ok(error instanceof AgentError && error.code === 'WORKSPACE_NOT_IN_PROJECT'); covered.add('AGENT_WORKSPACE_IN_PROJECT');
+    // AGENT_BUDGETS_BOUNDED: a budget outside its bound is refused, never reduced.
+    error = await refusal(f.actions.run('agent.create', { draft: agentDraft({ budgets: { maxRequests: -1, maxOutputTokens: null, maxJobsPerHour: null } }), actor: { kind: 'owner', identity: 'owner' } }, {}));
+    assert.ok(error instanceof AgentError && error.code === 'BUDGET_OUT_OF_BOUNDS' && /maxRequests must be a whole number from 1 to 100000/.test(error.message)); covered.add('AGENT_BUDGETS_BOUNDED');
+    // AGENT_CHANGE_PERMITTED: an agent may not create another agent at all.
+    error = await refusal(f.actions.run('agent.create', { draft: agentDraft(), actor: { kind: 'agent', identity: randomUUID() } }, {}));
+    assert.ok(error instanceof AgentError && error.code === 'NOT_PERMITTED' && /may not create another agent/.test(error.message)); covered.add('AGENT_CHANGE_PERMITTED');
+    // AGENT_NAME_UNIQUE: two live agents of this registry cannot share a name.
+    await f.actions.run('agent.create', { draft: agentDraft(), actor: { kind: 'owner', identity: 'owner' } }, {});
+    error = await refusal(f.actions.run('agent.create', { draft: agentDraft(), actor: { kind: 'owner', identity: 'owner' } }, {}));
+    assert.ok(error instanceof AgentError && error.code === 'DUPLICATE_NAME'); covered.add('AGENT_NAME_UNIQUE');
+    assert.equal(f.agents.list().length, 1, 'every refused creation wrote nothing');
+
+    // The bounded file-edit capability's own preconditions, each a refusal it really produces.
+    const editScope = scopeOf(f);
+    const editRequest = (over: Record<string, unknown> = {}) => ({ agentId: null, path: 'ws/probe.txt', content: 'one\n', ...over });
+    const editActor = { kind: 'owner', identity: 'owner' };
+    // FILE_EDIT_ENABLED: a disabled capability is not offered, and asking for it anyway is refused by name.
+    const disabledEditCapability: FileEditCapability = { enabled: false, mode: () => f.fileEdit.mode(), view: (projectId) => f.fileEdit.view(projectId), edit: (input) => f.fileEdit.edit(input) };
+    const disabledEdit: ActionEnvironment = { ...f.environment, control: { ...f.environment.control!, fileEdit: disabledEditCapability } };
+    const editRegistry = new ActionRegistry(disabledEdit);
+    const unavailableEdit = await actionRefusal(editRegistry.run('file-edit.write', { request: editRequest(), actor: editActor }, editScope), 'UNAVAILABLE');
+    assert.match(unavailableEdit, /file-edit capability is disabled on this instance/); covered.add('FILE_EDIT_ENABLED');
+    assert.deepEqual(editRegistry.list({ projectId: f.project.id }).actions.filter((descriptor) => descriptor.id.startsWith('file-edit.')), [], 'a disabled capability offers no file-edit action');
+    // FILE_EDIT_MODE_PERMITTED: auto-apply is refused while the policy in force is propose-only.
+    error = await refusal(f.actions.run('file-edit.write', { request: editRequest({ mode: 'auto-apply' }), actor: editActor }, editScope));
+    assert.ok(error instanceof FileEditError && error.code === 'NOT_PERMITTED' && /Auto-apply is not the mode in force/.test(error.message)); covered.add('FILE_EDIT_MODE_PERMITTED');
+    // FILE_EDIT_PATH_IN_WORKTREE: a path that could leave the connected worktree is refused.
+    error = await refusal(f.actions.run('file-edit.write', { request: editRequest({ path: '../outside.txt' }), actor: editActor }, editScope));
+    assert.ok(error instanceof FileEditError && error.code === 'OUTSIDE_WORKTREE'); covered.add('FILE_EDIT_PATH_IN_WORKTREE');
+    // FILE_EDIT_BOUNDED: an oversize change is refused, never truncated.
+    error = await refusal(f.actions.run('file-edit.write', { request: editRequest({ content: 'x'.repeat(FILE_EDIT_MAX_FILE_BYTES + 1) }), actor: editActor }, editScope));
+    assert.ok(error instanceof FileEditError && error.code === 'BOUNDED'); covered.add('FILE_EDIT_BOUNDED');
+    assert.deepEqual((await f.actions.run('file-edit.read', {}, editScope) as FileEditView).edits, [], 'every refused edit wrote nothing');
+
     // The limits this test does not drive, and why. A new code cannot be added without a decision.
+
     const undriven: Partial<Record<ActionPreconditionCode, string>> = {
       RUNNER_JOB_LIMIT: 'the 50-job bound belongs to the runner broker, which drives it in runner-broker.test.ts; driving it here would write 50 jobs to prove a bound this registry only repeats',
       SESSION_LIMIT: 'the 200-session bound belongs to the session registry, which drives it in session-registry.test.ts; driving it here would write 200 records to prove a bound this registry only repeats',

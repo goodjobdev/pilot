@@ -18,6 +18,7 @@
  import ActionPalette from './ActionPalette.svelte';
  import ProviderSettings from './ProviderSettings.svelte';
  import ProjectConnection from './ProjectConnection.svelte';
+ import AgentManager from './AgentManager.svelte';
  import { api,session,ApiError,download,whenSessionExpires } from './api';
  import type { Board,Operation,Project,Snapshot } from '../shared/model';
  import type { DocEntry,DocSnapshot } from '../shared/docs';
@@ -39,7 +40,7 @@
  let inbox=$state<{path:string;line:number;text:string;anchor:string|null;id:string}[]>([]),focusAnchor=$state<string|null>(null),inboxMenu=$state<HTMLDivElement>();
  let agentQuestions=$state<{id:string;text:string}[]>([]);
  let alertState=$state<AlertState>('off'),alertBusy=$state(false),alertMessage=$state('');
- let sessionExpired=$state(false),providersOpen=$state(false),connectionOpen=$state(false);
+ let sessionExpired=$state(false),providersOpen=$state(false),connectionOpen=$state(false),agentManagerOpen=$state(false);
  let docPathSet=$derived(new Set(docs.map(d=>d.path)));
  let shell=$state<HTMLDivElement>();
  let unlinked=$derived(snapshot?snapshot.board.tasks.filter(t=>t.scope==='active'&&!t.archived&&specState(t,docPathSet)==='unlinked').length:0);
@@ -241,6 +242,7 @@
   <div class="workspace-identity"><span class="workspace-prefix">WORKSPACE /</span><h1>{project?.name??'Pilot'}</h1></div>
   {#if project}<span class="authority-badge" class:adopted={snapshot?.board.adoption==='adopted'} title={snapshot?.board.adoption==='adopted'?'Adopted task planning; original specs/evidence remain authoritative.':'Original documents remain authoritative. This board is a planning mirror.'}>{snapshot?.board.adoption==='adopted'?'Adopted board':'Planning mirror'}</span>{/if}
   <div class="appbar-end">
+   <button class="icon-button" aria-label="Agents and privileges" title="Agents &amp; privileges" onclick={()=>agentManagerOpen=true}><Icon name="agent"/></button>
    <button class="icon-button" aria-label="Providers & models" title="Providers & models" onclick={()=>providersOpen=true}><Icon name="settings"/></button>
    <button class="icon-button" onclick={()=>theme=theme==='dark'?'light':'dark'} aria-label="Toggle theme" title="Toggle light / dark theme"><Icon name={theme==='dark'?'sun':'moon'}/></button>
    {#if project}
@@ -358,5 +360,6 @@
 {#if importing&&project}<ImportReview projectId={project.id} onclose={()=>importing=false} onapplied={imported}/>{/if}
 {#if adding}<AddProjectDialog onclose={()=>adding=false} oncreated={created}/>{/if}
 {#if providersOpen}<ProviderSettings onclose={()=>providersOpen=false}/>{/if}
+{#if agentManagerOpen}<AgentManager onclose={()=>agentManagerOpen=false} onchanged={()=>{const id=project?.id;if(id)void loadInbox();}}/>{/if}
 {#if connectionOpen&&project}<ProjectConnection {project} onclose={()=>connectionOpen=false} onconnected={()=>void connected()}/>{/if}
 {#if paletteOpen}<ActionPalette projectId={project?.id??null} onclose={()=>paletteOpen=false}/>{/if}

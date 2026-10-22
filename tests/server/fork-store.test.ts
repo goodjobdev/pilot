@@ -634,6 +634,10 @@ test('the child fork worktrees are a stated exclusion of a backup, never an entr
     const entries = await parentEntries(f);
     const fork = await createFork(f, entries[entries.length - 1].id);
     assert.equal(await exists(join(fork.worktreePath, 'README.md')), true, 'a real child worktree exists inside the data root this backup reads');
+    // A positive control for the exclusion below: a file written directly into the excluded fork root,
+    // outside any child worktree, means that directory genuinely holds files a walk would otherwise
+    // reach — so its absence from the archive is the exclusion's own effect and not an empty directory.
+    await writeFile(join(f.data, FORK_ROOT_DIRECTORY, 'positive-control.txt'), 'never captured\n');
     // A data root is a Pilot root because it carries a version-1 catalog: the registry a backup reads.
     await writeFile(join(f.data, 'catalog.json'), JSON.stringify({ version: 1, projects: [] }) + '\n');
     const archive = join(f.root, 'pilot-fork-backup.pbkp');
@@ -648,7 +652,15 @@ test('the child fork worktrees are a stated exclusion of a backup, never an entr
     // Nothing inside the fork root is captured, and the fork records themselves are, in the control store.
     assert.equal(manifest.files.some((file: { path: string }) => file.path.startsWith('forks')), false, 'no fork worktree file is captured under forks/');
     assert.equal(manifest.files.some((file: { path: string }) => file.path === 'control.sqlite'), true, 'the fork records themselves are captured in the control store');
-    assert.equal(manifest.files.some((file: { path: string }) => file.path.includes(fork.childSessionId)), false, 'and no captured path names a child worktree');
+    // No captured path names a child worktree. A child session id is Pi Durable's own conversation id,
+    // which is a short number ('12' in this fixture), so the check is a whole path component and the
+    // child's own archive-relative prefix — never a substring of any captured path. A substring test
+    // would match `agents/<projectId>/session.sqlite` whenever the project's random UUID happened to
+    // contain those digits, which is a property of the fixture's UUID rather than of the capture.
+    const worktreePrefix = join(FORK_ROOT_DIRECTORY, f.project.id, fork.childSessionId);
+    assert.equal(fork.worktreePath.endsWith('/' + worktreePrefix), true, 'the child worktree really is at the archive-relative path this assertion is about');
+    assert.equal(manifest.files.some((file: { path: string }) => file.path.split('/').includes(fork.childSessionId)), false, 'and no captured path names the child worktree directory');
+    assert.equal(manifest.files.some((file: { path: string }) => file.path === worktreePrefix || file.path.startsWith(worktreePrefix + '/')), false, 'and no captured path is inside the child worktree');
     // The archive manifest inside the archive states the same exclusion, so a restore reads it too:
     // verifying the archive writes nothing at all.
     const verified = await verifyArchive(archive, { passphrase: BACKUP_PASSPHRASE });

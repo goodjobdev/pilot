@@ -11,6 +11,7 @@ import {
   type LiveActivity, type LiveRunState, type LiveSessionActivity, type LiveToolInvocation, type LiveToolProjection, type LiveToolResult
 } from '../../shared/actions';
 import type { AgentEntry, AgentView } from '../../shared/agent';
+import { agentScopeVocabulary } from '../../shared/agent-registry';
 import type { SessionMigrationReport, SessionRegistry } from './session-registry';
 import type { SessionLifecycleService } from './session-lifecycle';
 import type { ApprovalStore } from './approval-store';
@@ -20,6 +21,9 @@ import type { RunnerBroker } from './runner-broker';
 import type { AcceptanceStore } from './acceptance-store';
 import type { ForkStore } from './fork-store';
 import { FORK_BASE_COMMIT_PATTERN } from '../../shared/forks';
+import { AGENT_ID_PATTERN, AGENT_SCOPES, type AgentScope } from '../../shared/agent-registry';
+import type { AgentStore } from './agent-store';
+import type { FileEditCapability } from './file-edit-tool';
 
 /**
  * The server half of the command registry: the one place an action id is bound to the handler that
@@ -96,6 +100,17 @@ export type ActionControl = {
    * unavailable.
    */
   readonly forks?: ForkStore;
+  /**
+   * The agent registry, or undefined when this instance has no durable control store. With it absent
+   * the agent actions are not offered at all, and asking for one anyway is refused as unavailable.
+   */
+  readonly agents?: AgentStore;
+  /**
+   * The bounded file-edit capability, or undefined when this instance has it disabled. It is absent
+   * rather than present-and-failing: with it absent the file-edit actions are not offered at all,
+   * and asking for one anyway is refused as unavailable. The tool is disabled by default.
+   */
+  readonly fileEdit?: FileEditCapability;
   /** The legacy-conversation migration, planned (dryRun true) or applied (false). */
   readonly migrate: (dryRun: boolean) => Promise<SessionMigrationReport>;
 };
@@ -165,6 +180,23 @@ const PARAM_VALIDATORS: Readonly<Record<ActionParamType, z.ZodTypeAny>> = Object
   // The cutoff is the transcript's own entry id: a whole number, and never zero. The fork model
   // re-checks it against the transcript the fork really branches from.
   'fork-cutoff': z.number().int().positive(),
+  // An identifier only; whether the agent exists is the store's business, not the schema's.
+  'agent-id': z.string().regex(AGENT_ID_PATTERN, 'an agent id must be 1-160 characters from A-Za-z0-9._:-'),
+  // The four agent payloads are parsed strictly by the agent registry model, which owns every rule
+  // (the closed scope vocabulary, the offered model, the workspace subpath, the budget bounds and the
+  // governance decision). The registry deliberately does not restate them, so a rule cannot drift.
+  'agent-draft': z.unknown(),
+  'agent-patch': z.unknown(),
+  'agent-actor': z.unknown(),
+  // The file-edit request is parsed strictly by the file-edit model, which owns containment and the
+  // mode rule. Only its shape is fixed here, so a path can never be refused as a malformed parameter
+  // when the containment helper is what must refuse it.
+  'file-edit-request': z.strictObject({
+    agentId: z.string().regex(AGENT_ID_PATTERN, 'an agent id must be 1-160 characters from A-Za-z0-9._:-').nullable(),
+    path: z.string().min(1).max(400),
+    content: z.string(),
+    mode: z.enum(['propose-only', 'auto-apply']).optional()
+  }),
   // An explicit flag: only a literal true forces a removal, and every other value is a false one.
   flag: z.boolean()
 });
@@ -312,6 +344,25 @@ function buildHandlers(environment: ActionEnvironment): Readonly<Record<ActionId
       );
     return durable.forks;
   };
+  /**
+   * The agent registry actions share one shape: this instance must really have the registry. The
+   * handler never restates a rule — the store and the agent registry model own every one of them,
+   * including the governance decision that refuses an agent widening its own scopes.
+   */
+  const agentRegistry = (): AgentStore => {
+    const durable = control();
+    if (!durable.agents) throw new ActionError('The agent registry is not open on this instance, so no agent is created, changed or archived', 'UNAVAILABLE');
+    return durable.agents;
+  };
+  /**
+   * The file-edit actions share one shape: this instance must really have the bounded capability.
+   * The handler never restates containment or the mode rule — the file-edit model owns both.
+   */
+  const fileEditTool = (): FileEditCapability => {
+    const durable = control();
+    if (!durable.fileEdit || !durable.fileEdit.enabled) throw new ActionError('The bounded file-edit capability is disabled on this instance, so no file is proposed or written', 'UNAVAILABLE');
+    return durable.fileEdit;
+  };
   /** The session a completion record claims, read only when it is already a well-formed identifier. */
   const claimedSession = (evidence: unknown): string | null => {
     if (typeof evidence !== 'object' || evidence === null || Array.isArray(evidence)) return null;
@@ -456,7 +507,39 @@ function buildHandlers(environment: ActionEnvironment): Readonly<Record<ActionId
     'fork.discard': async (params: Record<string, unknown>, scope: ActionScope) =>
       // The worktree is the one the record carries, never one a caller names; the force flag is the
       // only thing a caller may add, and the store refuses without it whenever the worktree is dirty.
-      forkStore().discard({ projectId: projectOf(scope), childSessionId: sessionOf(scope), revision: params.revision, force: params.force })
+      forkStore().discard({ projectId: projectOf(scope), childSessionId: sessionOf(scope), revision: params.revision, force: params.force }),
+    'agent.list': async () => {
+      const registry = agentRegistry();
+      const fileEdit = control().fileEdit;
+      return Object.freeze({
+        readOnly: true as const,
+        agents: Object.freeze(registry.list()),
+        scopes: Object.freeze(agentScopeVocabulary()),
+        models: registry.offeredModels(),
+        fileEdit: Object.freeze({
+          enabled: fileEdit !== undefined,
+          mode: fileEdit === undefined ? null : await fileEdit.mode()
+        })
+      });
+    },
+    'agent.read': async (params: Record<string, unknown>) => {
+      const registry = agentRegistry();
+      return Object.freeze({ readOnly: true as const, agent: registry.read(params.agentId), history: registry.history(params.agentId) });
+    },
+    'agent.create': async (params: Record<string, unknown>) => Object.freeze({ agent: agentRegistry().create({ draft: params.draft, actor: params.actor }) }),
+    'agent.update': async (params: Record<string, unknown>) =>
+      Object.freeze({ agent: agentRegistry().update({ agentId: params.agentId, revision: params.revision, patch: params.patch, actor: params.actor }) }),
+    'agent.archive': async (params: Record<string, unknown>) =>
+      Object.freeze({ agent: agentRegistry().archive({ agentId: params.agentId, revision: params.revision, actor: params.actor }) }),
+    'file-edit.read': async (_params: Record<string, unknown>, scope: ActionScope) => fileEditTool().view(projectOf(scope)),
+    'file-edit.write': async (params: Record<string, unknown>, scope: ActionScope) => {
+      const request = params.request as { agentId: string | null; path: string; content: string; mode?: 'propose-only' | 'auto-apply' };
+      const actor = params.actor as { kind: 'owner' | 'agent'; identity: string };
+      return fileEditTool().edit({
+        projectId: projectOf(scope), agentId: request.agentId, path: request.path, content: request.content,
+        mode: request.mode ?? null, actor
+      });
+    }
   };
 }
 
@@ -492,6 +575,18 @@ const ACCEPTANCE_ACTIONS: ReadonlySet<string> = new Set(ACTION_IDS.filter((id) =
  * and the acceptance record's are.
  */
 const FORK_ACTIONS: ReadonlySet<string> = new Set(ACTION_IDS.filter((id) => id.startsWith('fork.')));
+/**
+ * The actions that need the durable agent registry. An instance only has one when it has a control
+ * store and can name the models it offers and the projects it knows; absent, the actions are not
+ * offered rather than present-and-failing, exactly as the coding runner's are.
+ */
+const AGENT_ACTIONS: ReadonlySet<string> = new Set(ACTION_IDS.filter((id) => id.startsWith('agent.')));
+/**
+ * The actions that need the bounded file-edit capability, which is **disabled by default** behind an
+ * explicit switch. While it is disabled its actions are absent from the offered registry rather than
+ * present-and-failing, and asking for one anyway is refused with the named reason.
+ */
+const FILE_EDIT_ACTIONS: ReadonlySet<string> = new Set(ACTION_IDS.filter((id) => id.startsWith('file-edit.')));
 
 /**
  * Normalises and validates a requested scope: an omitted dimension stays omitted, an identifier that
@@ -543,6 +638,10 @@ export class ActionRegistry {
       return Object.freeze({ available: false, reason: 'the acceptance store is not open on this instance' });
     if (FORK_ACTIONS.has(descriptor.id) && !this.environment.control?.forks)
       return Object.freeze({ available: false, reason: 'the fork capability needs the agent harness, which is not enabled on this instance' });
+    if (AGENT_ACTIONS.has(descriptor.id) && !this.environment.control?.agents)
+      return Object.freeze({ available: false, reason: 'the agent registry is not open on this instance' });
+    if (FILE_EDIT_ACTIONS.has(descriptor.id) && !this.environment.control?.fileEdit?.enabled)
+      return Object.freeze({ available: false, reason: 'the bounded file-edit capability is disabled on this instance' });
     return Object.freeze({ available: true, reason: null });
   }
 

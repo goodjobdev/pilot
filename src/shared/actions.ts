@@ -66,6 +66,11 @@ export const ACTION_PARAM_TYPES = [
   'acceptance-actor',
   'fork-commit',
   'fork-cutoff',
+  'agent-id',
+  'agent-draft',
+  'agent-patch',
+  'agent-actor',
+  'file-edit-request',
   'flag'
 ] as const;
 export type ActionParamType = (typeof ACTION_PARAM_TYPES)[number];
@@ -76,7 +81,7 @@ export type ActionParamType = (typeof ACTION_PARAM_TYPES)[number];
  * carries it and a client pre-fills exactly that value — or asks for it when the read is not
  * available — instead of assuming a number the server will refuse.
  */
-export const ACTION_REVISION_SOURCES = ['session-lifecycle-revision', 'session-record-revision', 'queue-revision', 'acceptance-policy-revision', 'fork-revision'] as const;
+export const ACTION_REVISION_SOURCES = ['session-lifecycle-revision', 'session-record-revision', 'queue-revision', 'acceptance-policy-revision', 'fork-revision', 'agent-revision'] as const;
 export type ActionRevisionSource = (typeof ACTION_REVISION_SOURCES)[number];
 
 /** One declared parameter: what it is called, which rule it obeys, and whether it must be present. */
@@ -163,7 +168,14 @@ export const ACTION_IDS = [
   'fork.create',
   'fork.list',
   'fork.resume',
-  'fork.discard'
+  'fork.discard',
+  'agent.list',
+  'agent.read',
+  'agent.create',
+  'agent.update',
+  'agent.archive',
+  'file-edit.read',
+  'file-edit.write'
 ] as const;
 export type ActionId = (typeof ACTION_IDS)[number];
 
@@ -230,7 +242,18 @@ export const ACTION_PRECONDITION_CODES = [
   'TARGET_IN_FORK_ROOT',
   'TARGET_FREE',
   'FORK_LIMIT',
-  'WORKTREE_CLEAN'
+  'WORKTREE_CLEAN',
+  'AGENT_EXISTS',
+  'AGENT_NAME_UNIQUE',
+  'AGENT_MODEL_OFFERED',
+  'AGENT_WORKSPACE_IN_PROJECT',
+  'AGENT_BUDGETS_BOUNDED',
+  'AGENT_SCOPE_KNOWN',
+  'AGENT_CHANGE_PERMITTED',
+  'FILE_EDIT_ENABLED',
+  'FILE_EDIT_MODE_PERMITTED',
+  'FILE_EDIT_PATH_IN_WORKTREE',
+  'FILE_EDIT_BOUNDED'
 ] as const;
 export type ActionPreconditionCode = (typeof ACTION_PRECONDITION_CODES)[number];
 
@@ -411,6 +434,48 @@ const forkForceParameter: ActionParameter = Object.freeze({
   type: 'flag' as const,
   required: false,
   description: 'an explicit force, and the only way a child worktree holding uncommitted or untracked changes is ever removed; an absent or false value refuses that removal and reports the named operator-attention state instead'
+});
+
+const agentIdParameter: ActionParameter = Object.freeze({
+  name: 'agentId',
+  type: 'agent-id' as const,
+  required: true,
+  description: 'the stable id of one agent record, 1-160 characters starting alphanumeric from A-Za-z0-9._:-; read it from the registry (GET /api/agents)'
+});
+const agentRevisionParameter: ActionParameter = Object.freeze({
+  name: 'revision',
+  type: 'revision' as const,
+  required: true,
+  revisionSource: 'agent-revision' as const,
+  description: 'the agent revision the caller read; a stale one is refused as a conflict and writes nothing. Read it from the registry (GET /api/agents), which reports each record revision'
+});
+const agentDraftParameter: ActionParameter = Object.freeze({
+  name: 'draft',
+  type: 'agent-draft' as const,
+  required: true,
+  description: 'the whole record: name, description, enabled, model {provider, modelId}, workspace {projectId, subpath}, budgets {maxRequests, maxOutputTokens, maxJobsPerHour} and the scope allowlist. An unknown field, an unknown scope, a model this instance does not offer, a subpath that escapes the project root and a budget outside its bound are each refused by name',
+  validatedBy: 'the agent registry model (src/shared/agent-registry.ts)'
+});
+const agentPatchParameter: ActionParameter = Object.freeze({
+  name: 'patch',
+  type: 'agent-patch' as const,
+  required: true,
+  description: 'the fields that change: any of name, description, enabled, model, workspace, budgets and scopes, and at least one of them. A change that would leave a scope the actor does not hold itself is refused',
+  validatedBy: 'the agent registry model (src/shared/agent-registry.ts)'
+});
+const agentActorParameter: ActionParameter = Object.freeze({
+  name: 'actor',
+  type: 'agent-actor' as const,
+  required: true,
+  description: 'who is making the change: kind (owner or agent) and identity. Only the owner may create an agent or widen a scope, and an agent may neither edit its own record nor create one',
+  validatedBy: 'the agent registry model (src/shared/agent-registry.ts)'
+});
+const fileEditRequestParameter: ActionParameter = Object.freeze({
+  name: 'request',
+  type: 'file-edit-request' as const,
+  required: true,
+  description: 'the change: agentId (or null for the owner), a relative path inside the project\u2019s connected repository worktree, the full text the file would hold, and an optional mode (propose-only or auto-apply). The mode in force is read from the acceptance policy, and auto-apply is refused while that policy is propose-only',
+  validatedBy: 'the file-edit model (src/server/state/file-edit-tool.ts)'
 });
 
 function describe(value: Omit<ActionDescriptor, 'surfaces'> & { readonly surfaces?: readonly ActionSurface[] }): ActionDescriptor {
@@ -1060,8 +1125,117 @@ export const ACTION_DESCRIPTORS: readonly ActionDescriptor[] = Object.freeze([
     noops: Object.freeze(['discarding a fork whose worktree is already gone completes the discard and removes nothing']),
     writes: true,
     effect: "reads the child worktree's own status, removes it by one git worktree remove — with an explicit force only where the caller forced it — and writes the discarded state; a worktree git will not remove or cannot report becomes the named operator-attention state worktree-remove-refused or worktree-unreadable instead, and nothing outside the designated fork root is ever touched"
+  }),
+  describe({
+    id: 'agent.list' as const,
+    label: 'List the agents',
+    description: 'Read the agent registry, the closed privilege vocabulary and the file-edit switch in force.',
+    requires: noScope,
+    parameters: Object.freeze([]),
+    preconditions: Object.freeze([]),
+    noops: Object.freeze(['a registry with no agent reads as an empty list beside the full scope vocabulary; that is the registry, not an absence of one']),
+    writes: false,
+    effect: 'reads every agent record with its revision, its enablement and its scope allowlist, the closed scope vocabulary with each description, and whether the bounded file-edit capability is enabled and which mode the acceptance policy puts in force; it creates and changes nothing'
+  }),
+  describe({
+    id: 'agent.read' as const,
+    label: 'Read one agent',
+    description: 'Read one agent record and the durable record of who changed it, what changed and when.',
+    requires: noScope,
+    parameters: Object.freeze([agentIdParameter]),
+    preconditions: [
+      Object.freeze({ code: 'AGENT_EXISTS' as const, description: 'the id names an agent this registry holds; an unknown one is refused as not found' })
+    ],
+    noops: Object.freeze([]),
+    writes: false,
+    effect: 'reads one agent record at its current revision and its durable audit trail, oldest first, each entry naming the revision, the action, the actor and the instant; it writes nothing'
+  }),
+  describe({
+    id: 'agent.create' as const,
+    label: 'Create an agent',
+    description: 'Create one agent record with a declared model, a workspace scope, bounded budgets and an explicit scope allowlist.',
+    requires: noScope,
+    parameters: Object.freeze([agentDraftParameter, agentActorParameter]),
+    preconditions: [
+      Object.freeze({ code: 'AGENT_SCOPE_KNOWN' as const, description: 'every scope is one of the closed vocabulary and none is repeated; a value outside it is refused rather than ignored' }),
+      Object.freeze({ code: 'AGENT_MODEL_OFFERED' as const, description: 'the declared model is one this instance really offers; a model outside that set is refused, so an agent never declares a model that cannot run' }),
+      Object.freeze({ code: 'AGENT_WORKSPACE_IN_PROJECT' as const, description: 'the workspace names a registered project, and its subpath is relative with no parent, empty or current segment and no backslash; a subpath that could escape the project root is refused rather than normalised' }),
+      Object.freeze({ code: 'AGENT_BUDGETS_BOUNDED' as const, description: 'every budget is null or a whole number inside its documented bound; a negative or oversized budget is refused, never reduced' }),
+      Object.freeze({ code: 'AGENT_NAME_UNIQUE' as const, description: 'no live agent already carries this name; a duplicate is refused and names the agent that holds it. An archived agent\u2019s name is free again' }),
+      Object.freeze({ code: 'AGENT_CHANGE_PERMITTED' as const, description: 'the actor may make this change: the owner may create any agent, and an agent may not create an agent at all' })
+    ],
+    noops: Object.freeze([]),
+    writes: true,
+    effect: 'writes revision 1 of one agent record, disabled or enabled as the draft says, with its scope allowlist canonicalised, and records who created it and when in the durable audit row beside the record'
+  }),
+  describe({
+    id: 'agent.update' as const,
+    label: 'Change one agent',
+    description: 'Change one agent\u2019s name, description, model, budgets, workspace scope or scope allowlist, under a revision check.',
+    requires: noScope,
+    parameters: Object.freeze([agentIdParameter, agentRevisionParameter, agentPatchParameter, agentActorParameter]),
+    preconditions: [
+      Object.freeze({ code: 'AGENT_EXISTS' as const, description: 'the id names an agent this registry holds; an unknown one is refused as not found' }),
+      Object.freeze({ code: 'REVISION_MATCHES' as const, description: 'the revision the caller read is the stored revision; a stale one is refused as a conflict and writes nothing' }),
+      Object.freeze({ code: 'AGENT_SCOPE_KNOWN' as const, description: 'every scope the change leaves in force is one of the closed vocabulary and none is repeated' }),
+      Object.freeze({ code: 'AGENT_MODEL_OFFERED' as const, description: 'the model the change leaves declared is one this instance really offers' }),
+      Object.freeze({ code: 'AGENT_WORKSPACE_IN_PROJECT' as const, description: 'the workspace the change leaves in force names a registered project with a subpath that cannot escape it' }),
+      Object.freeze({ code: 'AGENT_BUDGETS_BOUNDED' as const, description: 'every budget the change leaves in force is null or inside its documented bound' }),
+      Object.freeze({ code: 'AGENT_NAME_UNIQUE' as const, description: 'no other live agent already carries the name the change leaves in force' }),
+      Object.freeze({ code: 'AGENT_CHANGE_PERMITTED' as const, description: 'the actor may make this change: the owner may change any scope, and an agent may neither edit its own record nor give another agent a scope it does not hold itself. The rule is checked against the allowlist the change would leave in force, so widening in two steps is refused at the step that widens' })
+    ],
+    noops: Object.freeze([]),
+    writes: true,
+    effect: 'writes the next revision of one agent record with the changed fields and every other field unchanged, and records who changed it, what the change was and when in the durable audit row beside the record'
+  }),
+  describe({
+    id: 'agent.archive' as const,
+    label: 'Archive one agent',
+    description: 'Close one agent so it is never in force again, keeping every field it held.',
+    requires: noScope,
+    parameters: Object.freeze([agentIdParameter, agentRevisionParameter, agentActorParameter]),
+    preconditions: [
+      Object.freeze({ code: 'AGENT_EXISTS' as const, description: 'the id names an agent this registry holds; an unknown one is refused as not found' }),
+      Object.freeze({ code: 'REVISION_MATCHES' as const, description: 'the revision the caller read is the stored revision; a stale one is refused as a conflict and writes nothing' }),
+      Object.freeze({ code: 'AGENT_CHANGE_PERMITTED' as const, description: 'the actor may make this change: the owner may archive any agent, and an agent may neither archive itself nor another agent' })
+    ],
+    noops: Object.freeze([]),
+    writes: true,
+    effect: 'writes the next revision of one agent record with the archived flag set and every other field unchanged, so it stops being in force and its name becomes free again; the record itself is kept'
+  }),
+  describe({
+    id: 'file-edit.read' as const,
+    label: 'Read the recorded file edits',
+    description: 'Read one project\u2019s proposed and applied file edits, each with its diff, beside the mode in force.',
+    requires: projectScope,
+    parameters: Object.freeze([]),
+    preconditions: [
+      Object.freeze({ code: 'PROJECT_REGISTERED' as const, description: 'the project scope names a registered project; an unknown one is refused as not found' }),
+      Object.freeze({ code: 'FILE_EDIT_ENABLED' as const, description: 'the bounded file-edit capability is enabled on this instance. While it is disabled its actions are absent from the offered registry rather than listed and failing' })
+    ],
+    noops: Object.freeze(['a project with no recorded edit reads as an empty list at the documented bounds: that is the project\u2019s edit ledger, not an absence of one']),
+    writes: false,
+    effect: 'reads one project\u2019s recorded changes in order, each naming the path, the mode, whether the file was really written, the actor, the instant and the diff that proves it, beside the file and diff caps and the mode the acceptance policy puts in force; it proposes and writes nothing'
+  }),
+  describe({
+    id: 'file-edit.write' as const,
+    label: 'Propose or apply a file edit',
+    description: 'Record one bounded change inside a project\u2019s connected repository worktree, and write it only where the policy permits.',
+    requires: projectScope,
+    parameters: Object.freeze([fileEditRequestParameter, agentActorParameter]),
+    preconditions: [
+      Object.freeze({ code: 'PROJECT_REGISTERED' as const, description: 'the project scope names a registered project with its own folder, which is the connected repository worktree the change is contained to' }),
+      Object.freeze({ code: 'FILE_EDIT_ENABLED' as const, description: 'the bounded file-edit capability is enabled on this instance' }),
+      Object.freeze({ code: 'FILE_EDIT_MODE_PERMITTED' as const, description: 'the mode in force permits what the request asks for. Propose-only is always permitted; auto-apply is refused while the acceptance policy in force is propose-only, because the mode comes from that policy rather than being assumed' }),
+      Object.freeze({ code: 'FILE_EDIT_PATH_IN_WORKTREE' as const, description: 'the path is relative, has no absolute prefix, no backslash and no empty, current or parent segment, has no symlink at any component, names no generated or app-managed directory and resolves nowhere near the data root; anything else is refused rather than rewritten' }),
+      Object.freeze({ code: 'FILE_EDIT_BOUNDED' as const, description: 'the change is inside the documented per-file byte cap, and so is the file it would replace; an oversize change is refused rather than truncated' })
+    ],
+    noops: Object.freeze(['the same change recorded again is the same record — its identity is derived from the change itself — and it writes no second record and no second file']),
+    writes: true,
+    effect: 'resolves the mode from the acceptance policy, refuses any path that could leave the connected worktree, records the change and its diff durably, and — only in auto-apply — writes the file atomically; in propose-only it writes no file at all, so every recorded change is reviewable through the acceptance machinery before anything lands'
   })
 ]);
+
 
 const byId: Readonly<Record<string, ActionDescriptor>> = Object.freeze(
   Object.fromEntries(ACTION_DESCRIPTORS.map((descriptor) => [descriptor.id, descriptor]))

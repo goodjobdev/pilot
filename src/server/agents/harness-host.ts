@@ -5,12 +5,14 @@ import { BACKGROUND_CONTEXT } from '@earendil-works/chord/context';
 import { createModels } from '@earendil-works/pi-ai/models';
 import { createAssistantMessageEventStream } from '@earendil-works/pi-ai/utils/event-stream';
 import { fauxAssistantMessage, fauxProvider, fauxToolCall, type FauxProviderHandle, type FauxResponseFactory } from '@earendil-works/pi-ai/providers/faux';
-import { Harness, createRegistry, defineExtension, defineTool, section } from '@earendil-works/pi-durable';
-import type { ConversationId, EntryId } from '@earendil-works/pi-durable';
+import { Harness, ToolTask, createRegistry, defineExtension, defineTool, hook, section } from '@earendil-works/pi-durable';
+import type { ConversationId, EntryId, Extension } from '@earendil-works/pi-durable';
 import { openNodeSqliteStorage } from '@earendil-works/pi-durable/storage/sqlite/node';
 import { Type } from 'typebox';
 import { safePath } from '../paths';
 import { modelAcceptsImages } from '../../shared/images';
+import { authorizeToolUse, type AgentPrivilegePort, type AgentScope, type DispatchAuthority } from '../../shared/agent-registry';
+import { FILE_EDIT_MAX_FILE_BYTES, FILE_EDIT_MAX_PATH_LENGTH, type FileEditCapability } from '../state/file-edit-tool';
 import { agentViewFrom, type AgentQuestion, type AgentView } from '../../shared/agent';
 import type { Project } from '../../shared/model';
 import { HttpError } from '../board-store';
@@ -266,6 +268,101 @@ export interface HarnessHostOptions {
   delivery?: AgentDeliveryPort;
   /** Where a live generation becomes visible to the durable session lifecycle, when one exists. */
   lifecycle?: SessionLifecycleHooks;
+  /**
+   * Where this harness learns the privilege scopes in force. Absent, every tool it exposes belongs
+   * to the owner's own dispatch and no agent allowlist applies.
+   */
+  privileges?: AgentPrivilegePort;
+  /**
+   * The bounded file-edit capability, or undefined when this instance has it disabled. The tool is
+   * installed only when the capability is enabled, so a disabled tool does not exist at all rather
+   * than existing and failing.
+   */
+  fileEdit?: FileEditCapability;
+}
+
+/**
+ * The tools a dispatch whose scopes are these is really enabled for.
+ *
+ * This is gate (a): only the permitted tools are offered to the model. The authoritative re-check is
+ * the privilege hook below, which reads the scopes on every call — so a scope revoked after this set
+ * was built is still refused at dispatch, with no effect. 'undefined' means the owner's own dispatch,
+ * where nothing is narrowed.
+ */
+function permittedTools(extensions: readonly Extension[], scopes: readonly AgentScope[] | null): Extension['tools'] | undefined {
+  if (scopes === null) return undefined;
+  return extensions
+    .flatMap((extension) => extension.tools ?? [])
+    .filter((tool) => authorizeToolUse({ scopes, tool: tool.name }).permitted);
+}
+
+/**
+ * The privilege extension: the one place the dispatch path re-checks a caller's scopes server-side.
+ *
+ * Its hook runs on **every** tool call — model-issued and nested — before the call's intent is
+ * recorded, so a tool the scopes forbid is refused with a precise reason and produces no side effect
+ * at all, however the call was crafted. Its section tells the model what its allowlist holds, so a
+ * well-behaved model never attempts what would be refused.
+ */
+function privilegeExtension(project: Project, authorityOf: () => Promise<DispatchAuthority>) {
+  return defineExtension({
+    name: 'agent-privileges',
+    sections: [section('agent-privileges', async () => {
+      const authority = await authorityOf();
+      if (authority.scopes === null) return undefined;
+      return authority.scopes.length === 0
+        ? 'This dispatch runs as an agent whose scope allowlist is empty, so every tool is refused at dispatch. Do not attempt one.'
+        : 'This dispatch runs as an agent. Its privilege scopes are: ' + authority.scopes.join(', ') + '. A tool outside them is refused at dispatch with no effect, so do not attempt one.';
+    }, { tag: false })],
+    hooks: [hook(ToolTask, {
+      beforeTool: async (call) => {
+        const authority = await authorityOf();
+        const verdict = authorizeToolUse({ scopes: authority.scopes, tool: call.name });
+        return verdict.permitted ? undefined : { block: verdict.reason };
+      }
+    })]
+  });
+}
+
+/**
+ * The bounded file-edit tool, installed only when this instance has the capability enabled.
+ *
+ * The tool itself never decides authority: the privilege hook above refuses a caller without the
+ * file_edit scope before this code runs. What the tool owns is containment — a relative path inside
+ * the project's connected worktree and nothing else — the size caps, the atomic write, and the mode,
+ * which comes from the acceptance policy rather than being assumed.
+ */
+function fileEditExtension(project: Project, capability: FileEditCapability, authorityOf: () => Promise<DispatchAuthority>) {
+  return defineExtension({
+    name: 'file-edit',
+    sections: [section('file-edit-protocol', () => 'Use file_edit to propose or apply one bounded change to a file inside this project\u2019s connected worktree. The path is relative and must stay inside it. In propose-only mode the change and its diff are recorded and no file is written.', { tag: false })],
+    tools: [defineTool({
+      name: 'file_edit',
+      description: 'Propose or apply one bounded edit to a file inside this project\u2019s connected repository worktree.',
+      parameters: Type.Object({
+        path: Type.String({ minLength: 1, maxLength: FILE_EDIT_MAX_PATH_LENGTH, description: 'A relative path inside this project\u2019s connected worktree' }),
+        content: Type.String({ maxLength: FILE_EDIT_MAX_FILE_BYTES, description: 'The full text the file would hold' })
+      }),
+      replay: 'unsafe',
+      execute: async (args) => {
+        const authority = await authorityOf();
+        const outcome = await capability.edit({
+          projectId: project.id,
+          agentId: authority.agentId,
+          path: args.path,
+          content: args.content,
+          mode: null,
+          actor: authority.agentId === null ? { kind: 'owner' as const, identity: 'owner' } : { kind: 'agent' as const, identity: authority.agentId }
+        });
+        return {
+          output: [{
+            type: 'text' as const,
+            text: (outcome.written ? 'Applied ' : 'Proposed ') + outcome.record.path + ' in ' + outcome.record.mode + ' mode; the change and its diff are recorded as ' + outcome.record.id + '.'
+          }]
+        };
+      }
+    })]
+  });
 }
 
 /**
@@ -296,6 +393,34 @@ export class HarnessHost {
   constructor(private readonly options: HarnessHostOptions) {}
   get enabled(): boolean { return this.options.enabled; }
   private assertEnabled() { if (!this.options.enabled) throw new HttpError(503, 'Agents are disabled on this instance'); }
+  /**
+   * The privilege scopes in force for one project's dispatch. It is read through the injected port
+   * on every call, so a change to an agent's allowlist takes effect immediately; with no port, the
+   * owner's own dispatch is in force and nothing is narrowed.
+   */
+  private async dispatchAuthority(project: Project): Promise<DispatchAuthority> {
+    if (!this.options.privileges) return Object.freeze({ agentId: null, scopes: null });
+    const authority = await this.options.privileges.authority({ projectId: project.id });
+    return Object.freeze({ agentId: authority.agentId ?? null, scopes: authority.scopes ?? null });
+  }
+  /**
+   * The models this instance really offers: the deterministic scripted stand-in it always has, and
+   * every model of every provider it has credentials for. An agent's declared model must be one of
+   * these, so a declaration can never name a model that cannot run here.
+   */
+  offeredModels(): readonly { readonly provider: string; readonly modelId: string }[] {
+    const offered: { provider: string; modelId: string }[] = [];
+    // The deterministic stand-in is offered exactly where the harness is: with the harness off it is
+    // not a model this instance can run at all.
+    if (this.options.enabled) {
+      const scripted = fauxProvider();
+      offered.push({ provider: scripted.provider.id, modelId: scripted.getModel().id });
+    }
+    // Every model of every provider this instance has credentials for is offered whether or not the
+    // harness is on: the catalog is the instance's, not the harness's.
+    for (const candidate of this.options.providers?.models.getModels() ?? []) offered.push({ provider: candidate.provider, modelId: candidate.id });
+    return Object.freeze(offered);
+  }
   private async serial<T>(key: string, work: () => Promise<T>): Promise<T> {
     const previous = this.tails.get(key) ?? Promise.resolve();
     const current = previous.catch(() => {}).then(work);
@@ -351,12 +476,34 @@ export class HarnessHost {
       const storage = await openNodeSqliteStorage(path);
       const question = questionExtension();
       const notes = notesExtension(project);
+      // The scopes in force are read once here, so the tools the model is offered are the permitted
+      // ones, and again on every call by the privilege hook, which is the authority. Nothing about
+      // the owner's own dispatch changes: with no privilege port the authority is null and every
+      // installed tool is offered exactly as before.
+      const authority = await this.dispatchAuthority(project);
+      const authorityOf = () => this.dispatchAuthority(project);
+      const privileges = privilegeExtension(project, authorityOf);
+      const extensions: Extension[] = [question, notes, privileges];
       const registry = createRegistry();
       registry.install(question);
       registry.install(notes);
+      registry.install(privileges);
+      const fileEdit = this.options.fileEdit;
+      if (fileEdit !== undefined && fileEdit.enabled) {
+        const edits = fileEditExtension(project, fileEdit, authorityOf);
+        extensions.push(edits);
+        registry.install(edits);
+      }
       const harness = await Harness.open(storage, { models, registry,settings:{retry:{enabled:false},stream:{maxRetries:0,timeoutMs:120000},compaction:{enabled:false}} }, BACKGROUND_CONTEXT);
       const initial=await this.options.providers?.defaultModel();
-      const conversation = await harness.root(BACKGROUND_CONTEXT, { agent: { model: initial??{ provider: provider.provider.id, modelId: provider.getModel().id }, extensions: [question,notes] } });
+      // Only the permitted tools are enabled for an agent, so the model is never offered one its
+      // scopes forbid. The owner's own dispatch passes no filter at all and is unchanged.
+      const permitted = permittedTools(extensions, authority.scopes);
+      const conversation = await harness.root(BACKGROUND_CONTEXT, { agent: {
+        model: initial??{ provider: provider.provider.id, modelId: provider.getModel().id },
+        extensions,
+        ...(permitted === undefined ? {} : { tools: permitted })
+      } });
       // Never replace an existing session's model with a newly changed global default.
       // Continue any run the previous process left unfinished.
       harness.resume();
