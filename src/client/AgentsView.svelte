@@ -11,6 +11,9 @@
  import SessionBar from './SessionBar.svelte';
  let { projectId,onerror,onquestions,agentsVersion=0 }:{ projectId:string; onerror:(message:string)=>void; onquestions?:()=>void; agentsVersion?:number }=$props();
  let view=$state<AgentView|null>(null),enabled=$state(true),status=$state('Connecting…'),draft=$state(''),sending=$state(false),problem=$state('');
+ // The session whose transcript the stream should follow. Updated when the owner selects a session
+ // in the session bar. An empty or absent value means the root (legacy project) conversation.
+ let selectedSessionId=$state('');
  let answers=$state<Record<string,string>>({}),answering=$state('');
  // The images attached to the next message, and the one way the composer's upload path is fed.
  let media=$state<ImageDraft[]>([]),composerApi=$state<{add:(files:File[])=>void}|null>(null),composerDragging=$state(false);
@@ -54,6 +57,7 @@
  }
  $effect(()=>{
    const id=projectId;
+   const sessionId=selectedSessionId;
    let cancelled=false;
    void (async()=>{
      try{
@@ -65,7 +69,7 @@
      }catch(e){if(!cancelled){status=(e as Error).message;onerror((e as Error).message);}return;}
      controller?.abort();
      controller=new AbortController();
-     try{await agentStream(id,next=>{if(!cancelled){view=next;status='Live';}},controller.signal);}
+     try{await agentStream(id,next=>{if(!cancelled){view=next;status='Live';}},controller.signal,sessionId||undefined);}
      catch(e){if(!cancelled&&(e as Error).name!=='AbortError')status='Stream closed — '+(e as Error).message;}
    })();
    return ()=>{cancelled=true;controller?.abort();};
@@ -163,7 +167,7 @@
  }
 </script>
 <section class="agents">
- {#if view?.conversationId}<SessionBar {projectId} sessionId={view.conversationId} {view} {agentsVersion} onerror={(message)=>onerror(message)}/>{/if}
+ {#if view?.conversationId}<SessionBar {projectId} sessionId={view.conversationId} {view} {agentsVersion} onerror={(message)=>onerror(message)} onsessionchange={(id)=>{selectedSessionId=id;}}/>{/if}
  <header class="agents-head">
   <div>
    <span class="eyebrow">{!view?.model||view.model.provider==='faux'?'SCRIPTED TEST PROVIDER':'MODEL PROVIDER'}</span>

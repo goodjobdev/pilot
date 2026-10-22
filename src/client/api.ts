@@ -51,7 +51,7 @@ export interface ActionListView{readOnly:true;scope:{projectId:string|null;sessi
 /** One execution: the id that ran and the handler's own result. */
 export interface ActionExecution{action:string;result:unknown}
 /** One scope of the closed vocabulary, with the one line that describes what granting it would allow. */
-export interface AgentScopeOption{scope:string;description:string}
+export interface AgentScopeOption{scope:string;description:string;installed:boolean}
 /** The registry as the server offers it: every agent, the vocabulary, the offered models and the switch. */
 export interface AgentRegistryView{agents:AgentRecord[];scopes:AgentScopeOption[];models:AgentModelChoice[];fileEdit:{enabled:boolean;mode:string|null}}
 export interface AgentDetailView{agent:AgentRecord;history:AgentAuditEntry[]}
@@ -187,8 +187,9 @@ export async function assetText(id:string,path:string):Promise<string>{
  * read from a streaming fetch instead; in hosted mode Cloudflare supplies the
  * Access assertion for this same-origin request.
  */
-export async function agentStream(id:string,onView:(view:AgentView)=>void,signal:AbortSignal):Promise<void>{
-  const res=await fetch('/api/projects/'+id+'/agents/stream',{headers:{'x-dashboard-token':token},signal});
+export async function agentStream(id:string,onView:(view:AgentView)=>void,signal:AbortSignal,sessionId?:string):Promise<void>{
+  const qs=sessionId?'?sessionId='+encodeURIComponent(sessionId):'';
+  const res=await fetch('/api/projects/'+id+'/agents/stream'+qs,{headers:{'x-dashboard-token':token},signal});
   if(!res.ok||!res.body)throw new ApiError(res.status,'Agent stream unavailable');
   const reader=res.body.getReader(),decoder=new TextDecoder();
   let buffer='';

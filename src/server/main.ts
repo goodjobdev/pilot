@@ -1265,7 +1265,7 @@ export async function createApp(options:AppOptions){
             if(agentsRoute[2]===undefined&&req.method==='GET'){json({enabled:false,view:null});return;}
             throw new HttpError(503,'Agents are disabled on this instance');
           }
-          if(agentsRoute[2]===undefined&&req.method==='GET'){json({enabled:true,view:await agents.view(p),delivery:await agents.deliveryView(p)});return;}
+          if(agentsRoute[2]===undefined&&req.method==='GET'){const viewSessionId=url.searchParams.get('sessionId');const viewResult=viewSessionId?(await agents.sessionView(p,viewSessionId))??{conversationId:viewSessionId,entries:[],questions:[],inbox:[],working:false,usage:{input:0,output:0}}:await agents.view(p);json({enabled:true,view:viewResult,delivery:await agents.deliveryView(p)});return;}
           if(agentsRoute[2]==='model'&&req.method==='POST'){const c=z.strictObject({model:z.strictObject({provider:z.string().min(1).max(100),modelId:z.string().min(1).max(200)}).nullable()}).parse(payload);json(await agents.setModel(p,c.model));return;}
           if(agentsRoute[2]==='media'&&req.method==='POST'){
             // Admission. An image is refused before anything is stored when the session's selected
@@ -1325,9 +1325,11 @@ export async function createApp(options:AppOptions){
           if(agentsRoute[2]==='stream'&&req.method==='GET'){
             res.statusCode=200;res.setHeader('Content-Type','text/event-stream');res.setHeader('Cache-Control','no-store');res.setHeader('Connection','keep-alive');
             res.write('retry: 3000\n\n');
+            // Accept optional sessionId so the owner can switch between per-session transcripts.
+            const streamSessionId=url.searchParams.get('sessionId')||undefined;
             let closed=false,dispose:()=>Promise<void>=async()=>{};
             try{
-              dispose=await agents.subscribe(p,view=>{if(!closed)res.write('data: '+JSON.stringify(view)+'\n\n');});
+              dispose=await agents.subscribe(p,view=>{if(!closed)res.write('data: '+JSON.stringify(view)+'\n\n');},streamSessionId);
             }catch(e){
               res.write('event: error\ndata: '+JSON.stringify({error:(e as Error).message})+'\n\n');res.end();return;
             }

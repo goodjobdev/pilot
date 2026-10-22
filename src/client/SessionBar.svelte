@@ -16,7 +16,7 @@
   * own words. The session list shows every named session with its agent, lifecycle, last activity and
   * linked work, and "New session" creates one with per-field validation.
   */
- let {projectId,sessionId,view=null,agentsVersion=0,onerror=()=>{}}:{projectId:string;sessionId:string;view?:AgentView|null;agentsVersion?:number;onerror?:(message:string)=>void}=$props();
+ let {projectId,sessionId,view=null,agentsVersion=0,onerror=()=>{},onsessionchange=()=>{}}:{projectId:string;sessionId:string;view?:AgentView|null;agentsVersion?:number;onerror?:(message:string)=>void;onsessionchange?:(sessionId:string)=>void}=$props();
 
  let sessions=$state<SessionOverview[]>([]);
  let agents=$state<AgentRecord[]>([]);
@@ -28,7 +28,18 @@
 
  const selected=$derived(sessions.find(session=>session.id===selectedId)??null);
  const authority=$derived(binding?.authority??null);
- const scopeText=$derived(authority===null?'':authority.scopes===null?'the owner\u2019s own dispatch (nothing narrowed)':authority.scopes.length===0?'none — every tool is refused':authority.scopes.join(', '));
+ const scopeText=$derived.by(()=>{
+   if(authority===null)return'';
+   if(authority.scopes===null)return'the owner\u2019s own dispatch (nothing narrowed)';
+   if(authority.scopes.length===0)return'none — every tool is refused';
+   const granted=authority.scopes;
+   const installed=granted.filter(s=>['ask_question','record_note','read_notes'].includes(s));
+   const uninstalled=granted.filter(s=>!['ask_question','record_note','read_notes'].includes(s));
+   if(uninstalled.length===0)return granted.join(', ');
+   const avail=installed.length>0?installed.join(', '):'(none)';
+   const unavail=uninstalled.join(', ')+' [unavailable — no tool installed]';
+   return avail+', '+unavail;
+ });
 
  async function loadSessions(){
   problem='';
@@ -72,7 +83,7 @@
    nameError=/name/.test(text)?text:text;problem=/name/.test(text)?'':text;
   }finally{busy=false;}
  }
- function openSession(id:string){selectedId=id;listOpen=false;}
+ function openSession(id:string){selectedId=id;listOpen=false;onsessionchange(id);}
  function linksOf(session:SessionOverview):string{
   if(!session.links.length)return 'no linked work';
   return session.links.map(link=>link.kind==='task'?'task '+link.taskId?.slice(0,8):link.kind==='document'?(link.path??'document'):'workspace').join(', ');

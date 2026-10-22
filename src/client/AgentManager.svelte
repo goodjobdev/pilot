@@ -238,7 +238,8 @@
     <small class="muted">An agent has only what its allowlist names. Everything else is refused at dispatch.</small>
     <div class="scopes" aria-label="Privilege scopes">
      {#each registry.scopes as entry (entry.scope)}
-     <label class="scope"><input type="checkbox" aria-label={'Scope '+entry.scope} checked={draft.scopes.includes(entry.scope)} onchange={e=>toggleScope(entry.scope,e.currentTarget.checked)}><span><strong>{entry.scope}</strong><small>{entry.description}</small></span></label>
+     {@const installed=['ask_question','record_note','read_notes'].includes(entry.scope)}
+     <label class="scope" class:unavailable={!installed} title={installed?'':'This scope has no tool installed in this build and cannot be used by any agent'}><input type="checkbox" aria-label={'Scope '+entry.scope} checked={draft.scopes.includes(entry.scope)} onchange={e=>toggleScope(entry.scope,e.currentTarget.checked)}><span><strong>{entry.scope}</strong><small>{entry.description}{!installed?' — no tool installed, unavailable':''}</small></span></label>
      {/each}
     </div>
     {#if fieldErrors.scopes}<small class="field-error" role="alert">{fieldErrors.scopes}</small>{/if}

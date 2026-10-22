@@ -86,6 +86,25 @@ export const AGENT_SCOPE_DESCRIPTIONS: Readonly<Record<AgentScope, string>> = Ob
  * refused for every agent, which is what makes the decision default-deny rather than default-open:
  * a tool added later is unreachable by an agent until it is named here and granted.
  */
+/**
+ * The scopes whose tool THIS BUILD actually installs in the agent harness, as distinct from scopes
+ * that the vocabulary declares but no tool exists for. Only tools in this map are callable by an
+ * agent; a scope whose name appears in AGENT_SCOPES but not here has no installed tool and is
+ * **unavailable** on this instance, whatever the allowlist says.
+ */ export const AGENT_DEFAULT_INSTALLED_TOOLS: Readonly<Record<string, AgentScope>> = Object.freeze({
+  ask_question: 'ask_question',
+  record_note: 'record_note',
+  read_notes: 'read_notes'
+});
+/**
+ * The scope that governs each tool this build exposes to a model. A tool this map does not name is
+ * refused for every agent, which is what makes the decision default-deny rather than default-open:
+ * a tool added later is unreachable by an agent until it is named here and granted.
+ *
+ * Note that AGENT_DEFAULT_INSTALLED_TOOLS is the subset of this map whose tools are actually
+ * installed; a scope listed here whose tool is not also listed there is declared by the vocabulary
+ * but unavailable on this instance, and the UI and the agent prompt report that.
+ */
 export const AGENT_TOOL_SCOPES: Readonly<Record<string, AgentScope>> = Object.freeze({
   ask_question: 'ask_question',
   record_note: 'record_note',
@@ -96,6 +115,21 @@ export const AGENT_TOOL_SCOPES: Readonly<Record<string, AgentScope>> = Object.fr
   file_edit: 'file_edit',
   run_tests: 'run_tests'
 });
+/** Whether a scope whose tool this build declares is also one it actually installs. */
+export function scopeToolIsInstalled(scope: AgentScope): boolean {
+  const installed = Object.values(AGENT_DEFAULT_INSTALLED_TOOLS) as readonly AgentScope[];
+  return installed.includes(scope);
+}
+/** The scopes this build actually installs tools for, in vocabulary order. */
+export function installedAgentScopes(): readonly AgentScope[] {
+  return Object.freeze(AGENT_SCOPES.filter(scopeToolIsInstalled));
+}
+/** The scopes this build declares but does NOT install a tool for, in vocabulary order. */
+export function unavailableAgentScopes(): readonly { readonly scope: AgentScope; readonly description: string; readonly reason: string }[] {
+  return Object.freeze(AGENT_SCOPES
+    .filter((scope) => !scopeToolIsInstalled(scope))
+    .map((scope) => Object.freeze({ scope, description: AGENT_SCOPE_DESCRIPTIONS[scope], reason: 'No tool is installed for this scope in this build' })));
+}
 
 /** The declared budget bounds. A value outside its bound is refused, never reduced. */
 export const AGENT_BUDGET_BOUNDS: Readonly<Record<'maxRequests' | 'maxOutputTokens' | 'maxJobsPerHour', { readonly min: number; readonly max: number }>> = Object.freeze({
@@ -569,9 +603,9 @@ export function decideScopeChange(input: {
   return Object.freeze({ permitted: true as const });
 }
 
-/** The closed vocabulary as the interface reads it: each scope beside the one line that describes it. */
-export function agentScopeVocabulary(): readonly { readonly scope: AgentScope; readonly description: string }[] {
-  return Object.freeze(AGENT_SCOPES.map((scope) => Object.freeze({ scope, description: AGENT_SCOPE_DESCRIPTIONS[scope] })));
+/** The closed vocabulary as the interface reads it: each scope beside the one line that describes it and whether a tool is installed for it. */
+export function agentScopeVocabulary(): readonly { readonly scope: AgentScope; readonly description: string; readonly installed: boolean }[] {
+  return Object.freeze(AGENT_SCOPES.map((scope) => Object.freeze({ scope, description: AGENT_SCOPE_DESCRIPTIONS[scope], installed: scopeToolIsInstalled(scope) })));
 }
 
 /** One entry of the durable audit trail: what changed, by whom, and when. */

@@ -32,7 +32,14 @@
   <div class="detail"><span class="detail-label">Effective model</span><span class="detail-value">{view?.model?view.model.provider+' / '+view.model.modelId:'not reported by this harness'}</span></div>
   <div class="detail"><span class="detail-label">Lifecycle</span><span class="detail-value">{session?.lifecycle.recorded?(session.lifecycle.state+(session.lifecycle.reason?' — '+session.lifecycle.reason:'')):'no durable lifecycle record'}</span></div>
   <div class="detail"><span class="detail-label">Agent in force</span><span class="detail-value">{authority===null?'unknown (no binding read)':authority.agentId===null?(authority.emptyReason??'no agent is bound'):authority.agentId}</span></div>
-  <div class="detail"><span class="detail-label">Scopes in effect</span><span class="detail-value">{authority===null?'unknown':authority.scopes===null?'the owner\u2019s own dispatch (nothing narrowed)':authority.scopes.length===0?'none — every tool is refused':authority.scopes.join(', ')}</span></div>
+  <div class="detail"><span class="detail-label">Scopes in effect</span><span class="detail-value">{authority===null?'unknown':authority.scopes===null?'the owner\u2019s own dispatch (nothing narrowed)':authority.scopes.length===0?'none — every tool is refused':(()=>{
+      const B=['ask_question','record_note','read_notes'];
+      const g=authority.scopes;
+      const i=g.filter(s=>B.includes(s));
+      const u=g.filter(s=>!B.includes(s));
+      if(u.length===0)return g.join(', ');
+      return (i.length?i.join(', '):'(none)')+'; '+u.join(', ')+' [unavailable]';
+    })()}</span></div>
   <div class="detail"><span class="detail-label">Project scope</span><span class="detail-value">{projectLine||'unknown'}</span></div>
   <div class="detail"><span class="detail-label">Tokens in</span><span class="detail-value">{view?String(view.usage.input):'not reported'}</span></div>
   <div class="detail"><span class="detail-label">Tokens out</span><span class="detail-value">{view?String(view.usage.output):'not reported'}</span></div>

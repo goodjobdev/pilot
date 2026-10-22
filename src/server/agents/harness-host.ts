@@ -11,7 +11,7 @@ import { openNodeSqliteStorage } from '@earendil-works/pi-durable/storage/sqlite
 import { Type } from 'typebox';
 import { safePath } from '../paths';
 import { modelAcceptsImages } from '../../shared/images';
-import { authorizeToolUse, type AgentPrivilegePort, type AgentScope, type DispatchAuthority } from '../../shared/agent-registry';
+import { authorizeToolUse, installedAgentScopes, unavailableAgentScopes, scopeToolIsInstalled, type AgentPrivilegePort, type AgentScope, type DispatchAuthority } from '../../shared/agent-registry';
 import { FILE_EDIT_MAX_FILE_BYTES, FILE_EDIT_MAX_PATH_LENGTH, type FileEditCapability } from '../state/file-edit-tool';
 import { agentViewFrom, type AgentQuestion, type AgentView } from '../../shared/agent';
 import type { Project } from '../../shared/model';
@@ -60,6 +60,10 @@ interface HostedAgent {
   harness: Harness;
   conversation: Awaited<ReturnType<Harness['root']>>;
   provider: FauxProviderHandle;
+  /** The extensions installed for this project's agent harness. */
+  extensions: Extension[];
+  /** The tools the root conversation's authority permits, or undefined for owner dispatch. */
+  permittedTools: readonly any[] | undefined;
   close(): Promise<void>;
 }
 
@@ -360,7 +364,7 @@ function permittedTools(extensions: readonly Extension[], scopes: readonly Agent
  * at all, however the call was crafted. Its section tells the model what its allowlist holds, so a
  * well-behaved model never attempts what would be refused.
  */
-function privilegeExtension(project: Project, authorityOf: (sessionId: string) => Promise<DispatchAuthority>) {
+function privilegeExtension(project: Project, authorityOf: (sessionId: string) => Promise<DispatchAuthority>, fileEditEnabled?: boolean) {
   return defineExtension({
     name: 'agent-privileges',
     sections: [section('agent-privileges', async (input) => {
@@ -371,7 +375,19 @@ function privilegeExtension(project: Project, authorityOf: (sessionId: string) =
         return 'No agent is bound to this session, so the owner\u2019s own dispatch is in force: no agent allowlist narrows these tools. Bind an agent to a session to run it under an explicit allowlist.';
       if (authority.scopes.length === 0)
         return 'This dispatch has no privilege scopes in force, so every tool is refused at dispatch. ' + (authority.emptyReason ?? 'No agent is bound.') + ' Do not attempt one.';
-      const scopeLine = 'This dispatch runs as an agent' + (authority.agentId === null ? '' : ' (' + authority.agentId + ')') + '. Its privilege scopes are: ' + authority.scopes.join(', ') + '. A tool outside them is refused at dispatch with no effect, so do not attempt one.';
+      const baseInstalled = installedAgentScopes();
+      // file_edit is installable but behind a switch: include it only when enabled.
+      const fileEditAvailable = fileEditEnabled === true && authority.scopes.includes('file_edit');
+      const installed = fileEditAvailable ? [...baseInstalled, 'file_edit' as const] : baseInstalled;
+      const available = authority.scopes.filter((s) => (installed as readonly string[]).includes(s));
+      const unavailable = authority.scopes.filter((s) => !(installed as readonly string[]).includes(s));
+      const fileEditNote = authority.scopes.includes('file_edit') && !fileEditAvailable
+        ? ' The file_edit scope is granted but the instance has it DISABLED: the operator must set DASHBOARD_FILE_EDIT=on and restart for the tool to appear. Until then, no file-editing tool is callable.' : '';
+      const availLine = available.length > 0 ? ' Its scopes with an installed tool are: ' + available.join(', ') + '.' : ' None of its scopes has an installed tool in this build.';
+      const unavailLine = unavailable.length > 0 ? ' The following scopes are granted but have NO installed tool in this build and cannot be used: ' + unavailable.join(', ') + '.' : '';
+      const uninstalledAll = unavailableAgentScopes().filter((s) => s.scope !== 'file_edit');
+      const uninstalledLine = uninstalledAll.length > 0 ? ' Scopes without an installed tool in this build: ' + uninstalledAll.map((s) => s.scope).join(', ') + '. They are declared in the vocabulary but the agent cannot call them.' : '';
+      const scopeLine = 'This dispatch runs as an agent' + (authority.agentId === null ? '' : ' (' + authority.agentId + ')') + '.' + availLine + unavailLine + fileEditNote + uninstalledLine + ' A tool outside the granted scopes is refused at dispatch with no effect, so do not attempt one.';
       const projectLine = authority.projects === null ? '' : ' Its project scope is the explicit set ' + authority.projects.join(', ') + ', so a call that acts on any other project is refused at dispatch with no effect.';
       return scopeLine + projectLine;
     }, { tag: false })],
@@ -449,6 +465,18 @@ function fileEditExtension(project: Project, capability: FileEditCapability, aut
 export class HarnessHost {
   private hosted = new Map<string, Promise<HostedAgent>>();
   private tails = new Map<string, Promise<unknown>>();
+  /**
+   * The mapping from a named session's ID to its conversation ID in the harness.
+   *
+   * A session created or selected through the session registry is given its own conversation, so its
+   * transcript is independent of the project's root conversation and of every other session's. The
+   * legacy root conversation remains bound to the project's root session id (ROOT_CONVERSATION_ID).
+   *
+   * Entries are written when a conversation is first created for a session, and read on every
+   * session-level access. This map is ephemeral (in-process); the durable binding lives in the
+   * session registry's own control-store records.
+   */
+  private readonly sessionConversations = new Map<string, ConversationId>();
   /**
    * The projects whose live generation an owner action is cancelling right now.
    *
@@ -563,7 +591,8 @@ export class HarnessHost {
       const rootSessionId = String(ROOT_CONVERSATION_ID);
       const authority = await this.dispatchAuthority(project, rootSessionId);
       const authorityOf = (sessionId: string) => this.dispatchAuthority(project, sessionId);
-      const privileges = privilegeExtension(project, authorityOf);
+      const fileEditEnabled = this.options.fileEdit?.enabled === true;
+      const privileges = privilegeExtension(project, authorityOf, fileEditEnabled);
       const extensions: Extension[] = [question, notes, privileges];
       const registry = createRegistry();
       registry.install(question);
@@ -585,6 +614,10 @@ export class HarnessHost {
         extensions,
         ...(permitted === undefined ? {} : { tools: permitted })
       } });
+      // Register the root conversation bound to the legacy root session id, so a session that
+      // names the root conversation finds it on lookup. Every named session registered later gets
+      // its own conversation through ensureSessionConversation.
+      this.sessionConversations.set(rootSessionId, conversation.id);
       // Never replace an existing session's model with a newly changed global default.
       // Continue any run the previous process left unfinished.
       harness.resume();
@@ -628,10 +661,14 @@ export class HarnessHost {
         }
         previous = { working: view.working, open, errors, primed: true };
       });
+      const sessionExtensions = extensions;
+      const sessionPermittedTools = permitted;
       return {
         harness,
         conversation,
         provider,
+        extensions: sessionExtensions,
+        permittedTools: sessionPermittedTools,
         close: async () => {
           const disposable = watched as unknown as { dispose?: () => Promise<void> };
           if (typeof disposable.dispose === 'function') await disposable.dispose();
@@ -776,13 +813,62 @@ export class HarnessHost {
     });
   }
 
-  /** Subscribes to committed view changes; the callback runs once immediately. */
-  async subscribe(project: Project, listener: (view: AgentSessionView) => void): Promise<() => Promise<void>> {
+  /**
+   * The conversation of one named session, creating a fork of the root conversation at entry 0
+   * when this session has never had one before. The fork inherits the root's extensions and agent
+   * configuration but starts with no entries, so a new session has an empty transcript.
+   *
+   * An existing session whose conversation was already created resolves to its forked conversation.
+   * The legacy root conversation (ROOT_CONVERSATION_ID) is always registered and never forked.
+   */
+  async ensureSessionConversation(project: Project, sessionId: string): Promise<ConversationId> {
+    this.assertEnabled();
+    // A numeric session id is already a conversation id — no derivation needed.
+    const direct = conversationIdOf(sessionId);
+    if (direct !== null) return direct;
+    // Check the in-process map for a conversation already created for this session.
+    const existing = this.sessionConversations.get(sessionId);
+    if (existing !== undefined) return existing;
+    // Fork the root conversation at entry 0 (before the first entry), creating a child
+    // conversation with the same extensions and tools but an empty transcript.
+    const hosted = await this.open(project);
+    const fork = await hosted.conversation.fork(0 as EntryId, {
+      ownership: { kind: 'ownerless' }
+    }, BACKGROUND_CONTEXT);
+    this.sessionConversations.set(sessionId, fork.id);
+    return fork.id;
+  }
+
+  /** Subscribes to committed view changes of one session's conversation, or the root when none is named. */
+  async subscribe(project: Project, listener: (view: AgentSessionView) => void, sessionId?: string): Promise<() => Promise<void>> {
     this.assertEnabled();
     const hosted = await this.open(project);
-    const state = await hosted.conversation.viewState(BACKGROUND_CONTEXT);
-    listener(this.shape(hosted, state.value));
-    const unsubscribe = state.subscribe(() => { listener(this.shape(hosted, state.value)); });
+    const convId = sessionId ? await this.ensureSessionConversation(project, sessionId) : hosted.conversation.id;
+    if (convId === hosted.conversation.id) {
+      const state = await hosted.conversation.viewState(BACKGROUND_CONTEXT);
+      listener(this.shape(hosted, state.value));
+      const unsubscribe = state.subscribe(() => { listener(this.shape(hosted, state.value)); });
+      return async () => {
+        if (typeof unsubscribe === 'function') unsubscribe();
+        const disposable = state as unknown as { dispose?: () => Promise<void> };
+        if (typeof disposable.dispose === 'function') await disposable.dispose();
+      };
+    }
+    const conversation = await hosted.harness.conversation(convId, BACKGROUND_CONTEXT);
+    if (!conversation) {
+      // Fall back to the root conversation if the session's conversation was lost.
+      const state = await hosted.conversation.viewState(BACKGROUND_CONTEXT);
+      listener(this.shape(hosted, state.value));
+      const unsubscribe = state.subscribe(() => { listener(this.shape(hosted, state.value)); });
+      return async () => {
+        if (typeof unsubscribe === 'function') unsubscribe();
+        const disposable = state as unknown as { dispose?: () => Promise<void> };
+        if (typeof disposable.dispose === 'function') await disposable.dispose();
+      };
+    }
+    const state = await conversation.viewState(BACKGROUND_CONTEXT);
+    listener(this.shape(hosted, state.value, convId));
+    const unsubscribe = state.subscribe(() => { listener(this.shape(hosted, state.value, convId)); });
     return async () => {
       if (typeof unsubscribe === 'function') unsubscribe();
       const disposable = state as unknown as { dispose?: () => Promise<void> };

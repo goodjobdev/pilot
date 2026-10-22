@@ -58,6 +58,30 @@ The scopes that govern a tool this build exposes to a model are declared in `AGE
 `file_read`, `file_edit`, `run_tests`). The rest are capabilities the command surface and
 the acceptance record name; nothing in the vocabulary is a label with nothing behind it.
 
+## Tool installation status
+
+Not every scope with a declared tool-scope mapping actually has a running tool in all builds.
+Only the following scopes correspond to a tool this instance installs:
+
+| Scope | Tool installed | Default |
+|---|---|---|
+| `ask_question` | Yes, always | On |
+| `record_note` | Yes, always | On |
+| `read_notes` | Yes, always | On |
+| `file_edit` | Conditional — see below | Off (behind switch) |
+| `read_docs` | **No** — not installed | N/A |
+| `write_docs` | **No** — not installed | N/A |
+| `file_read` | **No** — not installed | N/A |
+| `run_tests` | **No** — not installed | N/A |
+
+A scope whose tool is not installed is listed in the vocabulary and can be granted to an agent,
+but the agent cannot call the tool: the tool simply does not exist in the running instance. The
+UI and the agent's prompt section report this explicitly, so an owner is never told a capability
+is in effect when the agent cannot use it.
+
+An agent whose granted scopes include uninstalled-tool scopes is told which ones are usable and
+which ones are unavailable, with the reason.
+
 ## Default deny, and exactly where it is enforced
 
 **An agent has only what its allowlist names, in only the projects its project scope names.**
@@ -158,7 +182,17 @@ and dialog is unchanged.
 
 `file_edit` governs one tool, and it is **disabled by default**: while `DASHBOARD_FILE_EDIT` is
 not `on`, the tool does not exist at all and the two `file-edit.*` actions are **absent from the
-typed registry** rather than present-and-failing.
+typed registry** rather than present-and-failing. When the scope is granted but the switch is off,
+the agent's prompt section reports that the `file_edit` scope is granted but the tool is disabled
+and names the environment variable the operator must set to enable it.
+
+To enable file editing:
+
+1. Set `DASHBOARD_FILE_EDIT=on` in the environment (or in the instance's configuration).
+2. Restart the process. The tool will appear and agents with the `file_edit` scope can call it.
+3. The default mode is **propose-only**: the change and its diff are recorded but **no file is
+   written**. To allow auto-apply, set the acceptance policy to `agent-may-accept`; see the
+   acceptance policy documentation.
 
 When it is enabled, one change is contained like this:
 
