@@ -63,7 +63,10 @@ export const ACTION_PARAM_TYPES = [
   'acceptance-evidence',
   'acceptance-request',
   'acceptance-policy',
-  'acceptance-actor'
+  'acceptance-actor',
+  'fork-commit',
+  'fork-cutoff',
+  'flag'
 ] as const;
 export type ActionParamType = (typeof ACTION_PARAM_TYPES)[number];
 
@@ -73,7 +76,7 @@ export type ActionParamType = (typeof ACTION_PARAM_TYPES)[number];
  * carries it and a client pre-fills exactly that value — or asks for it when the read is not
  * available — instead of assuming a number the server will refuse.
  */
-export const ACTION_REVISION_SOURCES = ['session-lifecycle-revision', 'session-record-revision', 'queue-revision', 'acceptance-policy-revision'] as const;
+export const ACTION_REVISION_SOURCES = ['session-lifecycle-revision', 'session-record-revision', 'queue-revision', 'acceptance-policy-revision', 'fork-revision'] as const;
 export type ActionRevisionSource = (typeof ACTION_REVISION_SOURCES)[number];
 
 /** One declared parameter: what it is called, which rule it obeys, and whether it must be present. */
@@ -156,7 +159,11 @@ export const ACTION_IDS = [
   'acceptance.read',
   'acceptance.evidence.record',
   'acceptance.accept',
-  'acceptance.policy.update'
+  'acceptance.policy.update',
+  'fork.create',
+  'fork.list',
+  'fork.resume',
+  'fork.discard'
 ] as const;
 export type ActionId = (typeof ACTION_IDS)[number];
 
@@ -216,7 +223,14 @@ export const ACTION_PRECONDITION_CODES = [
   'ARTIFACT_NOT_ACCEPTED',
   'ACCEPTOR_PERMITTED',
   'ACTION_CLASS_DECIDED',
-  'POLICY_OWNER_ONLY'
+  'POLICY_OWNER_ONLY',
+  'FORK_EXISTS',
+  'CUTOFF_EXISTS',
+  'BASE_COMMIT_REAL',
+  'TARGET_IN_FORK_ROOT',
+  'TARGET_FREE',
+  'FORK_LIMIT',
+  'WORKTREE_CLEAN'
 ] as const;
 export type ActionPreconditionCode = (typeof ACTION_PRECONDITION_CODES)[number];
 
@@ -365,6 +379,38 @@ const acceptancePolicyRevisionParameter: ActionParameter = Object.freeze({
   required: true,
   revisionSource: 'acceptance-policy-revision' as const,
   description: 'the policy revision the caller read; a stale one is refused as a conflict and writes nothing. Read it from the policy in force (GET /api/acceptance/policy), which reports its revision'
+});
+
+const forkBaseCommitParameter: ActionParameter = Object.freeze({
+  name: 'baseCommit',
+  type: 'fork-commit' as const,
+  required: true,
+  description: "the full 40-character lowercase hex id of the commit the child's worktree is created from; it must be a commit of this project's own repository, and it is recorded as the fork's base"
+});
+const forkCutoffParameter: ActionParameter = Object.freeze({
+  name: 'cutoffEntryId',
+  type: 'fork-cutoff' as const,
+  required: true,
+  description: 'the whole-number id of the entry in the parent transcript the child branches at (the transcript view renders entry ids as strings); the child sees the parent context up to and including it and nothing after it'
+});
+const forkTargetParameter: ActionParameter = Object.freeze({
+  name: 'target',
+  type: 'identifier' as const,
+  required: false,
+  description: 'an optional single path component inside the designated fork root for the child worktree; it defaults to the child session id, and anything that could resolve outside the fork root — an absolute path, a separator or a parent segment — is refused rather than rewritten'
+});
+const forkRevisionParameter: ActionParameter = Object.freeze({
+  name: 'revision',
+  type: 'revision' as const,
+  required: true,
+  revisionSource: 'fork-revision' as const,
+  description: "the fork revision the caller read; a stale one is refused as a conflict and touches nothing. Read it from the project's forks (GET /api/projects/<projectId>/forks), which reports each fork's revision"
+});
+const forkForceParameter: ActionParameter = Object.freeze({
+  name: 'force',
+  type: 'flag' as const,
+  required: false,
+  description: 'an explicit force, and the only way a child worktree holding uncommitted or untracked changes is ever removed; an absent or false value refuses that removal and reports the named operator-attention state instead'
 });
 
 function describe(value: Omit<ActionDescriptor, 'surfaces'> & { readonly surfaces?: readonly ActionSurface[] }): ActionDescriptor {
@@ -948,6 +994,72 @@ export const ACTION_DESCRIPTORS: readonly ActionDescriptor[] = Object.freeze([
     noops: Object.freeze([]),
     writes: true,
     effect: 'writes the next revision of the acceptance policy — the mode and one ask-or-full-auto decision per action class — and reports the policy now in force'
+  }),
+  describe({
+    id: 'fork.create' as const,
+    label: 'Fork a session',
+    description: 'Branch a child session from this session at one transcript entry, with its own worktree created from a recorded commit.',
+    requires: sessionScope,
+    parameters: sessionParameters([forkBaseCommitParameter, forkCutoffParameter, forkTargetParameter]),
+    preconditions: [
+      Object.freeze({ code: 'PROJECT_REGISTERED' as const, description: 'the project scope names a registered project with its own folder, which is the repository the child worktree is added to' }),
+      Object.freeze({ code: 'SESSION_EXISTS' as const, description: 'the session scope names a live session of that project, and that session is the parent the fork branches from; an unknown one is refused as not found' }),
+      Object.freeze({ code: 'CUTOFF_EXISTS' as const, description: 'the parent transcript really holds that entry id, so the child can be shown to see a real context; an entry it does not hold is refused and nothing is created' }),
+      Object.freeze({ code: 'BASE_COMMIT_REAL' as const, description: "the base commit is a real commit of the project's own repository; a value that is not one is refused and no worktree is created" }),
+      Object.freeze({ code: 'TARGET_IN_FORK_ROOT' as const, description: 'the target is a single path component that resolves inside the designated fork root, with no symlink and no parent segment; anything else is refused rather than rewritten' }),
+      Object.freeze({ code: 'TARGET_FREE' as const, description: 'nothing already occupies the target: this build never reuses or removes what it did not create' }),
+      Object.freeze({ code: 'FORK_LIMIT' as const, description: 'the project holds fewer than the documented maximum of forks' })
+    ],
+    noops: Object.freeze([]),
+    writes: true,
+    effect: "creates the child conversation from the parent context up to and including the cutoff entry (nothing after it), adopts the child as a named session with no links and no declared model, and creates the child's worktree from the recorded base commit by one fixed git worktree add with no hooks, no submodule recursion, no network and no local-protocol transport; the child is created paused, and the parent's uncommitted and staged changes are never copied, never stashed and never inherited"
+  }),
+  describe({
+    id: 'fork.list' as const,
+    label: 'Read the forks',
+    description: "Read one project's forks, with the cutoff and worktree rules and the bounds in force.",
+    requires: projectScope,
+    parameters: Object.freeze([]),
+    preconditions: [
+      Object.freeze({ code: 'PROJECT_REGISTERED' as const, description: 'the project scope names a registered project; an unknown one is refused as not found' })
+    ],
+    noops: Object.freeze(["a project with no live fork reads as an empty list at the documented bounds: that is the project's fork state, not an absence of one"]),
+    writes: false,
+    effect: 'reads the durable fork records of one project that are not discarded, oldest first, each with its parent, cutoff entry, child session, worktree path, base commit, state and revision, beside the cutoff, worktree and paused-child rules and the bounds this build enforces; it creates nothing and removes nothing'
+  }),
+  describe({
+    id: 'fork.resume' as const,
+    label: 'Resume a fork',
+    description: 'Lift the pause on one fork so its child may be dispatched into. It dispatches nothing itself.',
+    requires: sessionScope,
+    parameters: sessionParameters([forkRevisionParameter]),
+    preconditions: [
+      Object.freeze({ code: 'PROJECT_REGISTERED' as const, description: 'the project scope names a registered project' }),
+      Object.freeze({ code: 'FORK_EXISTS' as const, description: 'the session scope names the child session of a fork this project really holds; an unknown one is refused as not found' }),
+      Object.freeze({ code: 'REVISION_MATCHES' as const, description: 'the revision the caller read is the stored fork revision; a stale one is refused as a conflict and writes nothing' }),
+      Object.freeze({ code: 'TRANSITION_LEGAL' as const, description: 'the fork can become active: only a paused fork can. A discarded fork is terminal and a failed fork has to be resolved and discarded first' })
+    ],
+    noops: Object.freeze(['resuming an already active fork returns the record unchanged at its own revision and dispatches nothing']),
+    writes: true,
+    effect: 'writes the active state, which is the only state a child may be dispatched into; it makes no model request, admits no input, adopts no link and grants no approval, artifact or permission of any kind'
+  }),
+  describe({
+    id: 'fork.discard' as const,
+    label: 'Discard a fork',
+    description: "Remove one fork's worktree and close the fork, refusing anything it did not create.",
+    requires: sessionScope,
+    parameters: sessionParameters([forkRevisionParameter, forkForceParameter]),
+    preconditions: [
+      Object.freeze({ code: 'PROJECT_REGISTERED' as const, description: 'the project scope names a registered project with its own folder' }),
+      Object.freeze({ code: 'FORK_EXISTS' as const, description: 'the session scope names the child session of a fork this project really holds; an unknown one is refused as not found' }),
+      Object.freeze({ code: 'REVISION_MATCHES' as const, description: 'the revision the caller read is the stored fork revision; a stale one is refused as a conflict and nothing is touched' }),
+      Object.freeze({ code: 'TARGET_IN_FORK_ROOT' as const, description: 'the worktree path the record itself carries is still inside the designated fork root; a record that says otherwise is refused as an escape and nothing is removed' }),
+      Object.freeze({ code: 'WORKTREE_CLEAN' as const, description: 'the child worktree holds no uncommitted or untracked change, or the caller explicitly forces it. A dirty worktree is never removed implicitly: the fork becomes the named operator-attention state worktree-dirty and the worktree is left exactly where it is' }),
+      Object.freeze({ code: 'TRANSITION_LEGAL' as const, description: 'the fork can become discarded: a paused, active or failed fork can, and a discarded fork is terminal' })
+    ],
+    noops: Object.freeze(['discarding a fork whose worktree is already gone completes the discard and removes nothing']),
+    writes: true,
+    effect: "reads the child worktree's own status, removes it by one git worktree remove — with an explicit force only where the caller forced it — and writes the discarded state; a worktree git will not remove or cannot report becomes the named operator-attention state worktree-remove-refused or worktree-unreadable instead, and nothing outside the designated fork root is ever touched"
   })
 ]);
 

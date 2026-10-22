@@ -1,6 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir,mkdtemp,readFile,rm,writeFile } from 'node:fs/promises';
+import { mkdir,mkdtemp,readFile,readdir,realpath,rm,stat,writeFile } from 'node:fs/promises';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -25,12 +27,36 @@ const listen=(app:Awaited<ReturnType<typeof createApp>>,security:ReturnType<type
  * default without weakening the assertions about everything else the registry offers.
  */
 const RUNNER_ACTION_IDS:readonly string[]=ACTION_IDS.filter(id=>id.startsWith('runner.'));
-const withoutRunner=<T extends {readonly id:string}>(descriptors:readonly T[])=>descriptors.filter(descriptor=>!RUNNER_ACTION_IDS.includes(descriptor.id));
+/**
+ * The fork capability needs the agent harness, which is off on the instances these registry assertions
+ * are made against, so its four actions are absent from the offered registry rather than listed and
+ * failing — exactly as the disabled coding runner's are. The fork routes themselves are driven against
+ * an instance that really has the harness, in the fork test below.
+ */
+const FORK_ACTION_IDS:readonly string[]=ACTION_IDS.filter(id=>id.startsWith('fork.'));
+const withoutRunner=<T extends {readonly id:string}>(descriptors:readonly T[])=>descriptors.filter(descriptor=>!RUNNER_ACTION_IDS.includes(descriptor.id)&&!FORK_ACTION_IDS.includes(descriptor.id));
 /** The containment every required property is checked against, as an injected port would report it. */
 const containment=(overrides:Partial<RunnerContainment>={}):RunnerContainment=>Object.freeze({runtime:'fake-runtime',image:'pilot-runner:test',network:'none',rootFilesystem:'read-only' as const,user:'10001:10001',capabilities:'none',noNewPrivileges:true,dockerSocket:false,mounts:Object.freeze(['workspace']) as readonly string[],maxMemoryBytes:1024*1024*1024,maxCpus:2,maxPids:128,maxWallClockMs:300_000,...overrides});
 /** One scripted execution: no container is started and no container runtime is contacted in this suite. */
 const execution=(overrides:Partial<RunnerExecution>={}):RunnerExecution=>Object.freeze({exitCode:0,stdout:'probe\n',stderr:'',stdoutBytes:6,stderrBytes:0,stdoutTruncated:false,stderrTruncated:false,timedOut:false,durationMs:3,startedAt:new Date(1700000000000).toISOString(),endedAt:new Date(1700000000003).toISOString(),...overrides});
 const hostProbe=(port:string,host:string):Promise<number>=>new Promise((ok,fail)=>{const req=request({host:'127.0.0.1',port,path:'/readyz',headers:{host}},res=>{res.resume();ok(res.statusCode??0);});req.on('error',fail);req.end();});
+const execAsync=promisify(execFile);
+/** One git command with the environment the fork port uses: no system or global config and no prompt. */
+const gitIn=async(cwd:string,args:string[]):Promise<string>=>{
+ const {stdout}=await execAsync('git',args,{cwd,timeout:30000,maxBuffer:1024*1024,env:{PATH:process.env.PATH,HOME:'/nonexistent',LANG:'C.UTF-8',GIT_CONFIG_NOSYSTEM:'1',GIT_CONFIG_GLOBAL:'/dev/null',GIT_TERMINAL_PROMPT:'0'}});
+ return stdout.trim();
+};
+const exists=async(path:string):Promise<boolean>=>{try{await stat(path);return true;}catch{return false;}};
+/** The project's conversation view, once it has settled and the condition holds. No model is called for the polling. */
+const agentViewUntil=async(url:string,token:Record<string,string>,projectId:string,ready:(view:any)=>boolean):Promise<any>=>{
+ const deadline=Date.now()+15000;
+ for(;;){
+  const body=await (await fetch(url+'/api/projects/'+projectId+'/agents',{headers:token})).json();
+  if(body.view&&!body.view.working&&ready(body.view))return body.view;
+  if(Date.now()>deadline)throw new Error('the conversation did not settle in time');
+  await new Promise(resolve=>setTimeout(resolve,25));
+ }
+};
 test('API authentication, origin, content type and project isolation',async()=>{
  const security=localConfig('http://127.0.0.1:0'),app=await createApp({dataRoot:await mkdtemp(join(tmpdir(),'dashboard-api-')),browseRoots:[],security});
  await new Promise<void>(ok=>app.server.listen(0,'127.0.0.1',ok));security.origin='http://127.0.0.1:'+(app.server.address() as any).port;
@@ -670,6 +696,7 @@ test('the command registry is owner-only, lists only what this instance implemen
   const globalIds=withoutRunner(ACTION_DESCRIPTORS.filter(descriptor=>descriptor.requires.length===0)).map(descriptor=>descriptor.id);
   const scopedIds=withoutRunner(ACTION_DESCRIPTORS).map(descriptor=>descriptor.id);
   assert.deepEqual(scopedIds.filter(id=>RUNNER_ACTION_IDS.includes(id)),[],'a disabled coding runner is absent from the registry');
+  assert.deepEqual(scopedIds.filter(id=>FORK_ACTION_IDS.includes(id)),[],'a fork capability this instance lacks (the agent harness is off) is absent from the registry, not listed and failing');
   const unscoped=await (await read('/api/actions')).json();
   assert.equal(unscoped.readOnly,true);
   assert.deepEqual(unscoped.scope,{projectId:null,sessionId:null});
@@ -1193,5 +1220,134 @@ test('the accept route records the declared actor whatever shape declares it, re
   const agreeingBody=await agreeing.json();
   assert.deepEqual([agreeingBody.acceptance.acceptedBy.kind,agreeingBody.acceptance.acceptedBy.identity],['agent','nested-worker']);
   assert.equal((await acceptanceOf(second.id) as {acceptedBy:{kind:string}}).acceptedBy.kind,'agent');
+ }finally{await app.close();store.close();await rm(root,{recursive:true,force:true});}
+});
+
+test('the fork routes are owner-only, branch a real repository at a cutoff and never carry the parent dirty state',async()=>{
+ const root=await mkdtemp(join(tmpdir(),'dashboard-forks-api-'));
+ const data=join(root,'data'),workspaces=join(root,'workspaces'),repo=join(workspaces,'repo');
+ await mkdir(data,{recursive:true,mode:0o700});await mkdir(repo,{recursive:true,mode:0o755});
+ await writeFile(join(repo,'README.md'),'# Base\n');
+ // A real repository with a real base commit; the sentinel below is left dirty and untracked.
+ await gitIn(repo,['init','-q']);
+ await gitIn(repo,['config','user.email','pilot@example.invalid']);
+ await gitIn(repo,['config','user.name','Pilot test']);
+ await gitIn(repo,['config','commit.gpgsign','false']);
+ await gitIn(repo,['add','.']);
+ await gitIn(repo,['commit','-q','-m','base']);
+ const baseCommit=await gitIn(repo,['rev-parse','HEAD']);
+ const sentinel=join(repo,'dirty-sentinel.txt');
+ await writeFile(sentinel,'parent only\n');
+ const store=new ControlStore(data);
+ const security=localConfig('http://127.0.0.1:0');
+ const app=await createApp({dataRoot:data,browseRoots:[workspaces],security,control:store,agents:'on'});
+ await listen(app,security);
+ const url=security.origin,token={'x-dashboard-token':security.token},writes={...token,'content-type':'application/json',origin:url};
+ const post=(p:string,body:unknown)=>fetch(url+p,{method:'POST',headers:writes,body:JSON.stringify(body)});
+ const read=(p:string)=>fetch(url+p,{headers:token});
+ try{
+  const project=await (await post('/api/projects',{name:'Forkable',path:repo,managed:false,confirm:true})).json();
+  const forks='/api/projects/'+project.id+'/forks',input='/api/projects/'+project.id+'/agents/input';
+  // Opening the project's conversation creates its durable store; the migration then adopts that
+  // conversation as the named parent session, exactly as it does on a fresh installation.
+  assert.equal((await (await read('/api/projects/'+project.id+'/agents')).json()).enabled,true);
+  await post('/api/sessions/migrate',{});
+  const parent=(await (await read('/api/sessions?projectId='+project.id)).json()).sessions[0];
+  // Owner-only like every other route, behind the unchanged Host check, with the same origin enforcement.
+  assert.equal((await fetch(url+forks)).status,401,'the forks of a project are behind owner auth');
+  const wrongHost=await new Promise<number>((ok,fail)=>{const req=request({host:'127.0.0.1',port:new URL(url).port,path:forks,headers:{host:'evil.example','x-dashboard-token':security.token}},res=>{res.resume();ok(res.statusCode??0);});req.on('error',fail);req.end();});
+  assert.equal(wrongHost,403,'the unchanged Host check applies to the forks');
+  assert.equal((await fetch(url+forks,{method:'POST',headers:{...token,'content-type':'application/json',origin:'https://evil.example'},body:'{}'})).status,403,'creating a fork is a write and needs the canonical origin');
+  assert.equal((await read(forks+'/'+parent.id+'/resume')).status,405,'resuming is a POST only');
+  const empty=await (await read(forks)).json();
+  assert.deepEqual([empty.readOnly,empty.projectId,empty.forks],[true,project.id,[]]);
+  assert.deepEqual(empty.limits,{forks:20,entryScan:2000,bytes:65536},'the bounds a fork is offered at are published');
+  assert.ok(empty.rules.worktree.includes('never copied'),'the worktree rule is published with the forks');
+  assert.ok(!JSON.stringify(empty).includes(data),'the fork view carries no fork root path of its own');
+
+  // A submission before the cutoff, then entries after it: the child must not see the later ones.
+  await post(input,{text:'parent before the cutoff'});
+  const settled=await agentViewUntil(url,token,project.id,(view)=>view.entries.some((entry:any)=>entry.kind==='assistant'&&entry.text.includes('parent before the cutoff')));
+  const cutoff=Number(settled.entries[settled.entries.length-1].id);
+  await post(input,{text:'parent after the cutoff'});
+  await agentViewUntil(url,token,project.id,(view)=>view.entries.some((entry:any)=>entry.kind==='assistant'&&entry.text.includes('parent after the cutoff')));
+
+  // Every creation refusal writes nothing and leaves no worktree behind. The root is compared
+  // canonically, because the store records the canonical path of the fork root it really created.
+  const forkRoot=join(await realpath(root),'data','forks',project.id);
+  const nothing=async()=>{assert.deepEqual((await (await read(forks)).json()).forks,[],'no fork was recorded');assert.deepEqual(await readdir(forkRoot).catch(()=>[]),[],'no worktree was left behind');};
+  const missingCutoff=await post(forks,{parentSessionId:parent.id,baseCommit,cutoffEntryId:999999});
+  assert.equal(missingCutoff.status,404);assert.match((await missingCutoff.json()).error,/holds no entry 999999/);
+  await nothing();
+  const badCommit=await post(forks,{parentSessionId:parent.id,baseCommit:'f'.repeat(40),cutoffEntryId:cutoff});
+  assert.equal(badCommit.status,422);
+  assert.ok(!(await badCommit.json()).error.includes(repo),'a refusal names no path');
+  await nothing();
+  assert.equal((await post(forks,{parentSessionId:parent.id,baseCommit,cutoffEntryId:cutoff,target:'../escape'})).status,422,'a target that could escape the fork root is refused');
+  await nothing();
+  const extraField=await post(forks,{parentSessionId:parent.id,baseCommit,cutoffEntryId:cutoff,branch:'work/pilot'});
+  assert.equal(extraField.status,422);assert.match((await extraField.json()).error,/does not accept/);await nothing();
+
+  // One real fork: paused, with its own worktree created from the recorded commit.
+  const created=await post(forks,{parentSessionId:parent.id,baseCommit,cutoffEntryId:cutoff});
+  assert.equal(created.status,201);
+  const forkBody=(await created.json()).fork;
+  assert.deepEqual([forkBody.state,forkBody.cutoffEntryId,forkBody.baseCommit,forkBody.parentSessionId],['paused',cutoff,baseCommit,parent.id]);
+  assert.equal(forkBody.worktreePath,join(forkRoot,forkBody.childSessionId),'the worktree lives inside this instance designated fork root');
+  assert.equal(await exists(join(forkBody.worktreePath,'README.md')),true);
+  assert.equal(await exists(join(forkBody.worktreePath,'dirty-sentinel.txt')),false,'the child worktree does not carry the parent untracked sentinel');
+  assert.equal(await readFile(sentinel,'utf8'),'parent only\n','the parent sentinel is untouched');
+  assert.deepEqual(await gitIn(repo,['stash','list']),'','no stash was created anywhere');
+  assert.equal(await gitIn(forkBody.worktreePath,['rev-parse','HEAD']),baseCommit,'the child worktree is at the recorded base commit');
+  assert.equal(await gitIn(forkBody.worktreePath,['status','--porcelain=v1','--untracked-files=all']),'','the child worktree inherited no dirty state');
+
+  // The child transcript really branches at the cutoff, and the child is a named session with no link.
+  const listed=await (await read(forks)).json();
+  assert.deepEqual(listed.forks.map((fork:any)=>[fork.childSessionId,fork.revision]),[[forkBody.childSessionId,1]]);
+  const childView=await app.agents.sessionView(app.catalog.get(project.id),forkBody.childSessionId);
+  assert.ok(childView,'the child transcript is readable');
+  assert.ok(childView.entries.some((entry)=>Number(entry.id)===cutoff),'the child sees the entry it branched at');
+  assert.equal(childView.entries.some((entry)=>Number(entry.id)>cutoff),false,'the child holds no entry the parent recorded after the cutoff');
+  assert.equal(JSON.stringify(childView.entries).includes('parent after the cutoff'),false,'nothing the parent recorded after the cutoff reached the child');
+  const sessions=await (await read('/api/sessions?projectId='+project.id)).json();
+  assert.equal(sessions.sessions.some((session:any)=>session.id===forkBody.childSessionId&&session.links.length===0),true,'the child is a named session with no link');
+
+  // The child cannot be dispatched into while it is paused, and this project's queue refuses to
+  // misdirect a child's queued input into the root conversation.
+  assert.equal((await post('/api/sessions/'+forkBody.childSessionId+'/queue/claim',{projectId:project.id,owner:'fork-dispatcher'})).status,409,'a child input is never dispatched into the project root conversation');
+  const dispatchRefusal=await app.forks!.dispatchChild({projectId:project.id,childSessionId:forkBody.childSessionId,text:'not yet'}).then(()=>null).catch((error:Error)=>error);
+  assert.ok(dispatchRefusal instanceof Error&&/paused/.test(dispatchRefusal.message),'a paused child refuses to dispatch');
+
+  // A stale revision is a conflict that touches nothing, and the resume is what lifts the pause.
+  assert.equal((await post(forks+'/'+forkBody.childSessionId+'/resume',{revision:forkBody.revision+3})).status,409);
+  assert.equal((await (await read(forks)).json()).forks[0].revision,1,'a refused resume wrote no revision');
+  const resumed=await post(forks+'/'+forkBody.childSessionId+'/resume',{revision:forkBody.revision});
+  assert.equal(resumed.status,200);
+  assert.deepEqual([(await resumed.json()).outcome,(await (await read(forks)).json()).forks[0].state],['resumed','active']);
+  assert.equal((await post(forks+'/'+forkBody.childSessionId+'/discard',{})).status,422,'a discard needs the revision it read');
+
+  // A worktree holding this child's own work is never removed without an explicit force.
+  await writeFile(join(forkBody.worktreePath,'child-only.txt'),'this worktree own work\n');
+  const dirty=await post(forks+'/'+forkBody.childSessionId+'/discard',{revision:2});
+  assert.equal(dirty.status,200);
+  const dirtyBody=await dirty.json();
+  assert.deepEqual([dirtyBody.outcome,dirtyBody.removed,dirtyBody.fork.state,dirtyBody.fork.attention.reason],['attention',false,'failed','worktree-dirty']);
+  assert.equal(await exists(join(forkBody.worktreePath,'child-only.txt')),true,'the dirty worktree is untouched');
+  assert.equal((await post(forks+'/'+forkBody.childSessionId+'/resume',{revision:3})).status,409,'a fork that needs an operator cannot be resumed');
+  const forced=await post(forks+'/'+forkBody.childSessionId+'/discard',{revision:3,force:true});
+  assert.equal(forced.status,200);
+  const forcedBody=await forced.json();
+  assert.deepEqual([forcedBody.outcome,forcedBody.removed,forcedBody.fork.state],['discarded',true,'discarded']);
+  assert.equal(await exists(forkBody.worktreePath),false,'the forced discard removed the worktree');
+  assert.deepEqual((await (await read(forks)).json()).forks,[],'a discarded fork is not listed any more');
+  assert.equal(await readFile(sentinel,'utf8'),'parent only\n','the parent working tree is untouched by every step');
+  assert.equal((await post(forks+'/'+forkBody.childSessionId+'/discard',{revision:4})).status,200,'discarding a discarded fork is a legal no-op that touches nothing');
+  // The registry offers the fork actions on this instance, and the same capability works through it.
+  const offered=await (await read('/api/actions?projectId='+project.id+'&sessionId='+parent.id)).json();
+  assert.deepEqual(offered.actions.map((action:any)=>action.id).filter((id:string)=>id.startsWith('fork.')).sort(),['fork.create','fork.discard','fork.list','fork.resume']);
+  const viaRegistry=await post('/api/actions/execute',{id:'fork.create',params:{baseCommit,cutoffEntryId:cutoff},scope:{projectId:project.id,sessionId:parent.id}});
+  assert.equal(viaRegistry.status,200,'the same capability is reachable through the registry the palette writes with');
+  assert.equal((await viaRegistry.json()).action,'fork.create');
+  assert.equal((await post(forks,{parentSessionId:parent.id,baseCommit,cutoffEntryId:0})).status,422,'a cutoff of zero is not an entry of any transcript');
  }finally{await app.close();store.close();await rm(root,{recursive:true,force:true});}
 });

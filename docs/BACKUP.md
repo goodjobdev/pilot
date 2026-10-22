@@ -57,6 +57,7 @@ entry, not an unrecognised one, so it is never listed here:
 | `credentials/` | Provider API keys, provider sign-in tokens and project deploy keys are secrets. **This milestone adds no opt-in to include them**: an archive carries no credential, by construction, and a restored root therefore has none. |
 | `alerts/` | The private VAPID signing key and the device push endpoints that belong to it. The endpoints are only meaningful with that key, so a restored root re-establishes alerts by enabling them again on each device. |
 | `repositories/` | Agent git worktrees, derived from the project repository, which is its own backup. |
+| `forks/` | Child fork worktrees (`forks/<projectId>/<childSessionId>`). Each one is derived state: a commit of the project repository checked out again, held as a git worktree registered inside that repository — which is itself excluded, because the repository is its own backup — so a restored root could not reuse the directory anyway and no commit is lost with it. The fork records that describe them **are** captured: they are rows of `control.sqlite`. |
 | `service.lock` | Ownership evidence for the process holding the root. A backup is refused while **any** lock evidence is present — a live lock, a lock recorded for a process that is gone, a malformed one — and a lock is never part of a backup. It then takes its own lock (purpose `backup`) for the duration, so during a backup *this tool* is the holder; restore and promotion only refuse evidence, they never take a lock. |
 | `RESTORE-PAUSED.json` | The restore pause marker of a restored root, not application data. |
 | `snapshots/` | The bounded board revision history **the application itself writes**: `snapshots/<projectId>/<timestamp>-<uuid>.md`, the newest 20 per project, the older ones pruned automatically. It is derived from the boards, which *are* captured, and it is not the board a project is served from, so a restored root rebuilds it as boards are edited. |
@@ -65,7 +66,13 @@ An unrecognised entry at the data root (or under `settings/` or `agents/`) is li
 with the reason `not captured by this tool`, so the manifest never overstates what a preview of the
 archive contains. `snapshots/` is **not** such an entry: the application writes it, so it is named
 in the exclusion list with a reason of its own instead of being reported as something this tool
-failed to recognise.
+failed to recognise. `forks/` is named exactly the same way and for the same reason — the application
+writes it — so the fork worktrees are a stated exclusion rather than an entry that fell into the
+unrecognised-entry branch. The test that drives this is
+`tests/server/fork-store.test.ts` ("the child fork worktrees are a stated exclusion of a backup,
+never an entry it failed to recognise"): it backs up a data root that really holds a child worktree and
+asserts the exclusion is named with its own reason, that no file under `forks/` is captured, and that
+the archive's own manifest says the same thing.
 
 ## One consistent copy per database
 
@@ -257,6 +264,13 @@ in the encrypted single-file format.
   no partial restore, no per-project restore and no reverse-import into a live root.
 - **A backup holds committed data only.** Anything a crash left uncommitted is not in it, and a
   backup says nothing about work that was in flight.
+- **A restored root keeps the fork records and none of their worktrees.** `control.sqlite` **is**
+  captured, so a restored root lists the forks of the root it was backed up from — and every record
+  still names the worktree path of *that* root. A discard acts on the path a record carries and
+  re-checks that it is inside the root in force now, so this build refuses to touch those paths
+  (`OUTSIDE_ROOT`) rather than following them out of the restored root. Such a fork is left as a
+  deliberate operator decision, and this build has no path that clears one yet; see
+  [Forks](FORKS.md#honest-limits).
 - **The archive format is versioned but not eternal.** A future format version is refused by name
   rather than guessed at; keep the tool release that wrote an archive alongside it.
 - **Copy completed archives somewhere else.** An archive on the same disk as the data root is not a

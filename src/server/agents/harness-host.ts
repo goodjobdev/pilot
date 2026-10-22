@@ -6,6 +6,7 @@ import { createModels } from '@earendil-works/pi-ai/models';
 import { createAssistantMessageEventStream } from '@earendil-works/pi-ai/utils/event-stream';
 import { fauxAssistantMessage, fauxProvider, fauxToolCall, type FauxProviderHandle, type FauxResponseFactory } from '@earendil-works/pi-ai/providers/faux';
 import { Harness, createRegistry, defineExtension, defineTool, section } from '@earendil-works/pi-durable';
+import type { ConversationId, EntryId } from '@earendil-works/pi-durable';
 import { openNodeSqliteStorage } from '@earendil-works/pi-durable/storage/sqlite/node';
 import { Type } from 'typebox';
 import { safePath } from '../paths';
@@ -22,6 +23,16 @@ export interface AgentImage { readonly mimeType: string; readonly data: string }
 /** What the model a submission would run under accepts. */
 export interface AgentVision { readonly provider: string; readonly modelId: string; readonly acceptsImages: boolean }
 const uuidPattern = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
+/**
+ * The conversation behind one named session id, or null when the id is not one.
+ *
+ * A session id is the string form of the conversation id it names — the legacy root session is stored
+ * exactly that way — so a value that is not a whole number can never address a conversation of this
+ * project, and this build refuses to guess at one.
+ */
+function conversationIdOf(sessionId: string): ConversationId | null {
+  return /^[0-9]{1,15}$/.test(sessionId) ? (Number(sessionId) as ConversationId) : null;
+}
 
 interface HostedAgent {
   harness: Harness;
@@ -405,9 +416,9 @@ export class HarnessHost {
     this.hosted.set(project.id, pending);
     try { return await pending; } catch (error) { this.hosted.delete(project.id); throw error; }
   }
-  private shape(hosted: HostedAgent, value: unknown): AgentView {
+  private shape(hosted: HostedAgent, value: unknown, conversationId?: ConversationId): AgentView {
     const view = agentViewFrom(value);
-    return { ...view, conversationId: String(hosted.conversation.id), model: view.model ?? { provider: hosted.provider.provider.id, modelId: hosted.provider.getModel().id } };
+    return { ...view, conversationId: String(conversationId ?? hosted.conversation.id), model: view.model ?? { provider: hosted.provider.provider.id, modelId: hosted.provider.getModel().id } };
   }
   async view(project: Project): Promise<AgentView> {
     this.assertEnabled();
@@ -418,6 +429,103 @@ export class HarnessHost {
     if (typeof disposable.dispose === 'function') await disposable.dispose();
     return shaped;
   }
+  /**
+   * The conversation of one named session of this project, or null when this project has none.
+   *
+   * It is the read a fork is built on: the parent it branches from, and — for a fork's child — the
+   * forked conversation itself. Reading it attaches the conversation exactly as `view` does, and it
+   * writes no record of its own.
+   */
+  async sessionView(project: Project, sessionId: string): Promise<AgentView | null> {
+    this.assertEnabled();
+    const id = conversationIdOf(sessionId);
+    if (id === null) return null;
+    const hosted = await this.open(project);
+    const conversation = await hosted.harness.conversation(id, BACKGROUND_CONTEXT);
+    if (conversation === undefined) return null;
+    const state = await conversation.viewState(BACKGROUND_CONTEXT);
+    const shaped = this.shape(hosted, state.value, id);
+    const disposable = state as unknown as { dispose?: () => Promise<void> };
+    if (typeof disposable.dispose === 'function') await disposable.dispose();
+    return shaped;
+  }
+
+  /** Whether this project's harness holds a conversation for this session id. Read-only. */
+  async hasSession(project: Project, sessionId: string): Promise<boolean> {
+    this.assertEnabled();
+    const id = conversationIdOf(sessionId);
+    if (id === null) return false;
+    const hosted = await this.open(project);
+    return (await hosted.harness.conversation(id, BACKGROUND_CONTEXT)) !== undefined;
+  }
+
+  /**
+   * Whether one conversation's transcript holds this entry id, searched oldest first inside the
+   * documented bound. It is a read: it commits nothing, writes nothing and asks no model anything.
+   * An entry outside the bound is reported as absent, so a cutoff is never guessed at.
+   */
+  async hasEntry(project: Project, sessionId: string, entryId: number, bound: number): Promise<boolean> {
+    this.assertEnabled();
+    const id = conversationIdOf(sessionId);
+    if (id === null) return false;
+    const hosted = await this.open(project);
+    const conversation = await hosted.harness.conversation(id, BACKGROUND_CONTEXT);
+    if (conversation === undefined) return false;
+    let cursor: Parameters<typeof conversation.entries>[2];
+    let read = 0;
+    for (;;) {
+      const page = await conversation.entries({ order: 'ascending' }, Math.max(1, Math.min(200, bound - read)), cursor, BACKGROUND_CONTEXT);
+      for (const entry of page.items) if (Number(entry.id) === entryId) return true;
+      read += page.items.length;
+      if (page.next === undefined || page.items.length === 0 || read >= bound) return false;
+      cursor = page.next;
+    }
+  }
+
+  /**
+   * Create the child conversation of a fork: the parent's context **up to and including the cutoff
+   * entry** and nothing the parent recorded after it.
+   *
+   * This is Pi Durable's own `fork(at)`, so the cutoff is the transcript's own rule rather than a copy
+   * this application performs; it commits the child and makes **no** model request. The child is
+   * created with ownerless ownership, exactly like the project's root conversation, so it is durable
+   * and readable like any other conversation of this project.
+   */
+  async forkTranscript(project: Project, parentSessionId: string, cutoffEntryId: number): Promise<{ childSessionId: string }> {
+    this.assertEnabled();
+    return this.serial('agent:' + project.id, async () => {
+      const hosted = await this.open(project);
+      const id = conversationIdOf(parentSessionId);
+      const parent = id === null ? undefined : await hosted.harness.conversation(id, BACKGROUND_CONTEXT);
+      if (parent === undefined) throw new HttpError(404, 'This project holds no conversation for that session');
+      const child = await parent.fork(cutoffEntryId as EntryId, { ownership: { kind: 'ownerless' } }, BACKGROUND_CONTEXT);
+      return { childSessionId: String(child.id) };
+    });
+  }
+
+  /**
+   * Dispatch one input to a conversation of this project under a stable request identity.
+   *
+   * It is called **only** for a fork this application has already found active: the fork store owns
+   * that rule and refuses a paused, discarded or failed fork before it reaches here. Pi collapses a
+   * repeat of one request id onto the submission it already holds, so a retry is the same submission
+   * rather than a second model request.
+   */
+  async dispatchToSession(project: Project, sessionId: string, input: { requestId: string; text: string }): Promise<{ submissionId: string }> {
+    this.assertEnabled();
+    const text = input.text.trim();
+    if (text === '') throw new HttpError(422, 'Enter a message');
+    if (text.length > 8000) throw new HttpError(413, 'Message is too long');
+    return this.serial('agent:' + project.id, async () => {
+      const hosted = await this.open(project);
+      const id = conversationIdOf(sessionId);
+      const conversation = id === null ? undefined : await hosted.harness.conversation(id, BACKGROUND_CONTEXT);
+      if (conversation === undefined) throw new HttpError(404, 'This project holds no conversation for that session');
+      const submission = await conversation.submit({ type: 'input', content: text, requestId: input.requestId }, BACKGROUND_CONTEXT);
+      return { submissionId: String(submission.id) };
+    });
+  }
+
   /** Subscribes to committed view changes; the callback runs once immediately. */
   async subscribe(project: Project, listener: (view: AgentView) => void): Promise<() => Promise<void>> {
     this.assertEnabled();

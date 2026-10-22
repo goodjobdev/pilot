@@ -14,6 +14,8 @@ import { SessionLifecycleService, SessionLifecycleStore, adoptRunningSessions, t
 import { QueueStore, type QueueResult, type QueueSubmissionRecord } from '../../src/server/state/queue-store';
 import { RunnerBroker, createProjectWorkspaceResolver, type RunnerExecution, type RunnerExecutionRequest, type RunnerPort, type RunnerSettleResult } from '../../src/server/state/runner-broker';
 import { AcceptanceStore, type AcceptanceResult, type EvidenceResult, type ProjectAcceptanceView } from '../../src/server/state/acceptance-store';
+import { ForkStore, type ForkCreationResult, type ForkTranscriptPort, type ForkWorktreePort } from '../../src/server/state/fork-store';
+import { FORK_MAX_FORKS, ForkError, type ForkActionResult, type ForkView } from '../../src/shared/forks';
 import { RunnerError, type RunnerContainment, type RunnerJobRecord, type RunnerView } from '../../src/shared/runner';
 import { ActionError, ActionRegistry, actionHandlerIds, assertActionRegistryConsistent, assertHandlerSet, liveActivity, normaliseActionScope, type ActionEnvironment, type ActionScope } from '../../src/server/state/action-registry';
 import { ACTION_DESCRIPTORS, ACTION_IDS, ACTION_PRECONDITION_CODES, ACTION_REVISION_SOURCES, LIVE_RUN_DETAILS, LIVE_RUN_REASONS, LIVE_TOOL_DETAILS, LIVE_TOOL_REASONS, LIVE_TOOL_SOURCE, type ActionDescriptor, type ActionId, type ActionPreconditionCode } from '../../src/shared/actions';
@@ -53,6 +55,7 @@ type Fixture = {
   lifecycle: SessionLifecycleService; approvals: ApprovalStore; ledger: DeliveryLedger; port: Port;
   queue: QueueStore; queueClock: { now: number }; queueLedger: Map<string, QueueSubmissionRecord>; queueCalls: string[];
   runner: RunnerBroker; runnerWorkspace: string; runnerPort: RunnerPortStub; acceptance: AcceptanceStore;
+  forks: ForkStore; forkCalls: string[]; forkWorktree: { state: 'clean' | 'dirty' | 'absent'; createFails: boolean; commitRefused: boolean };
   environment: ActionEnvironment; actions: ActionRegistry;
   cleanup(): Promise<void>;
 };
@@ -153,9 +156,36 @@ async function fixture(): Promise<Fixture> {
   // The acceptance record: the durable policy, the frozen completion records and their Markdown
   // renderings, written into this disposable project folder and nowhere else.
   const acceptance = new AcceptanceStore(store, { projectRoot: (id) => (id === project.id ? projectPath : undefined) });
+  // The fork capability's two ports are synthetic: a transcript that holds three entry ids and mints a
+  // child per fork, and a worktree port whose state this suite sets. Neither starts a git command, a
+  // container or a harness, so the fork actions are reachable here without a repository at all; the
+  // real ports (one fixed git worktree add and Pi Durable's own fork) are driven in
+  // tests/server/fork-store.test.ts against a real disposable repository.
+  const forkCalls: string[] = [];
+  const forkWorktree = { state: 'clean' as 'clean' | 'dirty' | 'absent', createFails: false, commitRefused: false };
+  const forkEntries = new Set([1, 2, 3]);
+  const forkTranscripts: ForkTranscriptPort = {
+    parentSession: async () => { forkCalls.push('parentSession'); return true; },
+    hasEntry: async ({ cutoffEntryId }) => { forkCalls.push('hasEntry'); return forkEntries.has(cutoffEntryId); },
+    fork: async () => { forkCalls.push('fork'); return { childSessionId: 'fork-child-' + (forkCalls.filter((call) => call === 'fork').length) }; },
+    dispatch: async ({ childSessionId }) => { forkCalls.push('dispatch:' + childSessionId); }
+  };
+  const forkWorktrees: ForkWorktreePort = {
+    resolveCommit: async ({ commit }) => { forkCalls.push('resolveCommit'); if (forkWorktree.commitRefused) throw new Error('not a commit of this repository'); return commit; },
+    create: async () => { forkCalls.push('create'); if (forkWorktree.createFails) throw new Error('git refused'); },
+    inspect: async () => { forkCalls.push('inspect'); return { state: forkWorktree.state, head: 'd'.repeat(40) }; },
+    remove: async ({ force }) => { forkCalls.push('remove:' + (force ? 'force' : 'plain')); }
+  };
+  const forks = new ForkStore(store, {
+    projectFolder: (id) => (id === project.id ? projectPath : undefined),
+    forkRootParent: join(root, 'forks'),
+    worktrees: forkWorktrees,
+    transcripts: forkTranscripts,
+    sessions
+  });
   const environment: ActionEnvironment = {
     control: {
-      sessions, lifecycle, approvals, ledger, queue, runner, acceptance,
+      sessions, lifecycle, approvals, ledger, queue, runner, acceptance, forks,
       // An attached image id resolves to the stored facts the queue records; an id the media store
       // does not hold is refused, which the HTTP tests drive against the real media store.
       media: { resolve: async (ids) => Object.freeze(ids.map((id) => Object.freeze({ id, mimeType: 'image/png' as const, bytes: 64, width: 8, height: 8 }))) },
@@ -172,7 +202,7 @@ async function fixture(): Promise<Fixture> {
   };
   return {
     root, workspaces, data, project, taskId, store, sessions, lifecycleStore, lifecycle, approvals, ledger, port, queue, queueClock, queueLedger, queueCalls,
-    runner, runnerWorkspace, runnerPort, acceptance, environment,
+    runner, runnerWorkspace, runnerPort, acceptance, forks, forkCalls, forkWorktree, environment,
     actions: new ActionRegistry(environment),
     cleanup: async () => { store.close(); await rm(root, { recursive: true, force: true }); }
   };
@@ -423,6 +453,30 @@ test('every declared action is reachable and really acts through its own handler
       [acceptedEvidence.acceptance.acceptedBy.kind, acceptedEvidence.acceptance.acceptedBy.identity, acceptedEvidence.acceptance.acceptedBy.policyRule, acceptedEvidence.acceptance.singleUse],
       ['agent', 'registry-worker', agentPolicyRule('commit'), true]
     );
+
+    // The forks: created from a real cutoff through the parent session scope, listed, resumed and
+    // discarded, and finally discarded again so that the discard path really ran. The session scope of
+    // a creation names the parent; the session scope of a resume or a discard names the *fork* — its
+    // child session, which is the fork's own identity, so no caller ever addresses a path.
+    const forked = await drive('fork.create', { baseCommit: 'a'.repeat(40), cutoffEntryId: 3 }, scopeOf(f, created.id)) as ForkCreationResult;
+    assert.deepEqual([forked.created, forked.adopted, forked.fork.state, forked.fork.cutoffEntryId], [true, true, 'paused', 3]);
+    assert.equal(forked.fork.baseCommit, 'a'.repeat(40));
+    assert.ok(f.forkCalls.includes('fork'), 'the handler really asked its transcript port to branch the parent');
+    const forks = await drive('fork.list', {}, scopeOf(f)) as ForkView;
+    assert.deepEqual([forks.readOnly, forks.forks.map((fork) => fork.childSessionId)], [true, [forked.fork.childSessionId]]);
+    assert.equal(forks.rules.cutoff.includes('up to and including the cutoff entry'), true);
+    // A paused child refuses to dispatch, and the transcript port is never reached: a paused fork
+    // causes no submission and no model request at all.
+    const beforeDispatch = f.forkCalls.filter((call) => call.startsWith('dispatch')).length;
+    const pausedChild = await refusal(f.forks.dispatchChild({ projectId: f.project.id, childSessionId: forked.fork.childSessionId, text: 'not yet' }));
+    assert.ok(pausedChild instanceof ForkError && pausedChild.code === 'ILLEGAL' && /paused/.test(pausedChild.message));
+    assert.equal(f.forkCalls.filter((call) => call.startsWith('dispatch')).length, beforeDispatch, 'a refused dispatch calls nothing at all');
+    const resumedFork = await drive('fork.resume', { revision: forked.fork.revision }, scopeOf(f, forked.fork.childSessionId)) as ForkActionResult;
+    assert.deepEqual([resumedFork.outcome, resumedFork.fork.state, resumedFork.fork.revision], ['resumed', 'active', 2]);
+    assert.equal(f.forkCalls.filter((call) => call.startsWith('dispatch')).length, beforeDispatch, 'a resume dispatches nothing');
+    const discarded = await drive('fork.discard', { revision: resumedFork.fork.revision }, scopeOf(f, forked.fork.childSessionId)) as ForkActionResult;
+    assert.deepEqual([discarded.outcome, discarded.removed, discarded.fork.state], ['discarded', true, 'discarded']);
+    assert.ok(f.forkCalls.includes('remove:plain'), 'a clean worktree is removed without a force');
 
     const distinct = [...new Set(exercised)].sort();
     assert.deepEqual(distinct, [...ACTION_IDS].sort(), 'every declared action was driven through the registry');
@@ -766,6 +820,42 @@ test('every declared precondition matches a refusal the handlers really produce'
     assert.deepEqual([acceptedOnce.acceptance.acceptedBy.policyRule, acceptedOnce.acceptance.policy.classDecision], [agentPolicyRule('commit'), 'full-auto']);
     error = await refusal(f.actions.run('acceptance.accept', { request: acceptRequest({ actor: { kind: 'owner', identity: 'precondition-owner' } }) }, acceptanceScope));
     assert.ok(error instanceof AcceptanceError && error.code === 'ALREADY_ACCEPTED' && /an acceptance is single use/.test(error.message)); covered.add('ARTIFACT_NOT_ACCEPTED');
+
+    // The forks' own preconditions, each a refusal or a named attention state its handler really produces.
+    const forkScope = scopeOf(f, session.id);
+    const fork = await f.actions.run('fork.create', { baseCommit: 'c'.repeat(40), cutoffEntryId: 2 }, forkScope) as ForkCreationResult;
+    assert.equal(fork.created, true);
+    // CUTOFF_EXISTS: an entry the parent transcript does not hold is refused before anything is created.
+    error = await refusal(f.actions.run('fork.create', { baseCommit: 'c'.repeat(40), cutoffEntryId: 99 }, forkScope));
+    assert.ok(error instanceof ForkError && error.code === 'NOT_FOUND' && /holds no entry 99/.test(error.message)); covered.add('CUTOFF_EXISTS');
+    // BASE_COMMIT_REAL: a base commit the project's own repository does not hold is refused.
+    f.forkWorktree.commitRefused = true;
+    error = await refusal(f.actions.run('fork.create', { baseCommit: 'c'.repeat(40), cutoffEntryId: 2 }, forkScope));
+    assert.ok(error instanceof ForkError && error.code === 'INVALID'); covered.add('BASE_COMMIT_REAL');
+    f.forkWorktree.commitRefused = false;
+    // TARGET_IN_FORK_ROOT: a target that could resolve outside the designated fork root is refused.
+    error = await refusal(f.actions.run('fork.create', { baseCommit: 'c'.repeat(40), cutoffEntryId: 2, target: '../escape' }, forkScope));
+    assert.ok(error instanceof ActionError && error.code === 'INVALID'); covered.add('TARGET_IN_FORK_ROOT');
+    // TARGET_FREE: a target something already occupies is refused rather than reused or removed.
+    await mkdir(join(f.root, 'forks', f.project.id, 'taken'), { recursive: true, mode: 0o700 });
+    error = await refusal(f.actions.run('fork.create', { baseCommit: 'c'.repeat(40), cutoffEntryId: 2, target: 'taken' }, forkScope));
+    assert.ok(error instanceof ForkError && error.code === 'CONFLICT'); covered.add('TARGET_FREE');
+    // FORK_EXISTS: a fork this project does not hold is refused as not found.
+    error = await refusal(f.actions.run('fork.resume', { revision: 1 }, scopeOf(f, 'no-such-fork')));
+    assert.ok(error instanceof ForkError && error.code === 'NOT_FOUND'); covered.add('FORK_EXISTS');
+    // WORKTREE_CLEAN: a worktree with uncommitted changes is never removed implicitly — the fork becomes
+    // the named operator-attention state and the worktree is left where it is.
+    f.forkWorktree.state = 'dirty';
+    const dirty = await f.actions.run('fork.discard', { revision: fork.fork.revision }, scopeOf(f, fork.fork.childSessionId)) as ForkActionResult;
+    assert.deepEqual([dirty.outcome, dirty.removed, dirty.fork.attention?.reason], ['attention', false, 'worktree-dirty']); covered.add('WORKTREE_CLEAN');
+    assert.equal(f.forkCalls.includes('remove:force'), false, 'nothing was removed while the worktree was dirty');
+    f.forkWorktree.state = 'clean';
+    const forced = await f.actions.run('fork.discard', { revision: dirty.fork.revision, force: true }, scopeOf(f, fork.fork.childSessionId)) as ForkActionResult;
+    assert.deepEqual([forced.outcome, forced.fork.state], ['discarded', 'discarded']);
+    // FORK_LIMIT: a project at its documented fork bound refuses another creation.
+    for (let index = 0; index < FORK_MAX_FORKS; index += 1) await f.actions.run('fork.create', { baseCommit: 'c'.repeat(40), cutoffEntryId: 2 }, forkScope);
+    error = await refusal(f.actions.run('fork.create', { baseCommit: 'c'.repeat(40), cutoffEntryId: 2 }, forkScope));
+    assert.ok(error instanceof ForkError && error.code === 'BOUNDED'); covered.add('FORK_LIMIT');
 
     // The limits this test does not drive, and why. A new code cannot be added without a decision.
     const undriven: Partial<Record<ActionPreconditionCode, string>> = {

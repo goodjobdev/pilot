@@ -18,6 +18,8 @@ import type { DeliveryLedger } from './delivery';
 import type { QueueImageResolver, QueueStore } from './queue-store';
 import type { RunnerBroker } from './runner-broker';
 import type { AcceptanceStore } from './acceptance-store';
+import type { ForkStore } from './fork-store';
+import { FORK_BASE_COMMIT_PATTERN } from '../../shared/forks';
 
 /**
  * The server half of the command registry: the one place an action id is bound to the handler that
@@ -87,6 +89,13 @@ export type ActionControl = {
    * all, and asking for one anyway is refused as unavailable.
    */
   readonly acceptance?: AcceptanceStore;
+  /**
+   * The forks of this instance, or undefined when it has none. A fork needs the agent harness — it
+   * branches a transcript and creates a child worktree — so with the harness off the store is absent
+   * rather than present-and-failing, and asking for one of its actions anyway is refused as
+   * unavailable.
+   */
+  readonly forks?: ForkStore;
   /** The legacy-conversation migration, planned (dryRun true) or applied (false). */
   readonly migrate: (dryRun: boolean) => Promise<SessionMigrationReport>;
 };
@@ -149,7 +158,15 @@ const PARAM_VALIDATORS: Readonly<Record<ActionParamType, z.ZodTypeAny>> = Object
   'acceptance-evidence': z.unknown(),
   'acceptance-request': z.unknown(),
   'acceptance-policy': z.unknown(),
-  'acceptance-actor': z.unknown()
+  'acceptance-actor': z.unknown(),
+  // A base commit is a full commit id and nothing else, so no ref, branch or abbreviation can be
+  // recorded as the commit a child worktree was created from.
+  'fork-commit': z.string().regex(FORK_BASE_COMMIT_PATTERN, 'a base commit must be the full 40-character lowercase hex id of one commit'),
+  // The cutoff is the transcript's own entry id: a whole number, and never zero. The fork model
+  // re-checks it against the transcript the fork really branches from.
+  'fork-cutoff': z.number().int().positive(),
+  // An explicit flag: only a literal true forces a removal, and every other value is a false one.
+  flag: z.boolean()
 });
 
 /** A ZodError becomes this application's own words, never the schema library's raw message. */
@@ -278,6 +295,22 @@ function buildHandlers(environment: ActionEnvironment): Readonly<Record<ActionId
   const acceptanceScope = (scope: ActionScope): { acceptance: AcceptanceStore; projectId: string; durable: ActionControl } => {
     const durable = control();
     return { acceptance: acceptanceStore(), projectId: projectOf(scope), durable };
+  };
+  /**
+   * The fork actions share one shape: the project scope must name a project and this instance must
+   * really have the fork capability. The handler never guesses at a path or a session — the store is
+   * the authority on the parent, the cutoff, the base commit, the fork root and the paused rule — and
+   * the child session a resume or a discard acts on is the one the *session scope* names, so a caller
+   * can address a fork and never a path.
+   */
+  const forkStore = (): ForkStore => {
+    const durable = control();
+    if (!durable.forks)
+      throw new ActionError(
+        'The fork capability needs the agent harness, which is not enabled on this instance, so no fork is created, resumed or discarded',
+        'UNAVAILABLE'
+      );
+    return durable.forks;
   };
   /** The session a completion record claims, read only when it is already a well-formed identifier. */
   const claimedSession = (evidence: unknown): string | null => {
@@ -409,7 +442,21 @@ function buildHandlers(environment: ActionEnvironment): Readonly<Record<ActionId
       const { acceptance, projectId } = acceptanceScope(scope);
       return acceptance.accept({ projectId, request: params.request });
     },
-    'acceptance.policy.update': async (params: Record<string, unknown>) => acceptanceStore().updatePolicy(params)
+    'acceptance.policy.update': async (params: Record<string, unknown>) => acceptanceStore().updatePolicy(params),
+    'fork.create': async (params: Record<string, unknown>, scope: ActionScope) =>
+      forkStore().create({
+        // The session scope names the *parent* the fork branches from; the child is created by the store.
+        projectId: projectOf(scope), parentSessionId: sessionOf(scope),
+        baseCommit: params.baseCommit, cutoffEntryId: params.cutoffEntryId, target: params.target
+      }),
+    'fork.list': async (_params: Record<string, unknown>, scope: ActionScope) => forkStore().view(projectOf(scope)),
+    'fork.resume': async (params: Record<string, unknown>, scope: ActionScope) =>
+      // The session scope names the fork itself: its child session is the fork's identity.
+      forkStore().resume({ projectId: projectOf(scope), childSessionId: sessionOf(scope), revision: params.revision }),
+    'fork.discard': async (params: Record<string, unknown>, scope: ActionScope) =>
+      // The worktree is the one the record carries, never one a caller names; the force flag is the
+      // only thing a caller may add, and the store refuses without it whenever the worktree is dirty.
+      forkStore().discard({ projectId: projectOf(scope), childSessionId: sessionOf(scope), revision: params.revision, force: params.force })
   };
 }
 
@@ -438,6 +485,13 @@ const RUNNER_ACTIONS: ReadonlySet<string> = new Set(ACTION_IDS.filter((id) => id
  * present-and-failing, exactly as the coding runner's are.
  */
 const ACCEPTANCE_ACTIONS: ReadonlySet<string> = new Set(ACTION_IDS.filter((id) => id.startsWith('acceptance.')));
+/**
+ * The actions that need the fork capability, which an instance only has when it has a control store
+ * **and** the agent harness. A fork branches a transcript and creates a child worktree, so with the
+ * harness off the actions are absent rather than present-and-failing, exactly as the coding runner's
+ * and the acceptance record's are.
+ */
+const FORK_ACTIONS: ReadonlySet<string> = new Set(ACTION_IDS.filter((id) => id.startsWith('fork.')));
 
 /**
  * Normalises and validates a requested scope: an omitted dimension stays omitted, an identifier that
@@ -487,6 +541,8 @@ export class ActionRegistry {
       return Object.freeze({ available: false, reason: 'the coding runner is not enabled on this instance' });
     if (ACCEPTANCE_ACTIONS.has(descriptor.id) && !this.environment.control?.acceptance)
       return Object.freeze({ available: false, reason: 'the acceptance store is not open on this instance' });
+    if (FORK_ACTIONS.has(descriptor.id) && !this.environment.control?.forks)
+      return Object.freeze({ available: false, reason: 'the fork capability needs the agent harness, which is not enabled on this instance' });
     return Object.freeze({ available: true, reason: null });
   }
 

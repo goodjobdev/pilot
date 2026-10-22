@@ -310,11 +310,15 @@ docker compose --env-file .env start dashboard
   and receipts, the outbox, approvals, named sessions and their lifecycle — plus `settings/`.
 - **Excluded, with a reason in every manifest:** `credentials/` (provider keys, sign-ins and project
   deploy keys — there is **no opt-in** to include them), `alerts/` (the VAPID signing key and the
-  device endpoints that belong to it), `repositories/` (derived git worktrees), `service.lock` and
-  `snapshots/` (the bounded board revision history the application writes itself: derived from the
-  boards that *are* captured, and rebuilt as boards are edited). An unrecognised data-root entry is
-  reported as excluded rather than copied blindly; `snapshots/` is named with its own reason rather
-  than reported as an entry this tool failed to recognise.
+  device endpoints that belong to it), `repositories/` (derived git worktrees), `forks/` (the child fork
+  worktrees under `forks/<projectId>/<childSessionId>`: derived state, being a commit of the project
+  repository checked out again and held as a git worktree registered inside that repository, so a
+  restored root could not reuse the directory. The fork records themselves are rows of the captured
+  `control.sqlite`; [Forks](FORKS.md#honest-limits) states what a restored root then lists), `service.lock`
+  and `snapshots/` (the bounded board revision history the application writes itself:
+  derived from the boards that *are* captured, and rebuilt as boards are edited). An unrecognised
+  data-root entry is reported as excluded rather than copied blindly; `snapshots/` and `forks/` are
+  named with their own reasons rather than reported as entries this tool failed to recognise.
 - **A restored root has no credentials.** Sign in again under **Providers & models**, generate new
   project deploy keys and add their public keys at the provider, and enable alerts again on each
   device.

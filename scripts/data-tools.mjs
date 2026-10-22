@@ -9,7 +9,9 @@
  * excluded is listed in every manifest with a reason: the credentials directory is never included
  * and this tool has no opt-in to include it, the alert signing key and device endpoints are not
  * included, the application's own bounded board-snapshot history is not included, and the service
- * lock is never part of a backup.
+ * lock is never part of a backup, and the child fork worktrees under forks/ are a named exclusion
+ * (they are derived from the project repository, which is its own backup) rather than an entry this
+ * tool failed to recognise.
  *
  * An archive's author holds the passphrase, so an archive can always be crafted deliberately. The
  * containment rules — the payload path allowlist, the strict-inside-the-staging-root check below and
@@ -189,6 +191,7 @@ async function collectSources(root,catalog) {
     { path: 'credentials/',reason: 'provider API keys, provider sign-in tokens and project deploy keys are secrets: a restored root has none, this tool has no opt-in to include them, and a fresh sign-in plus new deploy keys are required afterwards' },
     { path: 'alerts/',reason: 'the private VAPID signing key (alerts/vapid.json) and the device push endpoints that belong to it; a restored root re-establishes alerts by enabling them again on each device' },
     { path: 'repositories/',reason: 'agent git worktrees: derived from the project repository, which is its own backup' },
+    { path: 'forks/',reason: 'child fork worktrees (forks/<projectId>/<childSessionId>): derived state, each one being a commit of the project repository checked out again and held as a git worktree registered inside that repository, which is itself excluded because it is its own backup — so a restored root could not reuse the directory either, and losing it costs no commit. The fork records themselves are captured in control.sqlite; creating the fork again is what produces a worktree' },
     { path: 'service.lock',reason: 'the live service lock is ownership evidence for the process holding this root, and a backup is never taken while one is held' },
     { path: PAUSED_MARKER,reason: 'the restore pause marker of a restored root, not application data' },
     { path: 'snapshots/',reason: 'the bounded board revision history this application writes itself (snapshots/<projectId>/<timestamp>-<uuid>.md, the newest 20 per project, the older ones pruned automatically): it is derived from the boards that are captured, so a restore rebuilds it as boards are edited, and it is not the board a project is served from' },

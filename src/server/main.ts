@@ -32,6 +32,8 @@ import { RunnerBroker,createProjectWorkspaceResolver,dockerRunnerPort,type Runne
 import { RunnerError } from '../shared/runner';
 import { AcceptanceError, parseAcceptanceActor, type AcceptanceActor } from '../shared/acceptance';
 import { AcceptanceStore } from './state/acceptance-store';
+import { FORK_ROOT_DIRECTORY, ForkStore, createForkWorktreePort, type ForkTranscriptPort } from './state/fork-store';
+import { FORK_MAX_ENTRY_SCAN, ForkError } from '../shared/forks';
 import { ActionError,ActionRegistry,liveActivity,normaliseActionScope,type ActionEnvironment } from './state/action-registry';
 import { ApprovalError } from '../shared/approvals';
 import { SessionError } from '../shared/sessions';
@@ -145,6 +147,23 @@ export function runnerHttpStatus(code:RunnerError['code']):number {
 export function lifecycleHttpStatus(code:SessionLifecycleError['code']):number {
   if(code==='INVALID')return 422;
   if(code==='NOT_FOUND')return 404;
+  if(code==='CORRUPT'||code==='STORAGE')return 500;
+  return 409;
+}
+/**
+ * Forks answer with the status that says what happened: a malformed request and a base commit that is
+ * not a commit of the project's own repository are 422, a fork target that escapes the designated fork
+ * root is 403, a missing fork and a cutoff the parent transcript does not hold are 404, a stale
+ * revision, a taken target, a fork at its documented bound, a discard without the force a dirty
+ * worktree needs and an illegal state change are 409, a capability this instance lacks is 503, and a
+ * storage or corruption fault is 500. Every refusal is path-free: a git error names a path, so it is
+ * logged and never repeated in a response.
+ */
+export function forkHttpStatus(code:ForkError['code']):number {
+  if(code==='INVALID')return 422;
+  if(code==='NOT_FOUND')return 404;
+  if(code==='OUTSIDE_ROOT')return 403;
+  if(code==='UNAVAILABLE')return 503;
   if(code==='CORRUPT'||code==='STORAGE')return 500;
   return 409;
 }
@@ -495,6 +514,55 @@ export async function createApp(options:AppOptions){
     }
   }):undefined;
   /**
+   * The forks of this instance: a child transcript branched from a parent at one entry, a paused child
+   * session, and a child worktree created from a recorded commit.
+   *
+   * A fork needs the agent harness — it branches a transcript and reads the parent's entries — so with
+   * the harness off the store is absent rather than present-and-failing, exactly as the coding runner
+   * is when it is switched off. Nothing here opens a second persistence: a fork is one control-store
+   * operation per revision inside the child session's own scope.
+   *
+   * - `projectFolder` is the repository a child worktree is added to: the registered project's own
+   *   folder. A project this instance does not know has none, and the store refuses rather than guess.
+   * - `forkRootParent` is the designated fork root's parent inside the data root, so every child
+   *   worktree lives under this instance's own data and nowhere else.
+   * - the worktree port is the only git this build runs for a fork: one `git worktree add` from the
+   *   recorded commit, one `git worktree remove`, and one read of the child's own status. Hooks are
+   *   off, submodule recursion is off, no network command is ever issued, both file and external
+   *   protocols are refused, and no stash is created, read or applied anywhere.
+   * - the transcript port is the harness: the parent conversation, a bounded search for the cutoff
+   *   entry, Pi Durable's own `fork(at)` (which makes no model request) and — only for a fork the
+   *   store has already found active — one submission to the child under a stable request identity.
+   */
+  const forkTranscripts:ForkTranscriptPort={
+    parentSession:async({projectId,parentSessionId})=>{
+      const project=catalog.projects.find(candidate=>candidate.id===projectId);
+      return project!==undefined&&await agents.hasSession(project,parentSessionId);
+    },
+    hasEntry:async({projectId,parentSessionId,cutoffEntryId})=>{
+      const project=catalog.projects.find(candidate=>candidate.id===projectId);
+      if(project===undefined)return false;
+      return await agents.hasEntry(project,parentSessionId,cutoffEntryId,FORK_MAX_ENTRY_SCAN);
+    },
+    fork:async({projectId,parentSessionId,cutoffEntryId})=>{
+      const project=catalog.projects.find(candidate=>candidate.id===projectId);
+      if(project===undefined)throw new HttpError(404,'Unknown project');
+      return await agents.forkTranscript(project,parentSessionId,cutoffEntryId);
+    },
+    dispatch:async({projectId,childSessionId,requestId,text})=>{
+      const project=catalog.projects.find(candidate=>candidate.id===projectId);
+      if(project===undefined)throw new HttpError(404,'Unknown project');
+      await agents.dispatchToSession(project,childSessionId,{requestId,text});
+    }
+  };
+  const forks=options.control&&agents.enabled&&sessions!==undefined?new ForkStore(options.control,{
+    projectFolder:(projectId:string)=>catalog.projects.find(candidate=>candidate.id===projectId)?.path,
+    forkRootParent:join(options.dataRoot,FORK_ROOT_DIRECTORY),
+    worktrees:createForkWorktreePort(),
+    transcripts:forkTranscripts,
+    sessions
+  }):undefined;
+  /**
    * The bounded coding runner: one typed job per submission, run in a container created from
    * deploy/runner/Dockerfile, under the documented containment. It is **disabled by default** behind
    * an explicit switch (DASHBOARD_RUNNER=on), and while it is disabled its actions are absent from the
@@ -553,7 +621,7 @@ export async function createApp(options:AppOptions){
   // publishes; the two report actions read only.
   const actionEnvironment:ActionEnvironment={
     control:sessions&&lifecycle&&lifecycleService&&approvals&&ledger&&queueStore?{
-      sessions,lifecycle:lifecycleService,approvals,ledger,queue:queueStore,media:queueImages,runner,acceptance,
+      sessions,lifecycle:lifecycleService,approvals,ledger,queue:queueStore,media:queueImages,runner,acceptance,forks,
       // Whether the store really holds a lifecycle row for one session, read-only. The projection
       // needs it because the lifecycle store answers an unwritten session with its initial record,
       // and that must not be reported as the state it reads at.
@@ -754,6 +822,12 @@ export async function createApp(options:AppOptions){
               const projectId=queueBody.projectId as string;
               sessions.read(projectId,sessionId);
               const queueScope={projectId,sessionId};
+              // A fork's child transcript is a forked conversation of its own, and this project's queue
+              // dispatcher submits into the project's root conversation. A child's queued input would
+              // therefore reach the wrong transcript entirely, so claiming or submitting one is refused
+              // rather than silently misdirected; a fork's own guarded dispatch is the path for a child.
+              if((queueOperation==='claim'||queueOperation==='submit')&&forks!==undefined&&forks.read(projectId,sessionId)!==null)
+                throw new HttpError(409,'Session '+sessionId+' is the child of a fork: this project\'s queue dispatches into the project\'s own root conversation, so a child\'s queued input is refused rather than submitted to the wrong transcript. Resume the fork and dispatch into the child through the fork itself.','fork-child');
               let queueResult:QueueResult;
               if(queueOperation==='append')queueResult=await queueStore.append({...queueScope,revision:queueBody.revision,text:queueBody.text,images:queueBody.images===undefined?undefined:await queueImages.resolve(queueImageIds(queueBody.images))});
               else if(queueOperation==='edit')queueResult=await queueStore.edit({...queueScope,revision:queueBody.revision,entryId:queueBody.entryId,text:queueBody.text});
@@ -916,6 +990,44 @@ export async function createApp(options:AppOptions){
             throw error;
           }
         }
+        // The forks of one project: one read route and the three writes. Owner-only like every other
+        // route, behind the unchanged Host check, with the same origin/CSRF enforcement for the writes.
+        // The fork a write acts on is the one in the path — its child session, which *is* the fork's
+        // identity — so a caller addresses a fork and never a path: the worktree it removes is the one
+        // the durable record carries, re-checked against the designated fork root by the store itself.
+        // While this instance has no fork capability (the agent harness is off) these routes refuse
+        // with a named reason rather than pretending, exactly as the runner's do.
+        const forkList=path.match(/^\/api\/projects\/([a-f0-9-]{36})\/forks$/);
+        const forkAction=path.match(/^\/api\/projects\/([a-f0-9-]{36})\/forks\/([A-Za-z0-9][A-Za-z0-9._:-]{0,159})\/(resume|discard)$/);
+        if(forkList||forkAction){
+          if(!forks)throw new HttpError(503,'The fork capability needs the agent harness, which is not enabled on this instance: enable agents before a fork is created, resumed or discarded');
+          const projectId=(forkList??forkAction)![1];
+          catalog.get(projectId);
+          try{
+            if(forkList&&req.method==='GET'){json(forks.view(projectId));return;}
+            if(forkList&&req.method==='POST'){
+              const body=parseBody(z.strictObject({parentSessionId:z.unknown(),baseCommit:z.unknown(),cutoffEntryId:z.unknown(),target:z.unknown().optional()}),payload,'The fork request');
+              const created=await forks.create({projectId,parentSessionId:body.parentSessionId,baseCommit:body.baseCommit,cutoffEntryId:body.cutoffEntryId,target:body.target});
+              json({fork:created.fork,created:created.created,adopted:created.adopted},created.created?201:200);return;
+            }
+            if(forkAction&&req.method==='POST'){
+              const childSessionId=forkAction[2];
+              if(forkAction[3]==='resume'){
+                const body=parseBody(z.strictObject({revision:z.unknown()}),payload,'The fork resume request');
+                const resumed=await forks.resume({projectId,childSessionId,revision:body.revision});
+                json({fork:resumed.fork,outcome:resumed.outcome});return;
+              }
+              const body=parseBody(z.strictObject({revision:z.unknown(),force:z.unknown().optional()}),payload,'The fork discard request');
+              const discarded=await forks.discard({projectId,childSessionId,revision:body.revision,force:body.force});
+              json({fork:discarded.fork,outcome:discarded.outcome,removed:discarded.removed});return;
+            }
+            throw new HttpError(405,'Method not allowed');
+          }catch(error){
+            if(error instanceof ForkError)throw new HttpError(forkHttpStatus(error.code),error.message);
+            if(error instanceof SessionError)throw new HttpError(sessionHttpStatus(error.code),error.message);
+            throw error;
+          }
+        }
         if(path==='/api/browse' && req.method==='GET'){json(await browse(url.searchParams.get('path')??options.browseRoots[0]??'',options.browseRoots));return;}
         if(path==='/api/preview' && req.method==='POST'){json(await catalog.preview(payload.path));return;}
         if(path==='/api/suggestions' && req.method==='GET'){
@@ -1073,7 +1185,7 @@ export async function createApp(options:AppOptions){
     }
   });
   server.requestTimeout=30000;server.headersTimeout=10000;
-  return {server,catalog,boards,docs,agents,alerts,providers,repositories,sessions,lifecycle,actions,media,queue:queueStore,runner,acceptance,close:async()=>{
+  return {server,catalog,boards,docs,agents,alerts,providers,repositories,sessions,lifecycle,actions,media,queue:queueStore,runner,acceptance,forks,close:async()=>{
     // A server that never opened reports ERR_SERVER_NOT_RUNNING, which means "already closed", not
     // "close failed". A failed start (for example a port already in use) must still drain and
     // release the lock that this same start created, and must report the original failure instead.

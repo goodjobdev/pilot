@@ -69,7 +69,7 @@ and asking for such an action anyway is refused with a precise reason rather tha
 
 ## The implemented actions
 
-Thirty-six actions exist in this build. Nothing else is declared, and none of them commits, pushes,
+Forty actions exist in this build. Nothing else is declared, and none of them commits, pushes,
 deploys, spends, provisions or publishes.
 
 Five of them are the **bounded coding runner**, and they are **disabled by default** behind an explicit
@@ -189,6 +189,28 @@ written inside the project's own tree, and the policy that decides who may accep
 `acceptance.accept` performs no commit, push, deploy, spend, provision or publish: it records the
 decision and returns it. Nothing in this registry performs the thing an acceptance is about.
 
+### Forks — scope: `project`, and `project` + `session` for the fork itself
+
+A **fork** is one child session branched from a parent transcript at an exact cutoff entry, with its
+own git worktree created from a recorded base commit (see [docs/FORKS.md](FORKS.md)). The child is
+created **paused**, inherits nothing, and refuses to dispatch anything until an explicit resume.
+These actions need the agent harness as well as the durable store: with the harness off they are
+**absent** from the list below rather than present and failing.
+
+| id | scope | effect | writes |
+|---|---|---|---|
+| `fork.create` | `project` + `session` (the **parent**) | creates the child transcript conversation up to the cutoff, adopts the child as a paused named session with no link, and creates the child worktree from the recorded base commit by one fixed `git worktree add` | yes |
+| `fork.list` | `project` | reads the project's forks with the cutoff, worktree and paused-child rules and the bounds in force | no |
+| `fork.resume` | `project` + `session` (the **child**, which is the fork's identity) | lifts the pause so the child may be dispatched into; it dispatches nothing itself | yes |
+| `fork.discard` | `project` + `session` (the **child**) | removes the child worktree by one `git worktree remove` and closes the fork | yes |
+
+None of the four commits, pushes, deploys, spends, provisions or publishes. `fork.create` never reads
+the parent's working tree, never copies an uncommitted or staged change and never runs `git stash`;
+`fork.resume` makes no model request and grants nothing. Whether an *active* child is dispatched into
+is not an action of this registry in this build: the guarded dispatch lives in the fork store, and the
+owner surface offers creation, listing, resume and discard. See `docs/FORKS.md` for the model, the
+bounds and the honest limits.
+
 ## Preconditions, action by action
 
 Every code below is from the closed vocabulary. A request that trips one of them changes nothing.
@@ -273,6 +295,32 @@ refusal.
 **`doctor.report`, `delivery.reconciliation.report`** — no precondition beyond the schema. A
 diagnosis always answers: an invalid configuration or an unreadable lock is reported as data, not as
 a refusal of the action.
+
+**`fork.create`** — `PROJECT_REGISTERED` (with its own folder, which is the repository the child
+worktree is added to), `SESSION_EXISTS` (the parent), `CUTOFF_EXISTS` (the parent transcript really
+holds that entry id), `BASE_COMMIT_REAL` (a real commit of that repository; a value that is not one is
+refused and no worktree is created), `TARGET_IN_FORK_ROOT` (a target that is one path component inside
+the designated fork root, with no symlink and no parent segment), `TARGET_FREE` (nothing already
+occupies it), `FORK_LIMIT` (fewer than 20 forks). A creation whose worktree or child session could not
+be created after the transcript fork is recorded as a **named operator-attention state** in the
+`failed` state rather than reported as a success or hidden.
+
+**`fork.list`** — `PROJECT_REGISTERED`. No-op: a project with no live fork reads as an empty list at
+the documented bounds.
+
+**`fork.resume`** — `PROJECT_REGISTERED`, `FORK_EXISTS`, `REVISION_MATCHES`, `TRANSITION_LEGAL` (only
+a paused fork can become active; a discarded fork is terminal and a failed one has to be resolved and
+discarded first). No-op: resuming an already active fork returns the record unchanged at its own
+revision.
+
+**`fork.discard`** — `PROJECT_REGISTERED`, `FORK_EXISTS`, `REVISION_MATCHES`,
+`TARGET_IN_FORK_ROOT` (the worktree path the *record* carries is still inside the designated fork
+root; a record that says otherwise is refused as an escape and nothing is removed), `WORKTREE_CLEAN`
+(the child worktree holds no uncommitted or untracked change, or the caller explicitly forces it — a
+dirty worktree becomes the named operator-attention state `worktree-dirty` and is left exactly where
+it is), `TRANSITION_LEGAL`. A worktree git will not remove or cannot report becomes
+`worktree-remove-refused` or `worktree-unreadable`; nothing is ever forced implicitly. No-op:
+discarding a fork whose worktree is already gone completes the discard and removes nothing.
 
 **`queue.read`** — `SESSION_EXISTS`. No-op: a session whose queue was never written reads at
 revision 0 with no entries, which is the queue itself rather than an absence of one.
@@ -445,6 +493,10 @@ nothing is attached at all.
 | `/api/acceptance/policy` | POST | writes the next policy revision: `{ "revision": n, "policy": { "mode": "...", "actionClasses": { ... } } }`. Owner only. |
 | `/api/acceptance/evidence` | POST | records one completion record and writes its Markdown: `{ "projectId": "...", "evidence": { ... } }`. |
 | `/api/acceptance/accept` | POST | accepts one artifact exactly once: `{ "projectId": "...", "request": { ... }, "actor": { ... } }`. The actor may be declared beside the request or inside it (`request.actor`), which is the shape the registry publishes; both are honoured, two that disagree are refused 422, and only a body that declares none is the authenticated owner. |
+| `/api/projects/:id/forks` | GET | the project's forks, with the cutoff, worktree and paused-child rules and the bounds in force. Read-only, and refused (503) while the instance has no fork capability. |
+| `/api/projects/:id/forks` | POST | creates one fork: `{ "parentSessionId": "...", "baseCommit": "<40 hex>", "cutoffEntryId": n, "target": "..." }`. The parent session is named in the body because the fork is created *from* it; a 201 means the fork really exists, and a 200 with `created: false` carries the named operator-attention state instead. |
+| `/api/projects/:id/forks/:childSessionId/resume` | POST | lifts the pause on one fork: `{ "revision": n }`. The child session in the path **is** the fork's identity, so a caller addresses a fork and never a path. |
+| `/api/projects/:id/forks/:childSessionId/discard` | POST | removes one fork's worktree and closes it: `{ "revision": n, "force": false }`. The worktree is the one the durable record carries, re-checked against the designated fork root; without `force` a dirty worktree is never removed. |
 
 All three sit behind the same owner-only authentication as every other route, behind the unchanged
 Host check, and the write carries the same origin and CSRF enforcement. The scope may be supplied in
@@ -476,6 +528,16 @@ rather than listed and failing.
 The queue routes are the second surface over the same store methods the `queue.*` handlers call, so
 the two cannot disagree about what an operation does: the registry is where the palette finds them,
 and the routes are what a script or a dispatcher calls directly.
+
+The fork routes are the same shape one more time: they call the same store methods the `fork.*`
+handlers call, so the two cannot disagree about what an operation does. The fork a write acts on is the
+one in the path — its child session, which is the fork's identity — so a caller addresses a fork and
+never a path, and the worktree it removes is the one the durable record carries. While the instance has
+no fork capability (the agent harness is off) the routes refuse with a named reason (503) and the
+actions are absent from the registry rather than listed and failing. The queue's own claim and submit
+routes refuse a **fork child** (409) rather than dispatching its input into the project's root
+conversation: this project's queue dispatcher submits into the root conversation, so a child's queued
+input would reach the wrong transcript entirely. See `docs/FORKS.md`.
 
 The acceptance routes are the same shape again: they call the same store methods the `acceptance.*`
 handlers call. The policy write always acts as the authenticated owner. The acceptance write takes the
@@ -521,7 +583,9 @@ parameters and preconditions. Nothing in the client lists a capability of its ow
   revision parameter declares the queue read it comes from, and a claim is refused before the instance
   that cannot dispatch is asked to; the live projection distinguishes `none`, `no-conversation`,
   `unavailable` and `failed`, reports a session with no lifecycle row as an absence rather than as
-  `idle`, never invents an entry and declares exactly the contract fields.
+  `idle`, never invents an entry and declares exactly the contract fields; and all four `fork.*`
+  actions are driven through the registry against synthetic ports, with a paused child refusing a
+  dispatch the port never sees.
 - `tests/server/http.test.ts` — the routes are owner-only, behind the Host check and the origin
   check; the registry lists only what the instance implements; executing a real action really writes;
   an unknown id and a scope violation are both refused; the projection is path-free and names an
@@ -530,7 +594,11 @@ parameters and preconditions. Nothing in the client lists a capability of its ow
   queue, an empty entry, an unknown field, an image the media store does not hold and a dispatcher that
   cannot dispatch; and the flow the palette really performs is driven end to end: the revision is read
   from `/api/actions/activity` and a lifecycle write at that revision succeeds, while the revision a
-  client would have assumed is refused as a conflict.
+  client would have assumed is refused as a conflict. The fork routes are driven end to end against a
+  real disposable repository and the instance's own harness: the child worktree is created from the
+  recorded commit and does not carry the parent's dirty sentinel, the cutoff holds, a paused child
+  refuses, a dirty worktree needs an explicit `force`, and a stale revision or an escaping target
+  changes nothing.
 - `tests/server/queue.test.ts` — the durable queue itself, over a disposable root and a synthetic
   dispatcher: persistence across a close and reopen with the same order and revision; a stale revision
   refused with the record unchanged; unknown fields, empty entries, positions outside the queue and
@@ -560,6 +628,21 @@ parameters and preconditions. Nothing in the client lists a capability of its ow
   crash and reopen and from a second handle, and the Markdown record written with the expected fields
   and reported rather than trusted after a hand edit, and a write whose file cannot be rendered
   reporting the real, non-current state instead of a state it never verified. See `docs/ACCEPTANCE.md`.
+- `tests/server/fork-store.test.ts` — the forks themselves, over a disposable root, a real disposable
+  git repository and the application's own harness with its synthetic provider: the strict fork record
+  and every figure it refuses; the cutoff rule (the child sees the parent context up to and including
+  the cutoff entry and nothing the parent recorded after it, proved against the real transcript fork);
+  the sentinel proof (an untracked, unstaged file and a staged change left in the parent worktree are
+  absent from the child, the parent is untouched, `git stash list` is empty, the child is clean and at
+  the recorded base commit); a paused child refusing to dispatch with the transcript port never called;
+  an explicit resume dispatching nothing; no inherited approval, accepted artifact, link, declared model
+  or queue, with the parent's approval still pending and the parent's queue untouched and unclaimed; a
+  discard refusing a dirty worktree, succeeding with `force`, refusing a stale revision without
+  mutating anything, completing when the worktree is already gone, and refusing a record whose path is
+  outside the fork root with nothing removed; every creation refusal (an unreal base commit, an absent
+  cutoff, an unknown parent, an escaping or symlinked target, a taken target) creating nothing; the
+  documented fork bound; and a stored record that does not validate read as corruption. **No real
+  provider is called and no container is started in this suite.** See `docs/FORKS.md`.
 - `tests/browser/actions.spec.ts` — the palette opens from the keyboard, lists exactly the registry's
   actions for its scope, executes real actions, shows the handler's results and shows a refusal;
   a declared model choice is parsed in the palette and recorded by the handler; a revision-bound action
