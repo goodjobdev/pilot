@@ -189,8 +189,36 @@ not the `schemaId` the release names, refuses to serve rather than answering `50
 reported facts are `releaseId`, `schemaId`, `lockHeld`, `dataRootWritable` and `reasons` — never a
 filesystem path or secret. The reasons are `release-manifest-invalid`, `service-lock-not-held`,
 `data-root-not-writable`, `storage-schema-absent`, `storage-schema-unreadable`,
-`storage-schema-busy` (a live writer held the file) and `storage-schema-mismatch`. Readiness is
-read-only and takes no lock.
+`storage-schema-busy` (a live writer held the file), `storage-schema-mismatch`,
+`release-identity-mismatch` and `release-promotion-unreadable`. Readiness is read-only and takes no
+lock.
+
+### The release identity the service reports
+
+`GET /api/release` is owner-authenticated, read-only and path-free. It reports the identity this
+process runs as (release id, storage schema id, build version, the schema version that schema id maps
+to, the source digest and build id when the manifest declares them) and which candidate the durable
+store says is promoted:
+
+```json
+{
+  "release": {"releaseId": "release-2026-01", "schemaId": "pilot-state-1", "expectedSchemaVersion": 1, "version": "2.5.0", "source": "manifest"},
+  "promotion": {"state": "match", "revision": 1, "candidate": {"candidateId": "cand-1", "releaseId": "release-2026-01", "schemaId": "pilot-state-1", "artifact": {"reference": "ghcr.io/owner/pilot@sha256:…"}}},
+  "reasons": []
+}
+```
+
+`promotion.state` is `match` when the identity this build was started as is the promoted candidate,
+`mismatch` when it is not (with `differences` naming the fields), and `not-promoted` when the store
+records no promotion at all — the state of a fresh root or a local instance. A promotion that cannot
+be read is reported as `unreadable` and named in `reasons`.
+
+**Startup refuses to serve a build that is not the promoted release.** With a promotion recorded, a
+manifest whose release id, schema id or source digest does not match it makes the process refuse
+before anything listens: it prints the difference, exits non-zero and releases the lock it took, so a
+refusal strands nothing. A promotion history that cannot be read refuses the start the same way,
+rather than serving on a guess. Promoting a build is a deliberate operator step recorded in the
+control store — see [Releases](RELEASES.md).
 
 A supervisor should gate on readiness rather than liveness: a responding process that cannot hold
 its lock or match its expected schema is not ready to serve. Health checks stay cheap and
@@ -353,10 +381,47 @@ and it is an offline backup taken with the service stopped.
 
 ## Upgrades and rollback
 
-Stop only the application, let it drain, and check that `service.lock` is gone before
-switching releases. Point `current` at the new release, start, and verify readiness (`/readyz`)
-and the deny cases above. Roll back build artefacts only — never replace newer boards or documents
-with older ones.
+An upgrade is a **recorded promotion** of an immutable candidate, and a rollback returns to the
+release that promotion recorded before it. Stop the application and let it drain, then, from the
+source tree:
+
+```sh
+pnpm exec tsx scripts/releases.mjs candidate create … --execute   # one immutable candidate
+pnpm exec tsx scripts/releases.mjs status                          # the revision to promote from
+pnpm exec tsx scripts/releases.mjs promote --candidate <id> --expect-revision <n> --actor <you>   --release-root <release-root> --execute                          # swaps current, deletes nothing
+```
+
+Start the service and verify readiness (`/readyz`), `GET /api/release` reporting
+`"promotion": {"state": "match"}`, and the deny cases above. Roll back build artefacts only — never
+replace newer boards or documents with older ones:
+
+```sh
+pnpm exec tsx scripts/releases.mjs rollback --expect-revision <n> --actor <you>   --release-root <release-root> --execute
+```
+
+**The tool verifies the target can start before the pointer moves.** Both `promote` and `rollback`
+pre-flight the target and refuse, with the `current` pointer untouched, when the data root carries
+`service.lock` evidence in **any** state (so a crash that left a lock behind refuses both the promotion
+and the rollback instead of reporting a success the service then refuses to start on), when the root is
+a restored root still carrying `RESTORE-PAUSED.json`, when the staged
+`<release-root>/<releaseId>/release.json` does not match the candidate's release id, schema id or
+source digest, or when the storage schema on disk is one the target release cannot read. A refusal
+records nothing and leaves the pointer exactly where it was; `status` prints the same **start blockers**
+the doctor reports, so the command you use to decide says whether the root is startable.
+
+A rollback **must be compatible or it is refused**: if the storage schema on disk is newer than the
+release being returned to understands, the rollback is refused with a reason that names both schema
+versions, because starting that build would misread the data. Do not force it and do not edit
+`control.sqlite`: stay on the promoted release, or restore the matching state from the encrypted
+full-state backup into a new root and promote that (see
+[Releases](RELEASES.md) and [Backup, restore and promotion](BACKUP.md)). A promotion and a rollback
+never delete the previous release directory or image, and neither restarts the service: the restart is
+the deliberate step above.
+
+**Checking `service.lock` yourself is a fallback, not the mechanism.** The tool now refuses a held lock
+on its own; checking that the lock is gone before you switch, and clearing a stale one deliberately when
+it is not, is the runbook step for the *start*, not something the tool relies on you to remember. Never
+clear `service.lock` to force a promotion or a rollback.
 
 ## Operational notes
 

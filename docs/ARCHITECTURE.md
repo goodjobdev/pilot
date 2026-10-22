@@ -41,9 +41,28 @@ Three surfaces over one project's own files, plus derived state that can be rebu
    liveness (the process is responding); `/readyz` is authenticated expected-version readiness and
    is `200` only when the stores are open, this process holds the lock, the data root is writable,
    the manifest is valid and the storage schema observed from the open control store matches the
-   expected `schemaId`. Neither endpoint exposes a secret or a filesystem path, and the read-only
-   `--doctor` diagnostic acquires nothing.
-8. **Authorisation is explicit, scoped and single-use.** A consequential action is not a generic
+   expected `schemaId`. The identity a build runs as must also be the candidate the durable store
+   records as **promoted**: `GET /api/release` reports that comparison read-only, and a build that is
+   not the promoted release refuses to start at all. Neither endpoint exposes a secret or a filesystem
+   path, and the read-only `--doctor` diagnostic acquires nothing.
+8. **Releases are candidates, previews are disposable, and a promotion is recorded.** A release
+   candidate is an immutable record — a candidate id, the release id and storage schema id it declares,
+   the source digest of the revision it was built from, an image identity that is a sha256 digest or a
+   version-shaped tag, the creation instant and the target environment — with a content fingerprint,
+   stored as one control-store operation that is never updated: the same id with **different content is
+   refused**, and a restart cannot lose it. A preview is created **from a candidate**, with its own data
+   root (never the live one), no production credentials, no tunnel, loopback-only publishing, a bounded
+   lifetime and hard caps; a placement that cannot establish any of those is refused rather than
+   degraded, a preview is never promoted, and discarding it removes only what it created. Promotion
+   points the service at a candidate and records the candidate, the previously active release (the
+   rollback target), the instant and the actor at the next revision of an append-only chain, checked
+   against the revision the caller read; it and a rollback delete no artifact, and a rollback is refused
+   unless the target release can read the storage schema actually on disk. Both a promotion and a
+   rollback **pre-flight the target** before the pointer moves — the service lock in any state but
+   absent, a restored root's pause marker, the staged release manifest, and the on-disk schema — and
+   the observation is injected into the durable store (`canActivate`), so every caller is refused before
+   the pointer is switched, not only the operator CLI. See [Releases](RELEASES.md).
+9. **Authorisation is explicit, scoped and single-use.** A consequential action is not a generic
    confirmation: it is an approval record with a kind from a closed set, an exact target for that
    kind, a scope and a short lifetime. Consuming it is a checked durable transaction that records
    who consumed it and returns the exact target — and performs nothing. A delivery is a receipt:
@@ -148,6 +167,17 @@ appears in an agent view.
 | Delivery row that cannot be proven idempotent | Reported for an operator; never replayed |
 | Missing or forged identity | 401; wrong Host 403; the application verifies signatures itself |
 | Missing hosted release manifest | Startup refused; local mode runs as the explicit `unreleased-local` identity |
+| Release candidate recorded twice with different content | Refused as immutable; the stored candidate is unchanged and a changed build needs a new candidate id |
+| Preview placement that cannot establish its isolation | Refused with nothing created: at most a reservation an operator can see and discard, never an active preview |
+| Preview discard that would remove something outside its own data root | Refused; nothing is recorded as discarded and the preview is still listed |
+| Stale promotion or rollback revision | Refused naming the current revision; nothing is promoted and the port is never asked to activate anything |
+| Promotion or rollback whose target cannot start (held lock, paused root, mis-staged manifest, incompatible schema) | Refused before the pointer moves: nothing is recorded and `current` is unchanged |
+| Promotion race lost to another actor | Refused; the loser re-points the service at the recorded winner, so the pointer and the record cannot disagree silently |
+| Promotion history longer than this build reads | Refused as unreadable rather than reported as a silently truncated chain |
+| Promotion or rollback that deleted an artifact | Refused and not recorded: neither deletes the previous release |
+| Read-only release command on a root with no control store | Reports `controlStore: absent`; creates nothing (no data root, no `control.sqlite`, no lock) |
+| Rollback whose target cannot read the on-disk schema | Refused with both schema versions and the encrypted backup restore path named; nothing is promoted |
+| Build that is not the promoted candidate | Startup refused before anything listens, the lock released, nothing served |
 | Control store cannot be opened | Startup refused with a clear message, the lock is released, nothing serves |
 | Not ready (`/readyz`) | 503 with machine-readable reasons; liveness `/healthz` stays `200` |
 | Duplicate question or answer | The existing operation is returned unchanged (no second outbox row); different content under the same key is a conflict |
@@ -190,6 +220,12 @@ store cannot be opened, or its schema version is not the one the release manifes
 names, the start fails closed: the message names the cause, the lock is released, the exit is
 non-zero and nothing serves. Readiness asks that live handle, so it describes the database this
 process is actually using instead of opening a second connection beside it.
+
+Before anything listens, startup also reads the durable **promotion history** from that store: when a
+promotion is recorded and the identity this build runs as is not the promoted candidate — or the
+history cannot be read at all — the start is refused, the lock is released and the exit is non-zero.
+Nothing promotes, points or starts anything by itself: a promotion is a deliberate operator step
+recorded in the control store. See [Releases](RELEASES.md).
 
 Before anything listens, startup also **adopts** every session whose durable lifecycle says `running`
 but whose process is gone, marking it `interrupted` with a reason and `uncertain`, in a deterministically

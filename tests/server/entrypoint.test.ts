@@ -16,6 +16,7 @@ import { observeStorageSchema } from '../../src/server/release';
 import { doctorStartBlockers,restorePauseRefusal } from '../../src/server/main';
 import { PAUSED_MARKER,backup,promote,restore } from '../../scripts/data-tools.mjs';
 import { ControlStore } from '../../src/server/state/control-store';
+import { ReleaseStore } from '../../src/server/state/release-store';
 import { DeliveryLedger } from '../../src/server/state/delivery';
 import { SessionLifecycleStore } from '../../src/server/state/session-lifecycle';
 import { newTask } from '../../src/shared/model';
@@ -505,6 +506,96 @@ test('a release manifest supplies the lock releaseId and schemaId, and a malform
  }finally{
   await stop(badChild,badExited,'SIGKILL');
   await rm(bad,{recursive:true,force:true});
+ }
+});
+
+test('the running service reports its release identity, refuses a release the store did not promote, and keeps readiness intact',async()=>{
+ const manifest={version:'2.5.0',releaseId:'release-2026-01',schemaId:'pilot-state-1',createdAt:'2026-01-01T00:00:00.000Z',sourceDigest:'a'.repeat(40)};
+ const root=await releaseRoot(),data=join(root,'data');
+ await writeFile(join(root,'releases','v1','release.json'),JSON.stringify(manifest));
+ // The promoted candidate is recorded in the data root's own control store, through the release
+ // store's synthetic port: no container is built and no VPS is touched anywhere in this test.
+ await mkdir(data,{recursive:true,mode:0o700});
+ const store=new ControlStore(data);
+ const releases=new ReleaseStore(store,{promotionPort:{activate:async(request)=>({pointer:'/srv/pilot/releases/'+request.releaseId,removed:[]})}});
+ releases.createCandidate({candidateId:'cand-1',releaseId:manifest.releaseId,schemaId:manifest.schemaId,sourceDigest:manifest.sourceDigest,environment:'hosted-vps',createdAt:manifest.createdAt,artifact:{repository:'ghcr.io/owner/pilot',kind:'immutable-tag',identity:'v2.5.0',reference:'ghcr.io/owner/pilot:v2.5.0'}});
+ await releases.promote({candidateId:'cand-1',expectedRevision:0,actor:'owner'});
+ store.close();
+ const port=await freePort();
+ const child=spawnServer(join(root,'current','server.mjs'),{DASHBOARD_MODE:'local',DASHBOARD_DATA:data,PORT:String(port),DASHBOARD_REGISTRY:'',DASHBOARD_ROOTS:''});
+ const logs=collect(child),exited=once(child,'exit');
+ try{
+  await waitForListening(child,logs.stderr);
+  const token=await sessionToken(port),host='127.0.0.1:'+port,headers={'x-dashboard-token':token};
+  const canonical=await realpath(data);
+  assert.equal((await statusFor(port,'/api/release',host)).status,401,'the release identity is behind the owner door');
+  const report=await statusFor(port,'/api/release',host,headers);
+  assert.equal(report.status,200,logs.stderr());
+  const body=JSON.parse(report.body);
+  assert.deepEqual(body.release,{releaseId:manifest.releaseId,schemaId:manifest.schemaId,expectedSchemaVersion:1,version:'2.5.0',source:'manifest',sourceDigest:manifest.sourceDigest,buildId:null});
+  assert.equal(body.promotion.state,'match','the manifest identity is the promoted candidate');
+  assert.equal(body.promotion.revision,1);
+  assert.equal(body.promotion.candidate.candidateId,'cand-1');
+  assert.deepEqual(body.promotion.candidate.artifact,{repository:'ghcr.io/owner/pilot',kind:'immutable-tag',reference:'ghcr.io/owner/pilot:v2.5.0',identity:'v2.5.0'});
+  assert.deepEqual(body.reasons,[]);
+  assert.ok(!report.body.includes(canonical),'the release report carries no filesystem path');
+  // Readiness itself is unchanged: the same facts and the same reasons as before this feature.
+  const ready=await statusFor(port,'/readyz',host,headers);
+  assert.equal(ready.status,200);
+  assert.deepEqual(JSON.parse(ready.body),{ok:true,releaseId:manifest.releaseId,schemaId:manifest.schemaId,lockHeld:true,dataRootWritable:true,reasons:[]});
+  child.kill('SIGTERM');
+  assert.equal(await waitForExit(child,exited,logs),0,'a clean stop exits zero');
+ }finally{
+  await stop(child,exited,'SIGTERM');
+  await rm(root,{recursive:true,force:true});
+ }
+ // The same promoted store under a different manifest identity: the start is refused, nothing listens
+ // and the lock it took is released, so the refusal strands nothing.
+ const other=await releaseRoot(),otherData=join(other,'data');
+ await writeFile(join(other,'releases','v1','release.json'),JSON.stringify({...manifest,releaseId:'release-2026-02'}));
+ await mkdir(otherData,{recursive:true,mode:0o700});
+ const otherStore=new ControlStore(otherData);
+ const otherReleases=new ReleaseStore(otherStore,{promotionPort:{activate:async(request)=>({pointer:'/srv/pilot/releases/'+request.releaseId,removed:[]})}});
+ otherReleases.createCandidate({candidateId:'cand-1',releaseId:manifest.releaseId,schemaId:manifest.schemaId,sourceDigest:manifest.sourceDigest,environment:'hosted-vps',createdAt:manifest.createdAt,artifact:{repository:'ghcr.io/owner/pilot',kind:'immutable-tag',identity:'v2.5.0',reference:'ghcr.io/owner/pilot:v2.5.0'}});
+ await otherReleases.promote({candidateId:'cand-1',expectedRevision:0,actor:'owner'});
+ otherStore.close();
+ const otherPort=await freePort();
+ const mismatched=spawnServer(join(other,'current','server.mjs'),{DASHBOARD_MODE:'local',DASHBOARD_DATA:otherData,PORT:String(otherPort),DASHBOARD_REGISTRY:'',DASHBOARD_ROOTS:''});
+ const mismatchedLogs=collect(mismatched),mismatchedExited=once(mismatched,'exit');
+ try{
+  const [code]=await mismatchedExited as [number];
+  assert.notEqual(code,0,'a build that is not the promoted release must fail closed');
+  assert.match(mismatchedLogs.stderr(),/the control store says the promoted release is release-2026-01/);
+  assert.match(mismatchedLogs.stderr(),/differing in releaseId/);
+  await expectNothingListening(otherPort);
+  await assert.rejects(stat(join(await realpath(otherData),'service.lock')),{code:'ENOENT'},'the refusal releases the lock it took');
+ }finally{
+  await stop(mismatched,mismatchedExited,'SIGKILL');
+  await rm(other,{recursive:true,force:true});
+ }
+ // A promotion history that cannot be read refuses the start too: nothing is served on a guess.
+ const broken=await releaseRoot(),brokenData=join(broken,'data');
+ await writeFile(join(broken,'releases','v1','release.json'),JSON.stringify(manifest));
+ await mkdir(brokenData,{recursive:true,mode:0o700});
+ const brokenStore=new ControlStore(brokenData);
+ const brokenReleases=new ReleaseStore(brokenStore,{promotionPort:{activate:async(request)=>({pointer:'/srv/pilot/releases/'+request.releaseId,removed:[]})}});
+ brokenReleases.createCandidate({candidateId:'cand-1',releaseId:manifest.releaseId,schemaId:manifest.schemaId,sourceDigest:manifest.sourceDigest,environment:'hosted-vps',createdAt:manifest.createdAt,artifact:{repository:'ghcr.io/owner/pilot',kind:'immutable-tag',identity:'v2.5.0',reference:'ghcr.io/owner/pilot:v2.5.0'}});
+ const event=await brokenReleases.promote({candidateId:'cand-1',expectedRevision:0,actor:'owner'});
+ brokenStore.close();
+ const tamper=new DatabaseSync(join(await realpath(brokenData),'control.sqlite'));
+ tamper.prepare("UPDATE operations SET input_json=? WHERE kind='release.promotion'").run(JSON.stringify({...event,actor:'someone-else'}));
+ tamper.close();
+ const brokenPort=await freePort();
+ const brokenChild=spawnServer(join(broken,'current','server.mjs'),{DASHBOARD_MODE:'local',DASHBOARD_DATA:brokenData,PORT:String(brokenPort),DASHBOARD_REGISTRY:'',DASHBOARD_ROOTS:''});
+ const brokenLogs=collect(brokenChild),brokenExited=once(brokenChild,'exit');
+ try{
+  const [code]=await brokenExited as [number];
+  assert.notEqual(code,0,'an unreadable promotion history must fail closed');
+  assert.match(brokenLogs.stderr(),/promotion history in the control store could not be read/);
+  await expectNothingListening(brokenPort);
+ }finally{
+  await stop(brokenChild,brokenExited,'SIGKILL');
+  await rm(broken,{recursive:true,force:true});
  }
 });
 

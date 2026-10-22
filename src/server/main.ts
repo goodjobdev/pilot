@@ -23,6 +23,8 @@ import { effectiveConfig } from './effective-config';
 import { acquireServiceLock,inspectServiceLock,type ServiceLockHandle } from './service-lock';
 import { loadReleaseManifest,observeStorageSchema,resolveRelease,schemaVersionForId,SUPPORTED_SCHEMA_IDS,RELEASE_MANIFEST_ENV,RELEASE_MANIFEST_FILENAME,UNRELEASED_LOCAL,type StorageSchemaObservation } from './release';
 import { ControlStore,CONTROL_SCHEMA_VERSION } from './state/control-store';
+import { ReleaseStore } from './state/release-store';
+import { matchReleaseIdentity,type ReleaseDifference,type ReleaseTarget } from '../shared/releases';
 import { ApprovalStore } from './state/approval-store';
 import { DeliveryError,DeliveryLedger,type DeliveryReconciliation } from './state/delivery';
 import { SessionRegistry,createSessionResourcePort,legacyConversationPort,migrateLegacyConversations,type LegacyConversationPort } from './state/session-registry';
@@ -50,8 +52,21 @@ import { QueueError, queueView, type QueueImageRef } from '../shared/queue';
  * the schema observed from the live store handle. Startup supplies the live observer; a caller that
  * constructs createApp directly falls back to a read-only observation of the data root.
  */
-export interface ReadinessOptions {readonly releaseId:string;readonly schemaId:string;readonly manifestValid?:boolean;readonly lockHeld?:()=>boolean;readonly observeSchema?:()=>StorageSchemaObservation}
-export interface AppOptions {dataRoot:string;browseRoots:string[];security:SecurityConfig;allowedHosts?:readonly string[];clientRoot?:string;registry?:string;agents?:'on'|'off';agentPauseMs?:number;alertTransport?:AlertTransport;alertSubject?:string;alertCooldownMs?:number;readiness?:ReadinessOptions;control?:ControlStore;runner?:{readonly enabled?:boolean;readonly port?:RunnerPort};fileEdit?:{readonly enabled?:boolean}}
+export interface ReadinessOptions {readonly releaseId:string;readonly schemaId:string;readonly manifestValid?:boolean;readonly lockHeld?:()=>boolean;readonly observeSchema?:()=>StorageSchemaObservation;readonly releaseMatch?:()=>ReleasePromotionObservation}
+/**
+ * What this process knows about the candidate the durable store says is promoted, compared with the
+ * identity it was started as. It is a report, never a write: reading it promotes nothing, moves no
+ * pointer and starts no service. 'not-promoted' is not a failure by itself (a fresh or local instance
+ * has no promotion yet); a mismatch is, because a build must serve the release that was promoted.
+ */
+export type ReleasePromotionObservation =
+  | {readonly state:'not-promoted'}
+  | {readonly state:'match';readonly revision:number;readonly target:ReleaseTarget}
+  | {readonly state:'mismatch';readonly revision:number;readonly target:ReleaseTarget;readonly differences:readonly ReleaseDifference[]}
+  | {readonly state:'unreadable';readonly reason:string};
+/** What the running service reports about itself, and the one read-only seam that answers for promotion. */
+export interface ReleaseReportOptions {readonly version:string;readonly source:'manifest'|'unreleased-local';readonly buildId?:string;readonly sourceDigest?:string;readonly observe:()=>ReleasePromotionObservation}
+export interface AppOptions {dataRoot:string;browseRoots:string[];security:SecurityConfig;allowedHosts?:readonly string[];clientRoot?:string;registry?:string;agents?:'on'|'off';agentPauseMs?:number;alertTransport?:AlertTransport;alertSubject?:string;alertCooldownMs?:number;readiness?:ReadinessOptions;control?:ControlStore;runner?:{readonly enabled?:boolean;readonly port?:RunnerPort};fileEdit?:{readonly enabled?:boolean};release?:ReleaseReportOptions}
 /**
  * Approvals answer with a status that says what happened: an invalid request is 422, an approval
  * outside the caller's scope is 403, a missing one is 404, a storage fault is 500, and every
@@ -362,6 +377,30 @@ function questionNotification(questionId:string,projectId:string,projectName:str
   return {title:'An agent needs an answer',body:body.slice(0,240),url:'/?project='+projectId+'&view=Agents',tag:questionTag(questionId)};
 }
 export async function createApp(options:AppOptions){
+  // The release identity this process reports, and the read-only observation of which release the
+  // store says is promoted. Both are reports: neither promotes, points or starts anything.
+  const releaseReport=options.release??null;
+  const releaseIdentity={releaseId:options.readiness?.releaseId??UNRELEASED_LOCAL,schemaId:options.readiness?.schemaId??SUPPORTED_SCHEMA_IDS[0]};
+  const observeRelease:()=>ReleasePromotionObservation=releaseReport?.observe??(()=>({state:'not-promoted' as const}));
+  const readinessForReport:ReadinessOptions={...(options.readiness??{releaseId:releaseIdentity.releaseId,schemaId:releaseIdentity.schemaId}),releaseMatch:observeRelease};
+  /** The authenticated, path-free report of the release identity and the schema this build expects. */
+  const releaseView=()=>{
+    const observed=observeRelease();
+    const reasons:string[]=[];
+    if(observed.state==='mismatch')reasons.push('release-identity-mismatch');
+    if(observed.state==='unreadable')reasons.push('release-promotion-unreadable');
+    const promotion=observed.state==='not-promoted'
+      ?{state:'not-promoted' as const,revision:0,candidate:null,differences:[] as string[],reason:null}
+      :{state:observed.state,revision:observed.state==='unreadable'?0:observed.revision,
+        candidate:observed.state==='unreadable'?null:{candidateId:observed.target.candidateId,releaseId:observed.target.releaseId,schemaId:observed.target.schemaId,sourceDigest:observed.target.sourceDigest,artifact:observed.target.artifact},
+        differences:observed.state==='mismatch'?observed.differences.map(difference=>difference.field):[],
+        reason:observed.state==='unreadable'?observed.reason:null};
+    return Object.freeze({ok:true,release:Object.freeze({
+      releaseId:releaseIdentity.releaseId,schemaId:releaseIdentity.schemaId,expectedSchemaVersion:schemaVersionForId(releaseIdentity.schemaId)??null,
+      version:releaseReport?.version??'0.0.0-unreleased',source:releaseReport?.source??'unreleased-local',
+      sourceDigest:releaseReport?.sourceDigest??null,buildId:releaseReport?.buildId??null
+    }),promotion:Object.freeze(promotion),reasons:Object.freeze(reasons)});
+  };
   // The Host check is exactly the canonical origin's host. Startup passes the set that
   // effective-config derived from that same validated origin; a caller that constructs
   // createApp directly reads the same single value from its security config per request, so
@@ -707,7 +746,7 @@ export async function createApp(options:AppOptions){
       if(path==='/readyz'){
         if(!['GET','HEAD'].includes(req.method??''))throw new HttpError(405,'Method not allowed');
         await authorize(req,options.security);
-        const report=await readinessReport({dataRoot:options.dataRoot,readiness:options.readiness});
+        const report=await readinessReport({dataRoot:options.dataRoot,readiness:readinessForReport});
         json(report,report.ok?200:503);return;
       }
       if(path.startsWith('/api/')){
@@ -717,6 +756,9 @@ export async function createApp(options:AppOptions){
           let body='';for await(const chunk of req){body+=chunk.toString();if(Buffer.byteLength(body)>8*1024*1024)throw new HttpError(413,'Request too large');}
           try{payload=JSON.parse(body);}catch{throw new HttpError(400,'Invalid JSON');}
         }
+        // The release identity this process runs as, the storage schema it expects and which
+        // candidate the durable store says is promoted. Read-only, authenticated, path-free.
+        if(path==='/api/release'&&req.method==='GET'){json(releaseView());return;}
         if(path==='/api/settings/providers'&&req.method==='GET'){json(await providers.view());return;}
         if(path==='/api/settings/models'&&req.method==='POST'){json(await providers.savePreferences(payload));return;}
         const providerRoute=path.match(/^\/api\/settings\/providers\/([a-z0-9-]+)(?:\/(key|login))?$/);
@@ -1369,13 +1411,19 @@ async function readinessReport(input:{dataRoot:string;readiness?:ReadinessOption
   const writable=await dataRootWritable(input.dataRoot);
   if(!writable)reasons.push('data-root-not-writable');
   // The live handle is the authority: opening a second connection beside it would report a
-  // different, possibly transiently locked, view of the same schema.
+  // different, possibly transiently locked, view of the same schema. The promotion report is read
+  // from the durable chain alone, so it never opens a second connection and never waits on a lock.
   const schema=input.readiness?.observeSchema?input.readiness.observeSchema():observeStorageSchema(input.dataRoot);
   const expected=schemaVersionForId(schemaId);
   if(schema.state==='absent')reasons.push('storage-schema-absent');
   else if(schema.state==='busy')reasons.push('storage-schema-busy');
   else if(schema.state==='malformed')reasons.push('storage-schema-unreadable');
   else if(expected===undefined||schema.version!==expected)reasons.push('storage-schema-mismatch');
+  // A release identity that is not the candidate the store says is promoted is a reason too, never a
+  // silent difference: an unpromoted instance (a fresh or local root) reports no such reason.
+  const releaseMatch=input.readiness?.releaseMatch?.();
+  if(releaseMatch?.state==='mismatch')reasons.push('release-identity-mismatch');
+  else if(releaseMatch?.state==='unreadable')reasons.push('release-promotion-unreadable');
   return {ok:reasons.length===0,releaseId,schemaId,lockHeld,dataRootWritable:writable,reasons};
 }
 /** Bounded, read-only TCP probe: does anything appear to be listening on the configured endpoint. */
@@ -1437,6 +1485,31 @@ export function doctorStartBlockers(input:{readonly lockClassification:string;re
   else if(input.lockNamedForRoot)blockers.push('service-lock-present');
   if(input.probe==='listening')blockers.push('port-in-use');
   return blockers;
+}
+/**
+ * The start blockers for one data root, for the release tool's read-only 'status'. It reuses the
+ * same observations and the same doctorStartBlockers mapping the doctor uses, so the command an
+ * operator uses to decide names exactly the conditions that would make the next start fail closed:
+ * an existing service lock (any classification but absent), a restored root's pause marker, and an
+ * endpoint something already accepts connections on. It reads only: it creates nothing, removes
+ * nothing and takes no lock.
+ */
+export async function dataRootStartBlockers(dataRoot:string,env:NodeJS.ProcessEnv=process.env):Promise<StartBlocker[]>{
+  let canonical:string|null=null,lockNamedForRoot=false,restorePaused=false,lockClassification='absent';
+  try {
+    const info=await lstat(dataRoot);
+    if(!info.isSymbolicLink()&&info.isDirectory())canonical=await realpath(dataRoot);
+  } catch { /* an absent or unreadable root can carry neither a lock nor a pause marker */ }
+  if(canonical!==null){
+    const lock=await inspectServiceLock(canonical);
+    lockClassification=lock.classification;
+    lockNamedForRoot=lock.metadata!==undefined&&lock.metadata.root===canonical;
+    restorePaused=(await restorePauseRefusal(canonical))!==null;
+  }
+  let probe:'listening'|'not-listening'|'unknown'='unknown';
+  try {const config=effectiveConfig(env);probe=await probeServer(config.bindHost,config.port);}
+  catch { /* an invalid configuration is diagnosed by the doctor, not by the release tool */ }
+  return doctorStartBlockers({lockClassification,lockNamedForRoot,probe,restorePaused});
 }
 /**
  * Read-only diagnostics, as data. It acquires no lock, creates, deletes or rewrites nothing and
@@ -1590,6 +1663,11 @@ async function main(){
   const releaseId=release.state==='released'?release.identity.releaseId:lockReleaseId(env);
   const schemaId=release.state==='released'?release.identity.schemaId:SUPPORTED_SCHEMA_IDS[0];
   const expectedSchemaVersion=schemaVersionForId(schemaId);
+  // What this build reports about itself: the manifest's own version and identity, or the explicit
+  // unreleased identity. The source digest is compared only when a manifest declared one.
+  const identityVersion=release.state==='released'?release.identity.version:'0.0.0-unreleased';
+  const identityBuildId=release.state==='released'?release.identity.buildId:undefined;
+  const identitySourceDigest=release.state==='released'?release.identity.sourceDigest:undefined;
   // Install the stop handlers before the lock is created. A SIGTERM/SIGINT during startup must be
   // captured and drained like a normal stop; with the default disposition a stop that arrives while
   // the data root or the lock is being created — the systemctl --user stop / container stop during
@@ -1622,11 +1700,37 @@ async function main(){
     const store=openControlStore(canonicalRoot,expectedSchemaVersion,schemaId);
     if(!store){process.exitCode=1;return;}
     control=store;
+    // The candidate the durable store says is promoted is evidence, so the identity this process was
+    // started as must be that release: a build serving a release nobody promoted, or a promotion
+    // history that cannot be read, is refused here, before anything listens, and the lock is released.
+    const releaseStore=new ReleaseStore(store);
+    const manifestIdentity={releaseId,schemaId,...(identitySourceDigest===undefined?{}:{sourceDigest:identitySourceDigest})};
+    // The report reads the promotion chain and nothing else: readiness and this report must not open
+    // a second connection beside the live store handle, and must not wait on a writer's lock.
+    const observeRelease=():ReleasePromotionObservation=>{
+      try {
+        const status=releaseStore.promotionStatus();
+        if(status.target===null)return {state:'not-promoted' as const};
+        const match=matchReleaseIdentity(manifestIdentity,status.target);
+        if(match.state==='not-promoted')return {state:'not-promoted' as const};
+        if(match.state==='match')return {state:'match' as const,revision:status.revision,target:status.target};
+        return {state:'mismatch' as const,revision:status.revision,target:status.target,differences:match.differences};
+      } catch(error) {return {state:'unreadable' as const,reason:(error as Error).message};}
+    };
+    const startupRelease=observeRelease();
+    if(startupRelease.state==='mismatch'){
+      console.error('Refusing to start: this process runs as '+releaseId+' ('+schemaId+') but the control store says the promoted release is '+startupRelease.target.releaseId+' ('+startupRelease.target.schemaId+'), differing in '+startupRelease.differences.map(difference=>difference.field).join(', ')+'. A build must serve the release that was promoted: nothing is served and the service lock is released. Promote this build deliberately, or start the promoted release. See docs/RELEASES.md.');
+      process.exitCode=1;return;
+    }
+    if(startupRelease.state==='unreadable'){
+      console.error('Refusing to start: the promotion history in the control store could not be read, so this build cannot prove which release is promoted: '+startupRelease.reason+'. Nothing is served and the service lock is released. See docs/RELEASES.md.');
+      process.exitCode=1;return;
+    }
     // The delivery ledger lives in the app the store is handed to: createApp owns the reconciliation
     // of rows a crash left behind (below, before anything listens) because it is the layer that also
     // holds the notification channel and the harness.
     // Readiness reports the schema observed from this live handle, never from a second connection.
-    const app=await createApp({dataRoot:canonicalRoot,browseRoots:[...config.browseRoots],security:config.security,allowedHosts:[...config.allowedHosts],clientRoot:resolve(fileURLToPath(new URL('./client',import.meta.url))),registry:env.DASHBOARD_REGISTRY,control:store,readiness:{releaseId,schemaId,manifestValid:true,lockHeld:()=>lockHeld,observeSchema:()=>{
+    const app=await createApp({dataRoot:canonicalRoot,browseRoots:[...config.browseRoots],security:config.security,allowedHosts:[...config.allowedHosts],clientRoot:resolve(fileURLToPath(new URL('./client',import.meta.url))),registry:env.DASHBOARD_REGISTRY,control:store,release:{version:identityVersion,source:release.state==='released'?'manifest':'unreleased-local',...(identityBuildId===undefined?{}:{buildId:identityBuildId}),...(identitySourceDigest===undefined?{}:{sourceDigest:identitySourceDigest}),observe:observeRelease},readiness:{releaseId,schemaId,manifestValid:true,lockHeld:()=>lockHeld,observeSchema:()=>{
       try {return {state:'present' as const,version:store.schemaVersion()};}
       catch(error) {return {state:'malformed' as const,reason:(error as Error).message};}
     }}});
