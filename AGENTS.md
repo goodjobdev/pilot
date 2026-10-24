@@ -40,3 +40,17 @@ Check for hostnames, account identifiers, email addresses and tokens before any 
 
 Use disposable roots; never a live project or a real planning document. No automatic
 commits, pushes or publication, and no synchronisation between machines.
+
+## Bounded execution and progress
+
+- The Bash tool's `timeout` is in **seconds**. Use 60–120 seconds for test commands,
+  never `timeout: 30000`. Node's `--test-timeout=30000` is in milliseconds and is a
+  separate limit; it does not reliably bound process shutdown.
+- If assertions pass but Node does not exit, investigate open streams, sockets,
+  servers, timers, and teardown. Do not repeat the same hanging command unchanged.
+- After a timeout, report the blocker and change the diagnostic approach before retrying.
+- Run long checks in a background subagent and keep the owner informed. Do not leave
+  the conversation silently waiting on a foreground tool for extended periods.
+- Pilot's stopped session incurred at least 3 waits of about 8 hours 20 minutes
+  because `timeout: 30000` was used for a test process that did not exit. Preserve
+  this regression lesson when changing the test harness.

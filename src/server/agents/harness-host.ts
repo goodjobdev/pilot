@@ -64,6 +64,7 @@ interface HostedAgent {
   extensions: Extension[];
   /** The tools the root conversation's authority permits, or undefined for owner dispatch. */
   permittedTools: readonly any[] | undefined;
+  watch(conversation: HostedAgent["conversation"], sessionId: string): Promise<void>;
   close(): Promise<void>;
 }
 
@@ -334,6 +335,26 @@ export interface HarnessHostOptions {
    */
   privileges?: AgentPrivilegePort;
   /**
+   * Where this harness reads and records the durable session-to-conversation mapping.
+   *
+   * The mapping is written once when a conversation is first created for a named session, and read
+   * on every access after a restart. Without this port, named sessions lose their conversation on
+   * restart — the in-process cache is empty. The legacy root session's
+   * conversation is always the root conversation (ROOT_CONVERSATION_ID) and does not use this port.
+   *
+   * This port is the durable authority; the in-process Map below is only a cache.
+   */
+  conversationBinding?: {
+    list?(projectId: string): readonly { sessionId: string; conversationId: number }[];
+    /** Read the durable binding, or null when none exists for this session. */
+    read(projectId: string, sessionId: string): { conversationId: number; revision: number } | null;
+    /**
+     * Record a conversation binding exactly once. Throws when a binding with different content
+     * already exists for this session.
+     */
+    record(input: { projectId: string; sessionId: string; conversationId: number }): void;
+  };
+  /**
    * The bounded file-edit capability, or undefined when this instance has it disabled. The tool is
    * installed only when the capability is enabled, so a disabled tool does not exist at all rather
    * than existing and failing.
@@ -473,8 +494,9 @@ export class HarnessHost {
    * legacy root conversation remains bound to the project's root session id (ROOT_CONVERSATION_ID).
    *
    * Entries are written when a conversation is first created for a session, and read on every
-   * session-level access. This map is ephemeral (in-process); the durable binding lives in the
-   * session registry's own control-store records.
+   * session-level access. This map is an in-process **cache only**: the durable authority is the
+   * conversationBinding port (resolved from the control store), and after a restart the cache is
+   * repopulated from that durable record on first access.
    */
   private readonly sessionConversations = new Map<string, ConversationId>();
   /**
@@ -507,6 +529,28 @@ export class HarnessHost {
     if (!this.options.privileges) return Object.freeze({ agentId: null, scopes: null, projects: null, emptyReason: null });
     const authority = await this.options.privileges.authority({ projectId: project.id, sessionId });
     return Object.freeze({ agentId: authority.agentId ?? null, scopes: authority.scopes ?? null, projects: authority.projects ?? null, emptyReason: authority.emptyReason ?? null });
+  }
+  /** Resolve numeric aliases back to the named authority, including after restart. */
+  private sessionIdentity(project: Project, conversationId: ConversationId): string {
+    const names = new Set<string>();
+    for (const binding of this.options.conversationBinding?.list?.(project.id) ?? [])
+      if (binding.conversationId === conversationId) names.add(binding.sessionId);
+    for (const [key, id] of this.sessionConversations)
+      if (id === conversationId && key.startsWith(project.id + ':')) names.add(key.slice(project.id.length + 1));
+    const named = [...names].filter(name => conversationIdOf(name) === null);
+    if (named.length > 1) throw new HttpError(409, 'Ambiguous conversation authority');
+    return named[0] ?? String(conversationId);
+  }
+  /** Select an existing conversation for controls; never create one as a side effect. */
+  private async selected(project: Project, sessionId?: string): Promise<HostedAgent> {
+    const hosted = await this.open(project);
+    if (!sessionId) return hosted;
+    const id = conversationIdOf(sessionId) ?? this.options.conversationBinding?.read(project.id, sessionId)?.conversationId ?? this.sessionConversations.get(project.id + ':' + sessionId);
+    if (id === undefined) throw new HttpError(404, 'This session has no conversation');
+    const conversation = await hosted.harness.conversation(id as ConversationId, BACKGROUND_CONTEXT);
+    if (!conversation) throw new HttpError(409, 'The bound conversation is unavailable');
+    await hosted.watch(conversation, this.sessionIdentity(project, conversation.id));
+    return { ...hosted, conversation };
   }
   /**
    * The models this instance really offers: the deterministic scripted stand-in it always has, and
@@ -560,12 +604,36 @@ export class HarnessHost {
               for(const message of [...context.messages].reverse()){if(message.role==='user')break;if(message.role==='assistant')turns++;}
               if(turns>=8)throw new HttpError(409,'Pilot stopped at eight model turns. Review before sending another message.');
             }
-            options?.signal?.throwIfAborted();
+            const signal=options?.signal;signal?.throwIfAborted();
             const source=stream(model,context,{...options,maxTokens:Math.min(options?.maxTokens??4096,4096)});
             const safeError='Model request failed. Check the provider connection, model access and quota.';
             // Provider/OAuth exceptions may embed raw response bodies. Never persist
             // those as UI errors; retain usage and partial model output only.
-            for await(const event of source)output.push(event.type==='error'?{...event,error:{...event.error,errorMessage:safeError}}:event);
+            // Guard against a hanging provider stream: check the abort signal between events
+            // and race the iteration against the signal's own abort promise.
+            let abortHandler:(()=>void)|undefined;
+            const abortPromise=signal?new Promise<never>((_,reject)=>{
+              abortHandler=()=>reject(new Error('aborted'));
+              if(signal.aborted)abortHandler();
+              else signal.addEventListener('abort',abortHandler,{once:true});
+            }):undefined;
+            const iter=source[Symbol.asyncIterator]();
+            try {
+              for(;;){
+                const step=abortPromise?await Promise.race([iter.next(),abortPromise]):await iter.next();
+                if(step.done)break;
+                const event=step.value;
+                // The pushed events are the same shape the for-await loop produced; the type is an
+                // internal pi-ai type, so a cast to any is needed here at the call site.
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                (output.push as (event:any)=>void)(event.type==='error'?{...event as any,error:{...event.error,errorMessage:safeError}}:event as any);
+              }
+            } finally {
+              if(signal&&abortHandler)signal.removeEventListener('abort',abortHandler);
+              // Abort the provider iterator without waiting for its cleanup: a broken transport must not
+              // keep this generation or process shutdown pending after the signal has fired.
+              if(signal?.aborted&&iter.return)void Promise.resolve(iter.return()).catch(()=>{});
+            }
             const result=await source.result();
             output.end(result.stopReason==='error'?{...result,errorMessage:safeError}:result);
           }catch(error){
@@ -590,7 +658,10 @@ export class HarnessHost {
       // a fork's child conversation resolves its own session's binding by the same read.
       const rootSessionId = String(ROOT_CONVERSATION_ID);
       const authority = await this.dispatchAuthority(project, rootSessionId);
-      const authorityOf = (sessionId: string) => this.dispatchAuthority(project, sessionId);
+      const authorityOf = async (conversationId: string): Promise<DispatchAuthority> => {
+        try { return await this.dispatchAuthority(project, this.sessionIdentity(project, Number(conversationId) as ConversationId)); }
+        catch { return { agentId: null, scopes: [], projects: [], emptyReason: 'The conversation authority could not be verified.' }; }
+      };
       const fileEditEnabled = this.options.fileEdit?.enabled === true;
       const privileges = privilegeExtension(project, authorityOf, fileEditEnabled);
       const extensions: Extension[] = [question, notes, privileges];
@@ -617,50 +688,65 @@ export class HarnessHost {
       // Register the root conversation bound to the legacy root session id, so a session that
       // names the root conversation finds it on lookup. Every named session registered later gets
       // its own conversation through ensureSessionConversation.
-      this.sessionConversations.set(rootSessionId, conversation.id);
+      this.sessionConversations.set(project.id + ':' + rootSessionId, conversation.id);
       // Never replace an existing session's model with a newly changed global default.
-      // Continue any run the previous process left unfinished.
-      harness.resume();
-      // Watch this conversation so a question, a finished run or a failure is reported even
-      // when nobody has the interface open. The first reading only primes the comparison.
-      const watched = await conversation.viewState(BACKGROUND_CONTEXT);
-      const sessionId = String(conversation.id);
-      let previous = { working: false, open: 0, errors: 0, primed: false };
-      watched.subscribe(() => {
-        const view = agentViewFrom(watched.value);
-        const openQuestions = view.questions.filter(entry => !entry.answer);
-        const open = openQuestions.length;
-        const errors = view.entries.filter(entry => entry.stopReason === 'error').length;
-        if (previous.primed) {
-          if (open > previous.open) {
-            const asked = openQuestions.at(-1);
-            // The question is made durable before its notification is sent, so a crash between the
-            // two is recoverable. A question that cannot be admitted is reported and stays visible
-            // in the transcript; it never breaks the run.
-            if (asked && this.options.delivery) void this.options.delivery.questionSurfaced({ projectId: project.id, projectName: project.name, sessionId, questionId: asked.id, text: asked.text, askedAt: asked.askedAt }).catch(error => console.error('Question ' + asked.id + ' is open in the transcript but its delivery could not be admitted: ' + (error as Error).message));
-            this.options.onEvent?.({ projectId: project.id, projectName: project.name, kind: 'question', detail: asked?.text ?? '' });
-          }
-          if (previous.working && !view.working) {
-            const failed = errors > previous.errors;
-            if (failed) this.options.onEvent?.({ projectId: project.id, projectName: project.name, kind: 'error', detail: '' });
-            else this.options.onEvent?.({ projectId: project.id, projectName: project.name, kind: 'finished', detail: '' });
-            // The owner's own cancel is the one writer at this revision. A cancel of a genuinely
-            // running generation ends it in the same instant, and this settle is that end: writing
-            // `idle` here would race the owner's `paused`/`idle` write and could overwrite it. The
-            // flag is honoured (and cleared) exactly once, so a later genuine end still settles.
-            if (this.ownerCancels.delete(project.id)) {
-              // The owner is still told the run ended; only the durable write is the owner's to make.
-            } else {
-              // A run that ended settles the durable lifecycle, so a finished generation is not
-              // adopted as interrupted by the next start. Best-effort: it never breaks the run.
-              void Promise.resolve()
-                .then(() => this.options.lifecycle?.settled({ projectId: project.id, sessionId, outcome: failed ? 'failed' as const : 'idle' as const }))
-                .catch(error => console.error('The session lifecycle could not record that a generation settled for project ' + project.id + ': ' + (error as Error).message));
+      const watchers = new Map<ConversationId, Awaited<ReturnType<HostedAgent['conversation']['viewState']>>>();
+      const watch = async (conversation: HostedAgent['conversation'], sessionId: string) => {
+        // Watch this conversation so a question, a finished run or a failure is reported even
+        // when nobody has the interface open. The first reading only primes the comparison.
+        if (watchers.has(conversation.id)) return;
+        const watched = await conversation.viewState(BACKGROUND_CONTEXT);
+        watchers.set(conversation.id, watched);
+
+        let previous = { working: false, open: 0, errors: 0, primed: false };
+        let runFailed = false;
+        watched.subscribe(() => {
+          const view = agentViewFrom(watched.value);
+          const openQuestions = view.questions.filter(entry => !entry.answer);
+          const open = openQuestions.length;
+          const errors = view.entries.filter(entry => entry.stopReason === 'error').length;
+          if (previous.primed) {
+            if (errors > previous.errors) runFailed = true;
+            if (open > previous.open) {
+              const asked = openQuestions.at(-1);
+              // The question is made durable before its notification is sent, so a crash between the
+              // two is recoverable. A question that cannot be admitted is reported and stays visible
+              // in the transcript; it never breaks the run.
+              if (asked && this.options.delivery) void this.options.delivery.questionSurfaced({ projectId: project.id, projectName: project.name, sessionId, questionId: asked.id, text: asked.text, askedAt: asked.askedAt }).catch(error => console.error('Question ' + asked.id + ' is open in the transcript but its delivery could not be admitted: ' + (error as Error).message));
+              this.options.onEvent?.({ projectId: project.id, projectName: project.name, kind: 'question', detail: asked?.text ?? '' });
+            }
+            if (previous.working && !view.working) {
+              const failed = runFailed;
+              runFailed = false;
+              if (failed) this.options.onEvent?.({ projectId: project.id, projectName: project.name, kind: 'error', detail: '' });
+              else this.options.onEvent?.({ projectId: project.id, projectName: project.name, kind: 'finished', detail: '' });
+              // The owner's own cancel is the one writer at this revision. A cancel of a genuinely
+              // running generation ends it in the same instant, and this settle is that end: writing
+              // `idle` here would race the owner's `paused`/`idle` write and could overwrite it. The
+              // flag is honoured (and cleared) exactly once, so a later genuine end still settles.
+              if (this.ownerCancels.delete(project.id + ":" + sessionId)) {
+                // The owner is still told the run ended; only the durable write is the owner's to make.
+              } else {
+                // A run that ended settles the durable lifecycle, so a finished generation is not
+                // adopted as interrupted by the next start. Best-effort: it never breaks the run.
+                void Promise.resolve()
+                  .then(() => this.options.lifecycle?.settled({ projectId: project.id, sessionId, outcome: failed ? 'failed' as const : 'idle' as const }))
+                  .catch(error => console.error('The session lifecycle could not record that a generation settled for project ' + project.id + ': ' + (error as Error).message));
+              }
             }
           }
-        }
-        previous = { working: view.working, open, errors, primed: true };
-      });
+          previous = { working: view.working, open, errors, primed: true };
+        });
+      };
+      await watch(conversation, rootSessionId);
+      // Restore identity and watchers before checkpoint recovery can execute tools.
+      for (const binding of this.options.conversationBinding?.list?.(project.id) ?? []) {
+        this.sessionConversations.set(project.id + ':' + binding.sessionId, binding.conversationId as ConversationId);
+        const bound = await harness.conversation(binding.conversationId as ConversationId, BACKGROUND_CONTEXT);
+        if (!bound) throw new HttpError(409, 'A durable conversation binding is unavailable');
+        await watch(bound, binding.sessionId);
+      }
+      harness.resume();
       const sessionExtensions = extensions;
       const sessionPermittedTools = permitted;
       return {
@@ -669,9 +755,9 @@ export class HarnessHost {
         provider,
         extensions: sessionExtensions,
         permittedTools: sessionPermittedTools,
+        watch,
         close: async () => {
-          const disposable = watched as unknown as { dispose?: () => Promise<void> };
-          if (typeof disposable.dispose === 'function') await disposable.dispose();
+          for (const watched of watchers.values()) watched.dispose();
           await harness.close(BACKGROUND_CONTEXT);
           const closable = storage as unknown as { close?: () => Promise<void> };
           if (typeof closable.close === 'function') await closable.close();
@@ -707,13 +793,17 @@ export class HarnessHost {
     }
     return Object.freeze(dismissals);
   }
+  private async controlView(project: Project, sessionId?: string): Promise<AgentSessionView> {
+    const hosted = await this.selected(project, sessionId);
+    const state = await hosted.conversation.viewState(BACKGROUND_CONTEXT);
+    try { return this.shape(hosted, state.value); } finally { state.dispose(); }
+  }
   async view(project: Project): Promise<AgentSessionView> {
     this.assertEnabled();
     const hosted = await this.open(project);
     const state = await hosted.conversation.viewState(BACKGROUND_CONTEXT);
     const shaped = this.shape(hosted, state.value);
-    const disposable = state as unknown as { dispose?: () => Promise<void> };
-    if (typeof disposable.dispose === 'function') await disposable.dispose();
+    state.dispose();
     return shaped;
   }
   /**
@@ -726,24 +816,48 @@ export class HarnessHost {
   async sessionView(project: Project, sessionId: string): Promise<AgentSessionView | null> {
     this.assertEnabled();
     const id = conversationIdOf(sessionId);
-    if (id === null) return null;
-    const hosted = await this.open(project);
-    const conversation = await hosted.harness.conversation(id, BACKGROUND_CONTEXT);
-    if (conversation === undefined) return null;
-    const state = await conversation.viewState(BACKGROUND_CONTEXT);
-    const shaped = this.shape(hosted, state.value, id);
-    const disposable = state as unknown as { dispose?: () => Promise<void> };
-    if (typeof disposable.dispose === 'function') await disposable.dispose();
-    return shaped;
+    if (id !== null) {
+      const hosted = await this.open(project);
+      const conversation = await hosted.harness.conversation(id, BACKGROUND_CONTEXT);
+      if (conversation === undefined) return null;
+      const state = await conversation.viewState(BACKGROUND_CONTEXT);
+      const shaped = this.shape(hosted, state.value, id);
+      state.dispose();
+      return shaped;
+    }
+    // Named session (UUID): resolve the conversation through the durable binding.
+    const resolver = this.options.conversationBinding;
+    if (resolver) {
+      const binding = resolver.read(project.id, sessionId);
+      if (binding !== null) {
+        const convId = binding.conversationId as ConversationId;
+        const hosted = await this.open(project);
+        const conversation = await hosted.harness.conversation(convId, BACKGROUND_CONTEXT);
+        if (conversation === undefined) throw new HttpError(409, 'The durable session binding points to a conversation that is unavailable; it was not replaced');
+        const state = await conversation.viewState(BACKGROUND_CONTEXT);
+        const shaped = this.shape(hosted, state.value, convId);
+        state.dispose();
+        return shaped;
+      }
+    }
+    return null;
   }
 
   /** Whether this project's harness holds a conversation for this session id. Read-only. */
   async hasSession(project: Project, sessionId: string): Promise<boolean> {
     this.assertEnabled();
     const id = conversationIdOf(sessionId);
-    if (id === null) return false;
-    const hosted = await this.open(project);
-    return (await hosted.harness.conversation(id, BACKGROUND_CONTEXT)) !== undefined;
+    if (id !== null) {
+      const hosted = await this.open(project);
+      return (await hosted.harness.conversation(id, BACKGROUND_CONTEXT)) !== undefined;
+    }
+    // Named session (UUID): check the durable binding.
+    const resolver = this.options.conversationBinding;
+    if (resolver) {
+      const binding = resolver.read(project.id, sessionId);
+      if (binding !== null) return true;
+    }
+    return this.sessionConversations.has(project.id + ':' + sessionId);
   }
 
   /**
@@ -753,11 +867,13 @@ export class HarnessHost {
    */
   async hasEntry(project: Project, sessionId: string, entryId: number, bound: number): Promise<boolean> {
     this.assertEnabled();
-    const id = conversationIdOf(sessionId);
-    if (id === null) return false;
-    const hosted = await this.open(project);
-    const conversation = await hosted.harness.conversation(id, BACKGROUND_CONTEXT);
-    if (conversation === undefined) return false;
+    let hosted: HostedAgent;
+    try { hosted = await this.selected(project, sessionId); }
+    catch (error) {
+      if (error instanceof HttpError && error.status === 404) return false;
+      throw error;
+    }
+    const conversation = hosted.conversation;
     let cursor: Parameters<typeof conversation.entries>[2];
     let read = 0;
     for (;;) {
@@ -781,10 +897,8 @@ export class HarnessHost {
   async forkTranscript(project: Project, parentSessionId: string, cutoffEntryId: number): Promise<{ childSessionId: string }> {
     this.assertEnabled();
     return this.serial('agent:' + project.id, async () => {
-      const hosted = await this.open(project);
-      const id = conversationIdOf(parentSessionId);
-      const parent = id === null ? undefined : await hosted.harness.conversation(id, BACKGROUND_CONTEXT);
-      if (parent === undefined) throw new HttpError(404, 'This project holds no conversation for that session');
+      const hosted = await this.selected(project, parentSessionId);
+      const parent = hosted.conversation;
       const child = await parent.fork(cutoffEntryId as EntryId, { ownership: { kind: 'ownerless' } }, BACKGROUND_CONTEXT);
       return { childSessionId: String(child.id) };
     });
@@ -814,29 +928,55 @@ export class HarnessHost {
   }
 
   /**
-   * The conversation of one named session, creating a fork of the root conversation at entry 0
-   * when this session has never had one before. The fork inherits the root's extensions and agent
-   * configuration but starts with no entries, so a new session has an empty transcript.
-   *
-   * An existing session whose conversation was already created resolves to its forked conversation.
-   * The legacy root conversation (ROOT_CONVERSATION_ID) is always registered and never forked.
+   * The conversation of one named session, creating a fresh empty conversation when this session
+   * has never had one before. A durable binding is authoritative after creation; the legacy numeric
+   * session path still directly names its conversation id.
    */
   async ensureSessionConversation(project: Project, sessionId: string): Promise<ConversationId> {
     this.assertEnabled();
     // A numeric session id is already a conversation id — no derivation needed.
     const direct = conversationIdOf(sessionId);
     if (direct !== null) return direct;
-    // Check the in-process map for a conversation already created for this session.
-    const existing = this.sessionConversations.get(sessionId);
-    if (existing !== undefined) return existing;
-    // Fork the root conversation at entry 0 (before the first entry), creating a child
-    // conversation with the same extensions and tools but an empty transcript.
-    const hosted = await this.open(project);
-    const fork = await hosted.conversation.fork(0 as EntryId, {
-      ownership: { kind: 'ownerless' }
-    }, BACKGROUND_CONTEXT);
-    this.sessionConversations.set(sessionId, fork.id);
-    return fork.id;
+    // Use the project-qualified in-process cache only when no durable binding port is configured.
+    const cacheKey = project.id + ':' + sessionId;
+    const resolver = this.options.conversationBinding;
+    // Durable record is authoritative; do not allow a stale cache to mask corruption or mismatch.
+    const binding = resolver?.read(project.id, sessionId) ?? null;
+    if (binding !== null) {
+      this.sessionConversations.set(cacheKey, binding.conversationId as ConversationId);
+      return binding.conversationId as ConversationId;
+    }
+    const cached = this.sessionConversations.get(cacheKey);
+    if (cached !== undefined && resolver === undefined) return cached;
+    // Serialize first creation for this session. The control-store admission is the durable
+    // single-winner check; a failed durable write refuses the unbound conversation.
+    return this.serial('conversation:' + cacheKey, async () => {
+      const again = resolver?.read(project.id, sessionId) ?? null;
+      if (again !== null) {
+        this.sessionConversations.set(cacheKey, again.conversationId as ConversationId);
+        return again.conversationId as ConversationId;
+      }
+      const cachedAgain = this.sessionConversations.get(cacheKey);
+      if (cachedAgain !== undefined && resolver === undefined) return cachedAgain;
+      const hosted = await this.open(project);
+      // A named session starts as a genuinely new, empty conversation. Pi Durable's fork(at)
+      // requires a real visible entry (entry 0 is not valid); createConversation avoids copying
+      // root history and gives the new session its own durable transcript from its first input.
+      const rootAgent = await hosted.conversation.agent(BACKGROUND_CONTEXT);
+      const authority = await this.dispatchAuthority(project, sessionId);
+      const tools = permittedTools(hosted.extensions, authority.scopes);
+      const conversation = await hosted.harness.createConversation({
+        ownership: { kind: 'ownerless' },
+        agent: { model: rootAgent.model, extensions: hosted.extensions, ...(tools === undefined ? {} : { tools }) }
+      }, BACKGROUND_CONTEXT);
+      if (resolver) {
+        // On a concurrent-writer conflict, refuse: never return a conversation that was not durably bound.
+        resolver.record({ projectId: project.id, sessionId, conversationId: conversation.id });
+      }
+      this.sessionConversations.set(cacheKey, conversation.id);
+      await hosted.watch(conversation, sessionId);
+      return conversation.id;
+    });
   }
 
   /** Subscribes to committed view changes of one session's conversation, or the root when none is named. */
@@ -850,32 +990,20 @@ export class HarnessHost {
       const unsubscribe = state.subscribe(() => { listener(this.shape(hosted, state.value)); });
       return async () => {
         if (typeof unsubscribe === 'function') unsubscribe();
-        const disposable = state as unknown as { dispose?: () => Promise<void> };
-        if (typeof disposable.dispose === 'function') await disposable.dispose();
+        state.dispose();
       };
     }
     const conversation = await hosted.harness.conversation(convId, BACKGROUND_CONTEXT);
-    if (!conversation) {
-      // Fall back to the root conversation if the session's conversation was lost.
-      const state = await hosted.conversation.viewState(BACKGROUND_CONTEXT);
-      listener(this.shape(hosted, state.value));
-      const unsubscribe = state.subscribe(() => { listener(this.shape(hosted, state.value)); });
-      return async () => {
-        if (typeof unsubscribe === 'function') unsubscribe();
-        const disposable = state as unknown as { dispose?: () => Promise<void> };
-        if (typeof disposable.dispose === 'function') await disposable.dispose();
-      };
-    }
+    if (!conversation) throw new HttpError(409, 'The durable session binding points to a conversation that is unavailable; it was not replaced');
     const state = await conversation.viewState(BACKGROUND_CONTEXT);
     listener(this.shape(hosted, state.value, convId));
     const unsubscribe = state.subscribe(() => { listener(this.shape(hosted, state.value, convId)); });
     return async () => {
       if (typeof unsubscribe === 'function') unsubscribe();
-      const disposable = state as unknown as { dispose?: () => Promise<void> };
-      if (typeof disposable.dispose === 'function') await disposable.dispose();
+      state.dispose();
     };
   }
-  async submit(project: Project, input: { text: string; mode: AgentInputMode; requestId?: string; images?: readonly AgentImage[] }): Promise<{ submissionId: string; queued: boolean }> {
+  async submit(project: Project, input: { text: string; mode: AgentInputMode; requestId?: string; images?: readonly AgentImage[]; sessionId?: string }): Promise<{ submissionId: string; queued: boolean }> {
     this.assertEnabled();
     const text = input.text.trim();
     const images = input.images ?? [];
@@ -883,19 +1011,30 @@ export class HarnessHost {
     if (text.length > 8000) throw new HttpError(413, 'Message is too long');
     return this.serial('agent:' + project.id, async () => {
       const hosted = await this.open(project);
-      const selected=(await hosted.conversation.agent(BACKGROUND_CONTEXT)).model;
+      const conversationId = input.sessionId ? await this.ensureSessionConversation(project, input.sessionId) : hosted.conversation.id;
+      const conversation = conversationId === hosted.conversation.id ? hosted.conversation : await hosted.harness.conversation(conversationId, BACKGROUND_CONTEXT);
+      if (!conversation) throw new HttpError(409, 'The session is bound to a conversation that is unavailable; no replacement was created');
+      await hosted.watch(conversation, this.sessionIdentity(project, conversation.id));
+      const selected=(await conversation.agent(BACKGROUND_CONTEXT)).model;
       // The dispatch-time vision check. It reads the model this submission will actually run under, so
       // an image is refused outright — before anything is admitted — rather than dropped, or sent as
       // bytes a text-only model would ignore. Admission runs the same reading through vision().
-      if (images.length > 0) this.assertVision(await this.visionFor(hosted));
+      if (images.length > 0) this.assertVision(await this.visionFor({ ...hosted, conversation }));
       if(selected&&selected.provider!==hosted.provider.provider.id)await this.options.providers?.assertUsable(selected);
       const whenBusy = input.mode === 'steer' ? 'steer' as const : input.mode === 'reject' ? 'reject' as const : undefined;
       const content = inputContent(text, images);
       try {
-        const submission = await hosted.conversation.submit({ type: 'input', content, ...(whenBusy ? { whenBusy } : {}), ...(input.requestId ? { requestId: input.requestId } : {}) }, BACKGROUND_CONTEXT);
+        const submission = await conversation.submit({ type: 'input', content, ...(whenBusy ? { whenBusy } : {}), ...(input.requestId ? { requestId: input.requestId } : {}) }, BACKGROUND_CONTEXT);
         // The generation is visible in the durable lifecycle under the identity it was submitted with,
         // so a start that finds it running adopts it as interrupted. A hook failure never fails a run.
-        try { await this.options.lifecycle?.began({ projectId: project.id, sessionId: String(hosted.conversation.id), requestId: input.requestId ?? String(submission.id) }); }
+        try {
+          const status = await submission.status(BACKGROUND_CONTEXT);
+          // A repeated request can return a completed submission. It starts no generation and
+          // must not create another lifecycle attempt, including while another input is running.
+          if (status.status !== 'done' && status.status !== 'unanswered')
+            await this.options.lifecycle?.began({ projectId: project.id, sessionId: this.sessionIdentity(project, conversationId), requestId: input.requestId ?? String(submission.id) });
+          await this.reconcileIdleLifecycle(project, { ...hosted, conversation });
+        }
         catch (error) { console.error('The session lifecycle could not record that a generation began for project ' + project.id + ': ' + (error as Error).message); }
         return { submissionId: String(submission.id), queued: whenBusy !== 'reject' };
       } catch (error) {
@@ -908,8 +1047,7 @@ export class HarnessHost {
   private async openQuestion(hosted: HostedAgent, questionId: string): Promise<AgentQuestion> {
     const state = await hosted.conversation.viewState(BACKGROUND_CONTEXT);
     const view = this.shape(hosted, state.value);
-    const disposable = state as unknown as { dispose?: () => Promise<void> };
-    if (typeof disposable.dispose === 'function') await disposable.dispose();
+    state.dispose();
     const question = view.questions.find(candidate => candidate.id === questionId);
     if (!question) throw new HttpError(404, 'Unknown question');
     if (question.answer) throw new HttpError(409, 'This question has already been answered');
@@ -925,14 +1063,14 @@ export class HarnessHost {
    * id derived from the question, so a retry collapses onto the one dismissal. An answered question
    * and a question this conversation never asked are both refused.
    */
-  async dismissQuestion(project: Project, input: { questionId: string; reason: string; dismissedBy?: string }): Promise<{ submissionId: string | null }> {
+  async dismissQuestion(project: Project, input: { questionId: string; reason: string; dismissedBy?: string; sessionId?: string }): Promise<{ submissionId: string | null }> {
     this.assertEnabled();
     const reason = input.reason.trim();
     if (reason === '') throw new HttpError(422, 'Enter a reason for dismissing this question');
     if (reason.length > 400) throw new HttpError(413, 'The dismissal reason is too long');
     return this.serial('agent:' + project.id, async () => {
-      const hosted = await this.open(project);
-      const sessionId = String(hosted.conversation.id);
+      const hosted = await this.selected(project, input.sessionId);
+      const sessionId = this.sessionIdentity(project, hosted.conversation.id);
       const question = await this.openQuestion(hosted, input.questionId);
       const dismissedAt = Date.now();
       const dismissedBy = (input.dismissedBy ?? 'owner').slice(0, 160);
@@ -962,14 +1100,14 @@ export class HarnessHost {
    * the ledger only: a retry of the same text completes it here, and a start that finds the row
    * outstanding completes it through `redeliverAnswer` from the ledger's own text.
    */
-  async answer(project: Project, input: { questionId: string; text: string }): Promise<{ submissionId: string }> {
+  async answer(project: Project, input: { questionId: string; text: string; sessionId?: string }): Promise<{ submissionId: string }> {
     this.assertEnabled();
     const text = input.text.trim();
     if (text === '') throw new HttpError(422, 'Enter an answer');
     if (text.length > 4000) throw new HttpError(413, 'Answer is too long');
     return this.serial('agent:' + project.id, async () => {
-      const hosted = await this.open(project);
-      const sessionId = String(hosted.conversation.id);
+      const hosted = await this.selected(project, input.sessionId);
+      const sessionId = this.sessionIdentity(project, hosted.conversation.id);
       const question = await this.openQuestion(hosted, input.questionId);
       const answeredAt = Date.now();
       if (this.options.delivery) await this.options.delivery.answerRecorded({
@@ -1003,14 +1141,13 @@ export class HarnessHost {
    * and the original submission instead of adding a second; the receipt is the same shape the live
    * answer path acknowledges with, so the two paths cannot disagree about what was delivered.
    */
-  async redeliverAnswer(project: Project, questionId: string, recorded?: { text: string; answeredAt: string | number }): Promise<{ submissionId: string; requestId: string }> {
+  async redeliverAnswer(project: Project, questionId: string, recorded?: { text: string; answeredAt: string | number }, sessionId?: string): Promise<{ submissionId: string; requestId: string }> {
     this.assertEnabled();
     return this.serial('agent:' + project.id, async () => {
-      const hosted = await this.open(project);
+      const hosted = await this.selected(project, sessionId);
       const state = await hosted.conversation.viewState(BACKGROUND_CONTEXT);
       const view = this.shape(hosted, state.value);
-      const disposable = state as unknown as { dispose?: () => Promise<void> };
-      if (typeof disposable.dispose === 'function') await disposable.dispose();
+      state.dispose();
       const question = view.questions.find(candidate => candidate.id === questionId);
       if (!question) throw new HttpError(409, 'The transcript holds no question with this id, so the delivery needs an operator');
       const text = question.answer?.text ?? recorded?.text;
@@ -1032,18 +1169,18 @@ export class HarnessHost {
    * or any question or answer text, and a ledger it cannot read is reported as unavailable rather
    * than failing the view.
    */
-  async deliveryView(project: Project): Promise<unknown> {
+  async deliveryView(project: Project, sessionId?: string): Promise<unknown> {
     this.assertEnabled();
     if (!this.options.delivery) return undefined;
     const hosted = await this.open(project);
-    try { return await this.options.delivery.ledgerView({ projectId: project.id, sessionId: String(hosted.conversation.id) }); }
+    try { return await this.options.delivery.ledgerView({ projectId: project.id, sessionId: this.sessionIdentity(project, (await this.selected(project, sessionId)).conversation.id) }); }
     catch (error) { console.error('The delivery ledger could not be read for project ' + project.id + ': ' + (error as Error).message); return { unavailable: true }; }
   }
   /** Stops the current run: queued inputs are withdrawn and the agent goes idle. */
-  async abort(project: Project): Promise<void> {
+  async abort(project: Project, sessionId?: string): Promise<void> {
     this.assertEnabled();
     await this.serial('agent:' + project.id, async () => {
-      const hosted = await this.open(project);
+      const hosted = await this.selected(project, sessionId);
       await hosted.conversation.abort(BACKGROUND_CONTEXT);
     });
   }
@@ -1058,7 +1195,7 @@ export class HarnessHost {
    * The owner's lifecycle action is the single writer of that revision, so a pause keeps the session
    * resumable instead of racing the watcher's own settled `idle` write.
    */
-  async cancelLifecycle(project: Project): Promise<void> {
+  async cancelLifecycle(project: Project, sessionId?: string): Promise<void> {
     this.assertEnabled();
     if (!this.hosted.has(project.id)) return;
     // The owner's cancel owns the durable state its action writes next, so the watcher must not write
@@ -1066,13 +1203,20 @@ export class HarnessHost {
     // while it is being raised is already honoured) and is only kept when a generation is genuinely
     // running: a cancel that ends nothing suppresses nothing, so no later generation's settle can be
     // swallowed by a stale flag.
-    this.ownerCancels.add(project.id);
-    try {
-      if (!(await this.view(project)).working) this.ownerCancels.delete(project.id);
-      await this.abort(project);
-    } catch (error) {
-      this.ownerCancels.delete(project.id);
+    let selected: HostedAgent;
+    try { selected = await this.selected(project, sessionId); }
+    catch (error) {
+      // A registry-only session has no generation to cancel. Do not create one or act on root.
+      if (error instanceof HttpError && error.status === 404) return;
       throw error;
+    }
+    const key = project.id + ':' + this.sessionIdentity(project, selected.conversation.id);
+    this.ownerCancels.add(key);
+    try {
+      if (!(await this.controlView(project, sessionId)).working) return;
+      await this.abort(project, sessionId);
+    } finally {
+      this.ownerCancels.delete(key);
     }
   }
   /**
@@ -1087,8 +1231,7 @@ export class HarnessHost {
   private async lastInput(hosted: HostedAgent): Promise<{ text: string; images: AgentImage[] }> {
     const state = await hosted.conversation.viewState(BACKGROUND_CONTEXT);
     const value = state.value as unknown as { entries?: readonly unknown[] };
-    const disposable = state as unknown as { dispose?: () => Promise<void> };
-    if (typeof disposable.dispose === 'function') await disposable.dispose();
+    state.dispose();
     const entries = Array.isArray(value?.entries) ? value.entries : [];
     for (const entry of [...entries].reverse()) {
       const record = entry as { kind?: unknown; model?: unknown };
@@ -1119,14 +1262,28 @@ export class HarnessHost {
    * when the input carried images, the model the replay will actually run under must accept them, and
    * a refusal beats a replay with the images silently removed.
    */
-  async dispatchLifecycle(project: Project, requestId: string): Promise<void> {
+  async dispatchLifecycle(project: Project, requestId: string, sessionId?: string): Promise<void> {
     this.assertEnabled();
     await this.serial('agent:' + project.id, async () => {
-      const hosted = await this.open(project);
+      const hosted = await this.selected(project, sessionId);
       const input = await this.lastInput(hosted);
       if (input.images.length > 0) this.assertVision(await this.visionFor(hosted));
       await hosted.conversation.submit({ type: 'input', content: inputContent(input.text, input.images), requestId }, BACKGROUND_CONTEXT);
+      // A resume can resolve to an already-terminal submission. No working-to-idle edge occurs
+      // in that case, so reconcile the lifecycle instead of leaving a phantom running attempt.
+      await this.reconcileIdleLifecycle(project, hosted);
     });
+  }
+  /** Reconcile an already-terminal input without inventing a new generation or request identity. */
+  private async reconcileIdleLifecycle(project: Project, hosted: HostedAgent): Promise<void> {
+    const state = await hosted.conversation.viewState(BACKGROUND_CONTEXT);
+    try {
+      const view = agentViewFrom(state.value);
+      if (!view.working) {
+        const terminal = [...view.entries].reverse().find(entry => entry.stopReason !== undefined && entry.stopReason !== null);
+        await this.options.lifecycle?.settled({ projectId: project.id, sessionId: this.sessionIdentity(project, hosted.conversation.id), outcome: terminal?.stopReason === 'error' ? 'failed' : 'idle' });
+      }
+    } finally { state.dispose(); }
   }
   /**
    * The model a project's next submission would actually run under, with its image-input capability.
@@ -1143,27 +1300,27 @@ export class HarnessHost {
    * The dispatch-time vision reading, exposed so admission refuses on the very same model capability.
    * It performs no model work: it opens the conversation and reads the model that is configured.
    */
-  async vision(project: Project): Promise<AgentVision> {
+  async vision(project: Project, sessionId?: string): Promise<AgentVision> {
     this.assertEnabled();
-    return this.visionFor(await this.open(project));
+    return this.visionFor(await this.selected(project, sessionId));
   }
   /** Refuse a submission carrying images when the effective model cannot take them. A refusal beats a silent drop. */
   private assertVision(vision: AgentVision): void {
     if (vision.acceptsImages) return;
     throw new HttpError(409, 'The model ' + vision.provider + ' / ' + vision.modelId + ' does not accept image input, so the message was refused rather than sent with the image removed. Choose a model that accepts images, or remove the image and send again.');
   }
-  async setModel(project:Project,choice:ModelChoice|null):Promise<AgentView>{
+  async setModel(project:Project,choice:ModelChoice|null,sessionId?:string):Promise<AgentView>{
     this.assertEnabled();
     return this.serial('agent:'+project.id,async()=>{
-      const hosted=await this.open(project);
-      if((await this.view(project)).working)throw new HttpError(409,'Stop the current run before changing models');
+      const hosted=await this.selected(project, sessionId);
+      if((await this.controlView(project, sessionId)).working)throw new HttpError(409,'Stop the current run before changing models');
       if(choice){
         if(!this.options.providers)throw new HttpError(503,'Provider settings unavailable');
         const m=this.options.providers.models.getModel(choice.provider,choice.modelId);
         if(!m)throw new HttpError(422,'Unknown model');
       }
       await hosted.conversation.configure({model:choice??{provider:hosted.provider.provider.id,modelId:hosted.provider.getModel().id}},BACKGROUND_CONTEXT);
-      return this.view(project);
+      return this.controlView(project, sessionId);
     });
   }
   async detach(project:Project):Promise<void>{

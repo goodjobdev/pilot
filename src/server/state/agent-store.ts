@@ -3,8 +3,9 @@ import type { ControlScope, OperationRecord, OutboxRecord } from '../../shared/c
 import { ControlStore, ControlStoreError } from './control-store';
 import {
   AGENT_MAX_AGENTS, AgentError, buildAgentRecord, decideScopeChange, parseAgentActor, parseAgentDraft, parseAgentIdentifier,
-  parseAgentPatch, scopesInForceFor, validateAgentBinding, validateAgentRecord, agentInForce, projectScopeAllows, projectScopeSet,
-  type AgentActor, type AgentAuditEntry, type AgentBinding, type AgentDraft, type AgentPatch, type AgentRecord, type AgentScope
+  parseAgentPatch, scopesInForceFor, validateAgentBinding, validateConversationBinding, validateAgentRecord,
+  agentInForce, projectScopeAllows, projectScopeSet,
+  type AgentActor, type AgentAuditEntry, type AgentBinding, type ConversationBinding, type AgentDraft, type AgentPatch, type AgentRecord, type AgentScope
 } from '../../shared/agent-registry';
 
 /**
@@ -38,6 +39,9 @@ const OUTBOX_KIND = 'agent.registry';
 /** The durable kinds the session-binding half of this registry owns. Nothing else is ever reported. */
 const BINDING_OPERATION_KIND = 'agent.binding';
 const BINDING_OUTBOX_KIND = 'agent.binding';
+/** The durable kinds the conversation-binding half of this registry owns. Nothing else is ever reported. */
+const CONVERSATION_OPERATION_KIND = 'agent.conversation';
+const CONVERSATION_OUTBOX_KIND = 'agent.conversation';
 /**
  * The control store scopes operations by project and session, while the agent registry is a
  * deployment-level list. The storage bucket is therefore a bucket, never the authority: an agent's own
@@ -176,6 +180,59 @@ export class AgentStore {
       version: 1, projectId, sessionId, agentId, revision: revision + 1, boundBy: actor, boundAt: this.now()
     });
     return this.writeBinding(binding);
+  }
+
+  /* ----------------------------------------------------------------------------------------- *
+   * Conversation bindings: which harness conversation a named session resolves to.
+   * ----------------------------------------------------------------------------------------- */
+
+  /** Validated bindings used to restore dispatch authority before harness recovery. */
+  conversations(projectId: string): readonly ConversationBinding[] {
+    return this.rows('SELECT id,project_id,session_id FROM operations WHERE project_id=? AND kind=? ORDER BY rowid', [projectId, CONVERSATION_OPERATION_KIND])
+      .map(row => this.decodeConversation(String(row.id), { projectId, sessionId: String(row.session_id) }));
+  }
+
+  /** The durable conversation binding of one session, or null when none has been recorded. */
+  conversation(projectId: unknown, sessionId: unknown): ConversationBinding | null {
+    const project = parseAgentIdentifier(projectId, 'projectId');
+    const session = parseAgentIdentifier(sessionId, 'sessionId');
+    const rows = this.rows('SELECT id,project_id,session_id FROM operations WHERE session_id=? AND kind=? ORDER BY rowid', [session, CONVERSATION_OPERATION_KIND]);
+    let latest: ConversationBinding | null = null;
+    for (const row of rows) {
+      const storedProject=String(row.project_id),storedSession=String(row.session_id);
+      const binding = this.decodeConversation(String(row.id), { projectId: storedProject, sessionId: storedSession });
+      if (storedProject !== project || storedSession !== session)
+        throw storage('A conversation binding for session ' + session + ' exists in a foreign project scope and will not be ignored');
+      if (latest === null || binding.revision > latest.revision) latest = binding;
+      else if (binding.revision === latest.revision) throw storage('Corrupt conversation binding storage: two bindings of session ' + session + ' share revision ' + binding.revision);
+    }
+    return latest;
+  }
+
+  /**
+   * Records a conversation binding exactly once.
+   *
+   * The binding is written at revision 1 with the idempotency key 'conversation.r1'. A second call
+   * with the same content returns the existing record; a second call with different content for the
+   * same session is refused, so a session can never silently end up with two conversations.
+   */
+  recordConversation(input: unknown): ConversationBinding {
+    const data = requireObject(input, 'conversation binding request (requires projectId, sessionId, conversationId and actor)');
+    const projectId = parseAgentIdentifier(data.projectId, 'projectId');
+    const sessionId = parseAgentIdentifier(data.sessionId, 'sessionId');
+    const conversationId = data.conversationId;
+    if (typeof conversationId !== 'number' || !Number.isInteger(conversationId) || conversationId < 1)
+      throw new AgentError('conversationId must be a positive integer', 'INVALID');
+    const actor = parseAgentActor(data.actor);
+    const existing = this.conversation(projectId, sessionId);
+    if (existing !== null) {
+      if (existing.conversationId === conversationId) return existing;
+      throw new AgentError('Session ' + sessionId + ' is already bound to conversation ' + existing.conversationId + ', cannot bind to ' + conversationId, 'CONFLICT');
+    }
+    const binding = validateConversationBinding({
+      version: 1, projectId, sessionId, conversationId, revision: 1, createdBy: actor, createdAt: this.now()
+    });
+    return this.writeConversation(binding);
   }
 
   /**
@@ -362,6 +419,24 @@ export class AgentStore {
     }
     return binding;
   }
+  /** The one conversation binding write path: a strict record, one admission, and the store's own conflict verdict. */
+  private writeConversation(binding: ConversationBinding): ConversationBinding {
+    try {
+      this.store.admit({
+        scope: { projectId: binding.projectId, sessionId: binding.sessionId },
+        idempotencyKey: 'conversation.r' + binding.revision,
+        kind: CONVERSATION_OPERATION_KIND,
+        input: binding,
+        outbox: { kind: CONVERSATION_OUTBOX_KIND, payload: { version: 1, projectId: binding.projectId, sessionId: binding.sessionId, conversationId: binding.conversationId, revision: binding.revision, createdBy: binding.createdBy, createdAt: binding.createdAt } }
+      });
+    } catch (error) {
+      if (error instanceof ControlStoreError && error.code === 'CONFLICT')
+        throw new AgentError('The conversation binding of session ' + binding.sessionId + ' at revision ' + binding.revision + ' was already written with different content (' + error.message + '); it is unchanged', 'CONFLICT');
+      throw storage('The durable store refused the conversation binding write: ' + (error as Error).message);
+    }
+    return binding;
+  }
+
   /** One binding operation row as a record, through the store's own validated getters. */
   private decodeBinding(operationId: string, scope: ControlScope): AgentBinding {
     let operation: OperationRecord;
@@ -454,6 +529,33 @@ export class AgentStore {
     }
     return Object.freeze({ revision: record.revision, action: payload.action, changedBy, changedAt: payload.changedAt });
   }
+  /** One conversation binding operation row as a record, through the store's own validated getters. */
+  private decodeConversation(operationId: string, scope: ControlScope): ConversationBinding {
+    let operation: OperationRecord;
+    try {
+      operation = this.store.getOperation(operationId, scope);
+    } catch (error) {
+      throw storage('The durable store could not read conversation binding operation ' + operationId + ': ' + (error as Error).message);
+    }
+    if (operation.kind !== CONVERSATION_OPERATION_KIND) throw storage('Conversation binding storage holds an unexpected operation kind');
+    let binding: ConversationBinding;
+    try {
+      binding = validateConversationBinding(operation.input, 'CORRUPT');
+    } catch (error) {
+      throw corrupt('A stored conversation binding is corrupt: ' + (error as Error).message);
+    }
+    if (binding.projectId !== scope.projectId || binding.sessionId !== scope.sessionId) throw storage('A stored conversation binding is outside its own scope');
+    const outbox = this.outboxFor(operation.id, scope);
+    if (outbox.kind !== CONVERSATION_OUTBOX_KIND) throw storage('Conversation binding storage holds an unexpected outbox kind');
+    if (outbox.state !== 'pending') throw storage('A conversation binding outbox must stay pending for the life of the record');
+    const payload = outbox.payload as { version?: unknown; projectId?: unknown; sessionId?: unknown; conversationId?: unknown; revision?: unknown; createdBy?: unknown; createdAt?: unknown } | null;
+    let auditActor:AgentActor|null=null;
+    try { if(payload&&typeof payload==='object')auditActor=parseAgentActor(payload.createdBy,'createdBy'); } catch { auditActor=null; }
+    if (!payload || typeof payload !== 'object' || payload.version !== 1 || payload.projectId !== binding.projectId || payload.sessionId !== binding.sessionId || payload.conversationId !== binding.conversationId || payload.revision !== binding.revision || payload.createdAt !== binding.createdAt || auditActor?.kind !== binding.createdBy.kind || auditActor?.identity !== binding.createdBy.identity)
+      throw storage('The stored conversation binding audit payload does not describe its record');
+    return binding;
+  }
+
   private outboxFor(operationId: string, scope: ControlScope): OutboxRecord {
     const rows = this.rows('SELECT id FROM outboxes WHERE operation_id=? LIMIT 2', [operationId]);
     if (rows.length !== 1) throw storage('Agent storage holds no unambiguous outbox row for one of its operations');

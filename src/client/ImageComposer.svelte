@@ -12,7 +12,7 @@
   * way to feed files in, so the parent owns the single paste and drop handler for the whole composer
   * area and one gesture is enqueued once. `dragging` is the parent's reading of that same gesture.
   */
- let { projectId,items=$bindable([]),dragging=false,handle }:{ projectId:string; items?:ImageDraft[]; dragging?:boolean; handle?:(handle:{add:(files:File[])=>void})=>void }=$props();
+ let { projectId,sessionId,items=$bindable([]),dragging=false,handle }:{ projectId:string; sessionId?:string; items?:ImageDraft[]; dragging?:boolean; handle?:(handle:{add:(files:File[])=>void})=>void }=$props();
  let previews=$state<Record<string,string>>({});
  let busy=$derived(items.some(item=>item.status==='uploading'));
  $effect(()=>{handle?.({add:(files)=>void addFiles(files)});});
@@ -51,7 +51,7 @@
      if(file.size>MAX_IMAGE_BYTES){patch(key,{status:'refused',reason:human(file.size)+' is over the '+human(MAX_IMAGE_BYTES)+' limit for one image.'});continue;}
      // The upload and the preview are two separate conditions. An upload the server refused is a
      // refusal, with the server's own reason, per image: never a generic failure, never a silent drop.
-     const sent=await api.uploadImage(projectId,{data:await base64(file),name:file.name,declaredType:file.type}).catch((error:unknown)=>{
+     const sent=await api.uploadImage(projectId,{sessionId,data:await base64(file),name:file.name,declaredType:file.type}).catch((error:unknown)=>{
        patch(key,{status:'refused',reason:error instanceof ApiError?error.message:'The image could not be uploaded. Try again.'});
        return null;
      });

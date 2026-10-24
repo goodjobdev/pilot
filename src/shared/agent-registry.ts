@@ -675,6 +675,55 @@ export function validateAgentBinding(value: unknown, code: AgentErrorCode = 'INV
   return binding;
 }
 
+/**
+ * The durable conversation binder: which harness conversation a named session resolves to.
+ *
+ * Written once when a conversation is first forked for a session, and read on every access after a
+ * restart. The idempotency key is 'conversation.r' + revision, so the control store refuses a second
+ * creation with different content (CONFLICT) and returns the existing record for a repeat of the same
+ * content — the "exactly once" guarantee.
+ */
+export type ConversationBinding = {
+  readonly version: 1;
+  readonly projectId: string;
+  readonly sessionId: string;
+  readonly conversationId: number;
+  readonly revision: number;
+  readonly createdBy: AgentActor;
+  readonly createdAt: string;
+};
+
+export const AGENT_CONVERSATION_BINDING_VERSION = 1 as const;
+
+const conversationBindingSchema = z.strictObject({
+  version: z.literal(AGENT_CONVERSATION_BINDING_VERSION),
+  projectId: z.string().regex(AGENT_ID_PATTERN, 'a project id must be 1-160 characters from A-Za-z0-9._:-'),
+  sessionId: z.string().regex(AGENT_ID_PATTERN, 'a session id must be 1-160 characters from A-Za-z0-9._:-'),
+  conversationId: z.number().int().positive(),
+  revision: z.number().int().positive(),
+  createdBy: actorSchema,
+  createdAt: z.string().datetime()
+});
+
+/** Validates one stored conversation binding: strict fields, a positive revision and a readable instant. */
+export function validateConversationBinding(value: unknown, code: AgentErrorCode = 'INVALID'): ConversationBinding {
+  const parsed = parseStrict(conversationBindingSchema, value, 'conversation binding (requires version, projectId, sessionId, conversationId, revision, createdBy and createdAt)', code);
+  const binding: ConversationBinding = Object.freeze({
+    version: AGENT_CONVERSATION_BINDING_VERSION,
+    projectId: parsed.projectId,
+    sessionId: parsed.sessionId,
+    conversationId: parsed.conversationId,
+    revision: parsed.revision,
+    createdBy: Object.freeze({ kind: parsed.createdBy.kind, identity: parsed.createdBy.identity }) as AgentActor,
+    createdAt: parsed.createdAt
+  });
+  let encoded: string;
+  try { encoded = boundedJson(binding); }
+  catch (error) { throw new AgentError('The conversation binding is not bounded JSON data: ' + (error as Error).message, code); }
+  if (byteLength(encoded) > AGENT_MAX_RECORD_BYTES) throw new AgentError('The conversation binding exceeds ' + AGENT_MAX_RECORD_BYTES + ' bytes', code);
+  return binding;
+}
+
 /** What governs one session's dispatch: the agent bound to it, and the scopes in force. */
 export type DispatchAuthority = {
   /** The agent whose scopes govern this dispatch, or null when the owner's own dispatch is in force. */

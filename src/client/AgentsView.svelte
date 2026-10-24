@@ -51,7 +51,7 @@
  async function chooseModel(){
   if(modelBusy)return;modelBusy=true;problem='';
   const m=modelSettings?.models.find(m=>modelKey(m)===selectedModel);
-  try{view=await request('/projects/'+projectId+'/agents/model','POST',{model:m?{provider:m.provider,modelId:m.modelId}:null});}
+  try{view=await request('/projects/'+projectId+'/agents/model','POST',{sessionId:selectedSessionId||undefined,model:m?{provider:m.provider,modelId:m.modelId}:null});}
   catch(e){problem=(e as Error).message;}
   finally{modelBusy=false;}
  }
@@ -95,7 +95,7 @@
    // named next to them, so a person never reaches this branch without being told why.
    if(uploadingImages){problem='An image is still uploading. Wait for it to finish, then send — sending now would leave it out of the message.';return;}
    sending=true;problem='';
-   try{await api.agentInput(projectId,{text,mode,requestId:crypto.randomUUID(),images});draft='';media=[];}
+   try{await api.agentInput(projectId,{text,mode,requestId:crypto.randomUUID(),sessionId:selectedSessionId||undefined,images});draft='';media=[];}
    catch(e){problem=(e as Error).message;}
    finally{sending=false;}
  }
@@ -103,13 +103,13 @@
    const text=(answers[questionId]??'').trim();
    if(text==='')return;
    answering=questionId;problem='';
-   try{await api.agentAnswer(projectId,{questionId,text});answers={...answers,[questionId]:''};}
+   try{await api.agentAnswer(projectId,{questionId,text,sessionId:selectedSessionId||undefined});answers={...answers,[questionId]:''};}
    catch(e){problem=(e as Error).message;}
    finally{answering='';}
  }
  async function stop(){
    problem='';
-   try{await api.agentAbort(projectId);}
+   try{await api.agentAbort(projectId,selectedSessionId||undefined);}
    catch(e){problem=(e as Error).message;}
  }
  const working=$derived(view?.working??false);
@@ -127,13 +127,13 @@
  let slashHighlight=$state(0);
  $effect(()=>{void view?.conversationId;void projectId;void loadActions();});
  async function loadActions(){
-   try{actions=(await api.actions({projectId,...(view?.conversationId?{sessionId:view.conversationId}:{})})).actions;}
+   try{actions=(await api.actions({projectId,...(view?.conversationId?{sessionId:selectedSessionId||view.conversationId}:{})})).actions;}
    catch{actions=[];}
  }
  async function runSlash(action:ActionDescriptor){
    slashRefusal='';slashResult='';
    try{
-     const executed=await api.runAction(action.id,{scope:{projectId,...(view?.conversationId?{sessionId:view.conversationId}:{})}});
+     const executed=await api.runAction(action.id,{scope:{projectId,...(view?.conversationId?{sessionId:selectedSessionId||view.conversationId}:{})}});
      slashResult='Ran '+executed.action+': '+JSON.stringify(executed.result).slice(0,300);
      draft='';
    }catch(error){slashRefusal=(error as Error).message;}
@@ -161,13 +161,13 @@
    const reason=dismissReason.trim();
    if(reason===''){problem='Enter a reason for dismissing this question.';return;}
    dismissing=questionId;problem='';
-   try{await api.dismissQuestion(projectId,{questionId,reason});dismissOpen=null;dismissReason='';}
+   try{await api.dismissQuestion(projectId,{questionId,reason,sessionId:selectedSessionId||undefined});dismissOpen=null;dismissReason='';}
    catch(e){problem=(e as Error).message;}
    finally{dismissing='';}
  }
 </script>
 <section class="agents">
- {#if view?.conversationId}<SessionBar {projectId} sessionId={view.conversationId} {view} {agentsVersion} onerror={(message)=>onerror(message)} onsessionchange={(id)=>{selectedSessionId=id;}}/>{/if}
+ {#if view?.conversationId}<SessionBar {projectId} sessionId={selectedSessionId||view.conversationId} {view} {agentsVersion} onerror={(message)=>onerror(message)} onsessionchange={(id)=>{selectedSessionId=id;}}/>{/if}
  <header class="agents-head">
   <div>
    <span class="eyebrow">{!view?.model||view.model.provider==='faux'?'SCRIPTED TEST PROVIDER':'MODEL PROVIDER'}</span>
@@ -240,7 +240,7 @@
  <!-- svelte-ignore a11y_no_static_element_interactions -->
  <div class="agent-composer" onpaste={(event)=>composerEvent(event)} ondrop={(event)=>composerEvent(event)}
       ondragover={(event)=>{event.preventDefault();composerDragging=true;}} ondragleave={()=>composerDragging=false}>
-  <ImageComposer projectId={projectId} bind:items={media} dragging={composerDragging} handle={(composer)=>{composerApi=composer;}}/>
+  <ImageComposer projectId={projectId} sessionId={selectedSessionId||undefined} bind:items={media} dragging={composerDragging} handle={(composer)=>{composerApi=composer;}}/>
   {#if slashPicks}
   <div class="slash-list" aria-label="Slash commands">
    <span class="popover-heading">SLASH COMMANDS — from the action registry</span>

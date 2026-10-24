@@ -109,14 +109,14 @@ export const api={
   testAlert:()=>request<{sent:number;failed:number;skipped:boolean}>('/alerts/test','POST',{}),
   agents:(id:string)=>request<{enabled:boolean;view:AgentView|null}>('/projects/'+id+'/agents'),
   /** A message carries text, the ids of stored images, or both. */
-  agentInput:(id:string,body:{text:string;mode:'followUp'|'steer'|'reject';requestId?:string;images?:string[]})=>request<{submissionId:string;queued:boolean}>('/projects/'+id+'/agents/input','POST',body),
-  agentAbort:(id:string)=>request<{ok:true}>('/projects/'+id+'/agents/abort','POST',{}),
-  agentAnswer:(id:string,body:{questionId:string;text:string})=>request<{submissionId:string}>('/projects/'+id+'/agents/answer','POST',body),
+  agentInput:(id:string,body:{text:string;mode:'followUp'|'steer'|'reject';requestId?:string;sessionId?:string;images?:string[]})=>request<{submissionId:string;queued:boolean}>('/projects/'+id+'/agents/input','POST',body),
+  agentAbort:(id:string,sessionId?:string)=>request<{ok:true}>('/projects/'+id+'/agents/abort','POST',{sessionId}),
+  agentAnswer:(id:string,body:{questionId:string;text:string;sessionId?:string})=>request<{submissionId:string}>('/projects/'+id+'/agents/answer','POST',body),
   /**
    * One image, through the upload path. The declared name and type travel with it but the server
    * decides what the bytes are; a refusal is answered with the server's own per-image reason and code.
    */
-  uploadImage:(id:string,body:{data:string;name?:string;declaredType?:string})=>request<{media:MediaView}>('/projects/'+id+'/agents/media','POST',body),
+  uploadImage:(id:string,body:{data:string;name?:string;declaredType?:string;sessionId?:string})=>request<{media:MediaView}>('/projects/'+id+'/agents/media','POST',body),
   /**
    * The command registry, its live read-only projection and one action's execution. The registry is
    * the only source of what the palette may offer: nothing in the client hardcodes a capability.
@@ -128,7 +128,7 @@ export const api={
   sessionBinding:(projectId:string,sessionId:string)=>request<SessionBindingView>('/sessions/'+encodeURIComponent(sessionId)+'/agent?projectId='+encodeURIComponent(projectId)),
   bindSession:(projectId:string,sessionId:string,body:{revision:number;agentId:string|null;actor:AgentActorBody})=>request<{binding:SessionBindingView['binding'];authority:SessionBindingView['authority']}>('/sessions/'+encodeURIComponent(sessionId)+'/agent','POST',{projectId,...body}),
   /** A dismissal carries a reason and is recorded as its own durable entry, distinct from an answer. */
-  dismissQuestion:(projectId:string,body:{questionId:string;reason:string})=>request<{submissionId:string|null}>('/projects/'+projectId+'/agents/dismiss','POST',body),
+  dismissQuestion:(projectId:string,body:{questionId:string;reason:string;sessionId?:string})=>request<{submissionId:string|null}>('/projects/'+projectId+'/agents/dismiss','POST',body),
   actions:(scope:ActionScope={})=>{
     const query=new URLSearchParams();
     if(scope.projectId)query.set('projectId',scope.projectId);

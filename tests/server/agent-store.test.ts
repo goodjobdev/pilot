@@ -352,6 +352,91 @@ test('a session binding is revision-checked and durable, and the same session wi
   } finally { await f.cleanup(); }
 });
 
+test('a conversation binding is recorded exactly once, is durable across a reopen, and a second creation with different content is refused', async () => {
+  const f = await fixture();
+  try {
+    const sessionId = 'e6a7b8c9-0d1e-4f2a-8b3c-4d5e6f7a8b9c';
+    // First call records revision 1.
+    const recorded = f.agents.recordConversation({ projectId: f.projectId, sessionId, conversationId: 42, actor: OWNER });
+    assert.equal(recorded.revision, 1);
+    assert.equal(recorded.conversationId, 42);
+    assert.deepEqual(recorded.createdBy, OWNER);
+    assert.ok(Number.isFinite(Date.parse(recorded.createdAt)), 'the binding records when it was made');
+
+    // Same content returns the existing binding.
+    const same = f.agents.recordConversation({ projectId: f.projectId, sessionId, conversationId: 42, actor: OWNER });
+    assert.equal(same.conversationId, 42);
+    assert.equal(same.revision, 1);
+
+    // Different content is refused with CONFLICT.
+    const conflict = await refused(() => f.agents.recordConversation({ projectId: f.projectId, sessionId, conversationId: 99, actor: OWNER }), 'CONFLICT');
+    assert.match(conflict, /already bound to conversation 42/);
+
+    // The binding survives a new store handle on the same data root.
+    const reopened = new AgentStore(f.store, { models: () => OFFERED, projectKnown: () => true });
+    const restored = reopened.conversation(f.projectId, sessionId);
+    assert.notEqual(restored, null);
+    assert.equal(restored!.conversationId, 42);
+    assert.equal(restored!.revision, 1);
+
+    // A second session in the same project has its own binding.
+    const secondSessionId = 'f0a1b2c3-4d5e-6f7a-8b9c-0d1e2f3a4b5c';
+    const second = f.agents.recordConversation({ projectId: f.projectId, sessionId: secondSessionId, conversationId: 7, actor: OWNER });
+    assert.equal(second.conversationId, 7);
+
+    // A foreign-project session has its own binding.
+    const otherProject = randomUUID();
+    const otherSessionId = 'c3d4e5f6-a7b8-4c9d-0e1f-2a3b4c5d6e7f';
+    const otherBinding = f.agents.recordConversation({ projectId: otherProject, sessionId: otherSessionId, conversationId: 99, actor: OWNER });
+    assert.equal(otherBinding.conversationId, 99);
+
+    // Two distinct sessions each have exactly one binding operation row.
+    const rows = f.store.db.prepare("SELECT kind, count(*) AS n FROM operations WHERE kind='agent.conversation' GROUP BY kind").all() as { kind: string; n: number }[];
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].n, 3, 'three conversation binding operations across projects and sessions');
+    const outboxes = f.store.db.prepare("SELECT kind, count(*) AS n FROM outboxes WHERE kind='agent.conversation' GROUP BY kind").all() as { kind: string; n: number }[];
+    assert.equal(outboxes.length, 1);
+    assert.equal(outboxes[0].n, 3, 'three conversation binding outbox rows');
+  } finally { await f.cleanup(); }
+});
+
+test('a conversation binding for a session whose binding already exists with identical content returns existing', async () => {
+  const f = await fixture();
+  try {
+    const sessionId = 'a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d';
+    f.agents.recordConversation({ projectId: f.projectId, sessionId, conversationId: 12, actor: OWNER });
+    // Idempotent repeat.
+    const repeat = f.agents.recordConversation({ projectId: f.projectId, sessionId, conversationId: 12, actor: OWNER });
+    assert.equal(repeat.conversationId, 12);
+    // Exactly one operation row.
+    const rows = f.store.db.prepare("SELECT count(*) AS n FROM operations WHERE kind='agent.conversation' AND session_id=?").get(sessionId) as { n: number };
+    assert.equal(rows.n, 1);
+  } finally { await f.cleanup(); }
+});
+
+test('a conversation binding moved into a foreign scope is corruption, never a missing binding', async () => {
+  const f = await fixture();
+  try {
+    const sessionId = 'd4e5f6a7-b8c9-4012-8345-6789abcdef01';
+    f.agents.recordConversation({ projectId: f.projectId, sessionId, conversationId: 23, actor: OWNER });
+    const foreignProject = randomUUID();
+    f.store.db.prepare("UPDATE operations SET project_id=? WHERE kind='agent.conversation' AND session_id=?").run(foreignProject, sessionId);
+    await refused(() => f.agents.conversation(f.projectId, sessionId), 'STORAGE');
+    await refused(() => f.agents.recordConversation({ projectId: f.projectId, sessionId, conversationId: 24, actor: OWNER }), 'STORAGE');
+  } finally { await f.cleanup(); }
+});
+
+ test('a conversation binding refuses non-integer conversationId and missing fields', async () => {
+  const f = await fixture();
+  try {
+    const sessionId = 'b2c3d4e5-f6a7-4b8c-9d0e-1f2a3b4c5d6e';
+    const invalidConv = await refused(() => f.agents.recordConversation({ projectId: f.projectId, sessionId, conversationId: 0, actor: OWNER }), 'INVALID');
+    assert.match(invalidConv, /conversationId must be a positive integer/);
+    const invalidConv2 = await refused(() => f.agents.recordConversation({ projectId: f.projectId, sessionId, conversationId: 1.5, actor: OWNER }), 'INVALID');
+    assert.match(invalidConv2, /conversationId must be a positive integer/);
+  } finally { await f.cleanup(); }
+});
+
 test('the scope list is canonical, bounded and duplicate-free, and an oversize registry is refused', async () => {
   const f = await fixture();
   try {

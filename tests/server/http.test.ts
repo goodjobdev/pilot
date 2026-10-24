@@ -481,26 +481,26 @@ test('the session lifecycle routes are owner-only, revision-checked and honest a
   assert.equal(illegal.status,409);
   assert.match((await illegal.json()).error,/Only a paused or interrupted/);
   // A generation really runs in this process: run the agent once so the transcript has an input to continue.
-  assert.equal((await post('/api/projects/'+project.id+'/agents/input',{text:'seed the lifecycle',mode:'followUp'})).status,200);
-  const agentsBase=url+'/api/projects/'+project.id+'/agents';
-  await waitFor(async()=>{const view=await (await fetch(agentsBase,{headers:token})).json() as {view:{entries:{kind:string}[]}};return view.view.entries.some(entry=>entry.kind==='user')?true:undefined;});
+  assert.equal((await post('/api/projects/'+project.id+'/agents/input',{sessionId:session.id,text:'[pause] seed the lifecycle',mode:'followUp'})).status,200);
+  const agentsBase=url+'/api/projects/'+project.id+'/agents?sessionId='+session.id;
+  await waitFor(async()=>{const view=await (await fetch(agentsBase,{headers:token})).json() as {view:{working:boolean;entries:{kind:string}[]}};return !view.view.working&&view.view.entries.some(entry=>entry.kind==='user')?true:undefined;});
   // The durable state a live generation leaves: running, with the request identity it was submitted under.
   const lifecycle=new SessionLifecycleStore(store);
   lifecycle.markRunning({projectId:project.id,sessionId:session.id,requestId:'seed-request'});
   const running=(await (await read(basePath+'?projectId='+project.id)).json()).lifecycle;
-  assert.equal(running.state,'running');assert.equal(running.revision,1);assert.equal(running.requestId,'seed-request');
+  assert.equal(running.state,'running');assert.ok(running.revision>=1);assert.equal(running.requestId,'seed-request');
   // reconnect attaches and dispatches nothing: the record is unchanged and no effect flag is set.
-  const reconnected=await post(basePath+'/reconnect',{projectId:project.id,revision:1});
+  const reconnected=await post(basePath+'/reconnect',{projectId:project.id,revision:running.revision});
   assert.equal(reconnected.status,200);
   const reconnectedBody=await reconnected.json();
   assert.deepEqual([reconnectedBody.dispatched,reconnectedBody.cancelled,reconnectedBody.unchanged],[false,false,true]);
-  assert.equal(reconnectedBody.lifecycle.revision,1,'reconnect wrote no revision');
+  assert.equal(reconnectedBody.lifecycle.revision,running.revision,'reconnect wrote no revision');
   // A stale revision is a conflict, not a silent overwrite.
   const stale=await post(basePath+'/stop',{projectId:project.id,revision:0});
   assert.equal(stale.status,409);
-  assert.match((await stale.json()).error,/is at lifecycle revision 1, not 0/);
+  assert.match((await stale.json()).error,new RegExp('is at lifecycle revision '+running.revision+', not 0'));
   // stop cancels and dispatches nothing.
-  const stopped=await post(basePath+'/stop',{projectId:project.id,revision:1});
+  const stopped=await post(basePath+'/stop',{projectId:project.id,revision:running.revision});
   assert.equal(stopped.status,200);
   const stoppedBody=await stopped.json();
   assert.equal(stoppedBody.lifecycle.state,'idle');assert.equal(stoppedBody.cancelled,true);assert.equal(stoppedBody.dispatched,false);
@@ -561,9 +561,9 @@ test('two concurrent retries at one lifecycle revision dispatch one generation, 
   const project=await (await post('/api/projects',{name:'Retry race',managed:true,confirm:true})).json();
   const session=(await (await post('/api/sessions',{projectId:project.id,name:'Retry race session'})).json()).session;
   const agents=url+'/api/projects/'+project.id+'/agents';
-  const view=async()=>await (await fetch(agents,{headers:token})).json() as {view:{working:boolean;entries:{kind:string}[]}};
+  const view=async()=>await (await fetch(agents+'?sessionId='+session.id,{headers:token})).json() as {view:{working:boolean;entries:{kind:string}[]}};
   // One generation really runs, so the retry has an input to re-submit and a transcript to grow.
-  assert.equal((await post('/api/projects/'+project.id+'/agents/input',{text:'retry me',mode:'followUp'})).status,200);
+  assert.equal((await post('/api/projects/'+project.id+'/agents/input',{sessionId:session.id,text:'[pause] retry me',mode:'followUp'})).status,200);
   await waitFor(async()=>{const v=await view();return v.view.entries.some(entry=>entry.kind==='user')&&!v.view.working?true:undefined;});
   const lifecycle=new SessionLifecycleStore(store);
   lifecycle.markRunning({projectId:project.id,sessionId:session.id,requestId:'failed-attempt'});
@@ -592,7 +592,8 @@ test('two concurrent retries at one lifecycle revision dispatch one generation, 
   await waitFor(async()=>{const v=await view();return !v.view.working?true:undefined;});
   assert.equal((await view()).view.entries.filter(entry=>entry.kind==='assistant').length,repliesBefore+1,'exactly one model run started for the two retries');
   const settled=await (await fetch(url+basePath+'?projectId='+project.id,{headers:token})).json() as {lifecycle:{state:string;revision:number;attempt:number;requestId:string}};
-  assert.equal(settled.lifecycle.revision,winnerBody.lifecycle.revision,'the loser wrote no second revision');
+  assert.equal(settled.lifecycle.revision,winnerBody.lifecycle.revision+1,'only the winner and its completion wrote revisions');
+  assert.equal(settled.lifecycle.state,'idle','the named completion settled the winning attempt');
   assert.equal(settled.lifecycle.attempt,winnerBody.lifecycle.attempt,'the loser recorded no second attempt');
  }finally{await app.close();store.close();await rm(root,{recursive:true,force:true});}
 });

@@ -11,9 +11,9 @@
   * transcript header already reads (extended with the provider-reported cache counters). A fact the
   * harness does not report is shown as a **named absence** ("not reported"), never as a fabricated zero.
   */
- let {projectId,sessionId,view=null,binding=null,session=null}:{
+ let {projectId,sessionId,view=null,binding=null,session=null,installedScopes=[]}:{
   projectId:string; sessionId:string; view?:AgentView|null;
-  binding?:SessionBindingView|null; session?:SessionOverview|null;
+  binding?:SessionBindingView|null; session?:SessionOverview|null; installedScopes?:readonly string[];
  }=$props();
 
  let open=$state(false);
@@ -33,10 +33,9 @@
   <div class="detail"><span class="detail-label">Lifecycle</span><span class="detail-value">{session?.lifecycle.recorded?(session.lifecycle.state+(session.lifecycle.reason?' — '+session.lifecycle.reason:'')):'no durable lifecycle record'}</span></div>
   <div class="detail"><span class="detail-label">Agent in force</span><span class="detail-value">{authority===null?'unknown (no binding read)':authority.agentId===null?(authority.emptyReason??'no agent is bound'):authority.agentId}</span></div>
   <div class="detail"><span class="detail-label">Scopes in effect</span><span class="detail-value">{authority===null?'unknown':authority.scopes===null?'the owner\u2019s own dispatch (nothing narrowed)':authority.scopes.length===0?'none — every tool is refused':(()=>{
-      const B=['ask_question','record_note','read_notes'];
       const g=authority.scopes;
-      const i=g.filter(s=>B.includes(s));
-      const u=g.filter(s=>!B.includes(s));
+      const i=g.filter(scope=>installedScopes.includes(scope));
+      const u=g.filter(scope=>!installedScopes.includes(scope));
       if(u.length===0)return g.join(', ');
       return (i.length?i.join(', '):'(none)')+'; '+u.join(', ')+' [unavailable]';
     })()}</span></div>

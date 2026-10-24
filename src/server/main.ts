@@ -457,6 +457,28 @@ export async function createApp(options:AppOptions){
     // binding or scope change takes effect at the next dispatch with no restart. With no registry
     // open, the owner's own dispatch is in force and nothing is narrowed.
     privileges:{authority:async({projectId,sessionId})=>agentHolder.store?agentHolder.store.authorityForSession({projectId,sessionId:sessionId??''}):Object.freeze({agentId:null,scopes:null,projects:null,emptyReason:null})},
+    // The durable conversation binding port. It resolves the control-store holder at call time because
+    // the registry is wired later in createApp; with no control store, writes fail closed rather than
+    // claiming that an in-memory mapping is durable.
+    conversationBinding:{
+      list:projectId=>agentHolder.store?.conversations(projectId)??[],
+      // The harness is constructed before agentHolder.store is assigned below. Resolve the holder at
+      // call time so the port sees the durable store once createApp has finished wiring it.
+      read:(projectId,sessionId)=>{
+        const binding=agentHolder.store?.conversation(projectId,sessionId)??null;
+        return binding?{conversationId:binding.conversationId,revision:binding.revision}:null;
+      },
+      record:input=>{
+        const store=agentHolder.store;
+        if(!store)throw new HttpError(503,'The durable conversation binding store is unavailable; no replacement conversation was created');
+        store.recordConversation({
+          projectId:input.projectId,
+          sessionId:input.sessionId,
+          conversationId:input.conversationId,
+          actor:{kind:'owner',identity:'harness'}
+        });
+      }
+    },
     fileEdit,
     onEvent:event=>{
       // A question is notified by the ledger's own outbox step, which tags the notification by the
@@ -506,11 +528,11 @@ export async function createApp(options:AppOptions){
     // without claiming a revision. It performs no model work and opens no harness: opening one would
     // resume unfinished work, which is itself a model request.
     authoriseDispatch:({projectId})=>{if(!agents.enabled)throw new HttpError(503,'Agents are disabled on this instance');catalog.get(projectId);},
-    resume:async({projectId,requestId})=>{if(!agents.enabled)throw new HttpError(503,'Agents are disabled on this instance');await agents.dispatchLifecycle(catalog.get(projectId),requestId);},
-    retry:async({projectId,requestId})=>{if(!agents.enabled)throw new HttpError(503,'Agents are disabled on this instance');await agents.dispatchLifecycle(catalog.get(projectId),requestId);},
+    resume:async({projectId,sessionId,requestId})=>{if(!agents.enabled)throw new HttpError(503,'Agents are disabled on this instance');await agents.dispatchLifecycle(catalog.get(projectId),requestId,sessionId);},
+    retry:async({projectId,sessionId,requestId})=>{if(!agents.enabled)throw new HttpError(503,'Agents are disabled on this instance');await agents.dispatchLifecycle(catalog.get(projectId),requestId,sessionId);},
     // A cancel on an instance with no harness has nothing to stop, so it is a harmless no-op; a
     // resume or a retry, which would have to dispatch, refuse instead (above).
-    cancel:async({projectId})=>{if(!agents.enabled)return;await agents.cancelLifecycle(catalog.get(projectId));}
+    cancel:async({projectId,sessionId})=>{if(!agents.enabled)return;await agents.cancelLifecycle(catalog.get(projectId),sessionId);}
   }):undefined;
   // Which projects already have a conversation, and what to call the adopted session.
   const legacy:LegacyConversationPort=legacyConversationPort({dataRoot:options.dataRoot,projects:async()=>catalog.projects.map(p=>({id:p.id,name:p.name,path:p.path}))});
@@ -531,7 +553,7 @@ export async function createApp(options:AppOptions){
         // The ledger's recorded text is handed over so a transcript write a crash never made is
         // completed; it stays inside this call and appears in no view, log line or report.
         recordedAnswer:(scope,questionId)=>ledger.recordedAnswer({...scope,questionId}),
-        redeliverAnswer:agents.enabled?async(scope,questionId,recorded)=>agents.redeliverAnswer(catalog.get(scope.projectId),questionId,recorded):undefined
+        redeliverAnswer:agents.enabled?async(scope,questionId,recorded)=>agents.redeliverAnswer(catalog.get(scope.projectId),questionId,recorded,scope.sessionId):undefined
       });
     } catch(error) {console.error('The delivery ledger could not be reconciled (nothing was replayed): '+(error as Error).message);}
   }
@@ -1265,13 +1287,13 @@ export async function createApp(options:AppOptions){
             if(agentsRoute[2]===undefined&&req.method==='GET'){json({enabled:false,view:null});return;}
             throw new HttpError(503,'Agents are disabled on this instance');
           }
-          if(agentsRoute[2]===undefined&&req.method==='GET'){const viewSessionId=url.searchParams.get('sessionId');const viewResult=viewSessionId?(await agents.sessionView(p,viewSessionId))??{conversationId:viewSessionId,entries:[],questions:[],inbox:[],working:false,usage:{input:0,output:0}}:await agents.view(p);json({enabled:true,view:viewResult,delivery:await agents.deliveryView(p)});return;}
-          if(agentsRoute[2]==='model'&&req.method==='POST'){const c=z.strictObject({model:z.strictObject({provider:z.string().min(1).max(100),modelId:z.string().min(1).max(200)}).nullable()}).parse(payload);json(await agents.setModel(p,c.model));return;}
+          if(agentsRoute[2]===undefined&&req.method==='GET'){const viewSessionId=url.searchParams.get('sessionId');const viewResult=viewSessionId?(await agents.sessionView(p,viewSessionId))??{conversationId:viewSessionId,entries:[],questions:[],inbox:[],working:false,usage:{input:0,output:0}}:await agents.view(p);json({enabled:true,view:viewResult,delivery:await agents.deliveryView(p,viewSessionId??undefined)});return;}
+          if(agentsRoute[2]==='model'&&req.method==='POST'){const c=z.strictObject({sessionId:z.string().min(1).max(200).optional(),model:z.strictObject({provider:z.string().min(1).max(100),modelId:z.string().min(1).max(200)}).nullable()}).parse(payload);json(await agents.setModel(p,c.model,c.sessionId));return;}
           if(agentsRoute[2]==='media'&&req.method==='POST'){
             // Admission. An image is refused before anything is stored when the session's selected
             // model does not accept image input, so no bytes are kept for a model that would ignore them.
-            const data=z.strictObject({data:z.string().min(1).max(8*1024*1024),name:z.string().max(200).optional(),declaredType:z.string().max(100).optional()}).parse(payload);
-            const vision=await agents.vision(p);
+            const data=z.strictObject({sessionId:z.string().min(1).max(200).optional(),data:z.string().min(1).max(8*1024*1024),name:z.string().max(200).optional(),declaredType:z.string().max(100).optional()}).parse(payload);
+            const vision=await agents.vision(p,data.sessionId);
             if(!vision.acceptsImages)throw new HttpError(422,'The model '+vision.provider+' / '+vision.modelId+' does not accept image input, so this image was refused. Choose a model that accepts images, then try again.','vision');
             // The declared name and type are deliberately ignored: the bytes decide what this is.
             // A data root whose media container is a symlink, is not a directory, or cannot be written is
@@ -1293,6 +1315,7 @@ export async function createApp(options:AppOptions){
               text:z.string().max(8000).optional(),
               mode:z.enum(['followUp','steer','reject']).default('followUp'),
               requestId:z.string().min(1).max(200).optional(),
+              sessionId:z.string().min(1).max(200).optional(),
               images:z.array(z.string().regex(MEDIA_ID_PATTERN)).optional()
             }).superRefine((value,context)=>{
               if((value.text??'').trim()===''&&!(value.images??[]).length)context.addIssue({code:'custom',message:'a message needs text or an image'});
@@ -1308,33 +1331,37 @@ export async function createApp(options:AppOptions){
               if(!image)throw new HttpError(422,'An attached image is not in the media store. Remove it and send again.','unknown-media');
               images.push({mimeType:image.mimeType,data:Buffer.from(image.bytes).toString('base64')});
             }
-            json(await agents.submit(p,{text:data.text??'',mode:data.mode,requestId:data.requestId,images}));return;
+            json(await agents.submit(p,{text:data.text??'',mode:data.mode,requestId:data.requestId,sessionId:data.sessionId,images}));return;
           }
           if(agentsRoute[2]==='answer'&&req.method==='POST'){
-            const data=z.strictObject({questionId:z.string().min(1).max(100),text:z.string().min(1).max(4000)}).parse(payload);
+            const data=z.strictObject({sessionId:z.string().min(1).max(200).optional(),questionId:z.string().min(1).max(100),text:z.string().min(1).max(4000)}).parse(payload);
             json(await agents.answer(p,data));return;
           }
           if(agentsRoute[2]==='dismiss'&&req.method==='POST'){
             // A dismissal is deliberately distinct from an answer: it carries a reason, is recorded as
             // its own durable transcript entry (who, when, why), and tells the agent the question was
             // dismissed rather than silently ignored.
-            const data=z.strictObject({questionId:z.string().min(1).max(100),reason:z.string().min(1).max(400)}).parse(payload);
+            const data=z.strictObject({sessionId:z.string().min(1).max(200).optional(),questionId:z.string().min(1).max(100),reason:z.string().min(1).max(400)}).parse(payload);
             json(await agents.dismissQuestion(p,{...data,dismissedBy:subject||'owner'}));return;
           }
-          if(agentsRoute[2]==='abort'&&req.method==='POST'){await agents.abort(p);json({ok:true});return;}
+          if(agentsRoute[2]==='abort'&&req.method==='POST'){const data=z.strictObject({sessionId:z.string().min(1).max(200).optional()}).parse(payload);await agents.abort(p,data.sessionId);json({ok:true});return;}
           if(agentsRoute[2]==='stream'&&req.method==='GET'){
             res.statusCode=200;res.setHeader('Content-Type','text/event-stream');res.setHeader('Cache-Control','no-store');res.setHeader('Connection','keep-alive');
             res.write('retry: 3000\n\n');
             // Accept optional sessionId so the owner can switch between per-session transcripts.
             const streamSessionId=url.searchParams.get('sessionId')||undefined;
-            let closed=false,dispose:()=>Promise<void>=async()=>{};
+            let closed=false,dispose:(()=>Promise<void>)|undefined;
+            let keepAlive:ReturnType<typeof setInterval>|undefined;
+            // The client can disconnect while subscribe opens the durable conversation. Install
+            // cleanup before that await, and dispose a subscription that arrives after close.
+            res.once('close',()=>{closed=true;clearInterval(keepAlive);void dispose?.();});
             try{
               dispose=await agents.subscribe(p,view=>{if(!closed)res.write('data: '+JSON.stringify(view)+'\n\n');},streamSessionId);
             }catch(e){
-              res.write('event: error\ndata: '+JSON.stringify({error:(e as Error).message})+'\n\n');res.end();return;
+              if(!closed){res.write('event: error\ndata: '+JSON.stringify({error:(e as Error).message})+'\n\n');res.end();}return;
             }
-            const keepAlive=setInterval(()=>{if(!closed)res.write(': keep-alive\n\n');},20000);
-            req.on('close',()=>{closed=true;clearInterval(keepAlive);void dispose();});
+            if(closed){await dispose();return;}
+            keepAlive=setInterval(()=>{if(!closed)res.write(': keep-alive\n\n');},20000);
             return;
           }
         }

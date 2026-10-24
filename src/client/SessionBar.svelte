@@ -20,6 +20,7 @@
 
  let sessions=$state<SessionOverview[]>([]);
  let agents=$state<AgentRecord[]>([]);
+ let installedScopes=$state<string[]>([]);
  let selectedId=$state('');
  let binding=$state<SessionBindingView|null>(null);
  let listOpen=$state(false),creating=$state(false);
@@ -33,8 +34,8 @@
    if(authority.scopes===null)return'the owner\u2019s own dispatch (nothing narrowed)';
    if(authority.scopes.length===0)return'none — every tool is refused';
    const granted=authority.scopes;
-   const installed=granted.filter(s=>['ask_question','record_note','read_notes'].includes(s));
-   const uninstalled=granted.filter(s=>!['ask_question','record_note','read_notes'].includes(s));
+   const installed=granted.filter(scope=>installedScopes.includes(scope));
+   const uninstalled=granted.filter(scope=>!installedScopes.includes(scope));
    if(uninstalled.length===0)return granted.join(', ');
    const avail=installed.length>0?installed.join(', '):'(none)';
    const unavail=uninstalled.join(', ')+' [unavailable — no tool installed]';
@@ -46,7 +47,7 @@
   try{sessions=(await api.sessions(projectId)).sessions;}catch(error){problem=(error as Error).message;onerror(problem);}
  }
  async function loadAgents(){
-  try{agents=(await api.agentRegistry()).agents.filter(agent=>!agent.archived);}catch{agents=[];}
+  try{const registry=await api.agentRegistry();agents=registry.agents.filter(agent=>!agent.archived);installedScopes=registry.scopes.filter(entry=>entry.installed).map(entry=>entry.scope);}catch{agents=[];installedScopes=[];}
  }
  async function load(){await loadSessions();await loadAgents();}
  async function loadBinding(id:string){
@@ -130,7 +131,7 @@
  {/each}
 </div>
 {/if}
-<SessionDetails {projectId} sessionId={selectedId} view={selectedId===sessionId?view:null} {binding} session={selected}/>
+<SessionDetails {projectId} sessionId={selectedId} view={selectedId===sessionId?view:null} {binding} {installedScopes} session={selected}/>
 <style>
  .session-bar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:8px 12px;border-bottom:1px solid var(--line);background:var(--bg)}
  .session-current{display:flex;align-items:center;gap:8px;flex-wrap:wrap}

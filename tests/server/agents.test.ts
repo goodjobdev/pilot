@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtemp,readFile,stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { createApp } from '../../src/server/main';
 import { localConfig } from '../../src/server/security';
 import { ControlStore } from '../../src/server/state/control-store';
@@ -20,9 +21,14 @@ async function waitFor<T>(check: () => Promise<T | undefined>, timeoutMs = 10000
   }
 }
 
-async function instance(agents: 'on' | 'off', dataRoot: string, agentPauseMs = 300) {
+async function instance(agents: 'on' | 'off', dataRoot: string, agentPauseMs = 300, durableControl = false) {
   const security = localConfig('http://127.0.0.1:0');
-  const created = await createApp({ dataRoot, browseRoots: [], security, agents, agentPauseMs });
+  const control = durableControl ? new ControlStore(dataRoot) : undefined;
+  const created = await createApp({ dataRoot, browseRoots: [], security, agents, agentPauseMs, ...(control ? { control } : {}) });
+  if (control) {
+    const closeApp = created.close.bind(created);
+    created.close = async () => { await closeApp(); control.close(); };
+  }
   await new Promise<void>(ok => created.server.listen(0, '127.0.0.1', ok));
   security.origin = 'http://127.0.0.1:' + (created.server.address() as { port: number }).port;
   const token = { 'x-dashboard-token': security.token };
@@ -33,7 +39,7 @@ async function instance(agents: 'on' | 'off', dataRoot: string, agentPauseMs = 3
   const project = listed[0] ?? await (await fetch(security.origin + '/api/projects', { method: 'POST', headers: writes, body: JSON.stringify({ name: 'Agents', managed: true, confirm: true }) })).json();
   const base = security.origin + '/api/projects/' + project.id + '/agents';
   const view = async () => (await (await fetch(base, { headers: token })).json()) as { enabled: boolean; view: any };
-  return { created, security, token, writes, project, base, view };
+  return { created, security, token, writes, project, base, view, control };
 }
 
 /**
@@ -811,4 +817,237 @@ test('DEFECT2e: enabling the file_edit switch makes the tool appear', async () =
   assert.ok(defaultInstalledScopes.includes('record_note'));
   assert.ok(defaultInstalledScopes.includes('read_notes'));
   assert.ok(!defaultInstalledScopes.includes('file_edit'), 'file_edit is not in default installed tools');
+});
+
+// ---- P0 DURABILITY: named-session conversation binding survives restart ----
+
+test('P0: a named (UUID) session resolves to the same conversation after a restart, and no duplicate fork is created', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agents-p0-durable-'));
+  const app = await instance('on', root, 100, true);
+  const sessionId = crypto.randomUUID();
+  try {
+    // Open the stream endpoint with sessionId -- this triggers ensureSessionConversation,
+    // which creates the fork and records the durable binding.
+    const streamResp = await fetch(app.base + '/stream?sessionId=' + sessionId, { headers: app.token });
+    assert.equal(streamResp.status, 200);
+    // Read a frame from the stream to confirm it connected.
+    const reader = streamResp.body!.getReader();
+    const decoder = new TextDecoder();
+    let buffered = '';
+    const until = Date.now() + 2000;
+    while (!buffered.includes('data: {') && Date.now() < until) {
+      const chunk = await reader.read();
+      if (chunk.done) break;
+      buffered += decoder.decode(chunk.value, { stream: true });
+    }
+    await reader.cancel();
+    // Read through the session view endpoint; a brace regex cannot safely parse nested transcript JSON.
+    const firstResponse = await (await fetch(app.base + '?sessionId=' + sessionId, { headers: app.token })).json() as any;
+    const firstConvId = firstResponse.view.conversationId;
+    assert.ok(firstConvId !== undefined && String(firstConvId).length > 0, 'a named session has a conversation id: ' + firstConvId);
+    const initialBinding = app.control!.db.prepare("SELECT count(*) AS n FROM operations WHERE kind='agent.conversation' AND project_id=? AND session_id=?").get(app.project.id, sessionId) as {n:number};
+    assert.equal(initialBinding.n, 1, 'the initial named session has one durable binding');
+    const conversationCount = () => {
+      const db = new DatabaseSync(join(root, 'agents', app.project.id, 'session.sqlite'));
+      try { return (db.prepare('SELECT count(*) AS n FROM conversations').get() as {n:number}).n; }
+      finally { db.close(); }
+    };
+    assert.equal(conversationCount(), 2, 'root plus exactly one named conversation exist');
+
+    // Send a real message to the named conversation and wait for its committed transcript entry.
+    const messageText = 'durable named transcript ' + crypto.randomUUID();
+    const submitted = await fetch(app.base + '/input', {
+      method: 'POST', headers: app.writes,
+      body: JSON.stringify({ text: messageText, mode: 'followUp', requestId: crypto.randomUUID(), sessionId })
+    });
+    assert.equal(submitted.status, 200, await submitted.text());
+    const populated = await waitFor(async () => {
+      const response = await (await fetch(app.base + '?sessionId=' + sessionId, { headers: app.token })).json() as any;
+      return response.view.entries.length > 0 ? response.view : undefined;
+    });
+    assert.ok(populated.entries.some((entry: any) => entry.text?.includes(messageText)), 'the named conversation committed the owner message: ' + JSON.stringify(populated.entries));
+    // Close and reopen on the same data root -- restart simulation.
+    await app.created.close();
+    const reopened = await instance('on', root, 100, true);
+    try {
+      // The named session resolves to the SAME conversation id after restart.
+      const restoredView = await (await fetch(reopened.base + '?sessionId=' + sessionId, { headers: reopened.token })).json() as any;
+      const secondConvId = restoredView.view.conversationId;
+      assert.equal(String(secondConvId), String(firstConvId), 'the restart resolves to the same conversation id: ' + firstConvId + ' vs ' + secondConvId);
+      assert.ok(restoredView.view.entries.some((entry: any) => entry.text?.includes(messageText)), "the owner's previous message remains visible after restart");
+      const afterRestartBinding = reopened.control!.db.prepare("SELECT count(*) AS n FROM operations WHERE kind='agent.conversation' AND project_id=? AND session_id=?").get(reopened.project.id, sessionId) as {n:number};
+      assert.equal(afterRestartBinding.n, 1, 'restart did not create a second binding');
+      assert.equal(conversationCount(), 2, 'restart did not create an orphan duplicate conversation');
+
+      // An entirely new named session creates its own binding (distinct conversation).
+      const secondSessionId = crypto.randomUUID();
+      const secondStreamResp = await fetch(reopened.base + '/stream?sessionId=' + secondSessionId, { headers: reopened.token });
+      assert.equal(secondStreamResp.status, 200);
+      await secondStreamResp.body?.cancel();
+      const secondView = await (await fetch(reopened.base + '?sessionId=' + secondSessionId, { headers: reopened.token })).json() as any;
+      const thirdConvId = secondView.view.conversationId;
+      assert.ok(thirdConvId !== undefined && String(thirdConvId).length > 0);
+      assert.notEqual(String(thirdConvId), String(firstConvId), 'a second named session gets a distinct conversation from the first');
+      assert.equal(conversationCount(), 3, 'each named session has one conversation, with no orphan duplicates');
+    } finally {
+      await reopened.created.close();
+    }
+  } finally {
+    await app.created.close();
+  }
+});
+
+test('P0: the legacy numeric session still works as before (conversationIdOf path)', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agents-p0-legacy-'));
+  let app;
+  try {
+    app = await instance('on', root, 100);
+    // Use the root session (no sessionId parameter means root).
+    const resp = await fetch(app.base, { headers: app.token });
+    assert.equal(resp.status, 200);
+    const view = await resp.json() as any;
+    assert.equal(view.view.conversationId, '1', 'the legacy root session is always conversation 1');
+    assert.ok(view.enabled, 'agents are enabled');
+    // Submit to the root and verify it appears.
+    const inputResp = await fetch(app.base + '/input', {
+      method: 'POST', headers: app.writes,
+      body: JSON.stringify({ text: 'legacy message', mode: 'followUp', requestId: crypto.randomUUID() })
+    });
+    assert.equal(inputResp.status, 200);
+    await sleep(300);
+    const updated = await (await fetch(app.base, { headers: app.token })).json() as any;
+    const assistantReplies = updated.view.entries.filter((e: any) => e.kind === 'assistant');
+    assert.ok(assistantReplies.some((r: any) => r.text?.includes('legacy message')), 'legacy root conversation works after restart');
+  } finally {
+    if (app) await app.created.close();
+  }
+});
+
+test('an agent stream disconnected during subscription disposes the late subscription', { timeout: 10000 }, async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agents-stream-disconnect-'));
+  const app = await instance('on', root);
+  let release!: () => void;
+  const pending = new Promise<void>(resolve => { release = resolve; });
+  let disposed = 0;
+  // Hold subscription setup after the retry frame has reached the client. This makes
+  // the disconnect-before-subscribe race deterministic, without a real slow provider.
+  app.created.agents.subscribe = async () => {
+    await pending;
+    return async () => { disposed++; };
+  };
+  const disconnected = new Promise<void>(resolve => {
+    app.created.server.once('request', (_req, res) => res.once('close', resolve));
+  });
+  try {
+    const response = await fetch(app.base + '/stream', { headers: app.token });
+    assert.equal(response.status, 200);
+    await response.body!.cancel();
+    await disconnected;
+    release();
+    await waitFor(async () => disposed === 1 ? true : undefined);
+    assert.equal(disposed, 1, 'the late subscription is disposed exactly once');
+  } finally {
+    release();
+    await app.created.close();
+  }
+});
+
+test('P0: a first-time named session records exactly one conversation binding', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agents-p0-first-'));
+  const app = await instance('on', root, 100, true);
+  const sessionId = crypto.randomUUID();
+  try {
+    // Trigger binding creation via stream
+    const streamResp = await fetch(app.base + '/stream?sessionId=' + sessionId, { headers: app.token });
+    assert.equal(streamResp.status, 200);
+    await streamResp.body?.getReader()?.cancel();
+    await sleep(100);
+    // The harness binding is created. Verify via the view endpoint.
+    const view = await (await fetch(app.base + '?sessionId=' + sessionId, { headers: app.token })).json() as any;
+    assert.ok(view.view, 'the named session is accessible');
+    assert.ok(typeof view.view.conversationId === 'number' || typeof view.view.conversationId === 'string', 'it has a conversation id');
+    const rows = app.control!.db.prepare("SELECT count(*) AS n FROM operations WHERE kind='agent.conversation' AND project_id=? AND session_id=?").get(app.project.id, sessionId) as {n:number};
+    assert.equal(rows.n, 1, 'first access wrote exactly one durable binding');
+
+  } finally {
+    await app.created.close();
+  }
+});
+
+test('named startup adoption refuses uncertain resume without replaying root or named input', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pilot-named-uncertain-'));
+  let app = await instance('on', root, 100, true);
+  try {
+    const session = await app.created.sessions!.create({ projectId: app.project.id, name: 'Uncertain named session' });
+    await app.created.agents.submit(app.created.catalog.get(app.project.id), { sessionId: session.id, text: 'NAMED BEFORE RESTART', mode: 'followUp' });
+    await waitFor(async () => !(await app.created.agents.sessionView(app.created.catalog.get(app.project.id), session.id))!.working ? true : undefined);
+    const before = (await app.created.agents.sessionView(app.created.catalog.get(app.project.id), session.id))!.entries.length;
+    app.created.lifecycle!.markRunning({ projectId: app.project.id, sessionId: session.id, requestId: 'unproven-attempt' });
+    await app.created.close();
+    app = await instance('on', root, 100, true);
+    const record = app.created.lifecycle!.read(app.project.id, session.id);
+    assert.equal(record.state, 'interrupted');
+    assert.equal(record.uncertain, true);
+    const response = await fetch(app.security.origin + '/api/sessions/' + session.id + '/lifecycle/resume', { method: 'POST', headers: app.writes, body: JSON.stringify({ projectId: app.project.id, revision: record.revision }) });
+    assert.equal(response.status, 409);
+    assert.match((await response.json()).error, /uncertain|operator/i);
+    assert.equal((await app.created.agents.sessionView(app.created.catalog.get(app.project.id), session.id))!.entries.length, before);
+    assert.equal((await app.created.agents.view(app.created.catalog.get(app.project.id))).entries.length, 0);
+  } finally { await app.created.close(); }
+});
+
+test('named HTTP controls and lifecycle callbacks never act on the root or another named session', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pilot-named-http-'));
+  const app = await instance('on', root, 800, true);
+  const post = async (suffix: string, data: unknown) => fetch(app.base + suffix, { method: 'POST', headers: app.writes, body: JSON.stringify(data) });
+  const session = await app.created.sessions!.create({ projectId: app.project.id, name: 'Named controls' });
+  const other = await app.created.sessions!.create({ projectId: app.project.id, name: 'Other controls' });
+  const view = async (id?: string) => (await (await fetch(app.base + (id ? '?sessionId=' + id : ''), { headers: app.token })).json()).view;
+  const life = () => app.created.lifecycle!.read(app.project.id, session.id);
+  const action = async (name: string, revision = life().revision) => fetch(app.security.origin + '/api/sessions/' + session.id + '/lifecycle/' + name, { method: 'POST', headers: app.writes, body: JSON.stringify({ projectId: app.project.id, revision }) });
+  try {
+    assert.equal((await post('/input', { text: 'ROOT SENTINEL' })).status, 200);
+    await waitFor(async () => !(await view()).working ? true : undefined);
+    assert.equal((await post('/input', { sessionId: session.id, text: '[ask] named HTTP' })).status, 200);
+    await waitFor(async () => !(await view(session.id)).working && (await view(session.id)).questions.length ? true : undefined);
+    await waitFor(async () => life().state === 'idle' ? true : undefined);
+    const question = (await view(session.id)).questions[0];
+    assert.equal((await post('/answer', { sessionId: other.id, questionId: question.id, text: 'foreign' })).status, 404);
+    assert.equal((await post('/dismiss', { sessionId: session.id, questionId: question.id, reason: 'Defer this choice' })).status, 200);
+    await waitFor(async () => !(await view(session.id)).working ? true : undefined);
+    assert.ok((await view(session.id)).dismissals[question.id]);
+    assert.equal((await post('/answer', { sessionId: session.id, questionId: question.id, text: 'late' })).status, 409);
+    assert.equal((await post('/model', { sessionId: session.id, model: null })).status, 200);
+    await post('/input', { sessionId: session.id, text: '[pause] named replay only', requestId: 'named-original' });
+    await post('/input', { sessionId: other.id, text: '[pause] other input' });
+    await waitFor(async () => (await view(session.id)).working && (await view(other.id)).working ? true : undefined);
+    assert.equal((await action('pause')).status, 200);
+    assert.equal(life().state, 'paused');
+    assert.equal((await view(other.id)).working, true);
+    assert.equal((await action('resume')).status, 200);
+    assert.equal(life().state, 'idle', 'a terminal idempotent resume must not leave a phantom running attempt');
+    assert.ok(!(await view(session.id)).entries.some((entry: any) => entry.text.includes('ROOT SENTINEL')));
+    assert.equal((await post('/abort', { sessionId: other.id })).status, 200);
+    assert.equal((await view(other.id)).working, false);
+    // A transport refusal after admission is synthetic: no provider call or credential is used.
+    const model = app.created.providers.models.getModels().find(m => m.provider !== 'faux')!;
+    assert.ok(model);
+    await post('/model', { sessionId: session.id, model: { provider: model.provider, modelId: model.id } });
+    let checks = 0;
+    app.created.providers.assertUsable = async () => { if (++checks > 1) throw Error('synthetic transport refusal'); };
+    assert.equal((await post('/input', { sessionId: session.id, text: 'synthetic failure' })).status, 200);
+    await waitFor(async () => life().state === 'failed' ? true : undefined);
+    const rootBefore = (await view()).entries.length;
+    assert.equal((await action('retry')).status, 200);
+    await waitFor(async () => life().state === 'failed' ? true : undefined);
+    assert.equal((await view()).entries.length, rootBefore, 'retry callback carries the named identity');
+    // Keep stop idempotent and ensure it targets the named generation.
+    await post('/model', { sessionId: session.id, model: null });
+    await post('/input', { sessionId: session.id, text: '[pause] stop me' });
+    assert.equal((await action('stop')).status, 200);
+    assert.equal(life().state, 'idle');
+    const revision = life().revision;
+    assert.equal((await action('stop', revision)).status, 200);
+    assert.equal(life().revision, revision);
+  } finally { await app.created.close(); }
 });

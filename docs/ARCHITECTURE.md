@@ -99,7 +99,10 @@ the agent's own choices).
   working state in the same control store as the approvals and the delivery ledger — one operation
   per revision, so the revision is a real compare-and-swap and no second database is introduced — and
   a rename, link or unlink with a stale revision is a conflict that changes nothing. The declared
-  model choice is recorded, never applied: the registry opens no harness and changes no selection.
+  model choice is recorded, never applied: the registry opens no harness and changes no selection. The
+  session-to-conversation identity is a separate revision-1 binding operation in the same control store, keyed by
+  project and session id with an audit outbox; the harness's in-process map is only a cache. A named session's
+  conversation is created once, then resolved from that binding after restart rather than silently forked again.
   See [Sessions](SESSIONS.md) and [Migrating the legacy conversation](MIGRATION.md).
 - **Durable execution state.** Each session also carries a durable **lifecycle** — a closed state
   (`idle`, `running`, `paused`, `interrupted`, `failed`), a revision, the attempt and request
