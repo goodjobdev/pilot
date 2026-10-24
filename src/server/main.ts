@@ -776,7 +776,14 @@ export async function createApp(options:AppOptions){
   };
   const actions=new ActionRegistry(actionEnvironment);
   const previews=new Map<string,{projectId:string;revision:string;preview:ImportPreview;documents:{name:string;content:string}[];expires:number}>();
+  let closing=false;
+  const streams=new Set<{end:()=>void;done:Promise<void>}>();
+  const streamFailures:unknown[]=[];
   const server=createServer(async(req,res)=>{
+    // A response can become idle after server.close() checked existing keep-alives.
+    // Reap only idle connections on completion, including ordinary draining writers.
+    res.once('finish',()=>{if(closing)server.closeIdleConnections();});
+    if(closing){res.statusCode=503;res.setHeader('Connection','close');res.end();return;}
     headers(res);
     // Operational visibility without secrets: method, path and status only.
     const logged=(req.url??'/').split('?')[0];
@@ -1346,22 +1353,36 @@ export async function createApp(options:AppOptions){
           }
           if(agentsRoute[2]==='abort'&&req.method==='POST'){const data=z.strictObject({sessionId:z.string().min(1).max(200).optional()}).parse(payload);await agents.abort(p,data.sessionId);json({ok:true});return;}
           if(agentsRoute[2]==='stream'&&req.method==='GET'){
+            if(closing){res.statusCode=503;res.end();return;}
             res.statusCode=200;res.setHeader('Content-Type','text/event-stream');res.setHeader('Cache-Control','no-store');res.setHeader('Connection','keep-alive');
             res.write('retry: 3000\n\n');
             // Accept optional sessionId so the owner can switch between per-session transcripts.
             const streamSessionId=url.searchParams.get('sessionId')||undefined;
             let closed=false,dispose:(()=>Promise<void>)|undefined;
             let keepAlive:ReturnType<typeof setInterval>|undefined;
-            // The client can disconnect while subscribe opens the durable conversation. Install
-            // cleanup before that await, and dispose a subscription that arrives after close.
-            res.once('close',()=>{closed=true;clearInterval(keepAlive);void dispose?.();});
-            try{
-              dispose=await agents.subscribe(p,view=>{if(!closed)res.write('data: '+JSON.stringify(view)+'\n\n');},streamSessionId);
-            }catch(e){
-              if(!closed){res.write('event: error\ndata: '+JSON.stringify({error:(e as Error).message})+'\n\n');res.end();}return;
-            }
-            if(closed){await dispose();return;}
-            keepAlive=setInterval(()=>{if(!closed)res.write(': keep-alive\n\n');},20000);
+            let finish!:()=>void;
+            const ended=new Promise<void>(resolve=>{finish=resolve;});
+            const end=()=>{
+              if(closed)return;
+              closed=true;clearInterval(keepAlive);finish();
+              if(!res.destroyed&&!res.writableEnded)res.end();
+            };
+            // Track setup as well as the response: a disconnect or shutdown can precede
+            // the asynchronous subscription. Its late disposer must finish before agents close.
+            res.once('close',end);
+            const stream={end,done:Promise.resolve()};
+            streams.add(stream);
+            stream.done=(async()=>{
+              try{
+                dispose=await agents.subscribe(p,view=>{if(!closed)res.write('data: '+JSON.stringify(view)+'\n\n');},streamSessionId);
+              }catch(e){
+                if(!closed)res.write('event: error\ndata: '+JSON.stringify({error:(e as Error).message})+'\n\n');
+                end();return;
+              }
+              if(!closed)keepAlive=setInterval(()=>{if(!closed)res.write(': keep-alive\n\n');},20000);
+              await ended;
+              await dispose();
+            })().catch(e=>{streamFailures.push(e);}).finally(()=>{streams.delete(stream);});
             return;
           }
         }
@@ -1446,9 +1467,13 @@ export async function createApp(options:AppOptions){
     // "close failed". A failed start (for example a port already in use) must still drain and
     // release the lock that this same start created, and must report the original failure instead.
     // Any other close error stays fatal and remains, with the deadline, the only retention cause.
-    await new Promise<void>((ok,fail)=>server.close(error=>{
+    closing=true;
+    const httpClosed=new Promise<void>((ok,fail)=>server.close(error=>{
       if(!error||(error as NodeJS.ErrnoException).code==='ERR_SERVER_NOT_RUNNING')ok();else fail(error);
     }));
+    for(const stream of streams)stream.end();
+    await Promise.all([httpClosed,...Array.from(streams,stream=>stream.done)]);
+    if(streamFailures.length)throw streamFailures[0];
     await repositories.close();await boards.drain();await docs.drain();await agents.close();await providers.close();await catalog.close();}};
 }
 /** A server that cannot drain must not be able to hold the data root forever. */
@@ -1851,7 +1876,12 @@ async function main(){
       // The store is closed before the lock is released: the lock must outlive every writer, and a
       // close failure is reported rather than hidden behind a successful exit.
       try {control?.close();}
-      catch(error){console.error('Could not close the control store: '+(error as Error).message);process.exitCode=1;}
+      catch(error){
+        // Ownership must survive any writer cleanup failure, including the final store.
+        // Exit explicitly: a failed close may leave resources that prevent normal exit.
+        writeSync(2,'Could not close the control store: '+(error as Error).message+'; the service lock at '+lockPath+' is intentionally retained and no automatic recovery is performed.\n');
+        process.exit(1);
+      }
       try {await lock.release();lockHeld=false;}
       catch(error){console.error('Could not release '+lockPath+': '+(error as Error).message);process.exitCode=1;}
     }

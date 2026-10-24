@@ -29,10 +29,29 @@ function testEnv(overrides:NodeJS.ProcessEnv):NodeJS.ProcessEnv {
   return {...env,...overrides} as NodeJS.ProcessEnv;
 }
 /** The release layout the entrypoint is launched through, including the current symlink. */
-async function releaseRoot():Promise<string> {
+async function releaseRoot(fixture?:'reject-disposer'|'stuck-disposer'|'control-close'|'delayed-writer'):Promise<string> {
   const root=await mkdtemp(join(tmpdir(),'dashboard-entry-'));
   const release=join(root,'releases','v1');await mkdir(release,{recursive:true});
-  await build({entryPoints:[resolve('src/server/main.ts')],bundle:true,platform:'node',format:'esm',packages:'external',outfile:join(release,'server.mjs')});
+  // Synthetic test builds inject faults into the real entrypoint. No runtime flag or
+  // production endpoint can enable these hooks; ordinary builds contain none of them.
+  const fixtureCode=fixture==='control-close'
+    ? `store.close=()=>{throw new Error('synthetic control close failure');};`
+    : fixture==='reject-disposer'||fixture==='stuck-disposer'
+    ? `const subscribe=app.agents.subscribe.bind(app.agents);
+       app.agents.subscribe=async(...args)=>{await subscribe(...args);return async()=>{${fixture==='reject-disposer' ? "throw new Error('synthetic disposer failure');" : 'await new Promise(()=>{});'}};};`
+    : fixture==='delayed-writer'
+    ? `const create=app.docs.create.bind(app.docs);
+       app.docs.create=async(...args)=>{writeSync(2,'synthetic writer started\\n');await new Promise(ok=>setTimeout(ok,500));return create(...args);};`
+    : '';
+  await build({entryPoints:[resolve('src/server/main.ts')],bundle:true,platform:'node',format:'esm',packages:'external',outfile:join(release,'server.mjs'),plugins:fixture?[{
+    name:'synthetic-shutdown-fixture',setup(build){
+      build.onLoad({filter:/\/src\/server\/main\.ts$/},async args=>{
+        const source=await readFile(args.path,'utf8'),anchor='    let reason:NodeJS.Signals|null=null,failure:unknown=null;';
+        assert.equal(source.split(anchor).length,2,'the fixture must patch exactly one entrypoint location');
+        return {contents:source.replace(anchor,fixtureCode+'\n'+anchor),loader:'ts'};
+      });
+    },
+  }]:[]});
   // Production externals resolve from the app's installed dependencies, not this disposable root.
   await symlink(resolve('node_modules'),join(release,'node_modules'),'dir');
   // The local-mode session token is injected into the page it serves, so a test that needs an
@@ -287,6 +306,86 @@ test('the entrypoint starts through the current release symlink, holds the start
   await rm(root,{recursive:true,force:true});
  }
 });
+test('SIGTERM ends an uncancelled SSE client and releases the service lock', {timeout:15000}, async()=>{
+ const root=await releaseRoot(),data=join(root,'data'),port=await freePort();
+ const child=spawnServer(join(root,'current','server.mjs'),{DASHBOARD_MODE:'local',DASHBOARD_DATA:data,PORT:String(port),DASHBOARD_SHUTDOWN_DEADLINE_MS:'2000',DASHBOARD_AGENTS:'on',DASHBOARD_REGISTRY:'',DASHBOARD_ROOTS:''});
+ const logs=collect(child),exited=once(child,'exit');
+ try{
+  await waitForListening(child,logs.stderr);
+  const token=await sessionToken(port),base='http://127.0.0.1:'+port;
+  const created=await fetch(base+'/api/projects',{method:'POST',headers:{'x-dashboard-token':token,'content-type':'application/json',origin:base},body:JSON.stringify({name:'Shutdown stream',managed:true,confirm:true})});
+  assert.equal(created.status,201);
+  const project=await created.json() as {id:string};
+  const response=await fetch(base+'/api/projects/'+project.id+'/agents/stream',{headers:{'x-dashboard-token':token}});
+  assert.equal(response.status,200);
+  // Wait for a real subscription view, not just the initial retry frame.
+  const reader=response.body!.getReader();
+  let text='';
+  while(!text.includes('data: ')){
+   const chunk=await reader.read();assert.equal(chunk.done,false);
+   text+=new TextDecoder().decode(chunk.value);
+  }
+  child.kill('SIGTERM');
+  while(!(await reader.read()).done) { /* server-owned EOF; never cancel the client */ }
+  assert.equal(await waitForExit(child,exited,logs),0,logs.stderr());
+  await assert.rejects(stat(join(data,'service.lock')),{code:'ENOENT'});
+  assert.doesNotMatch(logs.stderr(),/intentionally retained/);
+ }finally{
+  await stop(child,exited,'SIGKILL');
+  await rm(root,{recursive:true,force:true});
+ }
+});
+
+for(const fixture of ['reject-disposer','stuck-disposer','control-close','delayed-writer'] as const) test(`production shutdown handles synthetic ${fixture}`, {timeout:15000}, async()=>{
+ const root=await releaseRoot(fixture),data=join(root,'data'),port=await freePort();
+ const child=spawnServer(join(root,'current','server.mjs'),{DASHBOARD_MODE:'local',DASHBOARD_DATA:data,PORT:String(port),DASHBOARD_SHUTDOWN_DEADLINE_MS:'1500',DASHBOARD_AGENTS:'on',DASHBOARD_REGISTRY:'',DASHBOARD_ROOTS:''});
+ const logs=collect(child),exited=once(child,'exit');
+ try{
+  await waitForListening(child,logs.stderr);
+  const token=await sessionToken(port),base='http://127.0.0.1:'+port;
+  const headers={'x-dashboard-token':token,'content-type':'application/json',origin:base};
+  const created=await fetch(base+'/api/projects',{method:'POST',headers,body:JSON.stringify({name:'Synthetic shutdown',managed:true,confirm:true})});
+  assert.equal(created.status,201);
+  const project=await created.json() as {id:string;path:string};
+  const response=await fetch(base+'/api/projects/'+project.id+'/agents/stream',{headers});
+  assert.equal(response.status,200);
+  const reader=response.body!.getReader();
+  let text='';
+  while(!text.includes('data: ')){
+   const chunk=await reader.read();assert.equal(chunk.done,false);
+   text+=new TextDecoder().decode(chunk.value);
+  }
+  let writerFinished=false;
+  const writer=fixture==='delayed-writer'
+   ? fetch(base+'/api/projects/'+project.id+'/docs/document',{method:'POST',headers,body:JSON.stringify({path:'shutdown-proof.md',text:'# Drained normally\n'})}).then(async res=>{const body=await res.text();writerFinished=true;return {status:res.status,body};})
+   : undefined;
+  if(writer)await waitFor(async()=>logs.stderr().includes('synthetic writer started')?true:undefined);
+  const lockEvidence=await readFile(join(data,'service.lock'),'utf8');
+  const start=Date.now();
+  child.kill('SIGTERM');
+  while(!(await reader.read()).done) { /* the server owns EOF */ }
+  if(writer){
+   assert.equal(writerFinished,false,'SSE ends before the ordinary writer finishes');
+   assert.equal((await writer).status,201);
+   assert.equal(await readFile(join(project.path,'shutdown-proof.md'),'utf8'),'# Drained normally\n');
+  }
+  const code=await waitForExit(child,exited,logs);
+  assert.ok(Date.now()-start<5000,'production shutdown must finish within a bounded interval');
+  if(writer){
+   assert.equal(code,0,logs.stderr());
+   await assert.rejects(stat(join(data,'service.lock')),{code:'ENOENT'});
+  }else{
+   assert.notEqual(code,0,logs.stderr());
+   assert.equal(await readFile(join(data,'service.lock'),'utf8'),lockEvidence,'failed cleanup preserves the exact ownership evidence');
+   assert.match(logs.stderr(),/intentionally retained/);
+   assert.match(logs.stderr(),fixture==='stuck-disposer'?/Shutdown did not finish within 1500ms/:fixture==='control-close'?/Could not close the control store: synthetic control close failure/:/Shutdown failed/);
+  }
+ }finally{
+  await stop(child,exited,'SIGKILL');
+  await rm(root,{recursive:true,force:true});
+ }
+});
+
 test('a drain that misses its deadline retains the lock and reports the timeout, and the root is usable once the operator clears it',async()=>{
  const root=await releaseRoot(),data=join(root,'data');
  const port=await freePort();

@@ -952,6 +952,38 @@ test('an agent stream disconnected during subscription disposes the late subscri
   }
 });
 
+for (const delayed of [false, true]) test(`shutdown ends an attached SSE client and drains ${delayed ? 'late' : 'active'} subscription`, { timeout: 10000 }, async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agents-stream-shutdown-'));
+  const app = await instance('on', root);
+  let release!: () => void;
+  const pending = new Promise<void>(resolve => { release = resolve; });
+  let disposed = 0, agentsClosed = false;
+  const originalClose = app.created.agents.close.bind(app.created.agents);
+  app.created.agents.subscribe = async () => {
+    if (delayed) await pending;
+    return async () => { assert.equal(agentsClosed, false); disposed++; };
+  };
+  app.created.agents.close = async () => { agentsClosed = true; await originalClose(); };
+  try {
+    const response = await fetch(app.base + '/stream', { headers: app.token });
+    assert.equal(response.status, 200);
+    const closing = app.created.close();
+    // Do not cancel the client: the server must send EOF itself, even during setup.
+    assert.match(await response.text(), /retry: 3000/);
+    if (delayed) {
+      assert.equal(agentsClosed, false, 'agent shutdown waits for subscription setup');
+      assert.equal(disposed, 0);
+    }
+    release();
+    await closing;
+    assert.equal(disposed, 1);
+    assert.equal(agentsClosed, true);
+  } finally {
+    release();
+    if (!agentsClosed) await app.created.close();
+  }
+});
+
 test('P0: a first-time named session records exactly one conversation binding', async () => {
   const root = await mkdtemp(join(tmpdir(), 'agents-p0-first-'));
   const app = await instance('on', root, 100, true);
