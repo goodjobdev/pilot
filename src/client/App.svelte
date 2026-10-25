@@ -1,5 +1,5 @@
 <script lang="ts">
- import { onMount } from 'svelte';
+ import { onMount,tick } from 'svelte';
  import ProjectSidebar from './ProjectSidebar.svelte';
  import AddProjectDialog from './AddProjectDialog.svelte';
  import ImportReview from './ImportReview.svelte';
@@ -20,6 +20,8 @@
  import ProjectConnection from './ProjectConnection.svelte';
  import AgentManager from './AgentManager.svelte';
  import { api,session,ApiError,download,whenSessionExpires } from './api';
+ import { HistoryStack,isHomeScreen,isView,narrowView,parseRoute,sameRoute,urlForRoute,type RouteSnapshot,type View } from './navigation';
+ import { readSelectedSession,writeSelectedSession } from './drafts';
  import type { Board,Operation,Project,Snapshot } from '../shared/model';
  import type { DocEntry,DocSnapshot } from '../shared/docs';
  import { newTask } from '../shared/model';
@@ -30,12 +32,21 @@
  import './theme.css';
  let projects=$state<Project[]>([]),project=$state<Project|null>(null),snapshot=$state<Snapshot|null>(null);
  let adding=$state(false),importing=$state(false),settings=$state(false),error=$state(''),loading=$state(false),missingBoard=$state(false);
- let view=$state(window.innerWidth<750?'List':'Dependencies'),search=$state(''),domain=$state('all'),status=$state('all'),scope=$state('all'),selected=$state('');
+ let view=$state<View>(window.innerWidth<750?'List':'Dependencies'),search=$state(''),domain=$state('all'),status=$state('all'),scope=$state('all'),selected=$state('');
+ // The selected named session ('' is the project's root conversation) and the session list. Both
+ // are part of the route or its layers, so Back and Forward move through them like any other layer.
+ let sessionId=$state(''),sessionListOpen=$state(false);
+ let narrowProjects=$state(window.innerWidth<=650),narrowDocs=$state(window.innerWidth<=900);
+ let booted=$state(false);
+ let stack:HistoryStack|null=null;
  let saving=$state(false),saveState=$state('Saved'),failed=$state(false),inspectorDirty=$state(false),undoStack=$state<Board[]>([]),redoStack=$state<Board[]>([]);
  let theme=$state<'dark'|'light'>(localStorage.getItem('dashboard.theme')==='light'?'light':'dark');
  let sidebarHidden=$state(localStorage.getItem('dashboard.sidebar.hidden')==='true'||(localStorage.getItem('dashboard.sidebar.hidden')===null&&window.innerWidth<900));
  let actionsMenu=$state<HTMLDivElement>(),filtersMenu=$state<HTMLDivElement>();
  let docs=$state<DocEntry[]>([]),doc=$state<DocSnapshot|null>(null),docDraft=$state(''),docEditing=$state(false),docDirty=$state(false),docConflict=$state(false),docSaving=$state(false),docMessage=$state(''),docsError=$state(''),treeOpen=$state(false);
+ // The document the route names while its read is still pending. The address and the history
+ // entry use this path from the first frame, so a direct document link writes one entry, not two.
+ let requestedDoc=$state<string|null>(null);
  let actionsOpen=$state(false),filtersOpen=$state(false),inboxOpen=$state(false),paletteOpen=$state(false);
  let inbox=$state<{path:string;line:number;text:string;anchor:string|null;id:string}[]>([]),focusAnchor=$state<string|null>(null),inboxMenu=$state<HTMLDivElement>();
  let agentQuestions=$state<{id:string;text:string}[]>([]);
@@ -51,12 +62,74 @@
  let doing=$derived(snapshot?.board.tasks.filter(t=>t.status==='doing').length??0);
  let done=$derived(snapshot?.board.tasks.filter(t=>t.status==='done').length??0);
  let visible=$derived(snapshot?.board.tasks.filter(t=>!t.archived&&(!search||t.title.toLowerCase().includes(search.toLowerCase()))&&(domain==='all'||t.domain===domain)&&(status==='all'||t.status===status)&&(scope==='all'||t.scope===scope))??[]);
+
+ /*
+  * The layers above the route, oldest first. A layer key is all history stores: the application
+  * owns what it means. The order puts a drawer under a panel, a panel under a menu, a menu under
+  * a dialog and the palette on top, which is the order these can really be open in.
+  */
+ const LAYER_ORDER=['drawer:projects','drawer:docs','panel:inbox','menu:actions','menu:filters','panel:sessions','dialog:settings','dialog:import','dialog:add','dialog:providers','dialog:agentManager','dialog:connection','dialog:palette'] as const;
+ const VIEW_MODES:View[]=['Dependencies','Timeline','List','Wiki','Agents'];
+ function currentLayers():string[]{
+   const open:Record<string,boolean>={
+     'drawer:projects':!sidebarHidden&&narrowProjects,
+     'drawer:docs':treeOpen&&narrowDocs,
+     'panel:inbox':inboxOpen,
+     'menu:actions':actionsOpen,
+     'menu:filters':filtersOpen,
+     'panel:sessions':sessionListOpen,
+     'dialog:settings':settings,
+     'dialog:import':importing,
+     'dialog:add':adding,
+     'dialog:providers':providersOpen,
+     'dialog:agentManager':agentManagerOpen,
+     'dialog:connection':connectionOpen,
+     'dialog:palette':paletteOpen,
+   };
+   return LAYER_ORDER.filter(key=>open[key]);
+ }
+ /** A route as history stores it. Layer contents are not part of the address. */
+ function routeSnapshot():RouteSnapshot{
+   return {project:project?.id??null,view,doc:requestedDoc??doc?.path??null,session:sessionId,layers:currentLayers()};
+ }
+ function setLayer(key:string,open:boolean):void{
+   switch(key){
+     case 'drawer:projects': sidebarHidden=!open;if(open&&narrowDocs)treeOpen=false;break;
+     case 'drawer:docs': treeOpen=open;break;
+     case 'panel:inbox': inboxOpen=open;break;
+     case 'menu:actions': actionsOpen=open;break;
+     case 'menu:filters': filtersOpen=open;break;
+     case 'panel:sessions': sessionListOpen=open;break;
+     case 'dialog:settings': if(open&&!snapshot)return;settings=open;break;
+     case 'dialog:import': if(open&&!project)return;importing=open;break;
+     case 'dialog:add': adding=open;break;
+     case 'dialog:providers': providersOpen=open;break;
+     case 'dialog:agentManager': agentManagerOpen=open;break;
+     case 'dialog:connection': if(open&&!project)return;connectionOpen=open;break;
+     case 'dialog:palette': paletteOpen=open;break;
+   }
+ }
+ /** Close the layers the target does not name, then open the ones it adds, in order. */
+ function applyLayers(target:string[]):void{
+   for(const key of [...currentLayers()].reverse())if(!target.includes(key))setLayer(key,false);
+   for(const key of target)if(!currentLayers().includes(key))setLayer(key,true);
+ }
+ /** Unsaved document text: an edit not yet saved, or a save the server has not accepted. */
+ function docUnsaved():boolean{return Boolean(doc)&&(docDirty||(docEditing&&docDraft!==doc!.text));}
+ function storedSession(id:string):string{
+   const stored=readSelectedSession(typeof localStorage==='undefined'?null:localStorage,id);
+   return stored.status==='selected'?stored.sessionId:'';
+ }
+
  $effect(()=>{document.documentElement.dataset.theme=theme;localStorage.setItem('dashboard.theme',theme);});
  $effect(()=>{if(project)localStorage.setItem('dashboard.filters.'+project.id,JSON.stringify({search,domain,status,scope,view}));});
  $effect(()=>{try{localStorage.setItem('dashboard.sidebar.hidden',String(sidebarHidden));}catch{/* UI preference is optional */}});
  // The narrow-screen project drawer starts below the header stack so it never covers
  // the command bar. The offset is measured because the header wraps on small screens.
  $effect(()=>{ void view; void project; void error; measureHeader(); });
+ // Follow the application state with history. Reading the snapshot here is what subscribes the
+ // effect to the route and the layer flags; no state change writes history by itself.
+ $effect(()=>{const next=routeSnapshot();if(!booted||!stack)return;stack.sync(next);});
  function measureHeader(){
    const area=(shell?.querySelector('.view-area')??null) as HTMLElement|null;
    const top=area?Math.round(area.getBoundingClientRect().top):0;
@@ -64,6 +137,23 @@
  }
  onMount(()=>{const onResize=()=>measureHeader();window.addEventListener('resize',onResize);return()=>window.removeEventListener('resize',onResize);});
  onMount(()=>{
+   // The two narrow layouts have their own drawers: the project rail below 650px and the document
+   // tree below 900px. Reading them from a media query keeps the layer list right after a rotation.
+   const projectQuery=matchMedia('(max-width:650px)'),docsQuery=matchMedia('(max-width:900px)');
+   const onMedia=()=>{narrowProjects=projectQuery.matches;narrowDocs=docsQuery.matches;if(!docsQuery.matches)treeOpen=false;};
+   onMedia();
+   projectQuery.addEventListener('change',onMedia);
+   docsQuery.addEventListener('change',onMedia);
+   // One stack owns history for the whole application. The application state is the truth.
+   stack=new HistoryStack({
+     history:window.history,
+     snapshot:routeSnapshot,
+     apply:applyRoute,
+     canLeave:canLeaveRoute,
+     urlFor:(snapshot)=>urlForRoute(snapshot,location.pathname),
+   });
+   const onPop=(event:PopStateEvent)=>stack?.onPop(event.state);
+   window.addEventListener('popstate',onPop);
    // Any request that meets the sign-in layer instead of the application reports here, and a
    // periodic probe warns before a form is filled in rather than after it fails.
    whenSessionExpires(()=>{sessionExpired=true;});
@@ -72,7 +162,7 @@
    document.addEventListener('visibilitychange',onVisible);
    void boot();
    const stopAlerts=onAlertNavigation(url=>void followAlert(url));
-   return ()=>{clearInterval(probe);document.removeEventListener('visibilitychange',onVisible);stopAlerts();};
+   return ()=>{clearInterval(probe);document.removeEventListener('visibilitychange',onVisible);stopAlerts();window.removeEventListener('popstate',onPop);projectQuery.removeEventListener('change',onMedia);docsQuery.removeEventListener('change',onMedia);};
  });
  async function checkSession(){
    try{await session();sessionExpired=false;}
@@ -100,20 +190,81 @@
    catch(e){alertMessage=(e as Error).message;}
    finally{alertBusy=false;}
  }
- function readDeepLink():{projectId:string|null;view:string|null}{
-   const params=new URLSearchParams(location.search);
-   const projectId=params.get('project'),view=params.get('view');
-   if(projectId!==null||view!==null)history.replaceState({},'',location.pathname);
-   return {projectId,view};
+ /** Apply one history entry. It must leave the application showing exactly this route. */
+ async function applyRoute(target:RouteSnapshot){
+   // Flush a pending draft write before a session or view can unmount its composer.
+   window.dispatchEvent(new Event('pilot:navigate'));
+   // A layer the person opens while this apply is waiting is their intent, not part of the entry
+   // being applied. Keep it after the route settles instead of closing it with the target's list.
+   const layersAtStart=currentLayers();
+   const p=target.project?projects.find(candidate=>candidate.id===target.project)??null:null;
+   if(target.project&&!p){error='That project is no longer registered.';applyLayers([]);return;}
+   if(p&&p.id!==project?.id){
+     await select(p,{view:target.view,doc:target.doc,session:target.session,confirmed:true,fromRoute:true});
+   }else if(p){
+     if(target.view!==view)setView(target.view,{fromRoute:true});
+     if(target.view==='Wiki'){
+       if(target.doc&&target.doc!==(requestedDoc??doc?.path??null))await openDoc(target.doc,{force:true});
+       else if(!target.doc&&(doc||requestedDoc))clearDoc();
+     }else if(!target.doc&&(doc||requestedDoc)){
+       // A direct link to a board view carries no document; do not keep one from the view just left.
+       clearDoc();
+     }
+     sessionId=target.session;
+   }else{
+     // The route names no project: show the project control state rather than staying on the
+     // project this page happened to show a moment ago.
+     project=null;snapshot=null;loading=false;selected='';docs=[];docsError='';clearDoc();
+     if(target.view!==view)setView(target.view,{fromRoute:true});
+     sessionId=target.session;
+   }
+   // A layer opened during the apply is intent to keep. A layer closed during the apply is intent
+   // to keep closed, even when the entry being applied names it. The reconciliation is symmetric.
+   const now=currentLayers();
+   const opened=now.filter(key=>!layersAtStart.includes(key));
+   const closed=layersAtStart.filter(key=>!now.includes(key));
+   applyLayers([
+     ...target.layers.filter(key=>!closed.includes(key)),
+     ...opened.filter(key=>!target.layers.includes(key)&&!closed.includes(key)),
+   ]);
  }
- /** An alert tap names the project and the view that needs attention. */
+ /** Refuse a traversal that would throw away text the person has not saved. */
+ function canLeaveRoute(current:RouteSnapshot,target:RouteSnapshot):boolean{
+   if(sameRoute(current,target))return true;
+   if(docUnsaved()&&(target.project!==current.project||target.doc!==current.doc))return confirm('Discard unsaved document edits?');
+   if(inspectorDirty&&(target.project!==current.project||target.view!==current.view))return confirm('Discard unapplied task edits? Export the task draft first if needed.');
+   if((saving||failed)&&target.project!==current.project)return confirm('A board save is pending or conflicted. Export the draft before leaving. Discard these edits?');
+   return true;
+ }
+ /** The application's selected session changed (a person chose one, or fell back). */
+ function sessionChanged(id:string):void{
+   sessionId=id;sessionListOpen=false;
+   if(project)writeSelectedSession(localStorage,project.id,id||null);
+ }
+ /** A direct session link named a session this project does not have: root, with its list open. */
+ function sessionUnavailable():void{
+   sessionId='';
+   stack?.replaceCurrent(routeSnapshot());
+ }
+ /** An alert tap names the project and the view that needs attention, in one history step. */
  async function followAlert(url:string){
    try{
      const params=new URL(url,location.origin).searchParams;
      const projectId=params.get('project');
-     if(projectId){const found=projects.find(candidate=>candidate.id===projectId);if(found&&found.id!==project?.id)await select(found);}
-     const view=params.get('view');
-     if(view&&['Dependencies','Timeline','List','Wiki','Agents'].includes(view))setView(view);
+     const requested=params.get('view');
+     const target=isView(requested)?requested:null;
+     const found=projectId?projects.find(candidate=>candidate.id===projectId):undefined;
+     if(projectId&&!found){
+       error='The project in this notification is not registered. Nothing was opened.';
+       return;
+     }
+     const current=routeSnapshot();
+     const next:RouteSnapshot={...current,project:found?.id??current.project,view:target??current.view,layers:[]};
+     // A notification is not a reason to throw away unsaved text. A refusal changes nothing.
+     if(!canLeaveRoute(current,next))return;
+     if(found&&found.id!==project?.id)await select(found,{view:target??undefined,confirmed:true});
+     else if(target)setView(target);
+     error='';
    }catch{/* a malformed alert link is ignored */}
  }
  function command(action:()=>void){actionsOpen=false;action();}
@@ -129,22 +280,43 @@
    }
    if((e.metaKey||e.ctrlKey)&&!e.altKey&&!e.shiftKey&&e.key.toLowerCase()==='b'&&!(e.target instanceof Element&&e.target.closest('input,textarea,select,[contenteditable]:not([contenteditable="false"])'))){e.preventDefault();toggleSidebar();}
  }
- function leave(){return !(saving||failed||inspectorDirty||docDirty)||confirm('There are unsaved edits. Export your draft before leaving. Discard these edits?');}
+ function leave(){return !(saving||failed||inspectorDirty||docUnsaved())||confirm('There are unsaved edits. Export your draft before leaving. Discard these edits?');}
+ interface SelectOptions {view?:View;doc?:string|null;session?:string|null;confirmed?:boolean;fromRoute?:boolean}
  async function boot(){
    try{
      await session();
      projects=await api.projects();
-     const link=readDeepLink();
-     const id=link.projectId??localStorage.getItem('dashboard.project');
-     const p=projects.find(candidate=>candidate.id===id)??projects[0];
-     if(p)await select(p);
-     if(link.view&&['Dependencies','Timeline','List','Wiki','Agents'].includes(link.view))setView(link.view);
+     const link=parseRoute(location.search);
+     const remembered=localStorage.getItem('dashboard.project');
+     const named=link.project?projects.find(candidate=>candidate.id===link.project):undefined;
+     // A project named by the address must exist. A silent fallback could send an edit to the wrong
+     // project, so an unknown one shows an error and selects nothing; the person chooses instead.
+     if(link.project&&!named){
+       view=narrowView(link.view??(window.innerWidth<750?'List':'Dependencies'),window.innerWidth<750);
+       error='The project in this link is not registered. Choose a project from the sidebar.';
+     }else{
+       const p=named??projects.find(candidate=>candidate.id===remembered)??projects[0];
+       if(p)await select(p,{view:link.view??undefined,doc:link.doc,session:link.session??undefined,confirmed:true});
+       else view=narrowView(link.view??(window.innerWidth<750?'List':'Dependencies'),window.innerWidth<750);
+     }
    }catch(e){error=(e as Error).message;}
+   finally{
+     // Write the resolved route once, in place. Nothing before this point is a navigation.
+     booted=true;
+     stack?.start({homeScreen:isHomeScreen()});
+   }
  }
- async function select(p:Project){
-   if(!leave())return;project=p;snapshot=null;error='';missingBoard=false;loading=true;selected='';failed=false;inspectorDirty=false;saveState='Saved';undoStack=[];redoStack=[];doc=null;docDraft='';docEditing=false;docDirty=false;docConflict=false;docMessage='';docsError='';docs=[];localStorage.setItem('dashboard.project',p.id);
-   try{const filters=JSON.parse(localStorage.getItem('dashboard.filters.'+p.id)??'null');if(filters){search=filters.search??'';domain=filters.domain??'all';status=filters.status??'all';scope=filters.scope??'all';view=window.innerWidth<750?'List':filters.view??'Dependencies';}else{search='';domain='all';status='all';scope='all';}}catch{/* defaults */}
+ async function select(p:Project,opts:SelectOptions={}){
+   if(!opts.confirmed&&!leave())return;project=p;snapshot=null;error='';missingBoard=false;loading=true;selected='';failed=false;inspectorDirty=false;saveState='Saved';undoStack=[];redoStack=[];doc=null;docDraft='';docEditing=false;docDirty=false;docConflict=false;docMessage='';docsError='';docs=[];requestedDoc=null;if(!opts.fromRoute){treeOpen=false;sessionListOpen=false;}localStorage.setItem('dashboard.project',p.id);
+   let remembered:View|undefined;
+   try{const filters=JSON.parse(localStorage.getItem('dashboard.filters.'+p.id)??'null');if(filters){search=filters.search??'';domain=filters.domain??'all';status=filters.status??'all';scope=filters.scope??'all';if(isView(filters.view))remembered=filters.view;}else{search='';domain='all';status='all';scope='all';}}catch{/* defaults */}
+   const narrow=window.innerWidth<750;
+   view=opts.view?narrowView(opts.view,narrow):(narrow?'List':remembered??'Dependencies');
+   // Name the requested document before the read, so the route and the address carry it at once.
+   requestedDoc=view==='Wiki'?(opts.doc??null):null;
+   sessionId=opts.session??storedSession(p.id);
    try{const v=await api.board(p.id);if(project?.id===p.id)snapshot=v;}catch(e){if(project?.id===p.id){error=(e as Error).message;missingBoard=e instanceof ApiError&&e.status===404;}}finally{loading=false;void loadDocs();void loadInbox();}
+   if(view==='Wiki'&&opts.doc)void openDoc(opts.doc,{force:true});
  }
  async function created(p:Project){adding=false;projects=await api.projects();await select(p);if(p.repository)connectionOpen=true;}
  async function connected(){const id=project?.id;projects=await api.projects();const p=projects.find(p=>p.id===id);if(p)await select(p);}
@@ -167,17 +339,25 @@
  async function redo(){if(!snapshot||!redoStack.length)return;const before=structuredClone($state.snapshot(snapshot.board)),target=redoStack.at(-1)!;await mutate({op:'restore',board:target},false);if(!failed){redoStack=redoStack.slice(0,-1);undoStack=[...undoStack,before];}}
  function exported(){if(snapshot)download(failed?'unsaved-board.md':'board.md',serializeBoard($state.snapshot(snapshot.board)),'text/markdown');}
  function imported(s:Snapshot){snapshot=s;undoStack=[];redoStack=[];saveState='Saved';selected='';}
- function setView(mode:string){
+ function setView(mode:View,opts:{fromRoute?:boolean;openTree?:boolean}={}){
    view=mode;
+   sessionListOpen=false;
    if(mode==='Wiki'){
      if(project)void loadDocs();
      // One drawer at a time: on a narrow screen the document tree takes the place of the project drawer.
-     if(window.innerWidth<900){sidebarHidden=true;treeOpen=true;}
+     // The tree is a layer of its own, so it opens after the view's entry exists. Opening both in
+     // one update would write one entry for two layers, and Back would skip the view.
+     if(narrowDocs){
+       sidebarHidden=true;
+       if(!opts.fromRoute&&opts.openTree!==false)void tick().then(()=>{if(view==='Wiki'&&narrowDocs)treeOpen=true;});
+     }
+   }else{
+     treeOpen=false;
    }
  }
  function toggleSidebar(){
    sidebarHidden=!sidebarHidden;
-   if(!sidebarHidden&&window.innerWidth<900)treeOpen=false;
+   if(!sidebarHidden&&narrowDocs)treeOpen=false;
  }
  async function loadDocs(){
    if(!project)return;
@@ -194,15 +374,17 @@
  }
  function openQuestion(path:string,anchor:string|null){
    inboxOpen=false;focusAnchor=anchor;
-   if(view!=='Wiki')setView('Wiki');
+   if(view!=='Wiki')setView('Wiki',{openTree:false});
    void openDoc(path);
  }
- async function openDoc(path:string){
+ async function openDoc(path:string,opts:{force?:boolean}={}){
    if(!project)return;
-   if(docDirty&&!confirm('Discard unsaved document edits?'))return;
-   try{docsError='';const loaded=await api.doc(project.id,path);doc=loaded;docDraft=loaded.text;docEditing=false;docDirty=false;docConflict=false;docMessage='';treeOpen=false;}
-   catch(e){docsError=(e as Error).message;}
+   if(!opts.force&&docUnsaved()&&!confirm('Discard unsaved document edits?'))return;
+   requestedDoc=path;
+   try{docsError='';const loaded=await api.doc(project.id,path);doc=loaded;docDraft=loaded.text;docEditing=false;docDirty=false;docConflict=false;docMessage='';treeOpen=false;requestedDoc=null;}
+   catch(e){docsError=(e as Error).message;/* the address keeps the requested path, and the error says why */}
  }
+ function clearDoc(){doc=null;requestedDoc=null;docDraft='';docEditing=false;docDirty=false;docConflict=false;docMessage='';focusAnchor=null;}
  function editDoc(){if(doc){docEditing=true;docMessage='';}}
  function discardDoc(){docEditing=false;docDirty=false;docConflict=false;docDraft=doc?.text??'';}
  async function reloadDoc(){
@@ -232,9 +414,9 @@
  }
  function createDocPrompt(){const path=prompt('New document path','docs/');if(path&&path.trim())void createDoc(path.trim());}
 </script>
-<svelte:window onkeydown={keys} onclick={outside} onbeforeunload={(e)=>{if(saving||failed||inspectorDirty||docDirty){e.preventDefault();e.returnValue='';}}}/>
+<svelte:window onkeydown={keys} onclick={outside} onbeforeunload={(e)=>{if(saving||failed||inspectorDirty||docUnsaved()){e.preventDefault();e.returnValue='';}}}/>
 <div class="shell" bind:this={shell}>
- <ProjectSidebar {projects} selected={project?.id??''} hidden={sidebarHidden} onselect={select} onadd={()=>{if(leave())adding=true;}}/>
+ <ProjectSidebar {projects} selected={project?.id??''} hidden={sidebarHidden} ready={booted} onselect={select} onadd={()=>{if(leave())adding=true;}}/>
  <main class="workspace">
  <header class="appbar">
   <button class="icon-button sidebar-toggle" aria-label={sidebarHidden?'Show project sidebar':'Hide project sidebar'} aria-expanded={!sidebarHidden} aria-controls="project-sidebar" title="Toggle project sidebar (⌘/Ctrl B)" onclick={toggleSidebar}><Icon name="sidebar"/></button>
@@ -264,7 +446,7 @@
      <button class="danger-command" aria-label="Unregister project" onclick={()=>command(()=>{void remove();})}><Icon name="close"/>Unregister project…</button>
     </div>
    </div>
-   {:else}<button class="small-button" aria-label="＋ Add project" onclick={()=>adding=true}><Icon name="plus"/>Add project</button>{/if}
+   {:else}<button class="small-button" aria-label="＋ Add project" disabled={!booted} onclick={()=>adding=true}><Icon name="plus"/>Add project</button>{/if}
    {#if project}
    <div class="popover" bind:this={inboxMenu}>
     <button class="icon-button" aria-label={inboxCount?'Needs me ('+inboxCount+')':'Needs me'} title="Open questions and missing specifications" aria-expanded={inboxOpen} onclick={()=>{inboxOpen=!inboxOpen;actionsOpen=false;filtersOpen=false;if(inboxOpen){void loadInbox();void loadDocs();}}}><Icon name="book"/> {#if inboxCount}<span class="inbox-count">{inboxCount}</span>{/if}</button>
@@ -280,7 +462,7 @@
  {#if error}<div class="error workspace-error" role="alert">{error}<div class="row">{#if failed}<button onclick={exported}>Export unsaved draft</button><button onclick={()=>select(project!)}>Reload & review</button>{:else if !snapshot}<button onclick={locate}>Locate folder</button>{#if missingBoard}<button onclick={initialize}>Confirm & initialize board</button>{/if}{/if}</div></div>{/if}
  <div class="commandbar">
   <div class="view-switch" aria-label="Board views">
-   {#each ['Dependencies','Timeline','List','Wiki','Agents'] as mode}
+   {#each VIEW_MODES as mode}
    <button class:active={view===mode} aria-pressed={view===mode} aria-label={mode} title={mode} onclick={()=>setView(mode)}><Icon name={mode==='Dependencies'?'graph':mode==='Timeline'?'timeline':mode==='List'?'list':mode==='Wiki'?'book':'agent'} size={14}/><span class="view-label">{mode}</span></button>
    {/each}
   </div>
@@ -314,7 +496,7 @@
  <div class="view-area">
  {#if view==='Wiki'}
  <aside class="wiki-tree" class:open={treeOpen} id="wiki-tree">
-  {#if docsError}<p class="error doc-message">{docsError}</p>{/if}
+  {#if docsError}<p class="error doc-message" role="alert">{docsError}</p>{/if}
   <DocBrowser {docs} selected={doc?.path??''} projectId={project.id} onselect={(path)=>void openDoc(path)} oncreate={(path)=>void createDoc(path)} onclose={()=>treeOpen=false}/>
  </aside>
  <section class="wiki-doc">
@@ -327,7 +509,7 @@
   {/if}
  </section>
  {:else if view==='Agents'}
- <AgentsView projectId={project.id} {agentsVersion} onerror={(message)=>error=message} onquestions={()=>void loadInbox()}/>
+ <AgentsView projectId={project.id} {agentsVersion} sessionId={sessionId} onsessionchange={sessionChanged} sessionListOpen={sessionListOpen} onsessionlistchange={(open)=>sessionListOpen=open} onmissing={sessionUnavailable} onerror={(message)=>error=message} onquestions={()=>void loadInbox()}/>
  {:else}
  <div class="view-content">
  {#if loading}<div class="empty"><p>Loading board…</p></div>
@@ -353,7 +535,8 @@
   <span class="save-indicator" class:dirty={failed||inspectorDirty} role="status">{inspectorDirty?'Unapplied edits':saveState}</span>
  {/if}
  </footer>
- {:else}<div class="empty"><div class="empty-mark"><Icon name="graph" size={36}/></div><span class="eyebrow">PROJECT CONTROL</span><h2>A workspace for the work.</h2><p>Dependencies, milestones and persistent Markdown. Add a project to start.</p><button class="primary" onclick={()=>adding=true}>＋ Add project</button>{#if error}<p role="alert" class="error">{error}</p>{/if}</div>{/if}
+ {:else if !booted}<div class="empty" role="status"><p>Opening Pilot…</p></div>
+ {:else}<div class="empty"><div class="empty-mark"><Icon name="graph" size={36}/></div><span class="eyebrow">PROJECT CONTROL</span><h2>A workspace for the work.</h2><p>Dependencies, milestones and persistent Markdown. Add a project to start.</p><button class="primary" disabled={!booted} onclick={()=>adding=true}>＋ Add project</button>{#if error}<p role="alert" class="error">{error}</p>{/if}</div>{/if}
  </main>
 </div>
 {#if settings&&snapshot}<BoardSettings board={snapshot.board} onclose={()=>settings=false} onoperation={mutate}/>{/if}

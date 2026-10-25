@@ -4,7 +4,7 @@
  import type { AgentView } from '../shared/agent';
  import { uniqueImageFiles,type ImageCapability,type ImageDraft } from '../shared/images';
  import ImageComposer from './ImageComposer.svelte';
- import { DraftStore,attemptFor,clearSaveFailure,draftSaveMessage,droppedFailureMessage,markSaveFailure,readSaveFailure,readSelectedSession,restoredImageItems,sessionKeyOf,storedAttachments,writeSelectedSession,type StoredAttempt,type StoredDraft } from './drafts';
+ import { DraftStore,attemptFor,clearSaveFailure,draftSaveMessage,droppedFailureMessage,markSaveFailure,readSaveFailure,restoredImageItems,sessionKeyOf,storedAttachments,type StoredAttempt,type StoredDraft } from './drafts';
  type Capability={state:'known';provider:string;modelId:string;acceptsImages:boolean}|{state:'unknown';reason:string};
  type CachedDraft={text:string;media:ImageDraft[];attempt:StoredAttempt|null;savedAt:number|null;unsaved:boolean};
  import Icon from './Icon.svelte';
@@ -15,15 +15,23 @@
  import {activityArrived,arrivalAfterFrame,countLabel,followIdentity,indicatorLabel,initialFollow,isNearBottom,readerScrolled,readerStillFollowing,type FollowState} from './follow';
  import SessionBar from './SessionBar.svelte';
  import SessionActivity from './SessionActivity.svelte';
- let { projectId,onerror,onquestions,agentsVersion=0 }:{ projectId:string; onerror:(message:string)=>void; onquestions?:()=>void; agentsVersion?:number }=$props();
+ let { projectId,sessionId='',onsessionchange=()=>{},sessionListOpen=false,onsessionlistchange=()=>{},onmissing=()=>{},onerror,onquestions,agentsVersion=0 }:{
+   projectId:string; sessionId?:string; onsessionchange?:(id:string)=>void;
+   sessionListOpen?:boolean; onsessionlistchange?:(open:boolean)=>void; onmissing?:()=>void;
+   onerror:(message:string)=>void; onquestions?:()=>void; agentsVersion?:number;
+ }=$props();
  let view=$state<AgentView|null>(null),enabled=$state(true),draft=$state(''),sending=$state(false),problem=$state('');
  // The stream's own state. `lastViewAt` is when a full snapshot was accepted, which is
  // different from transport freshness: an idle session stays `live` on keep-alives.
  let connection=$state<ConnectionStatus>({state:'connecting',detail:'Connecting…',attempt:0,lastFrameAt:null,lastViewAt:null});
  let reconnectNonce=$state(0),clock=$state(Date.now()),streamedIdentity='';
- // The session whose transcript the stream should follow. Updated when the owner selects a session
- // in the session bar. An empty or absent value means the root (legacy project) conversation.
+ // The session whose transcript the stream should follow. The route owns this value: the shell
+ // passes the session named by the address or remembered for the project, and Back or Forward
+ // changes it. An empty value means the project's root conversation.
  let selectedSessionId=$state('');
+ // A direct link to a session this project does not have falls back to the root conversation and
+ // opens the named-session list, instead of showing an empty transcript with no explanation.
+ let sessionFallback=$state('');
  let answers=$state<Record<string,string>>({}),answering=$state('');
  // The images attached to the next message, and the one way the composer's upload path is fed.
  let media=$state<ImageDraft[]>([]),composerApi=$state<{add:(files:File[])=>void}|null>(null),composerDragging=$state(false);
@@ -70,24 +78,37 @@
  const UNSAVED_SEND_WARNING='The message and its request identity could not be saved locally. Admission can still succeed if the reply is lost, and a reload may not recognise it as already sent. Check the transcript before resending. Copying or downloading keeps the text only; it does not prevent a duplicate.';
  const imageCapabilityBlocked=$derived(readyImages.length>0&&capability.state==='known'&&capability.acceptsImages===false);
  const sendHoldReason=$derived(uploadingImages?'An image is still uploading: the message is held until it is stored':checkingImages?'A stored image is still being checked: the message is held until it is ready':imageCapabilityBlocked?'The model for this session does not accept images':'');
- let lastProject='';
- // Return to the session the owner was last reading. The selection is only a preference: it is
- // validated against the server's session list, and an unknown one falls back to the root
- // conversation instead of opening a session that no longer exists.
+ // A session id is bounded by the server's own rule before it is used for a request or shown.
+ const SESSION_ID=/^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$/;
+ const SESSION_FALLBACK='The session named in this link is not in this project. Choose a session from the list.';
+ function sessionMissing():void{
+   selectedSessionId='';
+   sessionFallback=SESSION_FALLBACK;
+   onsessionchange('');
+   onsessionlistchange(true);
+   onmissing();
+ }
+ // Follow the route's session. The shell resolves the remembered selection at boot and on a
+ // project change; this component never writes a different session into the route by itself.
+ let fallbackProject='';
  $effect(()=>{
    const project=projectId;
-   if(project===lastProject)return;
-   lastProject=project;
-   const stored=readSelectedSession(draftStorage,project);
-   if(stored.status!=='selected')return;
-   selectedSessionId=stored.sessionId;
+   if(project!==fallbackProject){fallbackProject=project;sessionFallback='';}
+   if(sessionId===selectedSessionId)return;
+   if(sessionId&&!SESSION_ID.test(sessionId)){sessionMissing();return;}
+   selectedSessionId=sessionId;sessionFallback='';
+ });
+ // A named session is only a preference until the server confirms it exists in this project.
+ // A malformed id never reaches the server: the effect above already fell back.
+ $effect(()=>{
+   const project=projectId,wanted=sessionId;
+   if(!wanted||!SESSION_ID.test(wanted))return;
+   let current=true;
    void api.sessions(project).then(list=>{
-     if(project!==projectId||selectedSessionId!==stored.sessionId)return;
-     if(!list.sessions.some(session=>session.id===stored.sessionId)){
-       selectedSessionId='';
-       writeSelectedSession(draftStorage,project,null);
-     }
+     if(!current||project!==projectId||selectedSessionId!==wanted)return;
+     if(!list.sessions.some(session=>session.id===wanted))sessionMissing();
    }).catch(()=>{ /* the server still decides; the draft stays keyed by the selected id */ });
+   return ()=>{current=false;};
  });
  $effect(()=>{
    // An upload cannot follow the screen into another session: its callback is dropped when the
@@ -264,12 +285,18 @@
  $effect(()=>{
    const flush=()=>flushPendingSave();
    const hidden=()=>{if(document.visibilityState==='hidden')flush();};
+   // A navigation flushes before the session or view can change, so the last keystrokes are in
+   // storage and not only in this component.
+   const navigating=()=>flush();
    window.addEventListener('pagehide',flush);
+   window.addEventListener('pilot:navigate',navigating);
    document.addEventListener('visibilitychange',hidden);
-   return()=>{window.removeEventListener('pagehide',flush);document.removeEventListener('visibilitychange',hidden);flushPendingSave();};
+   return()=>{window.removeEventListener('pagehide',flush);window.removeEventListener('pilot:navigate',navigating);document.removeEventListener('visibilitychange',hidden);flushPendingSave();};
  }); function selectSession(id:string):void{
+   sessionFallback='';
    selectedSessionId=id;
-   writeSelectedSession(draftStorage,projectId,id||null);
+   // The shell writes the remembered selection and the address; this component follows the route.
+   onsessionchange(id);
  }
  /**
   * The one paste and drop handler for the whole composer area, which is what makes a gesture handled
@@ -294,6 +321,7 @@
    composerApi.add(uniqueImageFiles(files));
  }
  let transcript=$state<HTMLDivElement>();
+ let composerElement=$state<HTMLDivElement>();
  let streamGeneration=0;
  /**
   * Follow-scroll state for the transcript shown here.
@@ -650,7 +678,8 @@
  }
 </script>
 <section class="agents" class:compact={chromeCompact} bind:this={shell}>
- {#if view?.conversationId||selectedSessionId}<SessionBar {projectId} sessionId={selectedSessionId||view?.conversationId||''} {view} {agentsVersion} compact={chromeCompact} onerror={(message)=>onerror(message)} onsessionchange={(id)=>selectSession(id)}/>{/if}
+ {#if view?.conversationId||selectedSessionId}<SessionBar {projectId} sessionId={selectedSessionId||view?.conversationId||''} {view} {agentsVersion} compact={chromeCompact} listOpen={sessionListOpen} onlistchange={onsessionlistchange} onerror={(message)=>onerror(message)} onsessionchange={(id)=>selectSession(id)}/>{/if}
+ {#if sessionFallback}<p class="error agents-problem" role="alert">{sessionFallback}</p>{/if}
  {#snippet modelIdentity()}
  <div class="model-identity">
   <span class="eyebrow">{!view?.model||view.model.provider==='faux'?'SCRIPTED TEST PROVIDER':'MODEL PROVIDER'}</span>
@@ -677,7 +706,6 @@
    {#each modelSettings?.models.filter(m=>m.configured)??[] as m (modelKey(m))}<option value={modelKey(m)}>{modelSettings?.preferences.favourites.some(c=>modelKey(c)===modelKey(m))?'★ ':''}{m.provider} / {m.name}</option>{/each}
   </select></label>
   <span class="agent-state" class:busy={working} role="status">{working?'Working…':'Idle'}</span>
-  <button class="compact-button" aria-label="Stop the agent" disabled={!working} onclick={()=>void stop()}><Icon name="close" size={14}/><span>Stop</span></button>
  </header>
  {#if !enabled}
  <div class="empty"><div class="empty-mark"><Icon name="agent" size={32}/></div><h2>Agents are off here.</h2><p>This instance does not enable the agent harness, so nothing can run. Set <code>DASHBOARD_AGENTS=on</code> to enable it.</p></div>
@@ -754,7 +782,7 @@
  </div>
  {/if}
  <!-- svelte-ignore a11y_no_static_element_interactions -->
- <div class="agent-composer" onpaste={(event)=>composerEvent(event)} ondrop={(event)=>composerEvent(event)}
+ <div class="agent-composer" bind:this={composerElement} onpaste={(event)=>composerEvent(event)} ondrop={(event)=>composerEvent(event)}
       ondragover={(event)=>{event.preventDefault();composerDragging=true;}} ondragleave={()=>composerDragging=false}>
   <ImageComposer projectId={projectId} sessionId={selectedSessionId||undefined} identity={identityKey} bind:items={media} dragging={composerDragging} handle={(composer)=>{composerApi=composer;}} onchange={()=>persistDraft(true)}/>
   {#if slashPicks}
@@ -768,7 +796,7 @@
   {/if}
   {#if restoredNotice}<p class="agent-status draft-notice" role="status">{restoredNotice}</p>{/if}
   {#if storageNotice}<p class="error draft-notice" role="alert">{storageNotice}</p>{/if}
-  <label>Message the agent<textarea aria-label="Message the agent" value={draft} oninput={(event)=>{draft=(event.currentTarget as HTMLTextAreaElement).value;persistDraft();}} onkeydown={(event)=>composerKey(event)} placeholder="Ask for something, type / for commands, or include [pause]. Enter sends; Shift+Enter adds a newline."></textarea></label>
+  <label>Message the agent<textarea aria-label="Message the agent" value={draft} onfocus={()=>composerElement?.scrollIntoView({block:'nearest'})} oninput={(event)=>{draft=(event.currentTarget as HTMLTextAreaElement).value;persistDraft();}} onkeydown={(event)=>composerKey(event)} placeholder="Ask for something, type / for commands, or include [pause]. Enter sends; Shift+Enter adds a newline."></textarea></label>
   {#if media.length>0&&capability.state==='known'&&capability.acceptsImages===false}
   <p class="image-capability" role="alert">The model {capability.provider} / {capability.modelId} does not accept images. Remove the images or choose a model that accepts images before sending.</p>
   {:else if media.length>0&&capability.state==='unknown'}
@@ -791,6 +819,9 @@
   {#if slashRefusal}<p class="error" role="alert">{slashRefusal}</p>{/if}
   {#if slashResult}<p class="agent-status" role="status">{slashResult}</p>{/if}
   <div class="row">
+   <!-- Stop belongs with the other primary controls, so a short screen finds it beside Send and
+        Steer instead of only in the header above the transcript. -->
+   <button class="compact-button" aria-label="Stop the agent" disabled={!working} onclick={()=>void stop()}><Icon name="close" size={14}/><span>Stop</span></button>
    <button class="primary compact-button" aria-label="Send message" disabled={sending||unsettledImages||imageCapabilityBlocked||(draft.trim()===''&&readyImages.length===0)} title={sendHoldReason||undefined} onclick={()=>void send('followUp')}><Icon name="arrow" size={14}/><span>{working?'Queue follow-up':'Send'}</span></button>
    <button class="compact-button" aria-label="Steer the run" disabled={sending||unsettledImages||imageCapabilityBlocked||!working||(draft.trim()===''&&readyImages.length===0)} title={sendHoldReason||undefined} onclick={()=>void send('steer')}>Steer current run</button>
    {#if unsettledImages}<small class="agent-upload-state" role="status">{uploadingImages?'Uploading an image — the message is held until it is stored':'Checking a stored image — the message is held until it is ready'}</small>{/if}
@@ -812,7 +843,7 @@
 <style>
  /* The section scrolls in normal flow when the floor plus the chrome does not fit. Nothing is
     docked or overlaid, so the composer can never cover the conversation. */
- .agents{flex:1;min-height:0;display:flex;flex-direction:column;overflow-y:auto}
+ .agents{flex:1;min-height:0;display:flex;flex-direction:column;overflow-y:auto;scroll-padding-bottom:calc(8px + var(--safe-bottom,0px))}
  .agents-head{display:flex;align-items:center;gap:10px;padding:8px 12px;border-bottom:1px solid var(--line);background:var(--panel);flex-wrap:wrap}
  .model-picker{min-width:180px;max-width:100%;font-size:10px}.model-picker select{max-width:100%}
  .agents-head h2{margin:3px 0 0;font-size:13px}
@@ -842,7 +873,9 @@
  .agent-note{display:block;margin-top:6px;color:var(--muted);font-size:10px}.error-inline{color:var(--danger)}
  .agent-queue{margin:0 12px;padding:10px 12px;border:1px solid color-mix(in srgb,#d6b879 30%,var(--line));background:color-mix(in srgb,#d6b879 5%,transparent);border-radius:5px}
  .agent-queue p{margin:6px 0 0;font-size:12px;display:flex;gap:7px;align-items:center}
- .agent-composer{border-top:1px solid var(--line);background:var(--panel);padding:10px 12px}
+ /* The composer stays in normal flow. The bottom inset is added as padding, never as an overlay,
+    so a phone's home indicator cannot cover the controls and the transcript is never covered. */
+ .agent-composer{border-top:1px solid var(--line);background:var(--panel);padding:10px 12px calc(10px + var(--safe-bottom,0px))}
  .agent-composer textarea{min-height:80px;font:12px/1.6 var(--mono)}
  .agent-status{color:var(--muted)}
  .agent-status.connection{display:inline-flex;align-items:center;gap:5px}
@@ -870,7 +903,8 @@
  .agents.compact :global(.session-bar .session-actions){margin-left:0}
  .agents.compact .agents-head{padding:4px 8px;gap:6px}
  .agents.compact .model-picker{min-width:110px;flex:1 1 120px;font-size:9px}
- .agents.compact .agent-composer{padding:6px 8px}
+ .agents.compact .agent-composer{padding:6px 8px calc(6px + var(--safe-bottom,0px))}
+ .agents.compact .agent-composer .row .compact-button{min-height:36px}
  .agents.compact .agent-composer textarea{min-height:44px}
  .agents.compact .agent-composer .row{gap:6px}
  /* Secondary content is disclosed, never deleted: each summary is a native, focusable control. */

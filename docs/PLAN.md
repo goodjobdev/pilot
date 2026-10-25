@@ -508,9 +508,10 @@ done until the owner accepts it on a phone.
 
 ### Step 5 — Mobile Back stack and bottom controls
 
-**Status: Gap.** Pilot's views are component state. The browser Back button leaves the app
-instead of closing a drawer, a document or a session. The composer is not anchored as a
-bottom control with safe-area handling.
+**Status: Implemented — awaiting owner review.** The browser Back button now closes the newest
+drawer, menu, panel, dialog, document or session before it leaves the app, and Forward restores
+the entry. The composer and its primary controls remain in normal flow with safe-area padding;
+they are not docked over the transcript.
 
 **Required work**
 
@@ -541,6 +542,144 @@ bottom control with safe-area handling.
   state remains the truth and history follows it, as Pocket's `web/back.js` does.
 - A frozen page can hold a stream open. Mitigation: close the stream on `pagehide` and
   reconnect on `pageshow`.
+
+### Evidence (Step 5)
+
+- `src/client/navigation.ts` is the whole shared stack and has no framework dependency. A route
+  snapshot is `{project, view, doc, session, layers}`. Each entry this module writes carries that
+  snapshot, a per-page-load nonce, a serial and `owned`, the layers that entry itself added above
+  its predecessor. The nonce and serial together identify an entry this page load wrote. An entry
+  with this module's shape is readable, including one from an earlier page load; anything else in
+  `history.state` is another page's state and is never applied. The address carries only the route (`?project=`, `?view=`, `?doc=`, `?session=`); the layer keys live
+  in history state. `parseRoute` also accepts a document or a session without a view and implies
+  `Wiki` or `Agents`, and ignores an unknown view or an unknown query value.
+- The application state is still the truth. One Svelte effect reads the route and the open layers
+  and calls `sync`, so no individual button writes history. Each added layer gets its own entry,
+  one per layer; a removed layer takes its own entry back off with `history.go(-1)` only when the
+  nonce and serial under it are the entry this page wrote for that layer. A layer that was folded into an
+  entry by a correction has no entry of its own, so closing it rewrites the current entry and
+  never walks into another page. A route change first removes the layers above the route, then
+  pushes the route entry and then each layer the new route shows, so every layer stays closable.
+  The forward stack is kept until a new push truncates it, which is what lets Forward return to
+  its own entry after Back.
+- A traversal this module asks for names the nonce and serial it expects. Its popstate is
+  suppressed only when both arrive; another entry arriving in the window is handled as the
+  person's own move. A traversal that never delivers resolves after 500 ms, re-anchors to the shown route and
+  does not retry. An entry this page did not write is re-anchored at the current address when the
+  path is still the app's own; a cross-document Back is left to the browser. Each person's Back
+  and each Forward produces exactly one popstate in the tests; a marker set on the page survives
+  every same-document traversal, and the Back/Forward test asserts no non-GET request.
+- Layers are the mobile project drawer (below 650 px), the document tree (below 900 px), the
+  question inbox, the board-actions and filter menus, the named-session list, board settings,
+  import review, add project, providers and models, the agent manager, repository connection and
+  the command palette. The project rail and the document tree are layers only at the widths where
+  CSS makes them overlays; on a wide screen they stay in flow and toggle as before. The session
+  view is part of the route: choosing a session pushes an entry, and Back returns to the previous
+  session. The tree is written as its own entry after the Wiki view's entry, so closing the tree
+  lands on Wiki rather than on the view before it.
+- A direct link is `/?project=<id>&view=Agents&session=<id>` or
+  `/?project=<id>&view=Wiki&doc=docs/page.md`. A reload on a session route shows that session,
+  because the session is in the address. A session id the project does not have opens the root
+  conversation, shows the refusal and opens the named-session list. The fallback list is a layer
+  of its own entry: closing it with its own control keeps the app, and a later Back does not leave
+  the page. The bad id is removed from the address. A session id outside the server's documented
+  shape is rejected before any request and is never echoed into the interface. A project named by
+  the address that is not registered shows an explicit error and selects nothing: the remembered
+  project is not opened, so no edit can be sent to the wrong project. The sidebar is the explicit
+  selection path, and no write request is sent while the error is shown.
+- A direct document link writes its requested path in the first entry, before the document read
+  runs, by keeping the requested path separate from the loaded document. The read then fills the
+  same route without a second entry, so one Back leaves the app. A path the store refuses keeps
+  the requested address and shows its error in a `role="alert"` region until the person
+  navigates; this is the safe fallback, not a claim that the document exists.
+- A narrow screen still replaces `Dependencies` and `Timeline` with `List`, including a direct
+  link to either view. The stored view is the fallback only when the address names no view. Boot
+  writes one entry in place with `replaceState`; before boot resolves, the project add actions are
+  disabled and the workspace shows `Opening Pilot…`, so an interaction cannot race the first
+  route into history. A home-screen app gets one guarded entry under the app only in an installed
+  standalone display mode. A desktop fullscreen tab is not guarded; `shouldGuardHomeScreen` has a
+  unit test for that distinction.
+- Unsaved work is guarded on the way out. The document is dirty when a save is pending or when
+  the editor's text differs from the last saved text. A Back that changes the document, the
+  project or a board view asks first; a refused answer writes the shown route again above the
+  entry Back reached, keeps the editor and its text, and does not retry. A board view with
+  unapplied task edits and a board save that is pending or conflicted across a project change ask
+  too. A push notification runs the same guard before it changes anything: a refusal keeps the
+  draft, the route, the URL and the history length, and performs no request. `beforeunload` uses
+  the same document test.
+- A layer opened while a Back apply is waiting is kept. The apply records the layers that were
+  open when it started, and only closes the ones the target names; a new layer survives the
+  project or view change and gets its own entry afterwards. A layer closed during the apply is
+  subtracted from the entry's layer list, so it stays closed; the reconciliation is symmetric. A
+  sync that arrives during an apply is queued instead of being cleared, so its route or layer
+  intent is reconciled once the apply finishes.
+- Drafts flush on a new `pilot:navigate` event that the stack dispatches before applying an entry,
+  and still on `pagehide`, on `visibilitychange` to hidden, on a session identity change and on
+  unmount. The route owns the selected session: the shell resolves the remembered session at boot
+  and on a project change, `AgentsView` follows that prop, validates a well-formed id against the
+  server's list, and writes the person's choice back through the route. Each session's compose
+  text is restored after Back, Forward and reload. The named-session list is controlled by the
+  route so Back closes it; a session chosen from the list closes the list in the same step that
+  changes the route.
+- The composer, Send, Steer, Stop and Add image are not docked. They remain in normal flow at the
+  end of the session section; Stop moved from the header into the composer row so the primary
+  controls are together. `--safe-bottom` is `env(safe-area-inset-bottom, 0px)` and is added as
+  padding to the composer, the status bar and the fixed project drawer; `viewport-fit=cover` and
+  `interactive-widget=resizes-content` are in `index.html`. At 390×420 with a 24 px simulated
+  inset the section scrolls, the transcript keeps its 160 px floor, the composer's computed
+  position is `static`, its bottom padding includes the 24 px inset above its own padding, the
+  transcript does not intersect it, and Send, Steer, Stop, Add image and `Needs me` are all inside
+  the viewport. Step 4's normal-flow and no-overlap rules are unchanged.
+- `tests/unit/navigation.test.ts` (15 tests) covers route parsing and URL building, the narrow
+  board-view rule, layer prefixes, entry validation and ownership, the standalone-only home guard,
+  open/close push and pop, a person's Back and Forward, a route change that removes layers first,
+  a refused traversal that rewrites the shown route, `replaceCurrent`, a correction that shows a
+  layer (its own entry, then an in-app close stays in the app), an entry with the same serial but a
+  different page-load nonce (its route is read and re-anchored, never owned by this load), a
+  foreign entry under a layer that is re-anchored rather than walked past, and a traversal
+  timeout. The full unit and server suite is 481 passed.
+- `tests/browser/backstack.spec.ts` (12 tests, scripted provider only, phone viewports 390×844 and
+  390×420) covers: nested Back from a dialog through a document and the Wiki view to List and then
+  out of the app to the page it came from, with no write request on the traversals; the Android
+  equivalent with `history.back()`, two Forwards and a popstate count that proves no loop and no
+  reload; menus, session selection, documents and Forward; a direct session link, reload, a direct
+  document link, an unknown session falling back to a list whose in-app close keeps the app, a
+  remembered missing session, a 400-character session id that is not echoed, and an unknown
+  project that shows an error and selects nothing; a direct document link whose read is delayed
+  (one entry, one Back leaves) and a missing document (address kept, alert shown); a pushed alert
+  that refuses to discard unsaved document text and leaves route, URL and history unchanged; a
+  layer opened during a delayed Back apply that survives; a foreign history entry under a layer
+  that is re-anchored on an in-app close and keeps the app; an entry from an earlier page load
+  that is readable after a reload, re-anchored, and safe to close a layer over; the keyboard-short
+  controls and safe area; each session's draft across Back, Forward and reload; and a dirty
+  document that refuses Back and then accepts it.
+- Validation ran with this worktree's own binaries from
+  `/Users/john/dev/.archive/pilot-worktrees/integration-b23730b` (package `pilot` 0.1.0, Node
+  26.8.1): `./node_modules/.bin/svelte-check --tsconfig ./tsconfig.json` and
+  `./node_modules/.bin/tsc --noEmit` (0 errors, 0 warnings), `./node_modules/.bin/vite build` plus
+  `./node_modules/.bin/esbuild …` (fresh build before the browser runs),
+  `./node_modules/.bin/tsx --test tests/unit/*.test.ts tests/server/*.test.ts` (481 passed) and
+  `./node_modules/.bin/playwright test` (71 passed).
+- Honest limits. Layers are in history state, not the address, so a reload loses an open drawer,
+  menu, panel or dialog; only the route is a deep link. Forward reopens a dialog or panel fresh:
+  typed dialog values, including an unsubmitted approval form in the command palette, are not
+  restored. Closing the palette with Back performs no approval action, exactly as its close button
+  does. A refused Back writes the shown route again with `pushState`, so the browser's forward
+  entry now points at the same document; that is how the refusal avoids a traversal loop, and a
+  second Back asks again. An in-app close walks back only to an entry this page wrote for that
+  layer; if another script changed history, the close stops at that entry, rewrites the state and
+  address to what the app shows, and does not leave the page. Entries written by an earlier page
+  load are applied as routes and re-anchored with this load's nonce before ownership is granted.
+  After a reload or foreign-entry re-anchor, one Back can reach an equivalent base route without
+  a visible change; a later Back leaves. The home-screen guard is written only in an installed standalone display mode and is not
+  exercised by the normal browser suite; its predicate is unit-tested. The controls are reachable
+  by scrolling on a short viewport; they are not permanently pinned above the keyboard, because
+  docking the composer would cover the transcript that Step 4 protects. The attention entry stays
+  in the application bar, which the session section does not scroll. A missing document path
+  keeps its address and shows the store's error until the person navigates. An unknown project in
+  a link selects nothing until the person chooses a project; that is deliberate, not a fallback.
+  The provider select gained an explicit `aria-label="Provider"` so its accessible name does not
+  change when its options load; that is an accessibility fix, not a provider-flow change.
 
 ---
 

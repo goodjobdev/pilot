@@ -16,14 +16,16 @@
   * own words. The session list shows every named session with its agent, lifecycle, last activity and
   * linked work, and "New session" creates one with per-field validation.
   */
- let {projectId,sessionId,view=null,agentsVersion=0,compact=false,onerror=()=>{},onsessionchange=()=>{}}:{projectId:string;sessionId:string;view?:AgentView|null;agentsVersion?:number;compact?:boolean;onerror?:(message:string)=>void;onsessionchange?:(sessionId:string)=>void}=$props();
+ let {projectId,sessionId,view=null,agentsVersion=0,compact=false,listOpen=false,onlistchange=()=>{},onerror=()=>{},onsessionchange=()=>{}}:{projectId:string;sessionId:string;view?:AgentView|null;agentsVersion?:number;compact?:boolean;listOpen?:boolean;onlistchange?:(open:boolean)=>void;onerror?:(message:string)=>void;onsessionchange?:(sessionId:string)=>void}=$props();
 
  let sessions=$state<SessionOverview[]>([]);
  let agents=$state<AgentRecord[]>([]);
  let installedScopes=$state<string[]>([]);
  let selectedId=$state('');
  let binding=$state<SessionBindingView|null>(null);
- let listOpen=$state(false),creating=$state(false);
+ // The list is a layer of the route, so its open state belongs to the shell. This component asks
+ // for a change; the shell records it and passes the new value back.
+ let creating=$state(false);
  let newName=$state(''),nameError=$state('');
  let problem=$state(''),message=$state(''),busy=$state(false);
 
@@ -58,8 +60,9 @@
  // Re-read the agents when the manager reports a change, so a just-created agent is selectable.
  $effect(()=>{void agentsVersion;void loadAgents();});
  $effect(()=>{const id=selectedId;if(id)void loadBinding(id);});
- // The live conversation is the session the transcript belongs to; make it the default selection.
- $effect(()=>{if(sessionId&&sessionId!==selectedId&&!binding){selectedId=sessionId;}});
+ // Follow the route's session: a person's choice, Back, Forward and a restored selection all
+ // arrive as this prop. The binding is re-read for the session now shown.
+ $effect(()=>{if(sessionId&&sessionId!==selectedId)selectedId=sessionId;});
 
  async function chooseAgent(value:string){
   if(busy)return;busy=true;problem='';message='';
@@ -84,7 +87,7 @@
    nameError=/name/.test(text)?text:text;problem=/name/.test(text)?'':text;
   }finally{busy=false;}
  }
- function openSession(id:string){selectedId=id;listOpen=false;onsessionchange(id);}
+ function openSession(id:string){selectedId=id;onlistchange(false);onsessionchange(id);}
  function linksOf(session:SessionOverview):string{
   if(!session.links.length)return 'no linked work';
   return session.links.map(link=>link.kind==='task'?'task '+link.taskId?.slice(0,8):link.kind==='document'?(link.path??'document'):'workspace').join(', ');
@@ -118,8 +121,8 @@
  {@render bindingControls()}
  {/if}
  <div class="session-actions">
-  <button class="compact-button" aria-label="Sessions" aria-expanded={listOpen} onclick={()=>{listOpen=!listOpen;creating=false;}}><Icon name="list" size={14}/><span>Sessions</span></button>
-  <button class="compact-button" aria-label="New session" onclick={()=>{creating=!creating;listOpen=false;nameError='';}}><Icon name="plus" size={14}/><span>New session</span></button>
+  <button class="compact-button" aria-label="Sessions" aria-expanded={listOpen} onclick={()=>{onlistchange(!listOpen);creating=false;}}><Icon name="list" size={14}/><span>Sessions</span></button>
+  <button class="compact-button" aria-label="New session" onclick={()=>{creating=!creating;onlistchange(false);nameError='';}}><Icon name="plus" size={14}/><span>New session</span></button>
  </div>
 </section>
 {#if message}<p class="session-message" role="status">{message}</p>{/if}

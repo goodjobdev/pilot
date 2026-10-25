@@ -39,7 +39,7 @@
  <p class="muted">Credentials stay on this server, outside projects and ordinary backups. They are never returned to this form. Use provider-side spending limits.</p>
  <fieldset disabled={busy}>
   <legend>Connect a provider</legend>
-  <label>Provider<select bind:value={provider} onchange={()=>{key='';message='';}}>{#each settings?.providers??[] as p}<option value={p.id}>{p.name}{p.configured?' · connected':''}</option>{/each}</select></label>
+  <label>Provider<select aria-label="Provider" bind:value={provider} onchange={()=>{key='';message='';}}>{#each settings?.providers??[] as p}<option value={p.id}>{p.name}{p.configured?' · connected':''}</option>{/each}</select></label>
   {#if selected?.configured}<p role="status">Connected via {selected.credentialType==='oauth'?'sign-in':'API key'}.</p>{/if}
   {#if selected?.apiKey}
    <form onsubmit={e=>{e.preventDefault();void saveKey();}}>
