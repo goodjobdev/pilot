@@ -12,6 +12,7 @@
  import {modelKey,type ProviderSettings} from '../shared/settings';
  import type {ActionDescriptor} from '../shared/actions';
  import {slashMatches} from './slash';
+ import {activityArrived,arrivalAfterFrame,countLabel,followIdentity,indicatorLabel,initialFollow,isNearBottom,readerScrolled,readerStillFollowing,type FollowState} from './follow';
  import SessionBar from './SessionBar.svelte';
  import SessionActivity from './SessionActivity.svelte';
  let { projectId,onerror,onquestions,agentsVersion=0 }:{ projectId:string; onerror:(message:string)=>void; onquestions?:()=>void; agentsVersion?:number }=$props();
@@ -19,7 +20,7 @@
  // The stream's own state. `lastViewAt` is when a full snapshot was accepted, which is
  // different from transport freshness: an idle session stays `live` on keep-alives.
  let connection=$state<ConnectionStatus>({state:'connecting',detail:'Connecting…',attempt:0,lastFrameAt:null,lastViewAt:null});
- let reconnectNonce=$state(0),clock=$state(Date.now()),streamedSessionId='';
+ let reconnectNonce=$state(0),clock=$state(Date.now()),streamedIdentity='';
  // The session whose transcript the stream should follow. Updated when the owner selects a session
  // in the session bar. An empty or absent value means the root (legacy project) conversation.
  let selectedSessionId=$state('');
@@ -294,6 +295,93 @@
  }
  let transcript=$state<HTMLDivElement>();
  let streamGeneration=0;
+ /**
+  * Follow-scroll state for the transcript shown here.
+  *
+  * The state and the entry count belong to one project and session. A switch starts from the default
+  * (following, nothing counted) and bumps a generation, so a scroll, resize or stream callback that
+  * was queued for the previous identity can neither move this transcript nor add to this count.
+  */
+ let follow=$state<FollowState>(initialFollow());
+ let followKey='';
+ let followGeneration=0;
+ let seenEntryCount=0;
+ /** The position this page last scrolled the transcript to, or null when it never has. */
+ let lastFollowScrollTop:number|null=null;
+ /** Set while this page's own scroll is in flight, so its event is never read as reader input. */
+ let programmaticScroll=false;
+ /**
+  * Compact chrome on a phone or a short screen, and the sparser variant that also gives up the
+  * activity timeline and scrolls the whole section so the composer stays docked. Both are decided
+  * from the section's measured width and height, so the conversation keeps a usable height instead
+  * of being squeezed to nothing by fixed panels. The decision never reads the transcript's own
+  * resulting height, so a layout change can never feed back into it.
+  */
+ let shell=$state<HTMLElement>();
+ let chromeCompact=$state(false);
+ const COMPACT_WIDTH=620,COMPACT_HEIGHT=700;
+ function metricsOf(element:HTMLElement):{scrollTop:number;clientHeight:number;scrollHeight:number}{
+   return {scrollTop:element.scrollTop,clientHeight:element.clientHeight,scrollHeight:element.scrollHeight};
+ }
+ /** Scroll the transcript to its newest content. Always instant: no jump is ever animated. */
+ function scrollToBottom():void{
+   const element=transcript;
+   if(!element)return;
+   programmaticScroll=true;
+   element.scrollTop=element.scrollHeight;
+   lastFollowScrollTop=element.scrollTop;
+   // A scroll that was already at the bottom emits no event, so the flag is cleared next frame.
+   requestAnimationFrame(()=>{programmaticScroll=false;});
+ }
+ /** Resume following and show the newest content. Used by the indicator and by an admitted send. */
+ function showNewest():void{
+   follow=initialFollow();
+   scrollToBottom();
+ }
+ /**
+  * The reader moved the transcript: at the bottom follows, above it pauses and keeps its place.
+  *
+  * Only this page's own scroll is excluded, and it is marked before it happens. Every other scroll
+  * that moved the position up and away from the bottom pauses, including one made by a script or by
+  * assistive technology; such a scroll is never ignored. A scroll that left the position where this
+  * page put it is a layout change below the reader (the browser grew the content or clamped the
+  * end), not a move by the reader, and the resize observer then decides.
+  */
+ function onTranscriptScroll():void{
+   const element=transcript;
+   if(!element)return;
+   if(programmaticScroll){programmaticScroll=false;return;}
+   const live=metricsOf(element);
+   if(isNearBottom(live)){
+     lastFollowScrollTop=live.scrollTop;
+     if(!follow.following)follow=initialFollow();
+     return;
+   }
+   if(readerStillFollowing(live,lastFollowScrollTop))return;
+   const next=readerScrolled(follow,live);
+   if(next!==follow)follow=next;
+ }
+ /**
+  * Compact chrome when the section is narrow or short. Secondary content is moved into a native
+  * disclosure, never deleted, and the transcript keeps its floor: when the section cannot fit the
+  * floor plus the chrome, the section itself scrolls in normal flow.
+  */
+ function updateChromeBudget():void{
+   const element=shell;
+   if(!element)return;
+   const width=element.clientWidth,height=element.clientHeight;
+   if(width<=0||height<=0)return;
+   const compact=width<=COMPACT_WIDTH||height<COMPACT_HEIGHT;
+   if(chromeCompact!==compact)chromeCompact=compact;
+ }
+ $effect(()=>{
+   const element=shell;
+   if(!element)return;
+   const observer=new ResizeObserver(()=>updateChromeBudget());
+   observer.observe(element);
+   updateChromeBudget();
+   return ()=>observer.disconnect();
+ });
  let modelSettings=$state<ProviderSettings|null>(null),selectedModel=$state(''),modelBusy=$state(false);
  async function loadModels(){try{modelSettings=await request('/settings/providers');}catch(e){problem=(e as Error).message;}}
  async function chooseModel(){
@@ -319,9 +407,11 @@
    const controller=new AbortController();
    let cancelled=false;
    const current=()=>!cancelled&&generation===streamGeneration&&!controller.signal.aborted;
-   // A session switch starts from an empty view; a reconnect of the same session keeps
-   // the last confirmed snapshot visible until its replacement arrives.
-   if(sessionId!==streamedSessionId){streamedSessionId=sessionId;view=null;}
+   // A project or session switch starts from an empty view, so no entry of the conversation just
+   // left can be measured or scrolled against the new one. A reconnect of the same conversation
+   // keeps the last confirmed snapshot visible until its replacement arrives.
+   const streamIdentity=id+'\u0000'+sessionId;
+   if(streamIdentity!==streamedIdentity){streamedIdentity=streamIdentity;view=null;}
    connection={state:'connecting',detail:nonce>0?'Reconnecting…':'Connecting…',attempt:0,lastFrameAt:null,lastViewAt:null};
    void (async()=>{
      try{
@@ -376,7 +466,50 @@
  // Only a terminal state needs an owner action. While retrying, the manager owns the loop.
  const canReconnect=$derived(connection.state==='offline'||connection.state==='stale'||connection.state==='server-error');
  function reconnect(){reconnectNonce+=1;}
- $effect(()=>{if(transcript&&view?.entries.length)transcript.scrollTop=transcript.scrollHeight;});
+ // New entries: follow them only when the reader is following, otherwise count them (bounded).
+ // The live position decides, so a reader whose move has not been handled as an event yet is not
+ // dragged to the bottom by the next frame. Reading the identity makes a project or session switch
+ // reset the follow state and the count, so the previous session's number can never appear here.
+ $effect(()=>{
+   const key=followIdentity(projectId,sessionKeyOf(selectedSessionId));
+   const count=view?.entries.length??0;
+   const element=transcript;
+   if(key!==followKey){
+     followKey=key;followGeneration+=1;
+     follow=initialFollow();seenEntryCount=count;lastFollowScrollTop=null;
+     // A newly selected conversation opens at its newest entry. This is not a jump inside it.
+     if(count>0&&element)scrollToBottom();
+     return;
+   }
+   if(count===seenEntryCount)return;
+   const previous=seenEntryCount;
+   seenEntryCount=count;
+   const live=element?metricsOf(element):null;
+   const next=live?arrivalAfterFrame(follow,previous,count,live,lastFollowScrollTop):activityArrived(follow,previous,count);
+   if(next!==follow)follow=next;
+   if(next.following)scrollToBottom();
+ });
+ // A layout change the entry count cannot see — the phone keyboard, a rotation, an image that
+ // finished decoding, streamed text that rewrapped — must not steal a paused reader's place. When
+ // the reader is following, it keeps them at the bottom. A callback owned by a previous identity is
+ // dropped, so a resize can never scroll another session's transcript.
+ $effect(()=>{
+   const element=transcript;
+   if(!element)return;
+   const key=followKey;
+   const generation=followGeneration;
+   const observer=new ResizeObserver(()=>{
+     if(generation!==followGeneration||key!==followKey)return;
+     if(!follow.following)return;
+     const live=metricsOf(element);
+     if(!readerStillFollowing(live,lastFollowScrollTop))return;
+     scrollToBottom();
+   });
+   observer.observe(element);
+   const body=element.firstElementChild;
+   if(body)observer.observe(body);
+   return ()=>observer.disconnect();
+ });
  // Tell the application inbox when the set of open questions changes, so its badge and
  // list never count a question that has just been answered.
  let notified=$state<number|null>(null);
@@ -421,6 +554,9 @@
      // A switch while this was in flight means the result belongs to the old identity, and the new
      // session's draft, text and images are not touched.
      if(generation!==draftGeneration||identityKey!==identityAtSend)return;
+     // Only an admitted message returns the reader to the newest content and resumes following. A
+     // refused or failed send leaves the reading position exactly where the person left it.
+     showNewest();
      // Text typed while the send awaited is the person's work, not part of what was admitted.
      if(draft.trim()===sentText)draft='';
      else restoredNotice='The message was sent. The text you typed while it was sending was kept.';
@@ -513,19 +649,33 @@
    finally{dismissing='';}
  }
 </script>
-<section class="agents">
- {#if view?.conversationId||selectedSessionId}<SessionBar {projectId} sessionId={selectedSessionId||view?.conversationId||''} {view} {agentsVersion} onerror={(message)=>onerror(message)} onsessionchange={(id)=>selectSession(id)}/>{/if}
- {#if enabled}<SessionActivity {projectId} sessionId={selectedSessionId} {view}/>{/if}
+<section class="agents" class:compact={chromeCompact} bind:this={shell}>
+ {#if view?.conversationId||selectedSessionId}<SessionBar {projectId} sessionId={selectedSessionId||view?.conversationId||''} {view} {agentsVersion} compact={chromeCompact} onerror={(message)=>onerror(message)} onsessionchange={(id)=>selectSession(id)}/>{/if}
+ {#snippet modelIdentity()}
+ <div class="model-identity">
+  <span class="eyebrow">{!view?.model||view.model.provider==='faux'?'SCRIPTED TEST PROVIDER':'MODEL PROVIDER'}</span>
+  <h2>{view?.model?view.model.provider+' / '+view.model.modelId:'Agent'}</h2>
+  <span class="pill" title="No model is called and nothing is spent: replies come from a deterministic local provider.">no model called</span>
+ </div>
+ {/snippet}
+ {#if enabled}
+ <!-- The activity timeline is a native disclosure at every width: open on a roomy screen, closed
+      on a phone so it cannot grow and squeeze the conversation. Its content is never removed. -->
+ <details class="activity-more" open={!chromeCompact}>
+  <summary>Activity</summary>
+  <SessionActivity {projectId} sessionId={selectedSessionId} {view}/>
+ </details>
+ {/if}
  <header class="agents-head">
-  <div>
-   <span class="eyebrow">{!view?.model||view.model.provider==='faux'?'SCRIPTED TEST PROVIDER':'MODEL PROVIDER'}</span>
-   <h2>{view?.model?view.model.provider+' / '+view.model.modelId:'Agent'}</h2>
-  </div>
+  {#if chromeCompact}
+  <details class="head-more"><summary>Model &amp; provider</summary>{@render modelIdentity()}</details>
+  {:else}
+  {@render modelIdentity()}
+  {/if}
   <label class="model-picker">Session model<select aria-label="Session model" bind:value={selectedModel} disabled={working||modelBusy} onfocus={()=>void loadModels()} onchange={()=>void chooseModel()}>
    <option value="">Scripted test provider (free)</option>
    {#each modelSettings?.models.filter(m=>m.configured)??[] as m (modelKey(m))}<option value={modelKey(m)}>{modelSettings?.preferences.favourites.some(c=>modelKey(c)===modelKey(m))?'★ ':''}{m.provider} / {m.name}</option>{/each}
   </select></label>
-  <span class="pill" title="No model is called and nothing is spent: replies come from a deterministic local provider.">no model called</span>
   <span class="agent-state" class:busy={working} role="status">{working?'Working…':'Idle'}</span>
   <button class="compact-button" aria-label="Stop the agent" disabled={!working} onclick={()=>void stop()}><Icon name="close" size={14}/><span>Stop</span></button>
  </header>
@@ -565,8 +715,15 @@
   {/each}
  </section>
  {/if}
- <!-- svelte-ignore a11y_no_static_element_interactions -->
- <div class="agent-transcript" bind:this={transcript} aria-label="Agent transcript">
+ <!-- The transcript is a scrollable region, so it is keyboard-reachable and its own input is
+      read as reader movement. Svelte's a11y rules do not model that scroll-region pattern. -->
+ <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
+ <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+ <div class="agent-transcript-wrap">
+  <!-- The control has its own reserved row below the scroller, so it never covers text and the
+       scroller simply becomes shorter while it is shown. -->
+  <div class="agent-transcript" role="region" aria-label="Agent transcript" bind:this={transcript} tabindex="0" onscroll={onTranscriptScroll}>
+  <div class="agent-transcript-body">
   {#if !view?.entries.length}<p class="agent-empty">No messages yet. The scripted provider is free. A real model uses the connected provider account; existing tools are question and note operations only.</p>{/if}
   {#each view?.entries??[] as entry (entry.id)}
   <article class="agent-entry {entry.kind}">
@@ -578,6 +735,17 @@
    {#if entry.error}<small class="agent-note error-inline">{entry.error}</small>{/if}
   </article>
   {/each}
+  </div>
+  </div>
+  <!-- A live region that exists from the first frame, so both a count and a plain jump are announced
+       when they appear. The control is outside it, because an interactive element inside a live
+       region is re-announced by some screen readers. -->
+  <span class="sr-only" role="status" aria-live="polite" data-follow-status>{follow.following?'':(follow.missed>0?countLabel(follow.missed)+' while scrolled up':'Newer activity is below')}</span>
+  {#if !follow.following}
+  <div class="new-activity-row">
+   <button class="new-activity" data-follow="indicator" aria-label={indicatorLabel(follow)+' and resume following'} onclick={()=>showNewest()}>{follow.missed>0?'↓ '+countLabel(follow.missed):'↓ Jump to newest'}</button>
+  </div>
+  {/if}
  </div>
  {#if view?.inbox.length}
  <div class="agent-queue" aria-label="Queued messages">
@@ -613,7 +781,13 @@
    <button class="compact-button" aria-label="Download the unsaved draft" onclick={downloadDraft}>Download draft</button>
   </div>
   {:else if draftSavedAt}<small class="draft-saved">Draft saved for {currentSessionLabel} at {new Date(draftSavedAt).toLocaleTimeString()} · kept in this browser only</small>{/if}
+  {#if chromeCompact}
+  <details class="draft-more"><summary>Draft tools</summary>
+   <div class="draft-local-actions"><button class="compact-button" aria-label="Clear local drafts" onclick={clearLocalDrafts}>Clear local drafts</button></div>
+  </details>
+  {:else}
   <div class="draft-local-actions"><button class="compact-button" aria-label="Clear local drafts" onclick={clearLocalDrafts}>Clear local drafts</button></div>
+  {/if}
   {#if slashRefusal}<p class="error" role="alert">{slashRefusal}</p>{/if}
   {#if slashResult}<p class="agent-status" role="status">{slashResult}</p>{/if}
   <div class="row">
@@ -636,7 +810,9 @@
  {/if}
 </section>
 <style>
- .agents{flex:1;min-height:0;display:flex;flex-direction:column}
+ /* The section scrolls in normal flow when the floor plus the chrome does not fit. Nothing is
+    docked or overlaid, so the composer can never cover the conversation. */
+ .agents{flex:1;min-height:0;display:flex;flex-direction:column;overflow-y:auto}
  .agents-head{display:flex;align-items:center;gap:10px;padding:8px 12px;border-bottom:1px solid var(--line);background:var(--panel);flex-wrap:wrap}
  .model-picker{min-width:180px;max-width:100%;font-size:10px}.model-picker select{max-width:100%}
  .agents-head h2{margin:3px 0 0;font-size:13px}
@@ -648,7 +824,12 @@
  .agent-question .row{flex-wrap:nowrap}.agent-question input{min-width:0}
  .agent-answer{display:flex;gap:7px;align-items:center;color:var(--muted);font-size:11px}
  .agent-question.answered{opacity:.75}
- .agent-transcript{flex:1;min-height:0;overflow:auto;padding:14px 16px 20px;display:flex;flex-direction:column;gap:12px}
+ .agent-transcript-wrap{flex:1 1 0;min-height:160px;display:flex;flex-direction:column;min-width:0}
+ .agent-transcript{flex:1 1 auto;min-height:0;overflow:auto;padding:14px 16px 20px}
+ .agent-transcript-body{display:flex;flex-direction:column;gap:12px}
+ .new-activity-row{flex:0 0 auto;display:flex;justify-content:center;padding:6px 12px;background:var(--bg);border-top:1px solid var(--line)}
+ .sr-only{position:absolute;width:1px;height:1px;margin:-1px;padding:0;overflow:hidden;clip-path:inset(50%);white-space:nowrap}
+ .new-activity{min-height:44px;min-width:44px;border:1px solid color-mix(in srgb,var(--accent) 45%,var(--line));border-radius:999px;background:var(--raised);color:var(--ink);font:12px var(--mono);padding:10px 18px}
  .agent-empty{color:var(--muted);font-size:12px;line-height:1.7}
  .agent-entry{border:1px solid var(--line);border-left:2px solid var(--muted);border-radius:5px;background:var(--panel);padding:10px 12px}
  .agent-entry.user{border-left-color:var(--accent)}
@@ -679,4 +860,24 @@
  .slash-row{display:flex;gap:8px;align-items:baseline;text-align:left;background:none;border:1px solid transparent;border-radius:4px;padding:5px 6px}
  .slash-row.highlighted{border-color:color-mix(in srgb,var(--accent) 30%,var(--line));background:var(--raised)}
  .slash-row code{font:9px var(--mono);color:var(--accent)}
+ /*
+  * Compact chrome. The transcript is the work; the panels around it give up height on a phone and
+  * on any short screen so the conversation stays usable. updateChromeBudget chooses these from the
+  * transcript's measured height, so the layout answers the real geometry, not a device guess.
+  */
+ .agents.compact :global(.session-bar){padding:4px 8px;gap:4px}
+ .agents.compact :global(.session-bar .session-current .eyebrow){display:none}
+ .agents.compact :global(.session-bar .session-actions){margin-left:0}
+ .agents.compact .agents-head{padding:4px 8px;gap:6px}
+ .agents.compact .model-picker{min-width:110px;flex:1 1 120px;font-size:9px}
+ .agents.compact .agent-composer{padding:6px 8px}
+ .agents.compact .agent-composer textarea{min-height:44px}
+ .agents.compact .agent-composer .row{gap:6px}
+ /* Secondary content is disclosed, never deleted: each summary is a native, focusable control. */
+ .model-identity{display:flex;align-items:center;gap:8px;flex-wrap:wrap;min-width:0}
+ .head-more,.activity-more,.session-more,.draft-more{min-width:0}
+ .head-more summary,.activity-more summary,.draft-more summary{cursor:pointer;color:var(--muted);font:10px var(--mono);letter-spacing:1px;text-transform:uppercase}
+ .activity-more{margin:6px 12px 0;min-width:0}
+ .draft-more{margin-top:2px}
+ .draft-more summary{margin-bottom:4px}
 </style>

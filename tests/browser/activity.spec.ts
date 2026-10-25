@@ -18,6 +18,12 @@ async function addProject(page: import('@playwright/test').Page, name: string): 
 test('the session view shows a bounded activity timeline with recorded outcomes and says what it truncates', async ({ page }) => {
   await addProject(page, 'Activity fixture');
   await page.setViewportSize({ width: 390, height: 844 });
+  // The project drawer covers content by design at phone width, which was the desktop preference.
+  const hideSidebar = page.getByRole('button', { name: 'Hide project sidebar' });
+  if (await hideSidebar.isVisible().catch(() => false)) await hideSidebar.click();
+  // On a phone the timeline is disclosed through a native summary, so it cannot grow and squeeze the
+  // conversation. The content is unchanged; one tap opens it.
+  await page.locator('details.activity-more > summary').click();
   const activity = page.getByRole('region', { name: 'Session activity', exact: true });
   const transcript = page.getByLabel('Agent transcript');
 

@@ -384,9 +384,16 @@ capability.
 
 ### Step 4 — Follow-scroll and new-activity indication
 
-**Status: Gap.** The transcript jumps to the bottom on every update
-(`src/client/AgentsView.svelte`), which steals the reader's place while they read earlier
-output.
+**Status: Built — awaiting owner acceptance on a phone.** The transcript follows new entries only
+while the reader is at or near the bottom. A reader who scrolled up keeps their position, a bounded
+count of the entries that arrived meanwhile is shown in a control row with reserved space, and
+tapping it returns to the bottom and resumes following. An admitted send returns to the bottom; a
+refused send does not move the reader. A project or session switch resets the follow state and the
+count. The former unconditional jump (`transcript.scrollTop=transcript.scrollHeight` on every update,
+which stole the reader's place) is gone (`src/client/AgentsView.svelte`, `src/client/follow.ts`). On a
+390×844 phone the transcript measures 297 CSS px after six turns; on a 390×500 screen it keeps a
+160 px floor and the section scrolls in normal flow, so the composer never covers it. The step is not
+done until the owner accepts it on a phone.
 
 **Required work**
 
@@ -410,6 +417,92 @@ output.
 
 - A virtualised list can mis-measure the bottom. Mitigation: measure the scroller, not the
   content, and test on a phone-sized viewport.
+
+### Evidence (Step 4)
+
+- `src/client/follow.ts` is the whole rule set, and it is pure: it takes the scroller's own
+  measurement and the follow state and returns the next state. No DOM, no timer and no estimate is
+  involved. The bottom distance is `scrollHeight - clientHeight - scrollTop`, clamped at zero, and a
+  measurement that is not finite counts as far from the bottom, so a missing layout reading can never
+  scroll a reader by accident. `NEAR_BOTTOM_PX` is 8 and the threshold is inclusive. `readerScrolled`
+  resumes at the bottom and clears the count, pauses above it with a new empty count, and keeps a
+  pause that stays paused. A count changes only when an entry really arrived or the reader resumed: it
+  is not a timer, an age or a progress estimate, and nothing decays.
+- The count is exact at 99 and bounded one above it: `activityArrived` stores at most 100, so 99 reads
+  `99 new activities` and only a larger count reads `99+ new activities`.
+- `readerStillFollowing` compares the scroller's live `scrollTop` with the position this page last
+  scrolled to. Content that grows below the reader leaves that position unchanged and still follows; a
+  position that moved upward is a reader who left the bottom, whether or not the scroll event has
+  been delivered yet. `arrivalAfterFrame` applies that check before counting or following, which is
+  the race the transcript used to lose.
+- Scroll handling names its own scroll and nothing else. This page marks its scroll before it
+  performs it, and that one event is ignored. Every other scroll that moved the position up and away
+  from the bottom pauses, including a scroll made by a script or by assistive technology: such a
+  scroll is never ignored. A scroll event that leaves the position where this page put it is a layout
+  change below the reader, not a move by the reader, so it does not pause; the resize observer then
+  decides. A browser clamp that lands at the bottom records the new position as the follow position,
+  so the next arrival follows instead of counting. The transcript is a scrollable region with
+  `role="region"`, an accessible name and `tabindex="0"`, so it is keyboard-reachable.
+- No scroll is ever animated: `showNewest` and the entry and resize follows assign `scrollTop`
+  directly. There is no smooth scrolling to suppress and no stale animation target.
+- New entries follow only while following, and a `ResizeObserver` on the scroller and its content
+  covers what the entry count cannot see (keyboard, rotation, decoded image, rewrapped text). That
+  observer scrolls only when the live position still says following, so a paused reader is not moved.
+- The indicator is not an overlay. The transcript is a wrapper that holds the scroller and, when the
+  reader has paused, a control row in normal flow below it: the row takes its own space and the
+  scroller simply becomes shorter, so no text is ever covered. The button is at least 44×44 CSS px.
+  A live region that exists from the first frame announces either the bounded count or, at zero,
+  `Newer activity is below`; the button itself is outside the live region so it is not re-announced.
+  Measured at 390×844 with the row shown: scroller 240 px, row 57 px, no intersection, and the centre
+  of the scroller hit-tests to a transcript entry.
+- The layout is budgeted from the section's measured size, not a device guess: `compact` below 620 px
+  wide or 700 px tall. Nothing secondary is deleted; it is disclosed through native `<details>` at
+  every width where it would crowd the conversation: the session's agent picker and scope line
+  (`Agent & scopes`), the model identity and its state (`Model & provider`), the activity timeline
+  (`Activity`, open by default on a roomy screen), and the local draft actions (`Draft tools`).
+  `Session details` remains its own toggle and shows the scopes at every width.
+- The transcript wrapper has a 160 px floor. When the floor plus the chrome does not fit, the section
+  scrolls in normal flow: nothing is docked, sticky or overlaid, and the composer sits after the
+  transcript. Measured: 390×844 after six turns gives a 297 px scroller and a section of 736 px with
+  nothing to scroll; expanding the activity timeline gives a 160 px wrapper and a 160 px scroller with
+  the section at 751 px of content in 736 px, so it scrolls normally; 390×500 gives a 160 px scroller
+  in a 392 px section with 599 px of content, the composer below the transcript and reachable by
+  scrolling, and a 1440-wide window keeps the full chrome with a 348 px scroller.
+- A project or session switch resets the follow state, the seen-entry count and the view: the stream
+  identity now includes the project id, so a project change clears the transcript before the new one
+  is read, and the initial scroll runs only for the view that has actually rendered. A resize, scroll
+  or stream callback queued for the identity just left is dropped by its generation and key.
+- `tests/unit/follow.test.ts` (18 tests) drives the threshold boundary, a non-finite measurement, the
+  pause/resume transitions, the cap boundary (99 exact, 100 means 99+), the label and indicator text,
+  the identity key, the live-position check for content growth versus a reader move, and the frame
+  race, including that a paused reader keeps counting.
+- `tests/browser/follow.spec.ts` (10 tests at 390×844 and 390×500, scripted provider only) asserts:
+  the phone geometry after six turns (a usable scroller, no overlap and a hit test on the transcript);
+  that every condensed control is reachable by expansion and that the expanded activity timeline
+  keeps the floor without covering the composer; the control's geometry, its reserved row and its
+  live announcements; pause and resume with a real wheel gesture; the frame race with the scroll
+  event withheld; an admitted send returning to the bottom and a refused send leaving the position;
+  a keyboard-short screen scrolling the section in normal flow; a clamp from a layout change
+  continuing to follow; a session switch resetting the count; two projects with equal-length
+  conversations resetting between them; and a reload showing no phantom count.
+- Validation ran with this worktree's own binaries from
+  `/Users/john/dev/.archive/pilot-worktrees/integration-b23730b` (package `pilot` 0.1.0, Node
+  26.8.1): `./node_modules/.bin/svelte-check --tsconfig ./tsconfig.json` and
+  `./node_modules/.bin/tsc --noEmit` (0 errors, 0 warnings), `./node_modules/.bin/vite build` plus
+  `./node_modules/.bin/esbuild …` (fresh build before the browser runs),
+  `./node_modules/.bin/tsx --test tests/unit/*.test.ts tests/server/*.test.ts` (466 passed) and
+  `./node_modules/.bin/playwright test` (59 passed). `tests/browser/activity.spec.ts` gained one step
+  that opens the activity disclosure and hides the phone drawer, because the timeline is now a
+  disclosure on a phone.
+- Honest limits. The count counts transcript entries, so one message with tool calls can add more
+  than one, and it is not a message count. The budget reads the section's size, so an unusually tall
+  question panel can still shrink the scroller until the 160 px floor engages, after which the section
+  scrolls. A scroll the browser itself performs that leaves the position above the bottom (rather than
+  clamping it to the end) pauses following; the reader can resume with the control. The floor belongs
+  to the wrapper, so the scroller gives up the control row's height while it is shown. Selecting
+  another project leaves the agents view (existing application behaviour), so the two-project test
+  reopens it; the component also clears the view when its project changes while mounted. Step 5 owns
+  the docked composer and the safe-area work.
 
 ---
 
@@ -807,7 +900,7 @@ and its passphrase as the only key to the captured state.
 | 1 Reliable reconnect and honest states | Partial |
 | 2 Per-session drafts and attachments | Gap |
 | 3 Measured activity timeline | Partial |
-| 4 Follow-scroll and new activity | Gap |
+| 4 Follow-scroll and new activity | Built, pending owner acceptance |
 | 5 Mobile Back stack and bottom controls | Gap |
 | 6 Attention surface | Partial |
 | 7 `record_note` cancellation audit | Partial |

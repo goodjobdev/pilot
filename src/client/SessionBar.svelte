@@ -16,7 +16,7 @@
   * own words. The session list shows every named session with its agent, lifecycle, last activity and
   * linked work, and "New session" creates one with per-field validation.
   */
- let {projectId,sessionId,view=null,agentsVersion=0,onerror=()=>{},onsessionchange=()=>{}}:{projectId:string;sessionId:string;view?:AgentView|null;agentsVersion?:number;onerror?:(message:string)=>void;onsessionchange?:(sessionId:string)=>void}=$props();
+ let {projectId,sessionId,view=null,agentsVersion=0,compact=false,onerror=()=>{},onsessionchange=()=>{}}:{projectId:string;sessionId:string;view?:AgentView|null;agentsVersion?:number;compact?:boolean;onerror?:(message:string)=>void;onsessionchange?:(sessionId:string)=>void}=$props();
 
  let sessions=$state<SessionOverview[]>([]);
  let agents=$state<AgentRecord[]>([]);
@@ -92,12 +92,7 @@
  function lifecycleOf(session:SessionOverview):string{return session.lifecycle.recorded?(session.lifecycle.state??'unknown'):'no lifecycle record';}
 </script>
 <section class="session-bar" aria-label="Session">
- <div class="session-current">
-  <span class="eyebrow">SESSION</span>
-  <strong>{selected?.name??('conversation '+selectedId)}</strong>
-  <span class="pill" class:live={selectedId===sessionId}>{selectedId===sessionId?'live conversation':'not the live conversation'}</span>
-  <span class="session-life">{selected?lifecycleOf(selected):'no lifecycle record'}</span>
- </div>
+ {#snippet bindingControls()}
  <label class="agent-picker">Agent for this session
   <select aria-label="Agent for this session" value={binding?.authority.agentId??''} disabled={busy} onchange={e=>void chooseAgent(e.currentTarget.value)}>
    <option value="">No agent (unbound — no privileges)</option>
@@ -105,6 +100,23 @@
   </select>
  </label>
  <span class="session-scopes" role="status">Scopes in effect: {scopeText}{binding?.authority.emptyReason&&!binding.authority.scopes?.length?' — '+binding.authority.emptyReason:''}</span>
+ {/snippet}
+ <div class="session-current">
+  <span class="eyebrow">SESSION</span>
+  <strong>{selected?.name??('conversation '+selectedId)}</strong>
+  <span class="pill" class:live={selectedId===sessionId}>{selectedId===sessionId?'live conversation':'not the live conversation'}</span>
+  <span class="session-life">{selected?lifecycleOf(selected):'no lifecycle record'}</span>
+ </div>
+ {#if compact}
+ <!-- Progressive disclosure, not removal: the same picker and the same scope line, one tap away.
+      "Session details" below shows the full scopes list at every width. -->
+ <details class="session-more">
+  <summary>Agent &amp; scopes</summary>
+  {@render bindingControls()}
+ </details>
+ {:else}
+ {@render bindingControls()}
+ {/if}
  <div class="session-actions">
   <button class="compact-button" aria-label="Sessions" aria-expanded={listOpen} onclick={()=>{listOpen=!listOpen;creating=false;}}><Icon name="list" size={14}/><span>Sessions</span></button>
   <button class="compact-button" aria-label="New session" onclick={()=>{creating=!creating;listOpen=false;nameError='';}}><Icon name="plus" size={14}/><span>New session</span></button>
@@ -139,6 +151,10 @@
  .session-life{font:9px var(--mono);color:var(--muted)}
  .agent-picker{min-width:200px;font-size:10px}
  .session-scopes{font-size:11px;color:var(--muted);flex:1 1 240px;min-width:0;overflow-wrap:anywhere}
+ .session-more{flex:1 1 220px;min-width:0;font-size:12px}
+ .session-more summary{cursor:pointer;color:var(--muted);font:11px var(--mono)}
+ .session-more[open]{display:flex;flex-direction:column;gap:6px;width:100%}
+ .session-more .agent-picker{min-width:0}
  .session-actions{display:flex;gap:6px;margin-left:auto}
  .session-message{color:var(--muted);font-size:11px;margin:4px 12px}
  .session-problem{margin:6px 12px}
