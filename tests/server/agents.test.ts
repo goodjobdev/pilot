@@ -600,6 +600,44 @@ test('an image is refused at admission and again at dispatch when the model cann
   }finally{await app.created.close();}
 });
 
+test('the agent view and a model change report image capability, and the session query is bounded',async()=>{
+  const root=await mkdtemp(join(tmpdir(),'dashboard-agents-capability-'));
+  const app=await instance('on',root,150);
+  try{
+    // The capability travels with the view, so the composer needs no separate route.
+    const first=await fetch(app.base,{headers:app.token});
+    assert.equal(first.status,200);
+    const firstBody=await first.json() as {vision:{provider:string;modelId:string;acceptsImages:boolean}|null};
+    assert.ok(firstBody.vision,'the view reports image capability');
+    assert.equal(firstBody.vision.acceptsImages,true,'the scripted provider accepts images');
+
+    // A model change answers with the capability of the model now in force, and a later view agrees.
+    const textOnly=app.created.providers.models.getModels().find(model=>Array.isArray(model.input)&&!model.input.includes('image'));
+    assert.ok(textOnly,'this build offers a text-only model');
+    const changed=await fetch(app.base+'/model',{method:'POST',headers:app.writes,body:JSON.stringify({model:{provider:textOnly.provider,modelId:textOnly.id}})});
+    assert.equal(changed.status,200);
+    const changedBody=await changed.json() as {vision:{provider:string;modelId:string;acceptsImages:boolean}|null};
+    assert.ok(changedBody.vision);
+    assert.equal(changedBody.vision.acceptsImages,false);
+    assert.deepEqual({provider:changedBody.vision.provider,modelId:changedBody.vision.modelId},{provider:textOnly.provider,modelId:textOnly.id});
+    const after=await fetch(app.base,{headers:app.token});
+    const afterBody=await after.json() as {vision:{acceptsImages:boolean}|null};
+    assert.equal(afterBody.vision?.acceptsImages,false);
+
+    // The session query is bounded on the view and on the stream, and an explicit empty value is
+    // rejected consistently rather than silently meaning "root".
+    const tooLong='x'.repeat(201);
+    for(const path of [app.base+'?sessionId='+tooLong,app.base+'?sessionId=',app.base+'/stream?sessionId='+tooLong,app.base+'/stream?sessionId=']){
+      const response=await fetch(path,{headers:app.token});
+      assert.equal(response.status,422,path);
+      await response.body?.cancel();
+    }
+    const rootView=await fetch(app.base,{headers:app.token});
+    assert.equal(rootView.status,200);
+    assert.ok((await rootView.json() as {vision:unknown}).vision);
+  }finally{await app.created.close();}
+});
+
 /**
  * A resume and a retry re-submit the conversation's last input. That input can carry an image, and
  * the replay must carry it too: sending the text alone would silently drop it. The model is the

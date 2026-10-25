@@ -105,12 +105,27 @@ export function modelAcceptsImages(model: { input?: readonly string[] } | null |
 /** Why an image was refused, as a stable code the composer can label. */
 export type MediaRefusalCode = 'type' | 'bytes' | 'pixels' | 'decode' | 'dimension' | 'metadata' | 'vision';
 
-/** One image the composer has selected: its upload state, its stored facts, or its refusal reason. */
+/** The image capability of the model a session would dispatch under. */
+export interface ImageCapability {
+  provider: string;
+  modelId: string;
+  acceptsImages: boolean;
+}
+
+/**
+ * One image the composer has selected: its upload state, its stored facts, or its refusal reason.
+ *
+ * The states are deliberately distinct. `uploading` is work in progress; `checking` is a stored
+ * reference being looked up after a reload; `ready` is a server media id that may be sent;
+ * `refused` is the server's own refusal of the bytes; `failed` is an upload that did not reach the
+ * server or a reference the server no longer has; `missing` is a reference whose local bytes and
+ * server object cannot be recovered. Only `ready` is ever sent.
+ */
 export interface ImageDraft {
   key: string;
   name: string;
   declaredBytes: number;
-  status: 'uploading' | 'ready' | 'refused';
+  status: 'uploading' | 'checking' | 'ready' | 'refused' | 'failed' | 'missing';
   id?: string;
   mimeType?: string;
   bytes?: number;
@@ -120,6 +135,11 @@ export interface ImageDraft {
   reason?: string;
   /** Set when the stored image's preview could not be fetched: its own condition, never a refusal. */
   previewError?: string;
+  /**
+   * Set when a stored reference could not be looked up for a reason other than 404: a network,
+   * sign-in or server failure. The reference is kept and the lookup can be retried.
+   */
+  probeError?: string;
 }
 
 /** One accepted image as the upload route reports it. */

@@ -137,10 +137,13 @@ fallback and the client transcript-row cap remain.
 
 ### Step 2 — Per-session drafts and attachment recovery rules
 
-**Status: Gap.** The composer keeps one draft per mounted view
-(`src/client/AgentsView.svelte`), and images live only in memory. A session switch, reload
-or reconnect loses both. A send waits for an upload, which is the one correct rule already
-present.
+**Status: Partial — implemented after review, awaiting owner review.** A draft is stored per
+project and session (`src/client/drafts.ts`) and restored on switch and reload. Image references
+are recovered by server id, and every non-ready state is named. The review removed the
+unaccepted attachment-count policy and the age and clock deletion rules: there is **no attachment
+count limit** and **no age, clock or count rule that deletes a valid draft**. Only three technical storage bounds remain, each with a visible
+refusal or a reported, bounded drop of failure notes. The 18 new unit tests and 12 new browser
+tests pass; the step is not done until the owner accepts it.
 
 **Required work**
 
@@ -148,38 +151,149 @@ present.
   Clear it only after a send is admitted, never on a transient error.
 - Show which session the draft belongs to, so a restored draft is never mistaken for the
   current session's text.
-- Attachments have explicit states: `uploading`, `ready`, `failed`, `removed`. Only `ready`
-  stored image ids may be sent. An upload in flight blocks send with a named reason.
-- On reconnect or reload, recover attachment references that the server still knows, and
-  offer to remove the rest. Never re-upload automatically, never send an image the person
-  did not see as ready, and never silently drop one.
-- Keep image bytes out of local storage; store only references and metadata.
-- Apply these conservative limits (proposed defaults, not implemented): at most 64 KiB of text
-  per session draft, at most 10 pending attachment references per draft, and expiry after 30
-  days without an edit. Store at most 2 MiB of drafts per browser profile; when that is reached,
-  refuse a new save and tell the person, rather than evicting silently. These values become
-  binding only after the owner accepts them.
+- Attachments have explicit visible states: `uploading`, `checking`, `ready`, `refused`,
+  `failed`, `missing`. Only `ready` stored image ids may be sent. `uploading` and `checking`
+  block send with a named reason. A removal is an explicit delete of the reference.
+- On reconnect or reload, recover attachment references that the server still knows. **Only a
+  `404` means the server does not have the object.** A network, sign-in, permission or server
+  failure keeps the reference in `checking`, keeps its media id in the saved draft, and offers
+  an explicit retry. Never re-upload automatically, never send an image the person did not see
+  as ready, and never silently drop one.
+- Keep image bytes out of local storage; store only references and metadata. The text itself is
+  arbitrary and may contain a secret the person typed; the store adds no credential.
+- Keep only technical storage bounds, with a visible honest refusal: 64 KiB of UTF-8 text per
+  draft, 2 MiB of drafts per browser profile, and 16 KiB of failure notes per draft. When only
+  failure notes exceed their bound, drop notes with a visible count and keep every sendable
+  reference. Do not add an attachment count, expiry or clock rule without the owner's decision.
 - A send is keyed by its request identity, so a retry after a network failure remains one
   admission, not two.
+- If a local save is refused, keep the latest state in memory across switches, warn that it is
+  not saved, name the last saved time, and offer copy and download. Write a best-effort warning
+  marker for the next load.
 
 **Acceptance criteria**
 
-- Switching sessions and back restores each draft exactly.
+- Switching sessions and back restores each draft exactly, including text that could not be
+  saved.
 - Reload restores text and the recoverable attachment reference; a missing reference is
-  named, not hidden.
-- A failed upload stays visible and removable, and cannot be sent.
-- A reconnect neither uploads nor sends anything by itself.
-- Drafts and references respect the limits above, and exceeding one is refused with a named
-  reason.
-- Browser tests cover switch, reload, failed upload, reconnect and a send during upload.
+  named, not hidden; a failed lookup is kept and can be retried.
+- A failed or refused upload stays visible and removable, and cannot be sent.
+- A reconnect neither uploads nor sends anything by itself, and a later send happens once.
+- No valid draft is deleted by an age, clock or attachment count rule.
+- Exceeding a technical storage bound is refused with a named reason, or drops only bounded
+  failure notes and says how many.
+- Browser tests cover switch, reload, failed upload, reconnect with a draft and image, a send
+  during upload and a refused local save.
+
+**Evidence.**
+
+- `src/client/drafts.ts` is the pure store: versioned records keyed
+  `pilot.draft.v1:<projectId>:<sessionKey>` (`root` for the unnamed conversation), a per-project
+  `pilot.session.v1:<projectId>` selection preference validated against the server's session list,
+  and strict validation on both read and write. UTF-8 byte validation is symmetric on load and
+  save, including the send attempt's text. Unknown fields are dropped, so image bytes, object
+  URLs, file handles and application credentials cannot be stored even by a future caller. The
+  text is whatever the person typed and may itself contain a secret; the store adds none.
+- **Nothing deletes a valid draft automatically.** There is no age limit, no clock-skew rule and
+  no count rule. A corrupt record is reported and left in place; the next save of the same
+  identity replaces it, and an explicit clear removes it. A draft is removed only after an
+  admitted send, by **Clear local drafts**, or when a newer save replaces the same key.
+- Saves are refusal-only for the three technical bounds, the browser quota, or unavailable
+  storage. A text or profile refusal keeps the in-memory draft and shows its own reason; nothing
+  is evicted and no other draft is changed. When only failure notes exceed 16 KiB, the save
+  succeeds, every sendable reference is kept, and the dropped note count is shown. The profile
+  total is measured without parsing every draft, and writes are debounced by 200 ms, so typing
+  does not scan the whole store on each keystroke.
+- `src/client/AgentsView.svelte` keeps the latest state in memory per project and session, and
+  flushes the debounced write before a send, a session or project switch, `pagehide`, and a hidden
+  document. A refused save marks the state unsaved, keeps the last successful save time, writes a
+  best-effort `pilot.draft.warn.v1:<projectId>:<sessionKey>` marker, and shows **Copy draft** and
+  **Download draft**. After a reload the marker's warning distinguishes a last saved version from
+  no saved version at all, and says to check the transcript before resending because a message may
+  already be admitted. Copying or downloading keeps the text only; it does not prevent a duplicate.
+  The interface also offers a confirmed **Clear local drafts** action.
+- A send reuses the stored `requestId` only when the trimmed text and the ordered media ids are
+  exactly the message that was attempted; an edited message mints a new one. The attempt is saved
+  before the request, so a reload during an ambiguous failure retries the same admission. The
+  draft is cleared only after `agentInput` resolves; a rejection or a network failure keeps it.
+  When the attempt record itself could not be saved, the composer warns before the request that
+  admission can still succeed while the reply is lost, and that a reload may not recognise it as
+  already sent. Text typed while a send awaits is kept when it no longer equals the submitted text,
+  and only the submitted image keys leave the strip. A result that arrives after a project or
+  session switch is dropped rather than applied to the new identity.
+- Attachments have the six visible states above. On load, a stored id is shown as `checking` until
+  a read-only GET of `/api/media/<id>` answers. **A `404` becomes `missing`; any other failure
+  stays `checking` with an explicit reason and a Retry lookup control, and the media id stays in
+  the saved draft.** Recovery never uploads, re-uploads, sends or starts a model call: a browser
+  test records every non-GET request during a reload and asserts none touches `agents/input` or
+  `agents/media`. `ImageComposer.svelte` captures the project, session and identity at the start of
+  a gesture. An upload still in flight when the session changes is named `missing` in that
+  session's own draft rather than shown as forever checking or moved into the new session.
+- The image capability travels with the agent view: `GET /api/projects/<id>/agents?sessionId=…`
+  returns `vision`, and `POST /api/projects/<id>/agents/model` returns the capability of the model
+  now in force, so a model change refreshes it. A model change that arrives in the streamed view
+  triggers one guarded capability read through the same view request, once per model key and
+  stream run: no model dispatch and no retry loop, and a late answer cannot overwrite a newer
+  model reading. `vision` is `null` when it cannot be read, for
+  example a named session with no conversation. The query is bounded to 1–200 characters (`422`
+  otherwise), and an explicit empty value is rejected on the view and the stream alike. There is
+  no separate capability route. The view request already opens the project
+  harness, and opening it runs `harness.resume()`, which can continue an existing checkpoint; the
+  capability read adds no route and no model call, but the view is not execution-free. The
+  composer blocks a send only when the capability is known to be false; the server's admission and
+  dispatch checks stay authoritative.
+- **Privacy and retention.** Drafts are local working state, not documentation or a transcript.
+  They are not encrypted, are readable by scripts on the same origin, and are kept until an
+  admitted send, an explicit clear, or replacement by a newer save. There is no application
+  sign-out route: hosted mode signs in through Cloudflare Access, whose sign-out is external and
+  cannot be observed here. A transient `401` never clears a draft. On a shared device, use
+  **Clear local drafts** or clear the browser's site data.
+- Tests: `tests/unit/drafts.test.ts` (18) covers round-trip, project/session isolation, the unnamed
+  key, the sanitiser dropping bytes, a ready reference without an id, the restore states, a failed
+  lookup keeping its media id, corrupt records left in place, the absence of age and clock
+  deletion, many attachments stored without a count rule, the failure-metadata bound, the
+  technical text and profile bounds, symmetric UTF-8 validation, quota and unavailable storage,
+  exact attempt matching, the save-failure marker, `clearAll`, and the selection preference.
+  `tests/browser/drafts.spec.ts` (12) covers switch and reload, a rejected send, a network failure
+  with one reused request identity, a concurrent edit during a send, an upload finishing after a
+  session switch, a restored and a missing image reference, a failed lookup with retry, a refused
+  and a failed upload staying visible after a send, the checking state holding a send, capability
+  blocking and refreshing after a model change, the bounded view query, a reconnect with a draft
+  and image (one upload, one send), a corrupt record, and a refused local save with export and the
+  explicit clear. `tests/server/agents.test.ts` also covers the capability in the view, the
+  capability returned by a model change, and the 1–200 character bound with an explicit empty
+  value rejected on both the view and the stream.
+- Passing evidence in this worktree: `pnpm check`; `pnpm test` (440 tests, including 18 draft
+  tests); `pnpm test:browser` (46 tests, including 12 draft tests); `pnpm build`. No commit, push,
+  deployment or live-data use.
+
+**Technical bounds (not product policy).** 64 KiB of UTF-8 text, 2 MiB per browser profile, and
+16 KiB of failure notes in one draft. There is no attachment count, no expiry and no clock rule.
+A product limit needs the owner's decision before it is implemented.
 
 **Risks**
 
 - Local drafts can outlive the server's media object. Mitigation: recovery is by server
   reference, not by assuming local state is valid.
 - A draft could be restored into the wrong context. Mitigation: key by project and session,
-  with a visible session label.
-
+  with a visible session label and a generation guard on every restore.
+- An upload accepted by the server after the person switched away is not attached to either
+  session: its id is dropped rather than moved, and the old session names it `missing` when
+  revisited (the media store has no delete route, so the object remains orphaned). This is
+  deliberately the safe side of "no cross-session attachment leak".
+- A refused local save can still lose the newest text on a reload, because the browser will not
+  store it anywhere. Mitigation: keep it in memory across switches, warn, name the last saved time,
+  write a best-effort marker, and offer copy and download. None of that is a persistence guarantee,
+  and copying or downloading does not prevent a duplicate admission.
+- If storage refuses the attempt record as well, a reload cannot reuse the same request identity
+  for an ambiguous send. Mitigation: the warning and the copy and download actions name the risk;
+  the server's idempotency still applies whenever the attempt was stored.
+- The capability read needs a conversation; for a newly created named session with none it is
+  unknown until a message exists. The server's admission and dispatch checks remain authoritative.
+- Browser storage is per browser profile and is not synced or backed up. Losing it loses drafts,
+  never documentation, a transcript or a sent message.
+- Drafts are not encrypted and have no sign-out hook. Mitigation: an explicit local clear action,
+  and documentation that a shared device needs that action or a site-data clear.
 ---
 
 ### Step 3 — Measured activity timeline and tool outcomes

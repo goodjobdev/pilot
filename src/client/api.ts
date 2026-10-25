@@ -3,7 +3,7 @@ import type { DocEntry,DocSnapshot } from '../shared/docs';
 import type { AgentView } from '../shared/agent';
 import type { ActionDescriptor,LiveActivity } from '../shared/actions';
 import type { AgentAuditEntry,AgentModelChoice,AgentRecord } from '../shared/agent-registry';
-import type { MediaView } from '../shared/images';
+import type { ImageCapability, MediaView } from '../shared/images';
 const token=document.querySelector<HTMLMetaElement>('meta[name="dashboard-token"]')?.content??'';
 let csrf='';
 export type ApiErrorKind = 'http' | 'session' | 'network';
@@ -109,7 +109,13 @@ export const api={
   subscribeAlerts:(body:{endpoint:string;keys:{p256dh:string;auth:string}})=>request<{count:number}>('/alerts/subscribe','POST',body),
   unsubscribeAlerts:(endpoint:string)=>request<{count:number}>('/alerts/unsubscribe','POST',{endpoint}),
   testAlert:()=>request<{sent:number;failed:number;skipped:boolean}>('/alerts/test','POST',{}),
-  agents:(id:string)=>request<{enabled:boolean;view:AgentView|null}>('/projects/'+id+'/agents'),
+  /**
+   * The agent view for one project and, optionally, one session. The response also carries the
+   * image capability of the model that session would dispatch under, or null when it cannot be read
+   * (for example a named session with no conversation yet). It is the same request that already
+   * opens the project harness; there is no separate capability route.
+   */
+  agents:(id:string,sessionId?:string)=>request<{enabled:boolean;view:AgentView|null;vision:ImageCapability|null}>('/projects/'+id+'/agents'+(sessionId?'?sessionId='+encodeURIComponent(sessionId):'')),
   /** A message carries text, the ids of stored images, or both. */
   agentInput:(id:string,body:{text:string;mode:'followUp'|'steer'|'reject';requestId?:string;sessionId?:string;images?:string[]})=>request<{submissionId:string;queued:boolean}>('/projects/'+id+'/agents/input','POST',body),
   agentAbort:(id:string,sessionId?:string)=>request<{ok:true}>('/projects/'+id+'/agents/abort','POST',{sessionId}),
@@ -119,6 +125,7 @@ export const api={
    * decides what the bytes are; a refusal is answered with the server's own per-image reason and code.
    */
   uploadImage:(id:string,body:{data:string;name?:string;declaredType?:string;sessionId?:string})=>request<{media:MediaView}>('/projects/'+id+'/agents/media','POST',body),
+
   /**
    * The command registry, its live read-only projection and one action's execution. The registry is
    * the only source of what the palette may offer: nothing in the client hardcodes a capability.

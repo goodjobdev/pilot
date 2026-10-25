@@ -160,7 +160,8 @@ test('a delayed initial snapshot from the previous session cannot change the new
  const held=new Promise<void>(resolve=>{release=resolve;});
  let heldRoute:import('@playwright/test').Route|undefined;
  let heldOnce=false;
- await page.route(/\/api\/projects\/[^/]+\/agents$/,async route=>{
+ // The view request now names its session, so the query is part of the match as well.
+ await page.route(/\/api\/projects\/[^/]+\/agents(\?.*)?$/,async route=>{
   if(!heldOnce){heldOnce=true;heldRoute=route;release();return;}
   await route.continue();
  });

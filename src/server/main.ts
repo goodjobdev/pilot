@@ -1295,8 +1295,27 @@ export async function createApp(options:AppOptions){
             if(agentsRoute[2]===undefined&&req.method==='GET'){json({enabled:false,view:null});return;}
             throw new HttpError(503,'Agents are disabled on this instance');
           }
-          if(agentsRoute[2]===undefined&&req.method==='GET'){const viewSessionId=url.searchParams.get('sessionId');const viewResult=viewSessionId?(await agents.sessionView(p,viewSessionId))??{conversationId:viewSessionId,entries:[],questions:[],inbox:[],working:false,usage:{input:0,output:0}}:await agents.view(p);json({enabled:true,view:viewResult,delivery:await agents.deliveryView(p,viewSessionId??undefined)});return;}
-          if(agentsRoute[2]==='model'&&req.method==='POST'){const c=z.strictObject({sessionId:z.string().min(1).max(200).optional(),model:z.strictObject({provider:z.string().min(1).max(100),modelId:z.string().min(1).max(200)}).nullable()}).parse(payload);json(await agents.setModel(p,c.model,c.sessionId));return;}
+          if(agentsRoute[2]===undefined&&req.method==='GET'){
+            const viewSessionId=url.searchParams.get('sessionId');
+            // The session is a bounded opaque id everywhere else, so the view query accepts the
+            // same bound instead of passing an unbounded string into the harness lookup.
+            if(viewSessionId!==null&&(viewSessionId.length<1||viewSessionId.length>200))
+              throw new HttpError(422,'The sessionId query must be 1 to 200 characters');
+            const viewResult=viewSessionId?(await agents.sessionView(p,viewSessionId))??{conversationId:viewSessionId,entries:[],questions:[],inbox:[],working:false,usage:{input:0,output:0}}:await agents.view(p);
+            // The image capability comes with the view, so the composer needs no second route.
+            // A session with no conversation cannot report a model; the field is then null and the
+            // server's admission and dispatch checks stay authoritative. This view request already
+            // opens the project harness, whose resume step may continue an existing checkpoint.
+            const vision=await agents.vision(p,viewSessionId??undefined).catch(()=>null);
+            json({enabled:true,view:viewResult,delivery:await agents.deliveryView(p,viewSessionId??undefined),vision});return;
+          }
+          if(agentsRoute[2]==='model'&&req.method==='POST'){
+            const c=z.strictObject({sessionId:z.string().min(1).max(200).optional(),model:z.strictObject({provider:z.string().min(1).max(100),modelId:z.string().min(1).max(200)}).nullable()}).parse(payload);
+            const changed=await agents.setModel(p,c.model,c.sessionId);
+            // The capability of the model now in force travels with the change, so a client cannot
+            // keep showing an older model's image support.
+            json({...changed,vision:await agents.vision(p,c.sessionId).catch(()=>null)});return;
+          }
           if(agentsRoute[2]==='media'&&req.method==='POST'){
             // Admission. An image is refused before anything is stored when the session's selected
             // model does not accept image input, so no bytes are kept for a model that would ignore them.
@@ -1355,9 +1374,14 @@ export async function createApp(options:AppOptions){
           if(agentsRoute[2]==='abort'&&req.method==='POST'){const data=z.strictObject({sessionId:z.string().min(1).max(200).optional()}).parse(payload);await agents.abort(p,data.sessionId);json({ok:true});return;}
           if(agentsRoute[2]==='stream'&&req.method==='GET'){
             if(closing){res.statusCode=503;res.end();return;}
-            res.statusCode=200;res.setHeader('Content-Type','text/event-stream');res.setHeader('Cache-Control','no-store');res.setHeader('Connection','keep-alive');
             // Accept optional sessionId so the owner can switch between per-session transcripts.
-            const streamSessionId=url.searchParams.get('sessionId')||undefined;
+            // The same 1-200 character bound applies here as everywhere else, including an explicit
+            // empty value, and it is checked before the event-stream headers are sent.
+            const streamSessionQuery=url.searchParams.get('sessionId');
+            if(streamSessionQuery!==null&&(streamSessionQuery.length<1||streamSessionQuery.length>200))
+              throw new HttpError(422,'The sessionId query must be 1 to 200 characters');
+            const streamSessionId=streamSessionQuery??undefined;
+            res.statusCode=200;res.setHeader('Content-Type','text/event-stream');res.setHeader('Cache-Control','no-store');res.setHeader('Connection','keep-alive');
             let closed=false,dispose:(()=>Promise<void>)|undefined;
             let keepAlive:ReturnType<typeof setInterval>|undefined;
             let finish!:()=>void;
