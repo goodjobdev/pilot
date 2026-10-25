@@ -9,6 +9,7 @@ import { localConfig } from '../../src/server/security';
 import { ControlStore } from '../../src/server/state/control-store';
 import { DeliveryLedger } from '../../src/server/state/delivery';
 import type { AlertPayload } from '../../src/server/alerts';
+import { MAX_STREAM_FRAME_BYTES } from '../../src/shared/stream';
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 async function waitFor<T>(check: () => Promise<T | undefined>, timeoutMs = 10000): Promise<T> {
@@ -1082,4 +1083,158 @@ test('named HTTP controls and lifecycle callbacks never act on the root or anoth
     assert.equal((await action('stop', revision)).status, 200);
     assert.equal(life().revision, revision);
   } finally { await app.created.close(); }
+});
+
+/** Reads data frames until the socket is quiet, so one coalesced batch is counted as it is. */
+async function quietFrames(reader: ReadableStreamDefaultReader<Uint8Array>, quietMs = 300): Promise<string[]> {
+  const decoder = new TextDecoder();
+  let buffer = '';
+  const frames: string[] = [];
+  for (;;) {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const quiet = new Promise<'quiet'>(resolve => { timer = setTimeout(() => resolve('quiet'), quietMs); });
+    const next = await Promise.race([reader.read(), quiet]);
+    clearTimeout(timer);
+    if (next === 'quiet') break;
+    const { value, done } = next as ReadableStreamReadResult<Uint8Array>;
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    for (;;) {
+      const boundary = buffer.indexOf('\n\n');
+      if (boundary < 0) break;
+      const frame = buffer.slice(0, boundary);
+      buffer = buffer.slice(boundary + 2);
+      if (frame.startsWith('data: ')) frames.push(frame.slice(6));
+    }
+  }
+  return frames;
+}
+
+test('a slow stream client keeps one pending snapshot and receives the newest one', { timeout: 10000 }, async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agents-stream-backpressure-'));
+  const app = await instance('on', root);
+  let push: ((view: unknown) => void) | undefined;
+  let disposed = 0;
+  app.created.agents.subscribe = async (_project, listener) => {
+    push = listener as unknown as (view: unknown) => void;
+    return async () => { disposed += 1; };
+  };
+  const padding = 'x'.repeat(256 * 1024);
+  const snapshot = (index: number) => ({
+    conversationId: 'c', working: false, attempt: null, entries: [], partial: 'snapshot-' + index + '-' + padding,
+    inbox: [], usage: { input: 0, output: 0, cost: 0 }, model: null, questions: [], updatedAt: String(index)
+  });
+  try {
+    const response = await fetch(app.base + '/stream', { headers: app.token });
+    assert.equal(response.status, 200);
+    await waitFor(async () => push ? true : undefined);
+    const reader = response.body!.getReader();
+    for (let index = 0; index < 20; index += 1) push!(snapshot(index));
+    const frames = await quietFrames(reader);
+    assert.equal(frames.length, 2, 'one frame is in flight and one is pending, not twenty');
+    assert.match((JSON.parse(frames.at(-1)!) as { partial: string }).partial, /^snapshot-19-/);
+    await reader.cancel();
+    await waitFor(async () => disposed === 1 ? true : undefined);
+  } finally {
+    await app.created.close();
+  }
+});
+
+test('an oversized snapshot ends the stream with one bounded error frame', { timeout: 10000 }, async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agents-stream-oversize-'));
+  const app = await instance('on', root);
+  let push: ((view: unknown) => void) | undefined;
+  let disposed = 0;
+  app.created.agents.subscribe = async (_project, listener) => {
+    push = listener as unknown as (view: unknown) => void;
+    return async () => { disposed += 1; };
+  };
+  try {
+    const response = await fetch(app.base + '/stream', { headers: app.token });
+    assert.equal(response.status, 200);
+    await waitFor(async () => push ? true : undefined);
+    push!({ conversationId: 'c', partial: 'x'.repeat(MAX_STREAM_FRAME_BYTES + 1024) });
+    const text = await response.text();
+    assert.match(text, /event: error/);
+    assert.match(text, /STREAM_SNAPSHOT_TOO_LARGE/);
+    assert.ok(text.length < 20_000, 'the refusal itself is not a snapshot-sized frame');
+    await waitFor(async () => disposed === 1 ? true : undefined);
+  } finally {
+    await app.created.close();
+  }
+});
+
+test('an oversized snapshot during backpressure still delivers the terminal reason', { timeout: 10000 }, async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agents-stream-oversize-blocked-'));
+  const app = await instance('on', root);
+  let push: ((view: unknown) => void) | undefined;
+  let disposed = 0;
+  app.created.agents.subscribe = async (_project, listener) => {
+    push = listener as unknown as (view: unknown) => void;
+    return async () => { disposed += 1; };
+  };
+  try {
+    const response = await fetch(app.base + '/stream', { headers: app.token });
+    assert.equal(response.status, 200);
+    await waitFor(async () => push ? true : undefined);
+    // The first write is larger than the socket high-water mark, so the terminal frame
+    // must wait for the drain event instead of being written behind it immediately.
+    push!({ conversationId: 'c', partial: 'normal-' + 'n'.repeat(512 * 1024) });
+    await sleep(50);
+    push!({ conversationId: 'c', partial: 'x'.repeat(MAX_STREAM_FRAME_BYTES + 1024) });
+    await sleep(50);
+    const text = await response.text();
+    assert.match(text, /data: .*normal-/, 'the in-flight full snapshot is delivered first');
+    assert.match(text, /STREAM_SNAPSHOT_TOO_LARGE/, 'the terminal reason survives the blocked socket');
+    assert.ok(text.length < 1_500_000, 'the oversized frame was never written');
+    await waitFor(async () => disposed === 1 ? true : undefined);
+  } finally {
+    await app.created.close();
+  }
+});
+
+test('shutdown completes while a stream is blocked on backpressure', { timeout: 10000 }, async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agents-stream-shutdown-backpressure-'));
+  const app = await instance('on', root);
+  let push: ((view: unknown) => void) | undefined;
+  let disposed = 0;
+  app.created.agents.subscribe = async (_project, listener) => {
+    push = listener as unknown as (view: unknown) => void;
+    return async () => { disposed += 1; };
+  };
+  const padding = 'x'.repeat(256 * 1024);
+  try {
+    const response = await fetch(app.base + '/stream', { headers: app.token });
+    assert.equal(response.status, 200);
+    await waitFor(async () => push ? true : undefined);
+    // The client does not read, so the socket is blocked and one snapshot is pending.
+    for (let index = 0; index < 10; index += 1) push!({ conversationId: 'c', partial: 'snapshot-' + index + '-' + padding });
+    await sleep(50);
+    const closing = app.created.close();
+    // The server owns EOF even though the client never read while frames were queued.
+    assert.match(await response.text(), /retry: 3000/);
+    await closing;
+    assert.equal(disposed, 1);
+  } finally {
+    await app.created.close();
+  }
+});
+
+test('reopening the read-only stream never dispatches or admits a message', { timeout: 10000 }, async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agents-stream-no-dispatch-'));
+  const app = await instance('on', root);
+  try {
+    for (let index = 0; index < 3; index += 1) {
+      const response = await fetch(app.base + '/stream', { headers: app.token });
+      assert.equal(response.status, 200);
+      await response.body!.cancel();
+    }
+    await sleep(100);
+    const current = (await app.view()).view;
+    assert.equal(current.working, false);
+    assert.equal(current.entries.length, 0, 'no reconnect path submitted an input');
+    assert.equal(current.usage.input, 0, 'no reconnect path dispatched a model request');
+  } finally {
+    await app.created.close();
+  }
 });

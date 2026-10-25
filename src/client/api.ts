@@ -13,6 +13,8 @@ export function isSessionExpired(error:unknown):boolean{return error instanceof 
 let onExpiry:(()=>void)|null=null;
 /** Registers a single handler so any request can report an expired session. */
 export function whenSessionExpires(handler:()=>void){onExpiry=handler;}
+/** Reports an expired sign-in found by a path that does not use `request` (the event stream). */
+export function reportSessionExpired(){onExpiry?.();}
 export async function request<T>(path:string,method='GET',data?:unknown,retried=false):Promise<T> {
   let res:Response;
   try{
@@ -179,32 +181,6 @@ export async function assetBlobUrl(id:string,path:string):Promise<string>{
 export async function assetText(id:string,path:string):Promise<string>{
   const res=await assetResponse(id,path);
   return res.text();
-}
-/**
- * Reads the agent view as server-sent events.
- *
- * EventSource cannot send the dashboard session header, so the same frames are
- * read from a streaming fetch instead; in hosted mode Cloudflare supplies the
- * Access assertion for this same-origin request.
- */
-export async function agentStream(id:string,onView:(view:AgentView)=>void,signal:AbortSignal,sessionId?:string):Promise<void>{
-  const qs=sessionId?'?sessionId='+encodeURIComponent(sessionId):'';
-  const res=await fetch('/api/projects/'+id+'/agents/stream'+qs,{headers:{'x-dashboard-token':token},signal});
-  if(!res.ok||!res.body)throw new ApiError(res.status,'Agent stream unavailable');
-  const reader=res.body.getReader(),decoder=new TextDecoder();
-  let buffer='';
-  for(;;){
-    const {value,done}=await reader.read();
-    if(done)return;
-    buffer+=decoder.decode(value,{stream:true});
-    const frames=buffer.split('\n\n');
-    buffer=frames.pop()??'';
-    for(const frame of frames){
-      const line=frame.split('\n').find(entry=>entry.startsWith('data: '));
-      if(!line)continue;
-      try{onView(JSON.parse(line.slice(6)) as AgentView);}catch{/* a malformed frame is ignored, the next one still applies */}
-    }
-  }
 }
 export function download(name:string,text:string,type='text/plain'){
  const url=URL.createObjectURL(new Blob([text],{type})),a=document.createElement('a');a.href=url;a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);

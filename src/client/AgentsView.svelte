@@ -1,5 +1,6 @@
 <script lang="ts">
- import { api,agentStream } from './api';
+ import { api,reportSessionExpired } from './api';
+ import { openAgentStream,type ConnectionStatus } from './stream';
  import type { AgentView } from '../shared/agent';
  import { uniqueImageFiles,type ImageDraft } from '../shared/images';
  import ImageComposer from './ImageComposer.svelte';
@@ -10,7 +11,11 @@
  import {slashMatches} from './slash';
  import SessionBar from './SessionBar.svelte';
  let { projectId,onerror,onquestions,agentsVersion=0 }:{ projectId:string; onerror:(message:string)=>void; onquestions?:()=>void; agentsVersion?:number }=$props();
- let view=$state<AgentView|null>(null),enabled=$state(true),status=$state('Connecting…'),draft=$state(''),sending=$state(false),problem=$state('');
+ let view=$state<AgentView|null>(null),enabled=$state(true),draft=$state(''),sending=$state(false),problem=$state('');
+ // The stream's own state. `lastViewAt` is when a full snapshot was accepted, which is
+ // different from transport freshness: an idle session stays `live` on keep-alives.
+ let connection=$state<ConnectionStatus>({state:'connecting',detail:'Connecting…',attempt:0,lastFrameAt:null,lastViewAt:null});
+ let reconnectNonce=$state(0),clock=$state(Date.now()),streamedSessionId='';
  // The session whose transcript the stream should follow. Updated when the owner selects a session
  // in the session bar. An empty or absent value means the root (legacy project) conversation.
  let selectedSessionId=$state('');
@@ -45,7 +50,7 @@
    composerApi.add(uniqueImageFiles(files));
  }
  let transcript=$state<HTMLDivElement>();
- let controller:AbortController|null=null;
+ let streamGeneration=0;
  let modelSettings=$state<ProviderSettings|null>(null),selectedModel=$state(''),modelBusy=$state(false);
  async function loadModels(){try{modelSettings=await request('/settings/providers');}catch(e){problem=(e as Error).message;}}
  async function chooseModel(){
@@ -58,22 +63,52 @@
  $effect(()=>{
    const id=projectId;
    const sessionId=selectedSessionId;
+   // Reading the nonce makes a manual reconnect restart this effect. Every run owns one
+   // generation and one abort controller, so an older stream can never write this view.
+   const nonce=reconnectNonce;
+   const generation=++streamGeneration;
+   const controller=new AbortController();
    let cancelled=false;
+   const current=()=>!cancelled&&generation===streamGeneration&&!controller.signal.aborted;
+   // A session switch starts from an empty view; a reconnect of the same session keeps
+   // the last confirmed snapshot visible until its replacement arrives.
+   if(sessionId!==streamedSessionId){streamedSessionId=sessionId;view=null;}
+   connection={state:'connecting',detail:nonce>0?'Reconnecting…':'Connecting…',attempt:0,lastFrameAt:null,lastViewAt:null};
    void (async()=>{
      try{
        const snapshot=await api.agents(id);
-       if(cancelled)return;
-       enabled=snapshot.enabled;view=snapshot.view;selectedModel=view?.model?.provider==='faux'?'':view?.model?modelKey(view.model):'';
+       if(!current())return;
+       enabled=snapshot.enabled;
+       if(sessionId===''){view=snapshot.view;}
+       selectedModel=view?.model?.provider==='faux'?'':view?.model?modelKey(view.model):'';
        await loadModels();
-       if(!snapshot.enabled){status='Agents are disabled on this instance';return;}
-     }catch(e){if(!cancelled){status=(e as Error).message;onerror((e as Error).message);}return;}
-     controller?.abort();
-     controller=new AbortController();
-     try{await agentStream(id,next=>{if(!cancelled){view=next;status='Live';}},controller.signal,sessionId||undefined);}
-     catch(e){if(!cancelled&&(e as Error).name!=='AbortError')status='Stream closed — '+(e as Error).message;}
+       if(!snapshot.enabled)return;
+     }catch(e){
+       if(current())connection={state:'server-error',detail:(e as Error).message,attempt:0,lastFrameAt:null,lastViewAt:null};
+       if(!cancelled)onerror((e as Error).message);
+       return;
+     }
+     try{
+       await openAgentStream({
+         projectId:id,
+         sessionId:sessionId||undefined,
+         signal:controller.signal,
+         onView:next=>{if(current())view=next;},
+         onStatus:next=>{if(current())connection=next;},
+         onAuthExpired:()=>reportSessionExpired()
+       });
+     }catch(e){
+       if(current())connection={state:'server-error',detail:(e as Error).message,attempt:0,lastFrameAt:null,lastViewAt:null};
+     }
    })();
-   return ()=>{cancelled=true;controller?.abort();};
+   return ()=>{cancelled=true;controller.abort();};
  });
+ $effect(()=>{const timer=setInterval(()=>{clock=Date.now();},5000);return()=>clearInterval(timer);});
+ const snapshotAge=$derived(connection.lastViewAt===null?null:Math.max(0,Math.floor((clock-connection.lastViewAt)/1000)));
+ const snapshotAgeText=$derived(snapshotAge===null?'':' · last snapshot '+(snapshotAge<5?'just now':snapshotAge+'s ago'));
+ // Only a terminal state needs an owner action. While retrying, the manager owns the loop.
+ const canReconnect=$derived(connection.state==='offline'||connection.state==='stale'||connection.state==='server-error');
+ function reconnect(){reconnectNonce+=1;}
  $effect(()=>{if(transcript&&view?.entries.length)transcript.scrollTop=transcript.scrollHeight;});
  // Tell the application inbox when the set of open questions changes, so its badge and
  // list never count a question that has just been answered.
@@ -167,7 +202,7 @@
  }
 </script>
 <section class="agents">
- {#if view?.conversationId}<SessionBar {projectId} sessionId={selectedSessionId||view.conversationId} {view} {agentsVersion} onerror={(message)=>onerror(message)} onsessionchange={(id)=>{selectedSessionId=id;}}/>{/if}
+ {#if view?.conversationId||selectedSessionId}<SessionBar {projectId} sessionId={selectedSessionId||view?.conversationId||''} {view} {agentsVersion} onerror={(message)=>onerror(message)} onsessionchange={(id)=>{selectedSessionId=id;}}/>{/if}
  <header class="agents-head">
   <div>
    <span class="eyebrow">{!view?.model||view.model.provider==='faux'?'SCRIPTED TEST PROVIDER':'MODEL PROVIDER'}</span>
@@ -257,7 +292,17 @@
    <button class="primary compact-button" aria-label="Send message" disabled={sending||uploadingImages||(draft.trim()===''&&readyImages.length===0)} title={uploadingImages?'An image is still uploading: the message is held until it is stored':undefined} onclick={()=>void send('followUp')}><Icon name="arrow" size={14}/><span>{working?'Queue follow-up':'Send'}</span></button>
    <button class="compact-button" aria-label="Steer the run" disabled={sending||uploadingImages||!working||(draft.trim()===''&&readyImages.length===0)} title={uploadingImages?'An image is still uploading: the message is held until it is stored':undefined} onclick={()=>void send('steer')}>Steer current run</button>
    {#if uploadingImages}<small class="agent-upload-state" role="status">Uploading an image — the message is held until it is stored</small>{/if}
-   <small class="agent-status">{status}{view?.usage.input?(' · '+view.usage.input+' in / '+view.usage.output+' out'):''}</small>
+   <small class="agent-status connection" data-connection={connection.state} title={connection.lastFrameAt===null?'No frame received on this attempt':('Last transport frame '+new Date(connection.lastFrameAt).toLocaleTimeString())}>
+    <span class="connection-dot {connection.state}" aria-hidden="true"></span>
+    <span role="status" aria-live="polite">{connection.state==='live'?'Live':connection.detail}</span>
+    <span aria-hidden="true">{snapshotAgeText}</span>
+   </small>
+   {#if connection.state==='auth-required'}
+   <button class="compact-button" aria-label="Reload to sign in" onclick={()=>location.reload()}>Reload to sign in</button>
+   {:else if canReconnect}
+   <button class="compact-button" aria-label="Reconnect the agent stream" onclick={reconnect}>Reconnect</button>
+   {/if}
+   {#if view?.usage.input}<small class="agent-status">{view.usage.input} in / {view.usage.output} out</small>{/if}
   </div>
  </div>
  {/if}
@@ -291,6 +336,9 @@
  .agent-composer{border-top:1px solid var(--line);background:var(--panel);padding:10px 12px}
  .agent-composer textarea{min-height:80px;font:12px/1.6 var(--mono)}
  .agent-status{color:var(--muted)}
+ .agent-status.connection{display:inline-flex;align-items:center;gap:5px}
+ .connection-dot{width:7px;height:7px;border-radius:50%;background:var(--muted);flex:none}
+ .connection-dot.live{background:#5fbf7f}.connection-dot.stale,.connection-dot.offline{background:#d6b879}.connection-dot.auth-required,.connection-dot.server-error{background:var(--danger)}
  .agent-upload-state{color:var(--accent)}
  .agent-question.dismissed{opacity:.7;border-left:2px solid var(--danger)}
  .slash-list{border:1px solid var(--line);border-radius:5px;background:var(--bg);padding:8px 10px;margin-bottom:8px;max-height:24dvh;overflow:auto;display:flex;flex-direction:column;gap:4px}

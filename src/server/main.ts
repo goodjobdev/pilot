@@ -47,6 +47,7 @@ import { emptyBoard } from '../shared/model';
 import { serializeBoard } from '../shared/markdown';
 import { MAX_IMAGES_PER_MESSAGE, MEDIA_ID_PATTERN, TOO_MANY_IMAGES_CODE, inspectImage, tooManyImagesReason } from '../shared/images';
 import { QueueError, queueView, type QueueImageRef } from '../shared/queue';
+import { MAX_STREAM_FRAME_BYTES } from '../shared/stream';
 /**
  * Expected-version readiness inputs: the release identity, whether this process holds the lock, and
  * the schema observed from the live store handle. Startup supplies the live observer; a caller that
@@ -1355,31 +1356,77 @@ export async function createApp(options:AppOptions){
           if(agentsRoute[2]==='stream'&&req.method==='GET'){
             if(closing){res.statusCode=503;res.end();return;}
             res.statusCode=200;res.setHeader('Content-Type','text/event-stream');res.setHeader('Cache-Control','no-store');res.setHeader('Connection','keep-alive');
-            res.write('retry: 3000\n\n');
             // Accept optional sessionId so the owner can switch between per-session transcripts.
             const streamSessionId=url.searchParams.get('sessionId')||undefined;
             let closed=false,dispose:(()=>Promise<void>)|undefined;
             let keepAlive:ReturnType<typeof setInterval>|undefined;
             let finish!:()=>void;
             const ended=new Promise<void>(resolve=>{finish=resolve;});
+            // Every frame is a full snapshot, so a blocked socket needs only the newest one.
+            // The queue is exactly one frame, bounded in bytes, and never a growing list.
+            let pending:string|null=null,blocked=false,terminal:string|null=null;
+            const flush=()=>{
+              if(closed||blocked||terminal!==null||pending===null)return;
+              const frame=pending;pending=null;
+              blocked=!res.write(frame);
+            };
+            // A terminal reason waits for the one in-flight frame to drain, then ends the
+            // stream. It is never queued behind an unbounded write, and a blocked socket
+            // holds only this small frame until the client reads or shutdown ends it.
+            const flushTerminal=()=>{
+              if(closed||terminal===null||blocked)return;
+              const frame=terminal;terminal=null;
+              res.write(frame);
+              end();
+            };
+            const drain=()=>{
+              blocked=false;
+              if(terminal!==null)flushTerminal();else flush();
+            };
+            res.on('drain',drain);
+            const sendError=(code:string,message:string)=>{
+              if(closed||terminal!==null)return;
+              terminal='event: error\ndata: '+JSON.stringify({error:message,code})+'\n\n';
+              pending=null;
+              flushTerminal();
+            };
+            const sendSnapshot=(view:unknown)=>{
+              if(closed||terminal!==null)return;
+              const frame='data: '+JSON.stringify(view)+'\n\n';
+              const bytes=Buffer.byteLength(frame,'utf8');
+              if(bytes>MAX_STREAM_FRAME_BYTES){
+                // Never queue a frame this large: the client could not bound its own buffer.
+                sendError('STREAM_SNAPSHOT_TOO_LARGE','The agent view frame is '+bytes+' bytes, larger than this server sends on one stream frame.');
+                return;
+              }
+              pending=frame;
+              flush();
+            };
             const end=()=>{
               if(closed)return;
-              closed=true;clearInterval(keepAlive);finish();
+              closed=true;clearInterval(keepAlive);pending=null;terminal=null;res.removeListener('drain',drain);finish();
               if(!res.destroyed&&!res.writableEnded)res.end();
             };
+            res.once('error',end);
             // Track setup as well as the response: a disconnect or shutdown can precede
             // the asynchronous subscription. Its late disposer must finish before agents close.
             res.once('close',end);
             const stream={end,done:Promise.resolve()};
             streams.add(stream);
+            blocked=!res.write('retry: 3000\n\n');
             stream.done=(async()=>{
               try{
-                dispose=await agents.subscribe(p,view=>{if(!closed)res.write('data: '+JSON.stringify(view)+'\n\n');},streamSessionId);
+                dispose=await agents.subscribe(p,sendSnapshot,streamSessionId);
               }catch(e){
-                if(!closed)res.write('event: error\ndata: '+JSON.stringify({error:(e as Error).message})+'\n\n');
-                end();return;
+                sendError('STREAM_SUBSCRIBE_FAILED',(e as Error).message);
+                return;
               }
-              if(!closed)keepAlive=setInterval(()=>{if(!closed)res.write(': keep-alive\n\n');},20000);
+              if(!closed)keepAlive=setInterval(()=>{
+                if(closed)return;
+                // A skipped heartbeat under backpressure is harmless: the socket is not idle,
+                // and the drain event flushes the newest snapshot before the next interval.
+                if(!blocked&&terminal===null)blocked=!res.write(': keep-alive\n\n');
+              },20000);
               await ended;
               await dispose();
             })().catch(e=>{streamFailures.push(e);}).finally(()=>{streams.delete(stream);});

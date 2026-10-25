@@ -50,11 +50,11 @@ owner has accepted it. Nothing in this plan authorises a commit, push or deploym
 
 ### Step 1 — Reliable reconnect with bounded backoff and honest states
 
-**Status: Partial.** The server stream works and shutdown now closes it (`a3c4222`,
-`src/server/main.ts`). The client starts one stream per project/session
-(`src/client/AgentsView.svelte`) and the request layer retries exactly one CSRF rejection
-(`src/client/api.ts`). There is no bounded reconnect loop, no stale state, no snapshot
-refresh on reconnect and no session race guard.
+**Status: Partial — reconnect core built.** The server stream works and shutdown now closes it
+(`a3c4222`, `src/server/main.ts`). The bounded, heartbeat-aware reconnect client is now in
+`src/client/stream.ts` with tests in `tests/unit/stream.test.ts`,
+`tests/server/agents.test.ts` and `tests/browser/reconnect.spec.ts`. Evidence-based polling
+fallback and the client transcript-row cap remain.
 
 **Required work**
 
@@ -93,6 +93,36 @@ refresh on reconnect and no session race guard.
 - Polling starts only on the evidence named above and is visible.
 - Browser tests cover offline, slow first snapshot, stream close and session switching;
   a server test asserts no dispatch on the reconnect path.
+
+**Evidence (reconnect core).**
+
+- `src/client/stream.ts` reads full snapshots only. It treats every complete frame, including
+  the server's 20-second keep-alive comment, as transport activity; `lastViewAt` reports useful
+  progress and never makes an idle session stale. Parser tests cover fragmentation at every
+  boundary, CRLF, multiline frames, two valid frames in one chunk under a per-frame byte cap,
+  an aggregate many-short-lines overflow, a UTF-8 byte cap, and an incomplete frame.
+- Reconnect is bounded: the server's `retry:` hint is clamped to 1-30 seconds, the delay doubles
+  with jitter, and 6 automatic attempts end in a visible `offline` or `stale` state with a manual
+  `Reconnect`. The retry budget resets only after 10 seconds of transport-fresh time, so a
+  snapshot-then-drop sequence still reaches `offline`. `401` ends in `auth-required` immediately
+  and calls the sign-in expiry handler; `403` shows the server's message and code with no retry
+  loop, and a hanging refusal body cannot delay either state.
+- One generation and one `AbortController` own each project/session selection. A session switch
+  aborts the old stream, clears the old view and drops every late status, snapshot or question
+  update from the previous generation. A browser test holds the old selection's initial
+  `/agents` snapshot, switches sessions, and proves the stale response cannot disable the new
+  view. A reconnect is a `GET` only: it sends no input, answer, model change, `resume` or `retry`.
+- The server keeps at most one pending snapshot frame and drops intermediate full snapshots under
+  backpressure. A frame over 4 MiB is refused with one terminal `STREAM_SNAPSHOT_TOO_LARGE` error
+  frame, which waits for the in-flight frame to drain instead of being written behind it. The
+  existing drain order is preserved: `end()` clears the timer and pending frame, disposes one
+  subscription, and shutdown still waits for it.
+- The 600 ms delayed-first-snapshot browser test proves only that the state remains
+  `connecting`; the 45-second stale boundary is covered by the unit test, not by that browser
+  test.
+- Passing evidence in this worktree: `pnpm check`; `pnpm test` (421 tests, including 18 stream
+  client tests and 5 new stream server tests); `pnpm test:browser` (34 tests, including 5 new
+  reconnect browser tests); `pnpm build`. No commit, push, deployment or live-data use.
 
 **Risks**
 
