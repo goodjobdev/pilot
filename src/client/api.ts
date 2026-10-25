@@ -9,7 +9,7 @@ import type { ApprovalKind, ApprovalRecord, ApprovalScope, ApprovalState, Approv
 const token=document.querySelector<HTMLMetaElement>('meta[name="dashboard-token"]')?.content??'';
 let csrf='';
 export type ApiErrorKind = 'http' | 'session' | 'network';
-export class ApiError extends Error {constructor(public status:number,message:string,public kind:ApiErrorKind='http'){super(message);}}
+export class ApiError extends Error {constructor(public status:number,message:string,public kind:ApiErrorKind='http',public code?:string){super(message);}}
 /** True when the request was answered by the sign-in layer rather than the application. */
 export function isSessionExpired(error:unknown):boolean{return error instanceof ApiError&&error.kind==='session';}
 let onExpiry:(()=>void)|null=null;
@@ -40,7 +40,7 @@ export async function request<T>(path:string,method='GET',data?:unknown,retried=
     await session();
     return request<T>(path,method,data,true);
   }
-  if(!res.ok)throw new ApiError(res.status,value.error??'Request failed');
+  if(!res.ok)throw new ApiError(res.status,value.error??'Request failed','http',typeof value.code==='string'?value.code:undefined);
   return value as T;
 }
 let renewing:Promise<void>|undefined;

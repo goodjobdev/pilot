@@ -38,8 +38,12 @@ import { AcceptanceStore } from './state/acceptance-store';
 import { FORK_ROOT_DIRECTORY, ForkStore, createForkWorktreePort, type ForkTranscriptPort } from './state/fork-store';
 import { FORK_MAX_ENTRY_SCAN, ForkError } from '../shared/forks';
 import { AgentStore } from './state/agent-store';
+import { WorkerModelPolicyStore } from './state/model-policy-store';
 import { FileEditTool, FileEditError, type FileEditMode } from './state/file-edit-tool';
 import { AgentError, agentScopeVocabulary } from '../shared/agent-registry';
+import { WorkerModelPolicyError, type WorkerModelOption, type WorkerModelPolicyView } from '../shared/model-policy';
+import { WORKER_MODEL_POLICY_READBACK_UNCERTAIN } from '../shared/model-policy-codes';
+import { modelKey } from '../shared/settings';
 import { ActionError,ActionRegistry,liveActivity,normaliseActionScope,type ActionEnvironment } from './state/action-registry';
 import { ApprovalError } from '../shared/approvals';
 import { ATTENTION_LIMITS, AttentionCursorError, countAttentionItems, decodeAttentionCursor, pageAttentionItems, parseAttentionLimit } from '../shared/attention';
@@ -191,6 +195,27 @@ export function agentHttpStatus(code:AgentError['code']):number {
   if(code==='NOT_PERMITTED')return 403;
   if(code==='CORRUPT'||code==='STORAGE')return 500;
   return 422;
+}
+/** The worker model policy's refusals. A stale revision is a conflict; an agent write is forbidden. */
+export function workerModelPolicyHttpStatus(code:WorkerModelPolicyError['code']):number {
+  if(code==='CONFLICT')return 409;
+  if(code==='NOT_PERMITTED')return 403;
+  if(code==='CORRUPT'||code==='STORAGE')return 500;
+  return 422;
+}
+/**
+ * Map a policy storage failure without leaking internal details. The detail is logged on the
+ * server; the response carries one fixed, path-free sentence. A readback failure after a successful
+ * write is deliberately ambiguous: the UI must preserve the draft and offer a deliberate reload.
+ */
+function workerModelPolicyFailure(error:WorkerModelPolicyError,stage:'read'|'write'|'readback'):never {
+  if(error.code==='CORRUPT'||error.code==='STORAGE'){
+    console.error('Worker model policy '+stage+' failure: '+error.message);
+    if(stage==='readback')
+      throw new HttpError(500,'The worker model policy was written, but the current policy could not be read back. The saved value may be the new revision. Reload the current policy before you save again.',WORKER_MODEL_POLICY_READBACK_UNCERTAIN);
+    throw new HttpError(500,'The worker model policy is unreadable or corrupt. Nothing was changed.');
+  }
+  throw new HttpError(workerModelPolicyHttpStatus(error.code),error.message);
 }
 /** The bounded file-edit capability's own refusals. An escape from the worktree is a permission refusal. */
 export function fileEditHttpStatus(code:FileEditError['code']):number {
@@ -748,6 +773,62 @@ export async function createApp(options:AppOptions){
   }):undefined;
   agentHolder.store=agentStore;
   /**
+   * The owner's worker model policy: future owner-created workers only. It is configuration, not
+   * execution. The existing global default, per-session model and per-agent model remain the
+   * orchestrator controls. Nothing here opens a harness or dispatches a model.
+   */
+  const workerModelPolicy=options.control?new WorkerModelPolicyStore(options.control,{
+    models:()=>agents.offeredModels()
+  }):undefined;
+  /** One read-only projection: the stored policy plus every catalog entry it could choose. */
+  const workerModelPolicyView=async():Promise<WorkerModelPolicyView>=>{
+    const policy=workerModelPolicy?.read()??null;
+    // This is a read of the credential store and the bundled catalog. It makes no provider call.
+    const providerView=await providers.view();
+    const names=new Map(providerView.models.map(model=>[modelKey(model),model.name]));
+    const configured=new Set(providerView.providers.filter(provider=>provider.configured).map(provider=>provider.id));
+    const models:WorkerModelOption[]=agents.offeredModels().map(model=>{
+      const scripted=model.provider==='faux';
+      const credentialSaved=scripted?false:configured.has(model.provider);
+      const available=scripted?agents.enabled:credentialSaved;
+      return Object.freeze({
+        provider:model.provider,
+        modelId:model.modelId,
+        name:names.get(modelKey(model))??model.modelId,
+        known:true,
+        credentialSaved,
+        credentialNote:scripted
+          ?(agents.enabled?'Scripted provider. No credential is used.':'Scripted provider. The agent harness is off, so it cannot run.')
+          :credentialSaved
+            ?'A credential is saved. This is not a health check, and no provider probe is made.'
+            :'No credential is saved for this provider. The policy can keep the model, but a worker could not dispatch it yet.',
+        available,
+        unavailableReason:available?null:scripted
+          ?'The agent harness is off, so the scripted provider cannot run.'
+          :'No credential is saved for this provider. The policy can keep this model, but a worker could not dispatch it until a credential is saved.'
+      });
+    });
+    for(const saved of policy?.allowedWorkerModels??[]){
+      if(models.some(model=>modelKey(model)===modelKey(saved)))continue;
+      const scripted=saved.provider==='faux';
+      models.push(Object.freeze({
+        provider:saved.provider,
+        modelId:saved.modelId,
+        name:saved.modelId,
+        known:scripted,
+        credentialSaved:false,
+        credentialNote:scripted
+          ?'Scripted provider. The agent harness is off, so it cannot run. The saved entry is kept so you can inspect or remove it.'
+          :'This model is no longer in the offered catalog. It is preserved for inspection and removal.',
+        available:false,
+        unavailableReason:scripted
+          ?'The agent harness is off, so the scripted provider cannot run. The saved entry is kept so you can inspect or remove it.'
+          :'This model is no longer in the offered catalog. It is kept so you can inspect and remove it; it is not silently replaced.'
+      }));
+    }
+    return Object.freeze({policy,revision:policy?.revision??0,models:Object.freeze(models)});
+  };
+  /**
    * One session as the overview list reports it: the durable record plus the agent binding, the
    * lifecycle state it reads at and the linked work the record holds. Pure reads of existing stores:
    * nothing here opens a harness, writes a row or sends anything.
@@ -833,6 +914,37 @@ export async function createApp(options:AppOptions){
         if(path==='/api/release'&&req.method==='GET'){json(releaseView());return;}
         if(path==='/api/settings/providers'&&req.method==='GET'){json(await providers.view());return;}
         if(path==='/api/settings/models'&&req.method==='POST'){json(await providers.savePreferences(payload));return;}
+        // The owner-only worker model policy. The route derives the owner from the authenticated
+        // session and accepts no actor in the body. Saving it opens no harness and dispatches nothing.
+        if(path==='/api/settings/model-policy'){
+          if(!workerModelPolicy)throw new HttpError(503,'The worker model policy is unavailable: no durable control store is open on this instance');
+          if(req.method==='GET'){
+            try{json(await workerModelPolicyView());}
+            catch(error){
+              if(error instanceof WorkerModelPolicyError)workerModelPolicyFailure(error,'read');
+              // Any other view failure, including a corrupt provider settings file, is a sanitized
+              // 500. The internal detail is logged only on the server.
+              console.error('Worker model policy view read failure: '+(error as Error).message);
+              throw new HttpError(500,'The worker model policy view could not be read. Nothing was changed.');
+            }
+            return;
+          }
+          if(req.method==='POST'){
+            const body=parseBody(z.strictObject({revision:z.unknown(),policy:z.unknown()}),payload,'The worker model policy request');
+            try{workerModelPolicy.update(body,ownerActor);}
+            catch(error){if(error instanceof WorkerModelPolicyError)workerModelPolicyFailure(error,'write');throw error;}
+            try{json(await workerModelPolicyView());}
+            catch(error){
+              if(error instanceof WorkerModelPolicyError)workerModelPolicyFailure(error,'readback');
+              // The write already succeeded. Any readback failure is ambiguous for the client and
+              // must not leak its internal detail. The UI keeps the draft and offers a reload.
+              console.error('Worker model policy readback failure: '+(error as Error).message);
+              throw new HttpError(500,'The worker model policy was written, but the current policy could not be read back. The saved value may be the new revision. Reload the current policy before you save again.',WORKER_MODEL_POLICY_READBACK_UNCERTAIN);
+            }
+            return;
+          }
+          throw new HttpError(405,'Method not allowed');
+        }
         const providerRoute=path.match(/^\/api\/settings\/providers\/([a-z0-9-]+)(?:\/(key|login))?$/);
         if(providerRoute){
           if(providerRoute[2]==='key'&&req.method==='POST'){await providers.saveKey(providerRoute[1],payload);json({ok:true});return;}
@@ -1592,7 +1704,7 @@ export async function createApp(options:AppOptions){
     }
   });
   server.requestTimeout=30000;server.headersTimeout=10000;
-  return {server,catalog,boards,docs,agents,alerts,providers,repositories,sessions,lifecycle,actions,media,queue:queueStore,runner,acceptance,forks,agentStore,fileEdit,close:async()=>{
+  return {server,catalog,boards,docs,agents,alerts,providers,repositories,sessions,lifecycle,actions,media,queue:queueStore,runner,acceptance,forks,agentStore,fileEdit,workerModelPolicy,close:async()=>{
     // A server that never opened reports ERR_SERVER_NOT_RUNNING, which means "already closed", not
     // "close failed". A failed start (for example a port already in use) must still drain and
     // release the lock that this same start created, and must report the original failure instead.

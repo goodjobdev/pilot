@@ -971,9 +971,13 @@ deterministic delays are host-only test seams.
 
 ### Step 8 — Owner-configured models: orchestrator and workers
 
-**Status: Partial.** A model can be chosen per instance, per agent and per conversation,
-but there is no separate worker model, no owner-defined allowed set, and no policy that
-keeps a cheaper worker from changing the orchestrator.
+**Status: Partial — owner worker model policy configured; worker execution not built.** A
+model can be chosen per instance, per agent and per conversation. The owner can now set an
+allowed worker model set and an optional default worker model in the durable control store.
+There is no worker entity, worker creation path or worker dispatch path, so the policy is
+not used at dispatch. The existing global default, per-session model and per-agent model
+remain the orchestrator controls; this step adds no allowed-orchestrator setting that would
+look functional but have no effect. Step 9 will add worker execution and enforcement.
 
 **The owner requirement**
 
@@ -1006,12 +1010,14 @@ milestone does not give it one.
 
 **Gaps**
 
-- No worker/subagent model exists. The queue holds no per-worker model, and the runner
-  executes no model at all: its jobs are bounded tool execution.
-- There is no owner-defined allowed set. An agent has one model; the setting is not a
-  policy list with a default for workers.
-- No default worker model, and no rule that a cheaper worker cannot silently become the
-  orchestrator.
+- No worker/subagent **execution** exists. The queue holds no per-worker model, and the runner
+  executes no model at all: its jobs are bounded tool execution. The owner worker model policy
+  is stored and shown, but nothing dispatches a worker yet.
+- The owner-defined allowed set and optional default worker model now exist. They configure
+  future owner-created workers; they are not enforced because no worker dispatch exists. An
+  agent has one model of its own, not a policy list.
+- The default worker model is configured but not used. No rule yet keeps a cheaper worker from
+  changing the orchestrator; Step 9 enforces that rule when it creates a worker.
 - Cost is shown per conversation, not per worker run or per tool.
 - A queued input has no recorded model. A model change while work is queued changes what
   the queued work runs under, without saying so.
@@ -1020,12 +1026,13 @@ milestone does not give it one.
 
 **Required work**
 
-- Add an owner-only model policy: allowed orchestrator models, default orchestrator model,
-  and the allowed worker models from which Step 9 chooses a worker default. Validate every
-  entry against this instance's offered models. The worker **policy** itself — assignment,
-  default and enforcement — belongs to Step 9.
-- Separate the two selections in the interface and in the API. Do not derive one from the
-  other. Both select a model for harness turns; neither changes what runs in the runner.
+- Add an owner-only **worker model policy**: the allowed worker models and an optional default
+  worker model. Validate every entry against this instance's offered models. Keep the existing
+  global default, per-session model and per-agent model as the orchestrator controls; do not add
+  a second orchestrator setting that nothing uses. Worker assignment and enforcement belong to
+  Step 9.
+- Keep the worker policy separate from the existing orchestrator choices in the interface and
+  in the API. Do not derive one from the other. Neither changes what runs in the runner.
 - Keep every model request in the application harness. Do not add a provider client, a
   credential, a network route or a proxy to the runner container.
 - A model change applies to the next dispatch only. It never changes a running generation.
@@ -1042,8 +1049,9 @@ milestone does not give it one.
 
 **Acceptance criteria**
 
-- The owner can set an allowed set and a default for orchestrator and worker separately,
-  and cannot save a model this instance does not offer.
+- The owner can set an allowed worker set and an optional default worker model, and cannot
+  save a new model this instance does not offer. The existing orchestrator choices remain
+  unchanged.
 - A worker's model turns can use a cheaper allowed model in the application harness while
   the orchestrator keeps its stronger one, with both effective models and costs visible.
 - The runner container still has no network and no provider access after the change.
@@ -1066,13 +1074,80 @@ milestone does not give it one.
 - Cost attribution can be wrong if the provider reports per model, not per call. Mitigation:
   report at the granularity the provider supports and name the granularity.
 
+**Evidence (local).**
+
+- `src/shared/model-policy.ts` is the pure record and validation: `allowedWorkerModels` and
+  `defaultWorkerModel` only, canonical model order, no duplicates, a new model must be in the
+  offered catalog, and a default must be a member of its allowed set. A saved model that later
+  leaves the catalog is preserved so it can be inspected and removed; a new unknown model is
+  refused. Removing the default from the set without clearing it is refused. No value is cleared
+  or replaced silently.
+- `src/server/state/model-policy-store.ts` stores the policy in the existing control store as
+  one operation per revision. The reserved settings bucket is `projectId='settings'`,
+  `sessionId='worker-policy'`, which cannot collide with a real project UUID. Operation kind and
+  outbox kind are `settings.worker-model-policy`; the idempotency key is
+  `worker-model-policy.r<revision>`; the outbox row is the audit evidence. The control schema
+  still has exactly `control_schema`, `operations` and `outboxes`; no table or database was added.
+  A stale revision is `409` and writes nothing. The store's own unique index is the CAS.
+- `src/server/main.ts` exposes owner-only `GET /api/settings/model-policy` and
+  `POST /api/settings/model-policy`. The route derives the owner actor from the authenticated
+  session; it accepts no actor in the body. The unchanged Host, owner authentication and
+  origin/CSRF checks apply. `GET` reads the credential store and bundled catalog only; it makes
+  no provider call. The route never opens the harness and never dispatches a model. A policy
+  `CORRUPT` or `STORAGE` failure is `500` for both `GET` and `POST`; any other view failure,
+  including a corrupt provider settings file, is also a sanitized `500`. The response carries one
+  fixed, path-free sentence and the internal detail is logged only on the server. A readback
+  failure after a successful write returns an explicitly ambiguous `500` with the shared machine
+  code `WORKER_MODEL_POLICY_READBACK_UNCERTAIN`. The detail of the stored policy is not returned.
+- `src/client/ProviderSettings.svelte` shows the existing new-session default and states that an
+  existing session or a bound agent may use a different model. The worker policy is separate and
+  reserved for future owner-created workers. It states that no worker runs exist in this build
+  and that no worker cost is reported. A saved model from an unconnected provider is marked
+  unavailable and can be removed. The credential flag is `credentialSaved`, not a health check:
+  the interface states that no provider probe is made. Removing the default from the allowed set
+  shows the refusal; the owner must clear it explicitly. A stale save preserves the draft and the
+  message. The owner can review the latest revision without replacing the draft. The review shows
+  the current revision and the difference between the server choices and the draft. Only the
+  explicit `Use latest revision and save my choices` confirmation moves the CAS base and saves the
+  draft over the newer choices. `Keep my draft` dismisses the choice; a reload discards the draft.
+  An uncertain write keeps the draft in the same way, and the UI reads the shared machine code,
+  never the English message.
+- `tests/unit/model-policy.test.ts` (8 tests), `tests/server/model-policy-store.test.ts`
+  (8 tests), `tests/server/model-policy-http.test.ts` (6 tests) and
+  `tests/browser/model-policy.spec.ts` (6 tests) cover: separate choices, catalog validation,
+  duplicate refusal, default removal refusal and explicit clear, stale CAS (a sequential check),
+  a two-connection admission conflict at the store's unique index (no true concurrent interleave
+  is claimed), a tampered idempotency key or operation state as corruption, owner-only write, no
+  client actor, unavailable saved entry preservation and removal, no new table, unchanged global
+  default/agent/session choices during a policy write, a running generation unchanged, a two-tab
+  stale save that preserves the draft, an explicit review of the latest revision, the explicit
+  `Use latest revision and save my choices` confirmation that saves over the newer choices, a
+  third-writer race that conflicts again and preserves the draft, a deliberate reload that
+  discards the draft, an uncertain write that preserves it, a `500` without the machine code that
+  is not treated as uncertain, a phone layout with no horizontal overflow, generic `500` storage
+  failures including corrupt provider settings, an explicitly ambiguous `500` with the shared
+  machine code when a successful write cannot be read back, the accurate harness-off reason for a
+  saved scripted model, and no worker creation route. No provider is called and no worker runs.
+- Local validation in this worktree: `./node_modules/.bin/tsc --noEmit`,
+  `./node_modules/.bin/svelte-check --tsconfig ./tsconfig.json` (0 errors, 0 warnings),
+  `./node_modules/.bin/vite build` plus `./node_modules/.bin/esbuild src/server/main.ts
+  --bundle --platform=node --format=esm --packages=external --outfile=dist/server.mjs`,
+  `./node_modules/.bin/tsx --test tests/unit/*.test.ts tests/server/*.test.ts` (540 passed),
+  and `./node_modules/.bin/playwright test tests/browser/settings.spec.ts
+  tests/browser/agent-manager.spec.ts tests/browser/model-policy.spec.ts` (9 passed). No install,
+  remote call, live-data use, commit, push or deployment.
+- Still open in this step: worker execution, an effective worker model, per-worker cost, and a
+  queued input's model. These need the owner-created worker record and dispatch path in Step 9.
+
 ---
 
-### Step 9 — Bounded, owner-created workers (worker model policy lives here)
+### Step 9 — Bounded, owner-created workers (worker model enforcement lives here)
 
-**Status: Gap.** The runner and queue exist, but there is no bounded worker entity, and no
-agent may create one. **The worker model policy belongs to this step**: Step 8 only defines
-the owner's allowed set and the orchestrator choice.
+**Status: Deferred — waits for the worker execution design and owner acceptance of the worker
+policy.** The runner and queue exist, but there is no bounded worker entity, and no agent may
+create one. Step 8 now defines the owner's allowed worker set and optional default worker model.
+Step 9 will enforce that policy when it creates and dispatches an owner-created worker. No worker
+execution is built or claimed here.
 
 **Required work**
 
@@ -1251,7 +1326,7 @@ and its passphrase as the only key to the captured state.
 | 5 Mobile Back stack and bottom controls | Gap |
 | 6 Attention surface | Partial |
 | 7 `record_note` cancellation audit | Built, pending owner acceptance |
-| 8 Owner-configured orchestrator and worker models | Partial |
-| 9 Bounded owner-created workers | Gap |
+| 8 Owner-configured orchestrator and worker models | Partial — worker policy configured; no worker execution |
+| 9 Bounded owner-created workers | Deferred — waits for worker execution design and owner acceptance |
 | 10 Disconnect, cancel and crash tests | Partial |
 | Shared browser, runnable artifacts, unrestricted extensions, anonymous sharing | Deferred |
