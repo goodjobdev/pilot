@@ -109,11 +109,13 @@ the agent's own choices).
   identity of the current or last generation, the reason it is not idle, and the last durable
   activity — in the same control store, one operation per revision. The five owner actions over it
   are explicit and revision-checked: `reconnect` attaches without starting anything, `resume`
-  continues a paused or interrupted session under its **original request identity** (so it can never
-  double-submit), `retry` starts a **new attempt with a new identity** only for a failed session,
-  `stop` cancels idempotently, and `pause` cancels but keeps the session resumable. Only `resume`
-  and `retry` may dispatch a model request; an uncertain interruption is refused with operator
-  attention rather than replayed. See [Session recovery](RECOVERY.md).
+  continues **pending durable work** under its **original request identity** (so it can never
+  double-submit); if that identity is already terminal, resume starts nothing and reports
+  `terminal`/`dispatched:false` instead of claiming new work, `retry` starts a **new attempt with a
+  new identity** only for a failed session, `stop` cancels idempotently, and `pause` cancels but
+  keeps a still-pending session resumable. Only `resume` and `retry` may dispatch a model request,
+  and only for pending or new work; an uncertain interruption is refused with operator attention
+  rather than replayed. See [Session recovery](RECOVERY.md).
 
 ## The alert model
 

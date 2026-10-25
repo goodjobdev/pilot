@@ -34,7 +34,7 @@ function freePort(): Promise<number> {
  * values: an ambient DASHBOARD_ORIGIN, CF_ACCESS_*, DASHBOARD_EXPOSURE or DASHBOARD_ALLOWED_HOSTS
  * would make every start here fail closed before the behaviour under test is reached.
  */
-const DEPLOYMENT_VARIABLES=['DASHBOARD_MODE','DASHBOARD_EXPOSURE','DASHBOARD_BIND','DASHBOARD_ALLOWED_HOSTS','DASHBOARD_RELEASE','DASHBOARD_ROOT_ID','DASHBOARD_SHUTDOWN_DEADLINE_MS','DASHBOARD_ORIGIN','CF_ACCESS_TEAM','CF_ACCESS_AUD','DASHBOARD_OWNER','DASHBOARD_DATA','DASHBOARD_ROOTS','DASHBOARD_REGISTRY','PORT'];
+const DEPLOYMENT_VARIABLES=['DASHBOARD_MODE','DASHBOARD_EXPOSURE','DASHBOARD_BIND','DASHBOARD_ALLOWED_HOSTS','DASHBOARD_RELEASE','DASHBOARD_ROOT_ID','DASHBOARD_SHUTDOWN_DEADLINE_MS','DASHBOARD_ORIGIN','CF_ACCESS_TEAM','CF_ACCESS_AUD','DASHBOARD_OWNER','DASHBOARD_DATA','DASHBOARD_ROOTS','DASHBOARD_REGISTRY','DASHBOARD_AGENT_NOTE_DELAY_MS','DASHBOARD_AGENT_TEST_SEAMS','PORT'];
 function testEnv(overrides:NodeJS.ProcessEnv):NodeJS.ProcessEnv {
   const env:{[name:string]:string|undefined}={...process.env};
   for(const name of DEPLOYMENT_VARIABLES)delete env[name];
@@ -58,7 +58,7 @@ test('a run killed mid-tool resumes from its checkpoint and never replays an uns
   const data=join(root,'data');
   const port=await freePort();
   const base='http://127.0.0.1:'+port;
-  const env=testEnv({ DASHBOARD_MODE:'local',DASHBOARD_DATA:data,PORT:String(port),DASHBOARD_AGENTS:'on',DASHBOARD_AGENT_PAUSE_MS:'100',DASHBOARD_REGISTRY:'',DASHBOARD_ROOTS:'' });
+  const env=testEnv({ DASHBOARD_MODE:'local',DASHBOARD_DATA:data,PORT:String(port),DASHBOARD_AGENTS:'on',DASHBOARD_AGENT_PAUSE_MS:'100',DASHBOARD_AGENT_TEST_SEAMS:'on',DASHBOARD_AGENT_NOTE_DELAY_MS:'5000',DASHBOARD_REGISTRY:'',DASHBOARD_ROOTS:'' });
   const startServer=()=>spawn(process.execPath,[join(release,'server.mjs')],{env,stdio:['ignore','pipe','pipe']});
   const waitForListening=(child:ChildProcess)=>new Promise<void>((ok,fail)=>{
     const timer=setTimeout(()=>fail(Error('the server did not start listening')),10000);

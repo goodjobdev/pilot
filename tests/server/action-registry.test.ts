@@ -115,8 +115,8 @@ async function fixture(): Promise<Fixture> {
     calls: [],
     refusal: null,
     authoriseDispatch() { port.calls.push('authorise'); if (port.refusal) throw port.refusal; },
-    async resume({ requestId }) { port.calls.push('resume:' + requestId); },
-    async retry({ requestId }) { port.calls.push('retry:' + requestId); },
+    async resume({ requestId }) { port.calls.push('resume:' + requestId); return { kind: 'dispatched' as const }; },
+    async retry({ requestId }) { port.calls.push('retry:' + requestId); return { kind: 'dispatched' as const }; },
     async cancel() { port.calls.push('cancel'); if (port.refusal) throw port.refusal; }
   };
   const lifecycle = new SessionLifecycleService(lifecycleStore, port);

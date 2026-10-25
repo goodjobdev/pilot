@@ -170,7 +170,7 @@ export const api={
   consumeApproval:(id:string,body:{scope:ApprovalScope;kind:ApprovalKind;target:ApprovalTarget;consumedBy:string})=>request<{approval:ApprovalRecord;target:ApprovalTarget}>('/approvals/'+encodeURIComponent(id)+'/consume','POST',body),
   revokeApproval:(id:string,body:{scope:ApprovalScope;revokedBy:string;reason?:string|null})=>request<{approval:ApprovalRecord}>('/approvals/'+encodeURIComponent(id)+'/revoke','POST',body),
   /** One explicit lifecycle action. Only resume and retry can dispatch a model request. */
-  lifecycleAction:(projectId:string,sessionId:string,action:'reconnect'|'resume'|'retry'|'stop'|'pause',body:{revision:number;reason?:string})=>request<{lifecycle:{state:string;revision:number;reason:string|null};dispatched:boolean;cancelled:boolean;unchanged:boolean}>('/sessions/'+encodeURIComponent(sessionId)+'/lifecycle/'+action,'POST',{projectId,...body}),
+  lifecycleAction:(projectId:string,sessionId:string,action:'reconnect'|'resume'|'retry'|'stop'|'pause',body:{revision:number;reason?:string})=>request<{lifecycle:{state:string;revision:number;reason:string|null};dispatched:boolean;cancelled:boolean;unchanged:boolean;outcome:'dispatched'|'cancelled'|'terminal'|'unchanged';reason:string|null}>('/sessions/'+encodeURIComponent(sessionId)+'/lifecycle/'+action,'POST',{projectId,...body}),
   /** A dismissal carries a reason and is recorded as its own durable entry, distinct from an answer. */
   dismissQuestion:(projectId:string,body:{questionId:string;reason:string;sessionId?:string})=>request<{submissionId:string|null}>('/projects/'+projectId+'/agents/dismiss','POST',body),
   actions:(scope:ActionScope={})=>{

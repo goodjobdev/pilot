@@ -598,7 +598,7 @@ test('two concurrent retries at one lifecycle revision dispatch one generation, 
  }finally{await app.close();store.close();await rm(root,{recursive:true,force:true});}
 });
 
-test('an owner pause of a genuinely running generation is the only writer at its revision, and the session resumes',async()=>{
+test('an owner pause of a genuinely running generation is the only writer at its revision, and its terminal resume starts no new work',async()=>{
  const root=await mkdtemp(join(tmpdir(),'dashboard-lifecycle-pause-'));
  const data=join(root,'data');await mkdir(data,{recursive:true,mode:0o700});
  const store=new ControlStore(data);
@@ -638,8 +638,8 @@ test('an owner pause of a genuinely running generation is the only writer at its
   let revisionWhileCancelling:number|null=null;
   const service=new SessionLifecycleService(lifecycle,{
     authoriseDispatch:()=>{},
-    resume:async({requestId})=>{await app.agents.dispatchLifecycle(registered,requestId);},
-    retry:async({requestId})=>{await app.agents.dispatchLifecycle(registered,requestId);},
+    resume:async({requestId})=>app.agents.dispatchLifecycle(registered,requestId),
+    retry:async({requestId})=>app.agents.dispatchLifecycle(registered,requestId),
     cancel:async()=>{
       let ended:()=>void=()=>{};const stopped=new Promise<void>(resolve=>{ended=resolve;});
       const unsubscribe=await app.agents.subscribe(registered,value=>{if(!value.working)ended();});
@@ -665,18 +665,19 @@ test('an owner pause of a genuinely running generation is the only writer at its
   assert.equal(after.state,'paused','the settled hook did not overwrite the pause with idle');
   assert.equal(after.revision,live.revision+1,'the settled hook wrote no competing revision');
   assert.equal(after.attempt,live.attempt,'a pause starts no new attempt');
-  // A paused session is resumable through the application's own route, under its original identity.
+  // A paused session is resumable through the application's own route, but its original submission
+  // is already terminal: the response must say terminal/no-additional-work and settle idle.
   const basePath='/api/sessions/'+sessionId+'/lifecycle';
   const resumed=await post(basePath+'/resume',{projectId:project.id,revision:after.revision});
-  assert.equal(resumed.status,200,'a paused session resumes');
+  assert.equal(resumed.status,200,'a paused session resolves the resume route');
   const resumedBody=await resumed.json();
-  assert.equal(resumedBody.lifecycle.state,'running');
-  assert.equal(resumedBody.dispatched,true);
+  assert.equal(resumedBody.outcome,'terminal');
+  assert.equal(resumedBody.dispatched,false,'a terminal resume claims no dispatch and no new work');
+  assert.equal(resumedBody.lifecycle.state,'idle','the terminal resume settles instead of leaving a false running');
+  assert.match(resumedBody.reason,/No additional work was started/);
   assert.equal(resumedBody.lifecycle.requestId,live.requestId,'resume continued under the original request identity');
-  assert.equal(resumedBody.lifecycle.attempt,after.attempt,'resume continues the same attempt, it does not start a new one');
-  // Stop the resumed run before closing, so the test holds no live generation at teardown.
-  await post('/api/projects/'+project.id+'/agents/abort',{});
-  await waitFor(async()=>{const v=await view();return !v.view.working?true:undefined;});
+  assert.equal(resumedBody.lifecycle.attempt,after.attempt,'resume starts no new attempt');
+  assert.equal(lifecycle.read(project.id,sessionId).state,'idle','the durable record matches the terminal response');
  }finally{await app.close();store.close();await rm(root,{recursive:true,force:true});}
 });
 

@@ -508,7 +508,7 @@ export const ACTION_DESCRIPTORS: readonly ActionDescriptor[] = Object.freeze([
   describe({
     id: 'session.lifecycle.resume' as const,
     label: 'Resume session',
-    description: 'Continue a paused or interrupted generation under its original request identity.',
+    description: 'Continue pending durable work under the original request identity. A terminal identity starts nothing and reports no additional work.',
     requires: sessionScope,
     parameters: lifecycleParameters(),
     preconditions: [
@@ -520,7 +520,7 @@ export const ACTION_DESCRIPTORS: readonly ActionDescriptor[] = Object.freeze([
     ],
     noops: Object.freeze([]),
     writes: true,
-    effect: 'writes the running transition and then dispatches the generation under the request identity the record already carries'
+    effect: 'writes the running transition and, only while the original identity is still pending, dispatches under that identity. When the identity is already terminal, it starts nothing, reports outcome terminal with dispatched false, and settles the record to idle or its existing failed; no fresh identity is minted and the terminal effect is never replayed'
   }),
   describe({
     id: 'session.lifecycle.retry' as const,

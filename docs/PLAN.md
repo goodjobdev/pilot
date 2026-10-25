@@ -814,11 +814,13 @@ and changing them remains an owner decision. See [Attention](ATTENTION.md).
 
 ### Step 7 — `record_note` cancellation audit (delayed)
 
-**Status: Partial.** `record_note` is declared `replay: 'unsafe'` and appends after an
-optional `delayMs` (`src/server/agents/harness-host.ts`). The interruption path is
-specified, but cancellation *during the delay* is not audited: it is not proven that a
-cancelled call writes nothing, and that a crash during the write is reported as interrupted
-rather than replayed.
+**Status: Built (local validation complete); owner acceptance pending.** `record_note` remains
+`replay: 'unsafe'`. Its wait now observes the tool's abort signal, every side effect is guarded by
+a signal check, and an abort before the append writes nothing. A cancel after the append is
+reported as an uncertain abort and never as a rollback. A resume whose original identity is
+already terminal reports `terminal`/`dispatched:false` with a no-additional-work reason and settles
+the lifecycle; it never restarts the cancelled work. The model-visible `delayMs` is gone; the
+deterministic delays are host-only test seams.
 
 **Required work**
 
@@ -838,10 +840,132 @@ rather than replayed.
 - The tool remains bounded in text length and cannot escape the project root.
 - Server tests cover cancel, crash and restart.
 
+**Evidence (local).**
+
+- `src/server/agents/abortable.ts` is the one wait used by the tool (and by the scripted `[pause]`
+  response). It rejects with the signal's own reason, clears its timer and abort listener on both
+  paths, and rejects without waiting when the signal is already aborted. A 60-second wait that is
+  aborted leaves no `Timeout` resource behind; `tests/unit/abortable.test.ts` (3 tests) asserts the
+  resolve path, the reason and timer cleanup, and the already-aborted and non-positive cases.
+- `record_note` (`src/server/agents/harness-host.ts`) declares only `text` (1–400 characters) and
+  keeps `safePath` containment. Its `execute` checks `context.abortSignal` immediately before the
+  wait, after the wait, after resolving the contained path, and immediately before `appendFile`.
+  An abort in the wait or at the check before `mkdir` returns before any filesystem change; an abort
+  at the final check returns before the append.
+- **The delay is no longer model-visible.** `delayMs` was removed from the tool's schema and from
+  the scripted provider's call. Two host-only seams replace it: `recordNoteDelayMs` opens the
+  pre-write window and `recordNoteAfterWriteMs` opens the post-append window
+  (`HarnessHostOptions`, wired through `AppOptions` in `src/server/main.ts`); the real-server crash
+  test sets `DASHBOARD_AGENT_NOTE_DELAY_MS`. No model, provider or HTTP request can select either
+  value, and production wiring leaves them unset or zero.
+- **The append is the commit point.** After it, a cancellation is not a rollback: the line stays,
+  the transcript result is `aborted`/`interrupted` (the activity model already treats that as
+  uncertain), and the call does not claim the line was removed. A cancellation the tool observes
+  never returns `Recorded:`. The remaining unsafe window is between the last check and the start of
+  `appendFile`: a cancellation or crash there can still append. That is reported as an interrupted,
+  uncertain call and is never replayed automatically because the tool is `replay: 'unsafe'`.
+- **No duplicate input on resume, and no false dispatch.** `HarnessHost.submit` normalizes an
+  empty or absent request id to one generated identity, refuses a malformed non-empty id before
+  admission, and records the exact identity in the lifecycle. A `pause` followed by `resume`
+  therefore finds the existing submission instead of appending a second user input, which is what
+  could otherwise make the model repeat a non-idempotent tool call. If that identity is already
+  terminal, the resume response is `outcome: "terminal"`, `dispatched: false` and a fixed
+  no-additional-work reason, and the lifecycle settles to `idle` or its existing `failed`; if other
+  work in the same conversation is genuinely running, it leaves that running state alone instead of
+  writing a false `idle`. It never mints a fresh identity or restarts the cancelled effect. Fresh
+  work needs a new message, or the explicit `retry` action for a failed session. This adds no
+  authority and no new route.
+- Cancel scope is unchanged: `stop` and `pause` cancel only an open harness and only the selected
+  conversation; they dispatch no model request. The lock, delivery, approval and replay rules are
+  untouched. Startup adoption, the stale-lock refusal and the uncertain-interruption refusal keep
+  their existing behaviour.
+- Two host-only test seams open the cancellation windows deterministically: `recordNoteDelayMs`
+  and `recordNoteAfterWriteMs`. `recordNoteStarted` fires from inside `execute` before the pre-write
+  wait, so a test can abort after execution entered the wait rather than merely after the call was
+  admitted. The environment delay requires `DASHBOARD_AGENT_TEST_SEAMS=on`; the value must be a
+  whole number from 0 to 60000, is validated before the data root is touched, and a bad value fails
+  startup. No model, provider, tool argument or HTTP request can set either seam.
+- `tests/server/record-note-cancellation.test.ts` (10 tests) covers: a cancel before the write
+  creates no `docs/notes.md`, settles in under 2 seconds with one aborted result and one input; a
+  cancel after the append keeps the line exactly once and reports an uncertain abort without a
+  success claim; `stop` and `pause`/`resume` affect the named session only, the resume response is
+  terminal/idle with no dispatch, and resume adds no tool call, input or note; a graceful close
+  during the wait writes nothing and the next start reports `interrupted` with no replay; a stream
+  disconnect calls no abort and produces one note, one input and one call; an empty request id is
+  normalized and a malformed one is refused before admission; a duplicate identity while the first
+  run is open is admitted once; a refused busy admission writes no input and starts no run; a
+  symlinked `docs/` directory is refused with no outside write; and the delay seam's bound and
+  explicit test switch are enforced.
+- `tests/server/session-lifecycle.test.ts` adds three service-level terminal outcomes: a resume
+  whose port resolves a terminal identity returns `outcome: "terminal"`, `dispatched: false`, the
+  settled `idle` record and the unchanged original identity, never a false `running`; a terminal
+  resume that reports other work still running leaves the record `running` instead of writing a
+  false `idle`; and a settle that loses a compare-and-swap to a concurrent pause or watcher settle
+  returns that winner unchanged, without a `500` or an overwrite. The authorising write before the
+  port still refuses a stale initial revision with `409`.
+- `tests/server/entrypoint.test.ts` starts the real bundle with an invalid test-only note delay and
+  proves the start refuses before the data root is created: once without
+  `DASHBOARD_AGENT_TEST_SEAMS=on`, and once with an out-of-range value. `createApp` runs the same
+  shared validator, so a direct caller cannot bypass the bound.
+- `tests/server/recovery.test.ts` keeps the real child-process crash: the server is spawned from
+  the real bundle, SIGKILLed while `record_note` holds its execute checkpoint, refused a restart
+  while `service.lock` remains, and restarted after the deliberate lock removal. The next start
+  reports `interrupted`/`may have partially run`, no note exists, the input appears once, and a
+  replay of the same request id adds nothing. The test now sets the delay with
+  `DASHBOARD_AGENT_TEST_SEAMS=on` and `DASHBOARD_AGENT_NOTE_DELAY_MS=5000`. The delay boundary and
+  the "between delay and append" boundary are the same durable `execute` checkpoint: both are
+  before the append and both recover as interrupted, never repeated.
+- Validation ran with this worktree's own binaries from
+  `/Users/john/dev/.archive/pilot-worktrees/integration-b23730b` (package `pilot` 0.1.0, Node
+  26.8.1): `./node_modules/.bin/tsc --noEmit`, `./node_modules/.bin/svelte-check --tsconfig
+  ./tsconfig.json` (0 errors, 0 warnings), `./node_modules/.bin/vite build` plus
+  `./node_modules/.bin/esbuild src/server/main.ts --bundle --platform=node --format=esm
+  --packages=external --outfile=dist/server.mjs`, and
+  `./node_modules/.bin/tsx --test tests/unit/*.test.ts tests/server/*.test.ts` (518 passed, including
+  the new cancellation, resume and abortable-wait tests). The standalone
+  `./node_modules/.bin/tsx --test tests/server/recovery.test.ts` passed separately (1 test). No
+  commit, push, deployment, install or live-data use.
+
+**Remaining crash and cancellation windows (honest limits).**
+
+- A cancellation that lands during `mkdir` can leave an empty `docs/` directory. It cannot create
+  the notes file, and the call is reported as cancelled.
+- Between the last `throwIfAborted()` and `appendFile` entering the filesystem, cancellation or a
+  SIGKILL can still append. The call recovers as `interrupted` (unsafe, uncertain) and is never
+  replayed automatically. An operator may need to read `docs/notes.md` to decide whether the line
+  landed.
+- A crash during `appendFile` can leave a complete or partial line. The same interrupted/uncertain
+  rule applies; this build does not add a write-ahead journal, a temporary file swap or an
+  automatic reconciliation of note text.
+- SIGKILL still leaves `service.lock`, so the next start fails closed until an operator clears it.
+  The test deliberately proves that refusal rather than weakening it.
+- A cancellation that lands after the tool's final check but before the harness settles is a race:
+  the append may already be committed, so the call may return `Recorded:` or be reported aborted.
+  Either way the line is not removed and no rollback is claimed; the owner may need to read
+  `docs/notes.md` to know whether it landed.
+- The two delay seams are host configuration options. They are not reachable from a model, a
+  provider, a tool argument or an HTTP request. The environment variable requires
+  `DASHBOARD_AGENT_TEST_SEAMS=on`; setting it on a real deployment would only make every note write
+  slower, and an ordinary deployment cannot enable it with one variable.
+- A terminal resume writes the authorised `running` revision before it reads the submission
+  status, because that write is the serialisation point that stops two racers from dispatching. The
+  response and later reads are settled, except when other work is genuinely running: then the record
+  stays `running` for that work under the retained terminal identity, and the action reports
+  `terminal`/`dispatched:false` without claiming it. The action creates no new attempt and no fresh
+  identity. A crash after that write but before the port resolves the identity leaves a `running`
+  record that the next start adopts as an uncertain interruption, even though the resume started no
+  new work; nothing is replayed automatically. Removing the transient revision would need a terminal
+  check before the serialisation point, which would open the harness before the durable write.
+- The post-append transcript is the harness's own surface. An aborted `record_note` result says
+  only that the call was aborted; it cannot name whether the append landed without changing the
+  Durable tool-result protocol. The activity projection marks it uncertain, and the operator must
+  read `docs/notes.md` to decide. This build does not add a custom transcript entry for it.
+
 **Risks**
 
-- An append is not idempotent. Mitigation: rely on the unsafe-replay rule and add the
-  missing cancel and crash tests; do not add an automatic retry.
+- An append is not idempotent. Mitigation: the unsafe-replay rule and the cancel/crash/restart
+  tests above; there is still no automatic retry and no claim that a crash preserved exactly-once
+  execution.
 
 ---
 
@@ -1126,7 +1250,7 @@ and its passphrase as the only key to the captured state.
 | 4 Follow-scroll and new activity | Built, pending owner acceptance |
 | 5 Mobile Back stack and bottom controls | Gap |
 | 6 Attention surface | Partial |
-| 7 `record_note` cancellation audit | Partial |
+| 7 `record_note` cancellation audit | Built, pending owner acceptance |
 | 8 Owner-configured orchestrator and worker models | Partial |
 | 9 Bounded owner-created workers | Gap |
 | 10 Disconnect, cancel and crash tests | Partial |

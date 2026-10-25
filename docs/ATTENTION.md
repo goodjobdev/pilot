@@ -130,11 +130,13 @@ automatic, and no action is taken by viewing or refreshing.
 | approval | Consume grant | Calls the existing approval consume route. It records who consumed the grant and returns the exact target; **it performs no commit, push, deploy, spend, provision or publish**. A consumed, revoked or expired approval is refused with the reason. |
 | approval | Revoke | Revokes a pending approval; it can never be consumed. |
 | failure | Retry | Calls the lifecycle `retry` route with the revision the item showed. An already-changed revision is a visible refusal; nothing is written. |
-| interrupted, certain | Resume | Calls the lifecycle `resume` route under the original request identity. |
+| interrupted, certain | Resume | Calls the lifecycle `resume` route under the original request identity. If that identity is still pending, the resume continues it. If it is already terminal, the response is `outcome: "terminal"` with `dispatched: false`: no new work starts, the lifecycle settles, and nothing is replayed. |
 | interrupted, uncertain | — | No replay is offered. The item names the operator-attention case, and the `resume` route refuses it if called directly. |
 
-Only `resume` and `retry` can cause a model dispatch, exactly as the lifecycle already specifies.
-Reading, paging, opening an item and reviewing an approval dispatch nothing.
+Only `resume` and `retry` can cause a model dispatch, exactly as the lifecycle already specifies:
+`resume` only while the original identity is pending, and `retry` only as an explicit new attempt
+for a failed session. A terminal resume dispatches nothing. Reading, paging, opening an item and
+reviewing an approval dispatch nothing.
 
 ## Push deep links
 

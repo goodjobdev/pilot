@@ -153,7 +153,8 @@
      const result=await api.lifecycleAction(projectId,item.sessionId!,action,{revision:item.lifecycleRevision});
      if(run!==generation)return;
      message=action==='retry'?'Retry recorded as a new attempt.':'Resume requested under the original request identity.';
-     if(result.dispatched===false)message+=' This instance did not dispatch.';
+     if(result.outcome==='terminal')message=result.reason??'No additional work was started: the original request is already terminal.';
+     else if(result.dispatched===false)message+=' This instance did not dispatch.';
      await load(run);onchanged?.();
    }catch(e){
      if(run!==generation)return;

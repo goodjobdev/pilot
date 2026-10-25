@@ -85,7 +85,7 @@ to the five **agent registry** actions, which need a durable control store.
 | id | effect | writes |
 |---|---|---|
 | `session.lifecycle.reconnect` | reads the durable lifecycle record and returns it unchanged | no |
-| `session.lifecycle.resume` | writes the running transition, then dispatches under the record's original request identity | yes |
+| `session.lifecycle.resume` | writes the running transition; if the original identity is still pending it dispatches under that identity, and if the identity is already terminal it starts nothing and settles the record | yes |
 | `session.lifecycle.retry` | writes a new attempt, then dispatches under an identity derived from the revision | yes |
 | `session.lifecycle.stop` | asks the harness to cancel, then writes the idle transition | yes |
 | `session.lifecycle.pause` | asks the harness to cancel, then writes the paused transition with its reason | yes |
@@ -261,7 +261,9 @@ and changes nothing.
 ("Only a paused or interrupted session can be resumed"), `INTERRUPTION_CERTAIN` (an interruption
 whose effect cannot be proven idempotent is refused, and nothing is replayed), `DISPATCH_AVAILABLE`
 (this instance can dispatch at all — otherwise the request is refused before any revision is
-claimed).
+claimed). A terminal original identity is not refused: the action returns `outcome: "terminal"`
+with `dispatched: false`, starts no new work and settles the record. It never mints a fresh identity
+or replays the terminal effect.
 
 **`session.lifecycle.retry`** — `SESSION_EXISTS`, `REVISION_MATCHES`, `STATE_FAILED` ("Only a
 failed session can be retried"), `DISPATCH_AVAILABLE`.

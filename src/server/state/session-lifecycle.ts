@@ -95,9 +95,26 @@ function buildLifecycleRecord(
 }
 
 /**
+ * What a dispatching port found when it resolved the planned identity.
+ *
+ * `dispatched` means work is pending or running under that identity. `terminal` means the identity
+ * already names a terminal submission, so this action started no new work; the service must settle
+ * the lifecycle to the terminal state and must not report a dispatch.
+ */
+export type SessionLifecycleDispatchOutcome =
+  | { readonly kind: 'dispatched' }
+  | {
+      readonly kind: 'terminal';
+      readonly reason: string;
+      /** True when other work in the same conversation is still running. The service then leaves it alone. */
+      readonly stillWorking?: boolean;
+    };
+
+/**
  * How one action performs its effect outside the store.
  *
- * `resume` continues the current generation, reusing the record's original request identity.
+ * `resume` continues durable pending work under the record's original request identity. It does not
+ * restart a terminal submission: a terminal identity is reported as `terminal` and starts nothing.
  * `retry` starts a new attempt with the `requestId` the plan chose.
  * `cancel` asks the current generation to stop (used by both `stop` and `pause`).
  *
@@ -114,20 +131,27 @@ export interface SessionLifecyclePort {
    * agent harness here would itself be a model request, so it never happens.
    */
   authoriseDispatch(input: { readonly projectId: string; readonly sessionId: string; readonly record: SessionLifecycleRecord }): Promise<void> | void;
-  resume(input: { readonly projectId: string; readonly sessionId: string; readonly record: SessionLifecycleRecord; readonly requestId: string }): Promise<void>;
-  retry(input: { readonly projectId: string; readonly sessionId: string; readonly record: SessionLifecycleRecord; readonly requestId: string }): Promise<void>;
+  resume(input: { readonly projectId: string; readonly sessionId: string; readonly record: SessionLifecycleRecord; readonly requestId: string }): Promise<SessionLifecycleDispatchOutcome>;
+  retry(input: { readonly projectId: string; readonly sessionId: string; readonly record: SessionLifecycleRecord; readonly requestId: string }): Promise<SessionLifecycleDispatchOutcome>;
   cancel(input: { readonly projectId: string; readonly sessionId: string; readonly record: SessionLifecycleRecord }): Promise<void>;
 }
+
+/** How one action ended, as the caller and the interface must read it. */
+export type SessionLifecycleOutcome = 'dispatched' | 'cancelled' | 'terminal' | 'unchanged';
 
 /** One action's outcome: the record it produced and whether an effect was dispatched or cancelled. */
 export type SessionLifecycleActionResult = {
   readonly record: SessionLifecycleRecord;
-  /** True only when a model request may have been dispatched (`resume` or `retry`). */
+  /** True only when pending work is running or may be dispatched (`resume` or `retry`). */
   readonly dispatched: boolean;
   /** True when the port was asked to stop the current generation (`stop` or `pause`). */
   readonly cancelled: boolean;
   /** True for a legal no-op: reconnect, an already-stopped session, an already-paused one. */
   readonly unchanged: boolean;
+  /** The closed outcome the response names, including `terminal` when no additional work started. */
+  readonly outcome: SessionLifecycleOutcome;
+  /** A fixed, path-free reason for `terminal`; null for every other outcome. */
+  readonly reason: string | null;
 };
 
 export type SessionLifecycleOptions = {
@@ -362,7 +386,7 @@ export class SessionLifecycleService {
       reason: input?.reason,
       now: this.clock()
     });
-    if (plan.kind === 'unchanged') return Object.freeze({ record: current, dispatched: false, cancelled: false, unchanged: true });
+    if (plan.kind === 'unchanged') return Object.freeze({ record: current, dispatched: false, cancelled: false, unchanged: true, outcome: 'unchanged' as const, reason: null });
     return this.perform(project, session, parsedAction, plan);
   }
 
@@ -374,7 +398,7 @@ export class SessionLifecycleService {
     // the harness suppresses its own settled hook for an owner-initiated cancel.
     await this.port.cancel({ projectId, sessionId, record: plan.record });
     const persisted = this.store.write(plan.next);
-    return Object.freeze({ record: persisted, dispatched: false, cancelled: true, unchanged: false });
+    return Object.freeze({ record: persisted, dispatched: false, cancelled: true, unchanged: false, outcome: 'cancelled' as const, reason: null });
   }
 
   /**
@@ -400,9 +424,11 @@ export class SessionLifecycleService {
     if (requestId === null) throw new SessionLifecycleError('A dispatching action planned no request identity', 'CORRUPT');
     await this.port.authoriseDispatch({ projectId, sessionId, record: plan.record });
     const persisted = this.store.write(plan.next);
+    let outcome: SessionLifecycleDispatchOutcome;
     try {
-      if (action === 'resume') await this.port.resume({ projectId, sessionId, record: plan.record, requestId });
-      else await this.port.retry({ projectId, sessionId, record: plan.record, requestId });
+      outcome = action === 'resume'
+        ? await this.port.resume({ projectId, sessionId, record: plan.record, requestId })
+        : await this.port.retry({ projectId, sessionId, record: plan.record, requestId });
     } catch (error) {
       try {
         this.store.write(
@@ -420,7 +446,34 @@ export class SessionLifecycleService {
       }
       throw error;
     }
-    return Object.freeze({ record: persisted, dispatched: true, cancelled: false, unchanged: false });
+    if (outcome.kind === 'terminal') {
+      // The write authorised an attempt, but the planned identity already names a terminal
+      // submission. No new work started, so do not report a dispatch and settle the record to the
+      // state it really has. `markSettled` is a no-op unless the record is still running, so it
+      // cannot overwrite an idle or failed state the harness already recorded. When other work in
+      // the conversation is still running, the service leaves the record alone instead of writing
+      // a false idle.
+      const settled = (() => {
+        try {
+          return outcome.stillWorking === true
+            ? { record: this.store.read(projectId, sessionId), raced: false }
+            : { record: this.store.markSettled({ projectId, sessionId, outcome: 'idle', now: this.clock() }), raced: false };
+        } catch (error) {
+          // The terminal settle is a compare-and-swap at its own revision. A concurrent owner pause
+          // or the harness's own settle can win that revision first. That is not a server fault and
+          // it must not overwrite the winner: return the current record unchanged.
+          if (!(error instanceof SessionLifecycleError) || error.code !== 'CONFLICT') throw error;
+          return { record: this.store.read(projectId, sessionId), raced: true };
+        }
+      })();
+      const reason = settled.record.state === 'failed'
+        ? 'No additional work was started: the original request is already terminal and the session is failed. A terminal request cannot be resumed under its original identity; retry is the explicit new attempt.'
+        : settled.raced
+          ? 'No additional work was started: the original request is already terminal. A concurrent lifecycle action wrote the current state, so this response returns it unchanged.'
+          : outcome.reason;
+      return Object.freeze({ record: settled.record, dispatched: false, cancelled: false, unchanged: false, outcome: 'terminal' as const, reason });
+    }
+    return Object.freeze({ record: persisted, dispatched: true, cancelled: false, unchanged: false, outcome: 'dispatched' as const, reason: null });
   }
 }
 

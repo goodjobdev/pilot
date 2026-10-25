@@ -37,7 +37,7 @@ and a record larger than the 64 KiB payload cap all fail closed with a precise r
 |---|---|
 | `idle` | No generation is running and nothing is pending. Where a session begins and where a completed or deliberately stopped run ends. |
 | `running` | A generation with a request identity is in flight. |
-| `paused` | The owner stopped the current generation but kept it resumable under its original request identity. |
+| `paused` | The owner stopped the current generation and kept its original request identity for a possible resume. It is resumable only while the durable submission under that identity is still pending; a terminal cancellation cannot restart. |
 | `interrupted` | The owning process went away while the session was running. `uncertain` records whether the effect can be proven idempotent. |
 | `failed` | The generation ended in a terminal failure. It is re-run only by an explicit `retry`. |
 
@@ -51,13 +51,39 @@ each action does and whether it can cause a model request.
 | Action | Meaning | Legal from | Refusals | Dispatches a model request? |
 |---|---|---|---|---|
 | `reconnect` | Attach a fresh client to an existing session. It starts no generation and changes no execution state; it is a revision-checked read. | any | A stale revision (`409`). | **Never.** |
-| `resume` | Continue a paused or interrupted session. The generation is re-dispatched under its **original request identity**, so it can never double-submit. | `paused`; `interrupted` only when `uncertain` is false | `idle`, `running`, `failed` (`409`, "only a paused or interrupted session can be resumed"); an **uncertain** interruption (`409`, needs operator attention) | **Yes**, under the unchanged request identity. |
-| `retry` | Re-run a failed generation as a **new attempt**, only when the owner asks, under the request identity `retry:<sessionId>:r<revision>` that is **derived from the revision the attempt is written at** (never minted at random). | `failed` | Any other state (`409`, "only a failed session can be retried"); a derived identity equal to the failed one (`422`) | **Yes**, as a new attempt. |
+| `resume` | Continue **pending durable work** under the original request identity. If that identity already names a terminal submission, resume starts nothing, reports `outcome: "terminal"` and `dispatched: false` with a no-additional-work reason, and settles the lifecycle honestly. A terminal cancelled request cannot restart. | `paused`; `interrupted` only when `uncertain` is false | `idle`, `running`, `failed` (`409`, "only a paused or interrupted session can be resumed"); an **uncertain** interruption (`409`, needs operator attention) | **Only while the original submission is pending.** Never for a terminal identity. |
+| `retry` | Re-run a failed generation as a **new attempt**, only when the owner asks, under the request identity `retry:<sessionId>:r<revision>` that is **derived from the revision the attempt is written at** (never minted at random). This is the only explicit path to a fresh attempt after a failure. | `failed` | Any other state (`409`, "only a failed session can be retried"); a derived identity equal to the failed one (`422`) | **Yes**, as a new attempt, only for a failed session. |
 | `stop` | Cancel the current generation. **Idempotent**: a session that is not running is a no-op, and stopping an already-stopped session changes nothing. | `running` (a real cancel); any other state is a no-op | A stale revision (`409`). | **Never.** |
-| `pause` | Request a stop that keeps the session resumable: cancels the current generation and records `paused` with the owner's reason. | `running`; `paused` is an idempotent no-op | `idle`, `interrupted`, `failed` (`409`); an over-long or non-printable reason (`422`) | **Never.** |
+| `pause` | Request a stop that keeps the session resumable only while its original submission is still pending: cancels the current generation and records `paused` with the owner's reason. | `running`; `paused` is an idempotent no-op | `idle`, `interrupted`, `failed` (`409`); an over-long or non-printable reason (`422`) | **Never.** |
 
 There is no action outside these five. In this round nothing but `resume` and `retry` can enter
-`running`; there is no "start" action.
+`running`; there is no "start" action. Neither action invents work: resume continues only a
+pending durable submission, and retry is a new attempt for a failed session that the owner
+explicitly requested. Nothing retries automatically.
+
+### Resume continues pending work only
+
+A resume is not a general "try again". It re-submits the exact durable submission identity the
+paused or interrupted record holds. If Pi already holds that identity as terminal (`done` or
+`unanswered`), the resume resolves to that existing submission and starts no model request. The
+action then reports `outcome: "terminal"`, `dispatched: false` and a fixed no-additional-work
+reason, and settles the lifecycle to the state it really has: `idle`, or the existing `failed`
+when the terminal run failed. If other work in the same conversation is genuinely running, the
+action leaves that running state alone instead of writing a false `idle`. It never mints a fresh
+identity, never restarts a cancelled or failed effect, and never claims a new generation. Fresh
+work needs a new message, or `retry` for a failed session. Both are explicit owner decisions.
+
+A terminal resume does write the authorised `running` revision before it reads the submission
+status, because that write is the serialisation point that prevents two racers from dispatching.
+The response and every later read are the settled state, except when other work in the same
+conversation is genuinely running: then the record remains `running` for that work, still under the
+original (terminal) request identity, and the action reports `terminal`/`dispatched:false` without
+claiming it. In every case the terminal identity is retained, the action creates no new attempt and
+no fresh identity, and the `attempt` count does not increase. A crash after the authorised `running`
+write but before the port resolves the identity can leave the session `running`; the next start
+adopts it as an `uncertain` interruption even though this resume started no new work, and nothing is
+replayed automatically. Removing even the transient revision would need a terminal check before the
+serialisation point, which would open the harness before the durable write.
 
 ### No silent spend, and no uncertain replay
 
@@ -66,6 +92,10 @@ There is no action outside these five. In this round nothing but `resume` and `r
   already open to cancel - they never open a harness (opening one resumes unfinished work, which
   would itself be a model request). The tests assert a provider-call count that is `0` for
   `reconnect` and `stop`.
+- **Resume continues pending work, not history.** A resume whose original identity is already
+  terminal resolves to that submission, starts no generation, reports `terminal`/`dispatched:false`
+  and settles the record. A cancelled or failed effect is never replayed under the original
+  identity.
 - **One writer per revision, and no dispatch before the write that authorises it.** A dispatching
   action is checked for capability first (a port that cannot dispatch refuses and changes nothing),
   then writes its transition, and only then dispatches. The durable write *is* the compare-and-swap
@@ -131,18 +161,24 @@ no second table or second SQLite file is introduced.
 | Method and path | Body | Answer |
 |---|---|---|
 | `GET /api/sessions/:id/lifecycle?projectId=` | - | `{lifecycle}`. `422` without a `projectId`; `404` when the session does not exist |
-| `POST /api/sessions/:id/lifecycle/reconnect` | `projectId`, `revision` | `{lifecycle, dispatched, cancelled, unchanged}` |
-| `POST /api/sessions/:id/lifecycle/resume` | `projectId`, `revision` | `{lifecycle, dispatched, cancelled, unchanged}` |
-| `POST /api/sessions/:id/lifecycle/retry` | `projectId`, `revision` | `{lifecycle, dispatched, cancelled, unchanged}` |
-| `POST /api/sessions/:id/lifecycle/stop` | `projectId`, `revision` | `{lifecycle, dispatched, cancelled, unchanged}` |
-| `POST /api/sessions/:id/lifecycle/pause` | `projectId`, `revision`, optional `reason` | `{lifecycle, dispatched, cancelled, unchanged}` |
+| `POST /api/sessions/:id/lifecycle/reconnect` | `projectId`, `revision` | `{lifecycle, dispatched, cancelled, unchanged, outcome, reason}` |
+| `POST /api/sessions/:id/lifecycle/resume` | `projectId`, `revision` | `{lifecycle, dispatched, cancelled, unchanged, outcome, reason}` |
+| `POST /api/sessions/:id/lifecycle/retry` | `projectId`, `revision` | `{lifecycle, dispatched, cancelled, unchanged, outcome, reason}` |
+| `POST /api/sessions/:id/lifecycle/stop` | `projectId`, `revision` | `{lifecycle, dispatched, cancelled, unchanged, outcome, reason}` |
+| `POST /api/sessions/:id/lifecycle/pause` | `projectId`, `revision`, optional `reason` | `{lifecycle, dispatched, cancelled, unchanged, outcome, reason}` |
+
+`outcome` is one of `dispatched`, `cancelled`, `terminal` or `unchanged`. `reason` is a fixed,
+path-free sentence for `terminal` and `null` otherwise. A resume that resolves an already terminal
+identity answers `200` with `outcome: "terminal"`, `dispatched: false` and the settled `lifecycle`;
+it is not an error and it starts no work.
 
 Statuses: `422` for an invalid request (a missing `projectId`, a revision that is not a whole number,
 an over-long reason, an unknown field), `404` for a missing session or an unknown lifecycle action,
 `409` for an illegal jump, a stale revision, an uncertain interruption that needs operator attention,
 or a duplicate write, and `503` when the instance has no durable control store open. The response
-flags say what happened: `dispatched` is true only when a model request may have been sent,
-`cancelled` only when a generation was asked to stop, and `unchanged` only for a legal no-op. A
+flags say what happened: `dispatched` is true only when pending work is running or may have been
+sent, `cancelled` only when a generation was asked to stop, and `unchanged` only for a legal no-op.
+`outcome` names the same fact in one closed word, and `reason` explains a `terminal` outcome. A
 refusal never contains a filesystem path.
 
 An invalid body is refused with `422` and a reason in this application's own words (which field is
@@ -156,6 +192,8 @@ message, and never a generic `400`.
 | Illegal jump (resume a running session, retry a paused one, pause an idle one) | `409` naming the current state; nothing is written and no effect happens |
 | Stale revision | `409` naming the current revision; the record is unchanged |
 | Uncertain interruption, resumed | `409` operator attention: nothing is written and nothing is replayed |
+| Resume whose original identity is already terminal | `200` with `outcome: "terminal"`, `dispatched: false` and a no-additional-work reason; the lifecycle settles to `idle` or its existing `failed`; no new identity, no model request and no replay |
+| Retry | Only an explicit owner action on a `failed` session, with a new derived identity; there is no automatic retry and a terminal effect is never replayed |
 | Retry with an identity equal to the failed attempt's | `422`; a retry must be a new attempt |
 | Stop or pause on a session that is not running | An idempotent no-op (or a pause-specific refusal); no effect |
 | A port that cannot dispatch at all (agents disabled, project not registered) | Refused before anything is written: the refusal is returned and the record is unchanged |

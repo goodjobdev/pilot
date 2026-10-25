@@ -10,6 +10,7 @@ import type { ConversationId, EntryId, Extension } from '@earendil-works/pi-dura
 import { openNodeSqliteStorage } from '@earendil-works/pi-durable/storage/sqlite/node';
 import { Type } from 'typebox';
 import { safePath } from '../paths';
+import { abortableDelay } from './abortable';
 import { modelAcceptsImages } from '../../shared/images';
 import { authorizeToolUse, installedAgentScopes, unavailableAgentScopes, scopeToolIsInstalled, type AgentPrivilegePort, type AgentScope, type DispatchAuthority } from '../../shared/agent-registry';
 import { FILE_EDIT_MAX_FILE_BYTES, FILE_EDIT_MAX_PATH_LENGTH, type FileEditCapability } from '../state/file-edit-tool';
@@ -17,6 +18,7 @@ import { agentViewFrom, type AgentQuestion, type AgentView } from '../../shared/
 import type { Project } from '../../shared/model';
 import { HttpError } from '../board-store';
 import type { ProviderStore } from '../providers';
+import type { SessionLifecycleDispatchOutcome } from '../state/session-lifecycle';
 import type { ModelChoice } from '../../shared/settings';
 
 export type AgentInputMode = 'followUp' | 'steer' | 'reject';
@@ -45,6 +47,8 @@ export type AgentSessionView = AgentView & { readonly usageDetail: AgentUsageDet
 /** What the model a submission would run under accepts. */
 export interface AgentVision { readonly provider: string; readonly modelId: string; readonly acceptsImages: boolean }
 const uuidPattern = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
+/** The request identity rule, aligned with the durable lifecycle's own rule. */
+const requestIdPattern = /^[^\s\u0000-\u001f\u007f]{1,200}$/;
 /**
  * The conversation behind one named session id, or null when the id is not one.
  *
@@ -101,16 +105,6 @@ function usageDetailFrom(value: unknown): AgentUsageDetail {
     reasoning,
     cost: sum((entry) => entry.cost),
     models: Object.freeze(models.map((entry) => Object.freeze(entry)))
-  });
-}
-
-function pause(ms: number, signal?: AbortSignal): Promise<void> {
-  return new Promise((resolve, reject) => {
-    if (signal?.aborted) return reject(new Error('aborted'));
-    const finish = () => { clearTimeout(timer); signal?.removeEventListener('abort', onAbort); };
-    const onAbort = () => { finish(); reject(new Error('aborted')); };
-    const timer = setTimeout(() => { finish(); resolve(); }, ms);
-    signal?.addEventListener('abort', onAbort);
   });
 }
 
@@ -186,13 +180,27 @@ function questionExtension(){
 const notesPath = 'docs/notes.md';
 
 /**
+ * Test-only delays around the append. Nothing a model or a provider sends can select them:
+ * the tool's parameters carry `text` only, and these values come from the harness options.
+ * `beforeWriteMs` opens the window in which a cancellation must write nothing; `afterWriteMs`
+ * opens the window in which the append is already committed and a cancellation must not claim
+ * a rollback. Production wiring leaves both unset.
+ */
+export interface RecordNoteSeam {
+  readonly beforeWriteMs?: number;
+  readonly afterWriteMs?: number;
+  /** Test-only: called once when `record_note` has entered execution, before its pre-write wait. */
+  readonly onExecute?: () => void;
+}
+
+/**
  * Documentation tools, bounded to one project.
  *
  * `record_note` appends, which is not idempotent, so it is declared unsafe to replay: a run
  * that dies during it must be told the call was interrupted rather than repeating the write.
  * `read_notes` only reads and is safe to replay.
  */
-function notesExtension(project: Project){
+function notesExtension(project: Project, seam: RecordNoteSeam){
   return defineExtension({
     name: 'notes',
     sections: [section('notes-protocol', () => 'Use record_note to append a short note to this project documentation, and read_notes to read the notes back.', { tag: false })],
@@ -200,16 +208,29 @@ function notesExtension(project: Project){
       defineTool({
         name: 'record_note',
         description: 'Append one line to this project notes file.',
-        parameters: Type.Object({
-          text: Type.String({ minLength: 1, maxLength: 400, description: 'One line to append' }),
-          delayMs: Type.Optional(Type.Number({ minimum: 0, maximum: 60000, description: 'Wait this long before writing, to model a slow call' }))
-        }),
+        parameters: Type.Object({ text: Type.String({ minLength: 1, maxLength: 400, description: 'One line to append' }) }),
         replay: 'unsafe',
-        execute: async (args) => {
-          if (args.delayMs !== undefined && args.delayMs > 0) await new Promise(resolve => setTimeout(resolve, args.delayMs));
+        execute: async (args, _api, context) => {
+          const signal = context.abortSignal;
+          const beforeWriteMs = seam.beforeWriteMs ?? 0;
+          const afterWriteMs = seam.afterWriteMs ?? 0;
+          // Cancellation is cooperative. Every check below is immediately before the effect it
+          // guards, and the wait itself rejects with the signal's reason and clears its timer.
+          signal?.throwIfAborted();
+          seam.onExecute?.();
+          await abortableDelay(beforeWriteMs, signal);
+          signal?.throwIfAborted();
           await mkdir(join(project.path,'docs'),{ recursive: true, mode: 0o755 });
           const file = await safePath(project.path,notesPath);
+          // The last window: an abort that lands after this check but before `appendFile` starts
+          // cannot prevent the write. The call is then reported as aborted (uncertain), never as
+          // a rollback, because the bytes may already be committed.
+          signal?.throwIfAborted();
           await appendFile(file,args.text.trim()+'\n');
+          // The append is committed. A later cancellation is reported as uncertain; it never
+          // removes the line and the result never claims the line was not written.
+          if (afterWriteMs > 0) await abortableDelay(afterWriteMs, signal);
+          else signal?.throwIfAborted();
           return { output: [{ type: 'text', text: 'Recorded: ' + args.text.trim() }] };
         }
       }),
@@ -250,7 +271,9 @@ function scriptedResponses(provider: FauxProviderHandle, pauseMs: number) {
     if (messages.at(-1)?.role === 'toolResult') return fauxAssistantMessage('Scripted test reply — no model was called.\n\nI recorded that and stopped guessing.');
     const called = (name: string) => messages.some(message => message.role === 'assistant' && Array.isArray(message.content) && message.content.some(block => (block as { type?: string; name?: string })?.type === 'toolCall' && (block as { name?: string }).name === name));
     const noteBody = (marker: RegExp) => text.replace(marker,'').replace(/\]\s*$/,'').trim().slice(0,300) || 'a note';
-    if (/\[slow-note /i.test(text) && !called('record_note')) return fauxAssistantMessage([fauxToolCall('record_note',{ text: noteBody(/^[\s\S]*?\[slow-note/i), delayMs: 5000 })],{ stopReason: 'toolUse' });
+    // `[slow-note …]` selects the same tool as `[note …]`; a slow write comes from the harness's
+    // test-only `recordNoteDelayMs` seam, never from an argument the model can choose.
+    if (/\[slow-note /i.test(text) && !called('record_note')) return fauxAssistantMessage([fauxToolCall('record_note',{ text: noteBody(/^[\s\S]*?\[slow-note/i) })],{ stopReason: 'toolUse' });
     if (/\[note /i.test(text) && !called('record_note')) return fauxAssistantMessage([fauxToolCall('record_note',{ text: noteBody(/^[\s\S]*?\[note/i) })],{ stopReason: 'toolUse' });
     if (/\[read-notes\]/i.test(text) && !called('read_notes')) return fauxAssistantMessage([fauxToolCall('read_notes',{})],{ stopReason: 'toolUse' });
     const alreadyAsked = called('ask_question');
@@ -258,7 +281,7 @@ function scriptedResponses(provider: FauxProviderHandle, pauseMs: number) {
       const subject = text.replace(/\[ask\]/gi, '').trim().slice(0, 120) || 'this change';
       return fauxAssistantMessage([fauxToolCall('ask_question', { question: 'Should I proceed with: ' + subject + '?' })], { stopReason: 'toolUse' });
     }
-    if (/\[pause\]/i.test(text) && pauseMs > 0) await pause(pauseMs, (options as { signal?: AbortSignal } | undefined)?.signal);
+    if (/\[pause\]/i.test(text) && pauseMs > 0) await abortableDelay(pauseMs, (options as { signal?: AbortSignal } | undefined)?.signal);
     const summary = text.replace(/\[pause\]/gi, '').trim().slice(0, 160);
     return fauxAssistantMessage('Scripted test reply — no model was called.\n\nYou said: ' + (summary || '(nothing)'));
   };
@@ -322,6 +345,15 @@ export interface HarnessHostOptions {
   enabled: boolean;
   /** How long a [pause] message holds the run open, in milliseconds. */
   pauseMs?: number;
+  /**
+   * Test-only windows around `record_note`'s append. They are reachable only through the harness
+   * options (and the test environment), never through a model's tool arguments. Leave unset in
+   * production wiring: `0` or absent means no wait.
+   */
+  recordNoteDelayMs?: number;
+  recordNoteAfterWriteMs?: number;
+  /** Test-only: resolves when `record_note` execution begins, so a test can abort inside its wait. */
+  recordNoteStarted?: () => void;
   providers?: ProviderStore;
   /** Called when a run needs a person, finishes or fails, with no browser attached. */
   onEvent?: (event: AgentEvent) => void;
@@ -652,7 +684,7 @@ export class HarnessHost {
       scriptedResponses(provider, this.options.pauseMs ?? 2500);
       const storage = await openNodeSqliteStorage(path);
       const question = questionExtension();
-      const notes = notesExtension(project);
+      const notes = notesExtension(project, { beforeWriteMs: this.options.recordNoteDelayMs, afterWriteMs: this.options.recordNoteAfterWriteMs, onExecute: this.options.recordNoteStarted });
       // The scopes in force are read once here, so the tools the model is offered are the permitted
       // ones, and again on every call by the privilege hook, which is the authority. Nothing about
       // the owner's own dispatch changes: with no privilege port the authority is null and every
@@ -1013,6 +1045,15 @@ export class HarnessHost {
     const images = input.images ?? [];
     if (text === '' && images.length === 0) throw new HttpError(422, 'Enter a message');
     if (text.length > 8000) throw new HttpError(413, 'Message is too long');
+    // An empty request identity means "none was supplied", so it becomes one generated identity.
+    // A non-empty identity must satisfy the same rule the durable lifecycle records, and a bad one
+    // is refused here, before any harness opens or any submission is admitted.
+    const suppliedRequestId: unknown = input.requestId;
+    if (suppliedRequestId !== undefined && suppliedRequestId !== '') {
+      if (typeof suppliedRequestId !== 'string' || !requestIdPattern.test(suppliedRequestId))
+        throw new HttpError(422, 'requestId must be 1-200 printable characters without spaces');
+    }
+    const requestId = suppliedRequestId === undefined || suppliedRequestId === '' ? randomUUID() : suppliedRequestId;
     return this.serial('agent:' + project.id, async () => {
       const hosted = await this.open(project);
       const conversationId = input.sessionId ? await this.ensureSessionConversation(project, input.sessionId) : hosted.conversation.id;
@@ -1027,8 +1068,12 @@ export class HarnessHost {
       if(selected&&selected.provider!==hosted.provider.provider.id)await this.options.providers?.assertUsable(selected);
       const whenBusy = input.mode === 'steer' ? 'steer' as const : input.mode === 'reject' ? 'reject' as const : undefined;
       const content = inputContent(text, images);
+      // Every admission carries a durable request identity, even when the caller sends none. The
+      // lifecycle records this exact identity, so a pause followed by resume finds the existing
+      // submission instead of appending the same user input a second time (which could make the
+      // model repeat a non-idempotent tool call).
       try {
-        const submission = await conversation.submit({ type: 'input', content, ...(whenBusy ? { whenBusy } : {}), ...(input.requestId ? { requestId: input.requestId } : {}) }, BACKGROUND_CONTEXT);
+        const submission = await conversation.submit({ type: 'input', content, ...(whenBusy ? { whenBusy } : {}), requestId }, BACKGROUND_CONTEXT);
         // The generation is visible in the durable lifecycle under the identity it was submitted with,
         // so a start that finds it running adopts it as interrupted. A hook failure never fails a run.
         try {
@@ -1036,7 +1081,7 @@ export class HarnessHost {
           // A repeated request can return a completed submission. It starts no generation and
           // must not create another lifecycle attempt, including while another input is running.
           if (status.status !== 'done' && status.status !== 'unanswered')
-            await this.options.lifecycle?.began({ projectId: project.id, sessionId: this.sessionIdentity(project, conversationId), requestId: input.requestId ?? String(submission.id) });
+            await this.options.lifecycle?.began({ projectId: project.id, sessionId: this.sessionIdentity(project, conversationId), requestId });
           await this.reconcileIdleLifecycle(project, { ...hosted, conversation });
         }
         catch (error) { console.error('The session lifecycle could not record that a generation began for project ' + project.id + ': ' + (error as Error).message); }
@@ -1266,16 +1311,34 @@ export class HarnessHost {
    * when the input carried images, the model the replay will actually run under must accept them, and
    * a refusal beats a replay with the images silently removed.
    */
-  async dispatchLifecycle(project: Project, requestId: string, sessionId?: string): Promise<void> {
+  async dispatchLifecycle(project: Project, requestId: string, sessionId?: string): Promise<SessionLifecycleDispatchOutcome> {
     this.assertEnabled();
-    await this.serial('agent:' + project.id, async () => {
+    return this.serial('agent:' + project.id, async () => {
       const hosted = await this.selected(project, sessionId);
       const input = await this.lastInput(hosted);
       if (input.images.length > 0) this.assertVision(await this.visionFor(hosted));
-      await hosted.conversation.submit({ type: 'input', content: inputContent(input.text, input.images), requestId }, BACKGROUND_CONTEXT);
-      // A resume can resolve to an already-terminal submission. No working-to-idle edge occurs
-      // in that case, so reconcile the lifecycle instead of leaving a phantom running attempt.
-      await this.reconcileIdleLifecycle(project, hosted);
+      const submission = await hosted.conversation.submit({ type: 'input', content: inputContent(input.text, input.images), requestId }, BACKGROUND_CONTEXT);
+      const status = await submission.status(BACKGROUND_CONTEXT);
+      // A planned identity can already name a terminal submission (a resume after a cancelled or
+      // finished request, or a retry whose identity was already settled). No generation starts in
+      // that case, so report it as terminal rather than claiming a dispatch. `reconcileIdleLifecycle`
+      // settles an idle or failed record; the service settles the record if this hook did not.
+      if (status.status === 'done' || status.status === 'unanswered') {
+        const state = await hosted.conversation.viewState(BACKGROUND_CONTEXT);
+        let stillWorking = false;
+        try { stillWorking = agentViewFrom(state.value).working; } finally { state.dispose(); }
+        if (!stillWorking) await this.reconcileIdleLifecycle(project, hosted);
+        return {
+          kind: 'terminal',
+          stillWorking,
+          reason: stillWorking
+            ? 'No additional work was started by this resume: the original request is already terminal, and other work is running in this session.'
+            : status.status === 'unanswered'
+              ? 'No additional work was started: the original request is already terminal and unanswered. A terminal request cannot be resumed under its original identity; retry is available only for a failed session.'
+              : 'No additional work was started: the original request is already complete. A terminal request cannot be resumed under its original identity; send a new message, and retry only a failed session.'
+        };
+      }
+      return { kind: 'dispatched' };
     });
   }
   /** Reconcile an already-terminal input without inventing a new generation or request identity. */

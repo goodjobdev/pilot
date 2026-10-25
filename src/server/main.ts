@@ -20,6 +20,7 @@ import { RepositoryStore } from './repositories';
 import { browse,within } from './paths';
 import { authorize,headers,establishSession,type SecurityConfig } from './security';
 import { effectiveConfig } from './effective-config';
+import { resolveNoteDelaySeams } from './agent-test-seams';
 import { acquireServiceLock,inspectServiceLock,type ServiceLockHandle } from './service-lock';
 import { loadReleaseManifest,observeStorageSchema,resolveRelease,schemaVersionForId,SUPPORTED_SCHEMA_IDS,RELEASE_MANIFEST_ENV,RELEASE_MANIFEST_FILENAME,UNRELEASED_LOCAL,type StorageSchemaObservation } from './release';
 import { ControlStore,CONTROL_SCHEMA_VERSION } from './state/control-store';
@@ -69,7 +70,7 @@ export type ReleasePromotionObservation =
   | {readonly state:'unreadable';readonly reason:string};
 /** What the running service reports about itself, and the one read-only seam that answers for promotion. */
 export interface ReleaseReportOptions {readonly version:string;readonly source:'manifest'|'unreleased-local';readonly buildId?:string;readonly sourceDigest?:string;readonly observe:()=>ReleasePromotionObservation}
-export interface AppOptions {dataRoot:string;browseRoots:string[];security:SecurityConfig;allowedHosts?:readonly string[];clientRoot?:string;registry?:string;agents?:'on'|'off';agentPauseMs?:number;alertTransport?:AlertTransport;alertSubject?:string;alertCooldownMs?:number;readiness?:ReadinessOptions;control?:ControlStore;runner?:{readonly enabled?:boolean;readonly port?:RunnerPort};fileEdit?:{readonly enabled?:boolean};release?:ReleaseReportOptions}
+export interface AppOptions {dataRoot:string;browseRoots:string[];security:SecurityConfig;allowedHosts?:readonly string[];clientRoot?:string;registry?:string;agents?:'on'|'off';agentPauseMs?:number;recordNoteDelayMs?:number;recordNoteAfterWriteMs?:number;recordNoteStarted?:()=>void;alertTransport?:AlertTransport;alertSubject?:string;alertCooldownMs?:number;readiness?:ReadinessOptions;control?:ControlStore;runner?:{readonly enabled?:boolean;readonly port?:RunnerPort};fileEdit?:{readonly enabled?:boolean};release?:ReleaseReportOptions}
 /**
  * Approvals answer with a status that says what happened: an invalid request is 422, an approval
  * outside the caller's scope is 403, a missing one is 404, a storage fault is 500, and every
@@ -387,6 +388,9 @@ function questionNotification(questionId:string,projectId:string,sessionId:strin
   return {title:'An agent needs an answer',body:body.slice(0,240),url:agentQuestionLink(projectId,sessionId,questionId),tag:questionTag(questionId)};
 }
 export async function createApp(options:AppOptions){
+  // The same test-only seam validator the entrypoint uses before it creates the data root. A host
+  // option is accepted directly; the environment form additionally requires the explicit switch.
+  const { recordNoteDelayMs, recordNoteAfterWriteMs } = resolveNoteDelaySeams(options, process.env);
   // The release identity this process reports, and the read-only observation of which release the
   // store says is promoted. Both are reports: neither promotes, points or starts anything.
   const releaseReport=options.release??null;
@@ -459,6 +463,11 @@ export async function createApp(options:AppOptions){
     dataRoot:options.dataRoot,providers,delivery,lifecycle:lifecycleHooks,
     enabled:(options.agents??(process.env.DASHBOARD_AGENTS==='on'?'on':'off'))==='on',
     pauseMs:options.agentPauseMs??Number(process.env.DASHBOARD_AGENT_PAUSE_MS??2500),
+    // Test-only seams for deterministic cancellation tests. The tool's parameters never carry a
+    // delay, so a model cannot choose either window. The values were validated above.
+    recordNoteDelayMs,
+    recordNoteAfterWriteMs,
+    recordNoteStarted:options.recordNoteStarted,
     // The authoritative dispatch path reads this on every tool call, so an agent's scopes are
     // re-checked server-side however a call was crafted. With no registry open, the owner's own
     // dispatch is in force and nothing is narrowed.
@@ -539,8 +548,8 @@ export async function createApp(options:AppOptions){
     // without claiming a revision. It performs no model work and opens no harness: opening one would
     // resume unfinished work, which is itself a model request.
     authoriseDispatch:({projectId})=>{if(!agents.enabled)throw new HttpError(503,'Agents are disabled on this instance');catalog.get(projectId);},
-    resume:async({projectId,sessionId,requestId})=>{if(!agents.enabled)throw new HttpError(503,'Agents are disabled on this instance');await agents.dispatchLifecycle(catalog.get(projectId),requestId,sessionId);},
-    retry:async({projectId,sessionId,requestId})=>{if(!agents.enabled)throw new HttpError(503,'Agents are disabled on this instance');await agents.dispatchLifecycle(catalog.get(projectId),requestId,sessionId);},
+    resume:async({projectId,sessionId,requestId})=>{if(!agents.enabled)throw new HttpError(503,'Agents are disabled on this instance');return agents.dispatchLifecycle(catalog.get(projectId),requestId,sessionId);},
+    retry:async({projectId,sessionId,requestId})=>{if(!agents.enabled)throw new HttpError(503,'Agents are disabled on this instance');return agents.dispatchLifecycle(catalog.get(projectId),requestId,sessionId);},
     // A cancel on an instance with no harness has nothing to stop, so it is a harmless no-op; a
     // resume or a retry, which would have to dispatch, refuse instead (above).
     cancel:async({projectId,sessionId})=>{if(!agents.enabled)return;await agents.cancelLifecycle(catalog.get(projectId),sessionId);}
@@ -992,7 +1001,7 @@ export async function createApp(options:AppOptions){
               const data=parseBody(z.strictObject({projectId:z.unknown(),revision:z.unknown().optional(),reason:z.unknown().optional()}),payload,'The lifecycle request');
               sessions.read(data.projectId,sessionId);
               const result=await lifecycleService.run(data.projectId,sessionId,lifecycleAction,{revision:data.revision,reason:data.reason});
-              json({lifecycle:result.record,dispatched:result.dispatched,cancelled:result.cancelled,unchanged:result.unchanged});return;
+              json({lifecycle:result.record,dispatched:result.dispatched,cancelled:result.cancelled,unchanged:result.unchanged,outcome:result.outcome,reason:result.reason});return;
             }
             // The queue of pending inputs: one read route and the ten write operations. Owner-only
             // like every other route, behind the same Host check, with the same origin/CSRF
@@ -1893,6 +1902,9 @@ async function main(){
   // lock identity is durable evidence and the shutdown deadline bounds one drain. Invalid values
   // fail closed with a clear message and create nothing.
   const namedRootId=namedLockRootId(env),deadlineMs=shutdownDeadlineMs(env);
+  // The test-only note-delay seam is validated here, before the data root is created. `createApp`
+  // runs the same validator again, so a direct caller cannot bypass the bound either.
+  resolveNoteDelaySeams({}, env);
   // A manifest's releaseId/schemaId become the lock record's values; the bounded DASHBOARD_RELEASE
   // and 'pilot-state-1' remain the durable identity for the unreleased case. The fallback identity
   // is computed only when no manifest supplied one, so an invalid DASHBOARD_RELEASE cannot abort a

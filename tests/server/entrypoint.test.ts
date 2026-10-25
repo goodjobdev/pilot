@@ -22,7 +22,7 @@ import { SessionLifecycleStore } from '../../src/server/state/session-lifecycle'
 import { newTask } from '../../src/shared/model';
 
 /** The entrypoint validates the whole environment, so a test must not inherit deployment values. */
-const DEPLOYMENT_VARIABLES=['DASHBOARD_MODE','DASHBOARD_EXPOSURE','DASHBOARD_BIND','DASHBOARD_ALLOWED_HOSTS','DASHBOARD_RELEASE','DASHBOARD_RELEASE_MANIFEST','DASHBOARD_ROOT_ID','DASHBOARD_SHUTDOWN_DEADLINE_MS','DASHBOARD_ORIGIN','CF_ACCESS_TEAM','CF_ACCESS_AUD','DASHBOARD_OWNER','DASHBOARD_DATA','DASHBOARD_ROOTS','DASHBOARD_REGISTRY','PORT'];
+const DEPLOYMENT_VARIABLES=['DASHBOARD_MODE','DASHBOARD_EXPOSURE','DASHBOARD_BIND','DASHBOARD_ALLOWED_HOSTS','DASHBOARD_RELEASE','DASHBOARD_RELEASE_MANIFEST','DASHBOARD_ROOT_ID','DASHBOARD_SHUTDOWN_DEADLINE_MS','DASHBOARD_ORIGIN','CF_ACCESS_TEAM','CF_ACCESS_AUD','DASHBOARD_OWNER','DASHBOARD_DATA','DASHBOARD_ROOTS','DASHBOARD_REGISTRY','DASHBOARD_AGENT_TEST_SEAMS','DASHBOARD_AGENT_NOTE_DELAY_MS','PORT'];
 function testEnv(overrides:NodeJS.ProcessEnv):NodeJS.ProcessEnv {
   const env:{[name:string]:string|undefined}={...process.env};
   for(const name of DEPLOYMENT_VARIABLES)delete env[name];
@@ -88,6 +88,30 @@ async function sessionToken(port:number):Promise<string> {
   assert.ok(match,'the served page must carry the session token: '+html.slice(0,200));
   return match[1];
 }
+
+test('an invalid test-only note delay refuses before the data root is created', async () => {
+  const root=await releaseRoot();
+  const cases=[
+    { label: 'missing test switch', env: { DASHBOARD_AGENT_NOTE_DELAY_MS: '10' }, message: /test-only seam/ },
+    { label: 'out of range', env: { DASHBOARD_AGENT_TEST_SEAMS: 'on', DASHBOARD_AGENT_NOTE_DELAY_MS: '60001' }, message: /whole number/ }
+  ];
+  try {
+    for (const [index, one] of cases.entries()) {
+      const data=join(root,'data-'+index);
+      const child=spawnServer(join(root,'current','server.mjs'), {
+        DASHBOARD_MODE:'local',DASHBOARD_DATA:data,PORT:String(4317+index),
+        DASHBOARD_ROOTS:'',DASHBOARD_REGISTRY:'',...one.env
+      });
+      const output=collect(child);
+      const [code]=await once(child,'exit') as [number, NodeJS.Signals|null];
+      assert.notEqual(code,0,one.label+': the start must fail closed');
+      assert.match(output.stderr(),one.message,one.label+': the refusal names the seam');
+      assert.equal(await stat(data).then(()=>true,()=>false),false,one.label+': the data root was not created');
+    }
+  } finally {
+    await rm(root,{recursive:true,force:true});
+  }
+});
 /**
  * One authenticated request that stops mid-body. Authentication has happened and the handler is
  * waiting for bytes that never arrive, so the server can neither answer nor finish closing.

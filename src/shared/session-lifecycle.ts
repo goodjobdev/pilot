@@ -345,8 +345,9 @@ function transition(current: SessionLifecycleRecord, change: {
  * no-op (reconnect, an already-stopped session, an already-paused session) or exactly one transition.
  *
  * Nothing here dispatches or cancels anything; the caller performs the planned effect. What is
- * guaranteed here is the semantics: `resume` reuses the original request identity and `retry` uses
- * the identity derived from the revision it writes (so neither can ever mint an identity a second
+ * guaranteed here is the semantics: `resume` reuses the original request identity while its durable
+ * submission is pending (a terminal identity is reported by the port and never replayed), and `retry`
+ * uses the identity derived from the revision it writes (so neither can ever mint an identity a second
  * racer would not also derive), and an uncertain interruption is refused rather than replayed.
  */
 export function planSessionLifecycleAction(
