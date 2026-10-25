@@ -4,6 +4,8 @@ import type { AgentView } from '../shared/agent';
 import type { ActionDescriptor,LiveActivity } from '../shared/actions';
 import type { AgentAuditEntry,AgentModelChoice,AgentRecord } from '../shared/agent-registry';
 import type { ImageCapability, MediaView } from '../shared/images';
+import type { AttentionByKind, AttentionCounts, AttentionItem, AttentionPage } from '../shared/attention';
+import type { ApprovalKind, ApprovalRecord, ApprovalScope, ApprovalState, ApprovalTarget } from '../shared/approvals';
 const token=document.querySelector<HTMLMetaElement>('meta[name="dashboard-token"]')?.content??'';
 let csrf='';
 export type ApiErrorKind = 'http' | 'session' | 'network';
@@ -88,6 +90,21 @@ export interface FileEditRecordView{
   applied:boolean;created:boolean;bytes:number;diff:string;diffBytes:number;diffTruncated:boolean;
   createdAt:string;changedBy:{kind:'owner'|'agent';identity:string};
 }
+/** One attention page. The exact count and the capped page are separate fields on purpose. */
+export interface AttentionView{
+  projectId:string;items:AttentionItem[];page:AttentionPage;count:AttentionCounts;
+  limits:{perPage:number;listedCap:number;policy:'proposed'};
+  sources:{questions:'read'|'empty'|'unavailable';approvals:'read'|'unavailable';lifecycle:'read'|'unavailable'};
+}
+export interface AttentionCountView{
+  projectId:string;count:AttentionCounts;
+  limits:{perPage:number;listedCap:number;policy:'proposed'};
+  sources:AttentionView['sources'];
+}
+export interface ApprovalView{
+  id:string;kind:ApprovalKind;scope:ApprovalScope;target:ApprovalTarget;issuedAt:string;expiresAt:string;
+  state:ApprovalState;consumedAt:string|null;consumedBy:string|null;revokedAt:string|null;
+}
 export interface FileEditLedgerView{
   readOnly:true;projectId:string;enabled:boolean;mode:'propose-only'|'auto-apply';
   limits:{fileBytes:number;diffBytes:number;edits:number};edits:FileEditRecordView[];truncated:boolean;
@@ -136,6 +153,24 @@ export const api={
   /** The per-session agent binding: read the binding and its authority, or write one revision of it. */
   sessionBinding:(projectId:string,sessionId:string)=>request<SessionBindingView>('/sessions/'+encodeURIComponent(sessionId)+'/agent?projectId='+encodeURIComponent(projectId)),
   bindSession:(projectId:string,sessionId:string,body:{revision:number;agentId:string|null;actor:AgentActorBody})=>request<{binding:SessionBindingView['binding'];authority:SessionBindingView['authority']}>('/sessions/'+encodeURIComponent(sessionId)+'/agent','POST',{projectId,...body}),
+  /**
+   * The attention surface: a read-only projection of questions, approvals, failures and interrupted
+   * runs. Reading it opens no harness, changes nothing and sends no POST.
+   */
+  attention:(projectId:string,options:{cursor?:string|null;limit?:number}={})=>{
+    const query=new URLSearchParams();
+    if(options.cursor)query.set('cursor',options.cursor);
+    if(options.limit!==undefined)query.set('limit',String(options.limit));
+    const suffix=query.toString();
+    return request<AttentionView>('/projects/'+projectId+'/attention'+(suffix?'?'+suffix:''));
+  },
+  /** The exact open count, from its own query: it is never derived from the capped page. */
+  attentionCount:(projectId:string)=>request<AttentionCountView>('/projects/'+projectId+'/attention/count'),
+  /** One approval, consumed only when the owner reviewed its exact target. */
+  consumeApproval:(id:string,body:{scope:ApprovalScope;kind:ApprovalKind;target:ApprovalTarget;consumedBy:string})=>request<{approval:ApprovalRecord;target:ApprovalTarget}>('/approvals/'+encodeURIComponent(id)+'/consume','POST',body),
+  revokeApproval:(id:string,body:{scope:ApprovalScope;revokedBy:string;reason?:string|null})=>request<{approval:ApprovalRecord}>('/approvals/'+encodeURIComponent(id)+'/revoke','POST',body),
+  /** One explicit lifecycle action. Only resume and retry can dispatch a model request. */
+  lifecycleAction:(projectId:string,sessionId:string,action:'reconnect'|'resume'|'retry'|'stop'|'pause',body:{revision:number;reason?:string})=>request<{lifecycle:{state:string;revision:number;reason:string|null};dispatched:boolean;cancelled:boolean;unchanged:boolean}>('/sessions/'+encodeURIComponent(sessionId)+'/lifecycle/'+action,'POST',{projectId,...body}),
   /** A dismissal carries a reason and is recorded as its own durable entry, distinct from an answer. */
   dismissQuestion:(projectId:string,body:{questionId:string;reason:string;sessionId?:string})=>request<{submissionId:string|null}>('/projects/'+projectId+'/agents/dismiss','POST',body),
   actions:(scope:ActionScope={})=>{

@@ -41,6 +41,8 @@ import { FileEditTool, FileEditError, type FileEditMode } from './state/file-edi
 import { AgentError, agentScopeVocabulary } from '../shared/agent-registry';
 import { ActionError,ActionRegistry,liveActivity,normaliseActionScope,type ActionEnvironment } from './state/action-registry';
 import { ApprovalError } from '../shared/approvals';
+import { ATTENTION_LIMITS, AttentionCursorError, countAttentionItems, decodeAttentionCursor, pageAttentionItems, parseAttentionLimit } from '../shared/attention';
+import { buildAttention } from './state/attention';
 import { SessionError,legacySessionName } from '../shared/sessions';
 import { SessionLifecycleError } from '../shared/session-lifecycle';
 import { emptyBoard } from '../shared/model';
@@ -230,6 +232,10 @@ function parseBody<T>(schema:z.ZodType<T>,payload:unknown,label:string):T{
 /** The channel-level tag of a question notification: derived from the question id, so a re-send is
  * the same notification at the push service rather than a second one. */
 function questionTag(questionId:string):string{return 'pilot-question-'+questionId;}
+/** The attention deep link for one question: the project, the exact session and the exact item. */
+function agentQuestionLink(projectId:string,sessionId:string,questionId:string):string{
+  return '/?project='+encodeURIComponent(projectId)+'&view=Agents&session='+encodeURIComponent(sessionId)+'&attention='+encodeURIComponent('question:'+questionId);
+}
 /** What the alert store reports back for one delivery: the receipt the ledger acknowledges with. */
 type AlertReceipt=Awaited<ReturnType<AlertStore['notify']>>;
 /**
@@ -262,7 +268,10 @@ function createDeliveryPort(input:{ledger:DeliveryLedger;alerts:AlertStore}):Age
         // what is missing is the durable receipt, and that is reported rather than hidden.
         console.error('Question '+question.questionId+' could not be admitted to the delivery ledger ('+(error as Error).message+'); it is notified without a durable receipt');
       }
-      const receipt=await alerts.notify({title:'An agent needs an answer',body:[question.projectName,question.text].filter(Boolean).join(' — ').slice(0,240),url:'/?project='+question.projectId+'&view=Agents',tag:questionTag(question.questionId)},{key:question.projectId+':question'});
+      // The notification opens the exact session and the exact question, not only the project. The
+      // payload still carries no question text beyond the bounded line the owner already sees, and
+      // no approval target, path or secret.
+      const receipt=await alerts.notify({title:'An agent needs an answer',body:[question.projectName,question.text].filter(Boolean).join(' — ').slice(0,240),url:agentQuestionLink(question.projectId,question.sessionId,question.questionId),tag:questionTag(question.questionId)},{key:question.projectId+':question'});
       // A notification that reached no device is not a delivery, whether the channel deliberately
       // skipped it (no device subscribed, or a repeat inside the cooldown) or it had devices and
       // every send failed — the receipt only proves delivery when it reports at least one send. The
@@ -342,7 +351,7 @@ export async function reconcileDeliveries(input:{
         completed+=1;continue;
       }
       if(scoped&&entry.disposition==='redeliver-idempotent'&&delivery==='question'&&questionId!==null){
-        const receipt=await input.notify(questionNotification(questionId,scope.projectId,input.projectName(scope.projectId)),scope.projectId+':question');
+        const receipt=await input.notify(questionNotification(questionId,scope.projectId,scope.sessionId,input.projectName(scope.projectId)),scope.projectId+':question');
         // A re-send that reached no device is not a delivery either: the row stays outstanding.
         if(receipt.skipped||receipt.sent===0){outstanding+=1;continue;}
         input.ledger.markDelivered(questionId,receipt,{kind:'question',scope});
@@ -373,9 +382,9 @@ export async function reconcileDeliveries(input:{
 }
 /** One line of context for a re-sent question notification: never the question text, which the
  * ledger's report deliberately does not return. */
-function questionNotification(questionId:string,projectId:string,projectName:string|undefined):AlertPayload{
+function questionNotification(questionId:string,projectId:string,sessionId:string,projectName:string|undefined):AlertPayload{
   const body=projectName?projectName+' — a question is still waiting for an answer':'A question is still waiting for an answer';
-  return {title:'An agent needs an answer',body:body.slice(0,240),url:'/?project='+projectId+'&view=Agents',tag:questionTag(questionId)};
+  return {title:'An agent needs an answer',body:body.slice(0,240),url:agentQuestionLink(projectId,sessionId,questionId),tag:questionTag(questionId)};
 }
 export async function createApp(options:AppOptions){
   // The release identity this process reports, and the read-only observation of which release the
@@ -489,7 +498,8 @@ export async function createApp(options:AppOptions){
       if(event.kind==='question'&&delivery)return;
       const title=event.kind==='question'?'An agent needs an answer':event.kind==='error'?'An agent run failed':'An agent finished';
       const body=[event.projectName,event.detail].filter(Boolean).join(' — ').slice(0,240);
-      void alerts.notify({title,body,url:'/?project='+event.projectId+'&view=Agents',tag:'dashboard-'+event.projectId+'-'+event.kind},{key:event.projectId+':'+event.kind}).catch(()=>{/* a failed alert never breaks a run */});
+      const attention=event.kind==='question'&&event.questionId!==undefined?'&attention='+encodeURIComponent('question:'+event.questionId):event.kind==='error'?'&attention='+encodeURIComponent('failure:'+event.sessionId):'';
+      void alerts.notify({title,body,url:'/?project='+encodeURIComponent(event.projectId)+'&view=Agents&session='+encodeURIComponent(event.sessionId)+attention,tag:'dashboard-'+event.projectId+'-'+event.kind},{key:event.projectId+':'+event.kind}).catch(()=>{/* a failed alert never breaks a run */});
     }
   });
   // Approvals are scoped, single-use grants over the durable control store. Without a live store
@@ -1288,6 +1298,45 @@ export async function createApp(options:AppOptions){
         if(path==='/api/projects'){
           if(req.method==='GET'){json(await catalog.list());return;}
           if(req.method==='POST'){json(await catalog.register(payload),201);return;}
+        }
+        // The attention surface: one read-only projection of the four things that need a person —
+        // questions, approvals, failures and interrupted runs. Every source is a durable record that
+        // already exists; the read opens no harness (which would resume unfinished work), writes
+        // nothing and changes no state. The exact open count is computed from every item, while the
+        // listed list is capped, so "more than the cap" is visible rather than hidden.
+        const attentionRoute=path.match(/^\/api\/projects\/([a-f0-9-]{36})\/attention(?:\/(count))?$/);
+        if(attentionRoute){
+          if(req.method!=='GET')throw new HttpError(405,'Method not allowed');
+          const p=catalog.get(attentionRoute[1]);
+          let limit:number=ATTENTION_LIMITS.perPage,cursor=null;
+          try{
+            limit=parseAttentionLimit(url.searchParams.get('limit')??undefined);
+            const rawCursor=url.searchParams.get('cursor');
+            cursor=rawCursor===null?null:decodeAttentionCursor(rawCursor);
+          }catch(error){
+            if(error instanceof AttentionCursorError)throw new HttpError(422,error.message);
+            throw error;
+          }
+          // The conversation-binding helper is a best-effort read of the same records: a store that
+          // cannot answer contributes no session mapping rather than failing the whole surface.
+          let bindings:{sessionId:string;conversationId:number}[]=[];
+          try{bindings=agentHolder.store?[...agentHolder.store.conversations(p.id)]:[];}catch{bindings=[];}
+          const built=buildAttention({
+            projectId:p.id,
+            dataRoot:options.dataRoot,
+            now:new Date(),
+            bindings,
+            sessionOwners:sessions?(sessionId)=>sessions.sessionOwners(sessionId):undefined,
+            lifecycle:lifecycle?{attention:projectId=>lifecycle.attention(projectId)}:undefined,
+            approvals:approvals?{records:()=>approvals.records()}:undefined
+          });
+          // A count is complete only when every source answered. A partial count is reported as
+          // partial so a badge cannot read an unreadable source as an exact zero.
+          const complete=built.sources.questions!=='unavailable'&&built.sources.approvals!=='unavailable'&&built.sources.lifecycle!=='unavailable';
+          const count=countAttentionItems(built.items,complete);
+          if(attentionRoute[2]==='count'){json({projectId:p.id,count,limits:ATTENTION_LIMITS,sources:built.sources});return;}
+          const page=pageAttentionItems(built.items,{cursor,limit,openCount:count.open});
+          json({projectId:p.id,items:page.items,page:page.page,count,limits:ATTENTION_LIMITS,sources:built.sources});return;
         }
         const agentsRoute=path.match(/^\/api\/projects\/([a-f0-9-]{36})\/agents(?:\/(stream|input|abort|answer|dismiss|model|media))?$/);
         if(agentsRoute){

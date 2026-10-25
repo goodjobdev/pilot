@@ -228,7 +228,7 @@ test('a real question is a durable delivery, its notification is the ledger outb
     const notifications=sent.filter(payload=>payload.tag==='pilot-question-'+question.id);
     assert.equal(notifications.length,1,'a question notifies once');
     assert.match(notifications[0].body,/wire the delivery ledger/);
-    assert.equal(notifications[0].url,'/?project='+app.project.id+'&view=Agents');
+    assert.equal(notifications[0].url,'/?project='+app.project.id+'&view=Agents&session=1&attention='+encodeURIComponent('question:'+question.id),'the notification deep-links to the exact question');
     assert.ok(!JSON.stringify(asked.delivery).includes('wire the delivery ledger'),'the ledger view returns no question text');
 
     assert.equal((await answer({questionId:question.id,text:'Yes, wire it'})).status,200);

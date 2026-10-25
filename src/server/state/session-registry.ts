@@ -178,6 +178,19 @@ export class SessionRegistry {
     return this.latest(parseSessionIdentifier(projectId, 'projectId'), parseSessionIdentifier(sessionId, 'sessionId')) !== null;
   }
 
+  /**
+   * Every project whose registry holds this session id, deterministic and read-only.
+   *
+   * A named session is project-scoped, so the same id can exist in two projects — the legacy root
+   * session id `1` exists in every project. A caller that wants to attribute a session-only record
+   * to one project must find exactly one owner here; zero or two owners are not proof.
+   */
+  sessionOwners(sessionId: unknown): readonly string[] {
+    const id = parseSessionIdentifier(sessionId, 'sessionId');
+    const rows = this.rows('SELECT DISTINCT project_id FROM operations WHERE session_id=? AND kind=? ORDER BY project_id', [id, OPERATION_KIND]);
+    return Object.freeze(rows.map((row) => String(row.project_id)));
+  }
+
   /** Whether a live session of this project already carries this name. */
   nameTaken(projectId: unknown, name: unknown): boolean {
     const id = parseSessionIdentifier(projectId, 'projectId'), wanted = parseSessionName(name);

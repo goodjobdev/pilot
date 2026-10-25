@@ -158,6 +158,31 @@ export class SessionLifecycleStore {
     return this.latest(project, session) !== null;
   }
 
+  /**
+   * The latest record of every session in one project that needs a person: `failed` and
+   * `interrupted`. Read-only, deterministic (session id), and it opens no harness.
+   *
+   * `paused` is an owner choice, not an attention item, and `running` is ordinary work; neither is
+   * returned. A session with no durable row has no record at all and is not invented here.
+   */
+  attention(projectId: unknown): readonly SessionLifecycleRecord[] {
+    const project = parseSessionLifecycleIdentifier(projectId, 'projectId');
+    const rows = this.rows('SELECT id,project_id,session_id FROM operations WHERE project_id=? AND kind=? ORDER BY rowid', [project, OPERATION_KIND]);
+    const latest = new Map<string, SessionLifecycleRecord>();
+    for (const row of rows) {
+      const sessionId = String(row.session_id);
+      const record = this.decode(String(row.id), { projectId: project, sessionId });
+      const previous = latest.get(sessionId);
+      if (previous === undefined || record.revision > previous.revision) latest.set(sessionId, record);
+      else if (record.revision === previous.revision) throw storage('Corrupt lifecycle storage: two records share a revision');
+    }
+    return Object.freeze(
+      [...latest.values()]
+        .filter((record) => record.state === 'failed' || record.state === 'interrupted')
+        .sort((left, right) => left.sessionId.localeCompare(right.sessionId))
+    );
+  }
+
   /** Every session whose durable state is `running`, in a deterministic order, for startup adoption. */
   running(): readonly SessionLifecycleRecord[] {
     const rows = this.rows('SELECT id,project_id,session_id FROM operations WHERE kind=? ORDER BY rowid', [OPERATION_KIND]);

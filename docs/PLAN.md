@@ -685,10 +685,11 @@ they are not docked over the transcript.
 
 ### Step 6 — Attention: questions, approvals, failures and interrupted runs
 
-**Status: Partial.** Questions appear in the inbox and agents view, alerts open the right
-project, and the lifecycle exposes `failed`, `paused` and `interrupted`. There is no single
-attention surface that ranks all four kinds, and no approval or interrupted-run action from
-the phone.
+**Status: Built (local validation complete); owner acceptance pending.** One attention surface
+now ranks all four kinds, shows the exact open count apart from the capped list, and offers the
+explicit actions each kind allows from a phone. The 20-per-page and 100-listed limits are
+implemented as **proposed** defaults (`limits.policy: "proposed"`); they are not accepted policy
+and changing them remains an owner decision. See [Attention](ATTENTION.md).
 
 **Required work**
 
@@ -725,6 +726,89 @@ the phone.
   from the same durable records and refresh it with the same connection state.
 - A push link can point at a deleted item. Mitigation: the surface reports "no longer
   present" rather than an empty page.
+
+**Evidence (local).**
+
+- `src/shared/attention.ts` is the pure model: the closed four-kind set, the fixed severity order
+  (interrupted, failure, approval, question), the total age-then-id order, the keyset cursor, the
+  `20` / `100` **proposed** limits, `countAttentionItems` (which counts every open item rather than
+  a page and carries `complete`) and the age label. A missing instant is `at: null`: the label is
+  `age unknown`, the order puts it after recorded instants, and no epoch age is invented.
+  `tests/unit/attention.test.ts` (9 tests) covers severity/age/id ordering with a non-mutating sort,
+  equal-key id ties split across two one-item pages, the exact count above the cap, an incomplete
+  count, cursor round-trip, a null-instant item that still pages by keyset, a stale cursor whose
+  item was resolved, 100 listed out of 107, and refusals for an unreadable cursor or a limit
+  outside 1–100.
+- The server projection is read-only. `src/server/state/transcript-questions.ts` opens the project
+  transcript with a read-only handle (and SQLite's `immutable=1` URI when no writer sidecar exists),
+  so reading questions creates no file and cannot checkpoint; it starts no harness, because opening
+  one resumes work. It follows Durable's **active** transcript: the newest `head` marker bounds the
+  range, and older hidden history is not listed. `ApprovalStore.records()`,
+  `SessionLifecycleStore.attention()` and `SessionRegistry.sessionOwners()` add read-only passes over
+  the same durable records the existing routes use. `src/server/state/attention.ts` assembles the
+  items and never copies an approval nonce.
+- `GET /api/projects/:id/attention` returns one page with the exact count, the page state, the
+  source states and `limits.policy`. `GET /api/projects/:id/attention/count` is the separate count
+  query the badge uses. Both are `GET` only; another method is `405`.
+- `tests/server/attention.test.ts` (11 tests) covers: 105 approvals reported exactly while only 100
+  are listed, 20 per page, a deterministic order and a `complete` count; exact project isolation for
+  project-scoped and session-scoped approvals, with an operation-only approval attributed to
+  neither; two projects that both hold legacy session `1`, where a session-only approval is
+  attributed to neither, while a unique UUID session is attributed only to its own project and a
+  foreign project's consume is refused; an open question that leaves after an answer and a dismissed
+  question whose reason stays in the transcript; a failed session offering `retry`, an uncertain
+  interruption offering no action and refusing `resume` with the operator-attention refusal; a fresh
+  process reading attention twice with the transcript and its sidecars byte-identical; a stale cursor
+  after a consumption; an unreadable transcript reported as `unavailable` with `complete: false`
+  rather than as no questions; a synthetic transcript whose head marker hides an older question and
+  whose active question has no `askedAt`; a failed registry owner lookup that marks approvals
+  unavailable and attributes nothing; and `422` for an invalid cursor or limit.
+- A session-only approval is attributed only when the registry proves exactly one owner and that
+  owner is the requested project. A project scope, when present, is authoritative. Legacy session
+  ids are unchanged: `1` still exists in every project, which is exactly why it proves nothing.
+- `tests/browser/attention.spec.ts` (4 tests, 390×844) covers all four kinds in severity order with
+  the exact `4 open` count, only `GET` requests while the panel opens, no approval nonce or path in
+  the panel, the uncertain item's visible operator-attention refusal and no `Resume`, the full
+  exact approval target before an explicit consumption (which says it performs nothing), `Retry`
+  for a failure, opening the exact question, Back closing the layer and staying in the app, a
+  push-style `&attention=question:<id>` deep link, a 25-approval project paging 20 then 25 with the
+  count unchanged and the proposed-defaults note, an unreadable transcript that makes the badge say
+  `count incomplete` instead of an exact zero, and a service-worker alert switch to another project
+  while the first project's attention response is held: the panel remounts for the new project and
+  the released response adds no old target and no approval action. The browser server publishes its disposable data
+  root through one random, exclusively created `0600` marker in the ignored `test-results`
+  directory; the test discovers it by name and refuses a symlink, a non-file or a non-private file.
+  There is no fixed shared path and no production debug route. A runner-side global teardown
+  removes the marker and the disposable data root after every test outcome, because the web server
+  can be stopped with a signal it cannot catch. An unclean runner kill can still leave both in the
+  system temp folder and the ignored output directory, with no credentials in either.
+- The panel is keyed by project and also carries a request generation. A project change clears
+  items, page, count, sources, review and the missing-item notice at once. Every list, paging and
+  action response from the previous generation is discarded, so a delayed response cannot show one
+  project's target or consume action under another project.
+- The notification link now names the project, the exact session and the exact item for a question,
+  and the exact session and failure item for an agent failure; a finished run keeps its project and
+  session link. The payload still carries no approval target, path or token.
+- Query cost is not cached: each list request builds the projection once (one transcript read, one
+  approval pass, one lifecycle pass, one registry lookup per session-only approval); paging rebuilds
+  it from durable records so a status change is not hidden by a stale snapshot; the panel uses the
+  count its list response already carries, so opening the panel is one projection, and the separate
+  count route is for the badge. The registry lookup is a read-only scan by session id, not an
+  indexed point read, and the transcript query scans the conversation's entries. No new authority
+  or index is added.
+- Validation ran with this worktree's own binaries: `./node_modules/.bin/tsc --noEmit` and
+  `./node_modules/.bin/svelte-check --tsconfig ./tsconfig.json` (0 errors, 0 warnings), `vite build`
+  plus the `esbuild` server bundle, `tsx --test tests/unit/*.test.ts tests/server/*.test.ts`
+  (501 passed) and `playwright test` (75 passed).
+- Honest limits are listed in [Attention](ATTENTION.md): the transcript read depends on the durable
+  SQLite layout and reports `unavailable` rather than guessing; an approval scoped only to an
+  operation is not attributable to a project and stays out of that project's list; a session-only
+  approval with an ambiguous id such as legacy `1` is not attributed at all; question state is per
+  conversation, so a fork child is not merged into its parent; the transcript reader follows the
+  active head but does not apply context edits (the harness edits no question entry); a root-session
+  question deep link may omit `session` because the root conversation is the default; the panel
+  refreshes when it opens and after an action rather than by a background poll; and the action
+  surface itself still awaits owner acceptance.
 
 ---
 

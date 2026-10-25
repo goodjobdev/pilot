@@ -8,7 +8,7 @@
  import TaskList from './TaskList.svelte';
  import TaskInspector from './TaskInspector.svelte';
  import BoardSettings from './BoardSettings.svelte';
- import QuestionInbox from './QuestionInbox.svelte';
+ import AttentionPanel from './AttentionPanel.svelte';
  import { alertState as readAlertState, disableAlerts, enableAlerts, onAlertNavigation } from './push';
  import type { AlertState } from './push';
  import DocBrowser from './DocBrowser.svelte';
@@ -49,13 +49,13 @@
  let requestedDoc=$state<string|null>(null);
  let actionsOpen=$state(false),filtersOpen=$state(false),inboxOpen=$state(false),paletteOpen=$state(false);
  let inbox=$state<{path:string;line:number;text:string;anchor:string|null;id:string}[]>([]),focusAnchor=$state<string|null>(null),inboxMenu=$state<HTMLDivElement>();
- let agentQuestions=$state<{id:string;text:string}[]>([]);
+ let attentionCount=$state<number|null>(null),attentionCountComplete=$state(false),attentionChecked=$state(false),inboxRefresh=$state(0),attentionFocus=$state<string|null>(null),questionFocus=$state('');
  let alertState=$state<AlertState>('off'),alertBusy=$state(false),alertMessage=$state('');
  let sessionExpired=$state(false),providersOpen=$state(false),connectionOpen=$state(false),agentManagerOpen=$state(false),agentsVersion=$state(0);
  let docPathSet=$derived(new Set(docs.map(d=>d.path)));
  let shell=$state<HTMLDivElement>();
  let unlinked=$derived(snapshot?snapshot.board.tasks.filter(t=>t.scope==='active'&&!t.archived&&specState(t,docPathSet)==='unlinked').length:0);
- let inboxCount=$derived(inbox.length+agentQuestions.length);
+ let inboxCount=$derived(attentionChecked&&attentionCountComplete&&attentionCount!==null?inbox.length+attentionCount:null);
  let filterCount=$derived(Number(domain!=='all')+Number(status!=='all')+Number(scope!=='all'));
  let ready=$derived(snapshot?.board.tasks.filter(t=>readiness(snapshot!.board,t.id)==='ready').length??0);
  let waiting=$derived(snapshot?.board.tasks.filter(t=>readiness(snapshot!.board,t.id)==='waiting').length??0);
@@ -238,7 +238,7 @@
  }
  /** The application's selected session changed (a person chose one, or fell back). */
  function sessionChanged(id:string):void{
-   sessionId=id;sessionListOpen=false;
+   sessionId=id;sessionListOpen=false;questionFocus='';
    if(project)writeSelectedSession(localStorage,project.id,id||null);
  }
  /** A direct session link named a session this project does not have: root, with its list open. */
@@ -252,6 +252,8 @@
      const params=new URL(url,location.origin).searchParams;
      const projectId=params.get('project');
      const requested=params.get('view');
+     const requestedSession=params.get('session');
+     const attention=params.get('attention');
      const target=isView(requested)?requested:null;
      const found=projectId?projects.find(candidate=>candidate.id===projectId):undefined;
      if(projectId&&!found){
@@ -259,11 +261,15 @@
        return;
      }
      const current=routeSnapshot();
-     const next:RouteSnapshot={...current,project:found?.id??current.project,view:target??current.view,layers:[]};
+     const next:RouteSnapshot={...current,project:found?.id??current.project,view:target??current.view,session:requestedSession??current.session,layers:[]};
      // A notification is not a reason to throw away unsaved text. A refusal changes nothing.
      if(!canLeaveRoute(current,next))return;
-     if(found&&found.id!==project?.id)await select(found,{view:target??undefined,confirmed:true});
-     else if(target)setView(target);
+     if(found&&found.id!==project?.id)await select(found,{view:target??undefined,session:requestedSession??undefined,confirmed:true});
+     else{
+       if(target)setView(target);
+       if(requestedSession!==null)sessionId=requestedSession;
+     }
+     openAttentionDeepLink(attention);
      error='';
    }catch{/* a malformed alert link is ignored */}
  }
@@ -287,6 +293,7 @@
      await session();
      projects=await api.projects();
      const link=parseRoute(location.search);
+     const deepAttention=new URLSearchParams(location.search).get('attention');
      const remembered=localStorage.getItem('dashboard.project');
      const named=link.project?projects.find(candidate=>candidate.id===link.project):undefined;
      // A project named by the address must exist. A silent fallback could send an edit to the wrong
@@ -298,6 +305,7 @@
        const p=named??projects.find(candidate=>candidate.id===remembered)??projects[0];
        if(p)await select(p,{view:link.view??undefined,doc:link.doc,session:link.session??undefined,confirmed:true});
        else view=narrowView(link.view??(window.innerWidth<750?'List':'Dependencies'),window.innerWidth<750);
+       openAttentionDeepLink(deepAttention);
      }
    }catch(e){error=(e as Error).message;}
    finally{
@@ -307,7 +315,7 @@
    }
  }
  async function select(p:Project,opts:SelectOptions={}){
-   if(!opts.confirmed&&!leave())return;project=p;snapshot=null;error='';missingBoard=false;loading=true;selected='';failed=false;inspectorDirty=false;saveState='Saved';undoStack=[];redoStack=[];doc=null;docDraft='';docEditing=false;docDirty=false;docConflict=false;docMessage='';docsError='';docs=[];requestedDoc=null;if(!opts.fromRoute){treeOpen=false;sessionListOpen=false;}localStorage.setItem('dashboard.project',p.id);
+   if(!opts.confirmed&&!leave())return;project=p;snapshot=null;error='';missingBoard=false;loading=true;selected='';failed=false;inspectorDirty=false;saveState='Saved';undoStack=[];redoStack=[];doc=null;docDraft='';docEditing=false;docDirty=false;docConflict=false;docMessage='';docsError='';docs=[];requestedDoc=null;inbox=[];attentionCount=null;attentionCountComplete=false;attentionChecked=false;attentionFocus=null;questionFocus='';inboxRefresh+=1;if(!opts.fromRoute){treeOpen=false;sessionListOpen=false;}localStorage.setItem('dashboard.project',p.id);
    let remembered:View|undefined;
    try{const filters=JSON.parse(localStorage.getItem('dashboard.filters.'+p.id)??'null');if(filters){search=filters.search??'';domain=filters.domain??'all';status=filters.status??'all';scope=filters.scope??'all';if(isView(filters.view))remembered=filters.view;}else{search='';domain='all';status='all';scope='all';}}catch{/* defaults */}
    const narrow=window.innerWidth<750;
@@ -364,13 +372,43 @@
    try{docsError='';docs=(await api.docs(project.id)).documents;}
    catch(e){docsError=(e as Error).message;docs=[];}
  }
- async function loadInbox(){
+ /** The documentation questions of the project, and the count of the attention projection. */
+ async function loadDocInbox(){
    if(!project)return;
-   try{inbox=(await api.inbox(project.id)).questions;}catch{inbox=[];}
+   // A response for the project this page has since left is discarded, so a switch cannot show one
+   // project's count for another.
+   const id=project.id;
+   try{const loaded=(await api.inbox(id)).questions;if(project?.id===id)inbox=loaded;}catch{if(project?.id===id)inbox=[];}
+ }
+ async function loadAttentionCount(){
+   if(!project)return;
+   const id=project.id;
+   // An incomplete count is not an exact zero. The badge shows that state instead of hiding work.
    try{
-     const agents=await api.agents(project.id);
-     agentQuestions=agents.enabled&&agents.view?agents.view.questions.filter(question=>!question.answer).map(question=>({id:question.id,text:question.text})):[];
-   }catch{agentQuestions=[];}
+     const loaded=(await api.attentionCount(id)).count;
+     if(project?.id===id){attentionCount=loaded.open;attentionCountComplete=loaded.complete;attentionChecked=true;}
+   }catch{
+     if(project?.id===id){attentionCount=null;attentionCountComplete=false;attentionChecked=true;}
+   }
+ }
+ async function loadInbox(){await Promise.all([loadDocInbox(),loadAttentionCount()]);}
+ /**
+  * A push or deep link names one exact attention item. A question opens its session and the answer
+  * UI; every other kind opens the attention layer with the item focused. The address value is
+  * validated before it is used and is never echoed into the interface.
+  */
+ function openAttentionDeepLink(value:string|null|undefined){
+   if(!value)return;
+   const separator=value.indexOf(':');
+   if(separator<1)return;
+   const kind=value.slice(0,separator),identity=value.slice(separator+1);
+   if(!['question','approval','failure','interrupted'].includes(kind))return;
+   if(!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$/.test(identity))return;
+   if(kind==='question'){
+     questionFocus=identity;attentionFocus=null;inboxOpen=false;
+     return;
+   }
+   attentionFocus=value;inboxRefresh+=1;inboxOpen=true;
  }
  function openQuestion(path:string,anchor:string|null){
    inboxOpen=false;focusAnchor=anchor;
@@ -449,8 +487,8 @@
    {:else}<button class="small-button" aria-label="＋ Add project" disabled={!booted} onclick={()=>adding=true}><Icon name="plus"/>Add project</button>{/if}
    {#if project}
    <div class="popover" bind:this={inboxMenu}>
-    <button class="icon-button" aria-label={inboxCount?'Needs me ('+inboxCount+')':'Needs me'} title="Open questions and missing specifications" aria-expanded={inboxOpen} onclick={()=>{inboxOpen=!inboxOpen;actionsOpen=false;filtersOpen=false;if(inboxOpen){void loadInbox();void loadDocs();}}}><Icon name="book"/> {#if inboxCount}<span class="inbox-count">{inboxCount}</span>{/if}</button>
-    {#if inboxOpen}<QuestionInbox questions={inbox} agents={agentQuestions} {unlinked} {alertState} {alertBusy} {alertMessage} onopen={openQuestion} onanswer={()=>{inboxOpen=false;setView('Agents');}} onenable={()=>void enablePhoneAlerts()} ondisable={()=>void disablePhoneAlerts()} ontest={()=>void testPhoneAlert()} onclose={()=>inboxOpen=false}/>{/if}
+    <button class="icon-button" aria-label={inboxCount===null?'Needs me (count incomplete)':inboxCount?'Needs me ('+inboxCount+')':'Needs me'} title={inboxCount===null?'Open questions and missing specifications. The attention count is incomplete because a source is unavailable.':'Open questions and missing specifications'} aria-expanded={inboxOpen} onclick={()=>{inboxOpen=!inboxOpen;actionsOpen=false;filtersOpen=false;if(inboxOpen){attentionFocus=null;void loadDocInbox();void loadDocs();}else{attentionFocus=null;}}}><Icon name="book"/> {#if inboxCount}<span class="inbox-count">{inboxCount}</span>{:else if attentionChecked&&!attentionCountComplete}<span class="inbox-count" aria-hidden="true">?</span>{/if}</button>
+    {#if inboxOpen}{#key project.id}<AttentionPanel projectId={project.id} questions={inbox} {unlinked} {alertState} {alertBusy} {alertMessage} refreshKey={inboxRefresh} focusId={attentionFocus} onopen={openQuestion} onopenquestion={(session,questionId)=>{inboxOpen=false;attentionFocus=null;questionFocus=questionId;setView('Agents');sessionId=session??'';if(project)writeSelectedSession(localStorage,project.id,session??'');}} oncount={(loaded)=>{attentionCount=loaded.open;attentionCountComplete=loaded.complete;attentionChecked=true;}} onchanged={()=>{void loadDocInbox();}} onenable={()=>void enablePhoneAlerts()} ondisable={()=>void disablePhoneAlerts()} ontest={()=>void testPhoneAlert()} onclose={()=>{inboxOpen=false;attentionFocus=null;}}/>{/key}{/if}
    </div>
    {/if}
   </div>
@@ -509,7 +547,7 @@
   {/if}
  </section>
  {:else if view==='Agents'}
- <AgentsView projectId={project.id} {agentsVersion} sessionId={sessionId} onsessionchange={sessionChanged} sessionListOpen={sessionListOpen} onsessionlistchange={(open)=>sessionListOpen=open} onmissing={sessionUnavailable} onerror={(message)=>error=message} onquestions={()=>void loadInbox()}/>
+ <AgentsView projectId={project.id} {agentsVersion} sessionId={sessionId} onsessionchange={sessionChanged} sessionListOpen={sessionListOpen} onsessionlistchange={(open)=>sessionListOpen=open} onmissing={sessionUnavailable} onerror={(message)=>error=message} focusQuestion={questionFocus} onquestions={()=>{void loadInbox();inboxRefresh+=1;}}/>
  {:else}
  <div class="view-content">
  {#if loading}<div class="empty"><p>Loading board…</p></div>

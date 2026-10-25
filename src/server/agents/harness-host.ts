@@ -268,7 +268,11 @@ function scriptedResponses(provider: FauxProviderHandle, pauseMs: number) {
 export interface AgentEvent {
   projectId: string;
   projectName: string;
+  /** The exact session the event belongs to, so a notification can deep-link to it. */
+  sessionId: string;
   kind: 'question' | 'finished' | 'error';
+  /** The question the event is about, when it is a question. */
+  questionId?: string;
   /** Short human-facing context, never document text. */
   detail: string;
 }
@@ -713,13 +717,13 @@ export class HarnessHost {
               // two is recoverable. A question that cannot be admitted is reported and stays visible
               // in the transcript; it never breaks the run.
               if (asked && this.options.delivery) void this.options.delivery.questionSurfaced({ projectId: project.id, projectName: project.name, sessionId, questionId: asked.id, text: asked.text, askedAt: asked.askedAt }).catch(error => console.error('Question ' + asked.id + ' is open in the transcript but its delivery could not be admitted: ' + (error as Error).message));
-              this.options.onEvent?.({ projectId: project.id, projectName: project.name, kind: 'question', detail: asked?.text ?? '' });
+              this.options.onEvent?.({ projectId: project.id, projectName: project.name, sessionId, kind: 'question', questionId: asked?.id, detail: asked?.text ?? '' });
             }
             if (previous.working && !view.working) {
               const failed = runFailed;
               runFailed = false;
-              if (failed) this.options.onEvent?.({ projectId: project.id, projectName: project.name, kind: 'error', detail: '' });
-              else this.options.onEvent?.({ projectId: project.id, projectName: project.name, kind: 'finished', detail: '' });
+              if (failed) this.options.onEvent?.({ projectId: project.id, projectName: project.name, sessionId, kind: 'error', detail: '' });
+              else this.options.onEvent?.({ projectId: project.id, projectName: project.name, sessionId, kind: 'finished', detail: '' });
               // The owner's own cancel is the one writer at this revision. A cancel of a genuinely
               // running generation ends it in the same instant, and this settle is that end: writing
               // `idle` here would race the owner's `paused`/`idle` write and could overwrite it. The

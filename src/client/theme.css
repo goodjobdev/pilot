@@ -134,6 +134,34 @@ dialog::backdrop{background:#040b15b3;backdrop-filter:blur(3px)}.modal-head{disp
 :root[data-theme=light] .spec-chip.none{color:#785714}
 .inbox-count{position:absolute;margin:-16px 0 0 16px;min-width:14px;height:14px;display:grid;place-items:center;font:9px var(--mono);color:var(--bg);background:var(--accent);border-radius:7px;padding:0 3px}
 .inbox-panel{width:320px}
+/* Attention: the four kinds that need a person. The panel stays in the application bar, scrolls
+   inside the viewport and keeps its last control above the phone's home indicator. */
+.attention-panel{width:min(360px,calc(100vw - 20px));max-height:calc(100dvh - var(--header-h,42px) - var(--safe-bottom) - 20px);padding-bottom:calc(10px + var(--safe-bottom))}
+.attention-head{display:flex;align-items:center;justify-content:space-between;gap:8px}
+.attention-head .popover-heading{padding:7px 8px 10px}
+.attention-count{display:flex;flex-wrap:wrap;align-items:baseline;gap:8px;padding:0 8px 8px;font-size:11px;color:var(--muted)}
+.attention-count strong{font:13px var(--mono);color:var(--ink)}
+.attention-cap{font-size:10px;color:var(--danger)}
+.attention-item{border-top:1px solid var(--line);padding:9px 8px}
+.attention-item.inbox-item{display:block;width:100%;border:0;border-top:1px solid var(--line);background:none;text-align:left;cursor:pointer}
+.attention-item.inbox-item:hover{background:var(--raised)}
+.attention-open{font-size:11px;color:var(--accent)}
+.attention-item.critical{border-left:2px solid var(--danger)}
+.attention-item.danger{border-left:2px solid #d6b879}
+.attention-meta{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:4px}
+.attention-kind{border-color:currentColor}
+.attention-kind.critical{color:var(--danger)}
+.attention-kind.danger{color:#d6b879}
+.attention-kind.warning{color:var(--accent)}
+.attention-age{font:10px var(--mono);color:var(--muted);white-space:nowrap}
+.attention-context{margin:4px 0 8px;font-size:12px;line-height:1.55;overflow-wrap:anywhere}
+.attention-refusal{margin:6px 0 2px;padding:6px 8px;font-size:11px;line-height:1.55;color:var(--danger);background:color-mix(in srgb,var(--danger) 7%,transparent);border-radius:4px;overflow-wrap:anywhere}
+.attention-review{margin-top:8px;padding:8px;border:1px solid var(--line);border-top:2px solid var(--accent);border-radius:5px;background:var(--raised)}
+.attention-field{display:flex;gap:8px;align-items:baseline;margin:4px 0;font-size:11px;line-height:1.5}
+.attention-field span{flex:0 0 72px;color:var(--muted)}
+.attention-field code{min-width:0;overflow-wrap:anywhere;font-size:11px}
+.attention-more{justify-content:center;padding:8px 0}
+.attention-limits{margin:6px 8px 0;font-size:10px;line-height:1.55;color:var(--muted)}
 .inbox-hint{display:flex;gap:8px;align-items:center;margin:0 0 8px;padding:8px;font-size:11px;line-height:1.5;color:var(--muted);background:var(--raised);border-radius:4px}
 .inbox-item{display:block;width:100%;border:0;border-bottom:1px solid var(--line);background:none;text-align:left;padding:9px 8px;font-size:12px;color:var(--ink)}
 .inbox-item:hover{background:var(--raised)}

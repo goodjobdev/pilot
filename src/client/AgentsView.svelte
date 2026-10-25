@@ -15,12 +15,17 @@
  import {activityArrived,arrivalAfterFrame,countLabel,followIdentity,indicatorLabel,initialFollow,isNearBottom,readerScrolled,readerStillFollowing,type FollowState} from './follow';
  import SessionBar from './SessionBar.svelte';
  import SessionActivity from './SessionActivity.svelte';
- let { projectId,sessionId='',onsessionchange=()=>{},sessionListOpen=false,onsessionlistchange=()=>{},onmissing=()=>{},onerror,onquestions,agentsVersion=0 }:{
+ let { projectId,sessionId='',onsessionchange=()=>{},sessionListOpen=false,onsessionlistchange=()=>{},onmissing=()=>{},onerror,onquestions,agentsVersion=0,focusQuestion='' }:{
    projectId:string; sessionId?:string; onsessionchange?:(id:string)=>void;
    sessionListOpen?:boolean; onsessionlistchange?:(open:boolean)=>void; onmissing?:()=>void;
    onerror:(message:string)=>void; onquestions?:()=>void; agentsVersion?:number;
+   /** An exact question an attention deep link names; the view scrolls to it once it is rendered. */
+   focusQuestion?:string;
  }=$props();
  let view=$state<AgentView|null>(null),enabled=$state(true),draft=$state(''),sending=$state(false),problem=$state('');
+ // A deep link names one exact question. It is only a scroll target: it opens nothing and answers
+ // nothing, and an id this transcript does not hold simply has no target.
+ $effect(()=>{const id=focusQuestion,loaded=view;if(!id||!loaded)return;const target=document.getElementById('question-'+id);target?.scrollIntoView({block:'center'});});
  // The stream's own state. `lastViewAt` is when a full snapshot was accepted, which is
  // different from transport freshness: an idle session stays `live` on keep-alives.
  let connection=$state<ConnectionStatus>({state:'connecting',detail:'Connecting…',attempt:0,lastFrameAt:null,lastViewAt:null});
