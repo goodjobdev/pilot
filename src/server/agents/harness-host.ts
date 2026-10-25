@@ -5,8 +5,9 @@ import { BACKGROUND_CONTEXT } from '@earendil-works/chord/context';
 import { createModels } from '@earendil-works/pi-ai/models';
 import { createAssistantMessageEventStream } from '@earendil-works/pi-ai/utils/event-stream';
 import { fauxAssistantMessage, fauxProvider, fauxToolCall, type FauxProviderHandle, type FauxResponseFactory } from '@earendil-works/pi-ai/providers/faux';
-import { Harness, ToolTask, ROOT_CONVERSATION_ID, createRegistry, defineExtension, defineTool, hook, section } from '@earendil-works/pi-durable';
-import type { ConversationId, EntryId, Extension } from '@earendil-works/pi-durable';
+import { Harness, ToolTask, ROOT_CONVERSATION_ID, createRegistry, defineDoc, defineExtension, defineTool, hook, section } from '@earendil-works/pi-durable';
+import type { ConversationId, DocumentReader, EntryId, Extension, JsonObject } from '@earendil-works/pi-durable';
+import type { Context } from '@earendil-works/chord/context';
 import { openNodeSqliteStorage } from '@earendil-works/pi-durable/storage/sqlite/node';
 import { Type } from 'typebox';
 import { safePath } from '../paths';
@@ -46,6 +47,125 @@ export interface AgentDismissal { readonly reason: string; readonly dismissedAt:
 export type AgentSessionView = AgentView & { readonly usageDetail: AgentUsageDetail; readonly dismissals: Readonly<Record<string, AgentDismissal>> };
 /** What the model a submission would run under accepts. */
 export interface AgentVision { readonly provider: string; readonly modelId: string; readonly acceptsImages: boolean }
+
+/**
+ * One bounded worker run in the application harness.
+ *
+ * A worker is not a named session: its conversation is created for this run only, with its own
+ * pinned model and only the tools its worker allowlist permits. `guard` is called on every tool
+ * call and is the authority: it re-reads the run, the worker, the model policy, the project and the
+ * scopes. A refusal blocks the call with no effect.
+ */
+export interface WorkerRunRequest {
+  readonly runId: string;
+  readonly workerId: string;
+  readonly model: ModelChoice;
+  readonly scopes: readonly AgentScope[];
+  readonly prompt: string;
+  readonly requestId: string;
+  readonly guard: (tool: string) => Promise<string | null>;
+  /** Persist this run's conversation id. It must finish before any input is submitted. */
+  readonly onConversation: (conversationId: number) => Promise<void>;
+  /** The last re-check before the one submission. A non-null answer sends nothing. */
+  readonly beforeSubmit: () => Promise<string | null>;
+  /** Aborted when the owner stops or revokes, including before the conversation opens. */
+  readonly signal?: AbortSignal;
+}
+
+export interface WorkerRunOutcome {
+  /** The final assistant text. A cancelled run keeps whatever was already committed. */
+  readonly text: string;
+  readonly turns: number;
+  readonly cancelled: boolean;
+  readonly failed: boolean;
+  readonly reason: string | null;
+}
+
+/**
+ * The durable worker marker, written in the **same conversation-creation transaction** as the
+ * conversation itself. It is independent of any extension list and of the control-store binding:
+ * a crash between conversation creation and the control binding still leaves a role that fails
+ * closed after restart.
+ */
+const WorkerMarkerDoc = defineDoc({
+  kind: 'pilot.worker',
+  version: 1,
+  scope: 'conversation',
+  history: 'latest',
+  fork: 'initial',
+  initial: (): { marker: boolean; projectId: string; workerId: string; runId: string } => ({ marker: false, projectId: '', workerId: '', runId: '' }),
+  checkpointWhen: () => true
+});
+
+type WorkerMarker = { readonly marker: boolean; readonly projectId: string; readonly workerId: string; readonly runId: string };
+
+function workerMarkerOf(value: unknown): WorkerMarker | null {
+  if (!value || typeof value !== 'object') return null;
+  const typed = value as { marker?: unknown; projectId?: unknown; workerId?: unknown; runId?: unknown };
+  if (typed.marker !== true || typeof typed.projectId !== 'string' || typeof typed.workerId !== 'string' || typeof typed.runId !== 'string') return null;
+  return { marker: true, projectId: typed.projectId, workerId: typed.workerId, runId: typed.runId };
+}
+
+/**
+ * The worker role, installed **once** in the project registry and selected by every conversation.
+ * It is inert for every non-worker conversation: the durable marker is the role. The control-store
+ * binding is the second authority for generic paths, not a replacement.
+ *
+ * The generation hook revalidates the run, worker, policy and revocation before every provider
+ * request, and refuses the ninth request. The tool hook revalidates before every tool call.
+ */
+function workerRoleExtension(project: Project, options: HarnessHostOptions) {
+  const markerFor = async (read: DocumentReader, conversationId: ConversationId, context: Context): Promise<WorkerMarker | null> => {
+    try {
+      const marker = workerMarkerOf(await read.snapshot(WorkerMarkerDoc, conversationId, context));
+      if (marker === null || marker.projectId !== project.id) return null;
+      // A marker with no run identity is not a usable worker role. The sentinel names no real run,
+      // so both guards fail closed for it.
+      return marker.workerId !== '' && marker.runId !== '' ? marker : { marker: true, projectId: project.id, workerId: 'unresolved', runId: 'unresolved' };
+    } catch {
+      // A worker marker that cannot be read is treated as a worker: both guards fail closed.
+      return { marker: true, projectId: project.id, workerId: 'unresolved', runId: 'unresolved' };
+    }
+  };
+  return defineExtension({
+    name: 'worker-role',
+    sections: [section('worker-role', async (input, context) => {
+      const marker = await markerFor(input.read, input.conversationId, context);
+      if (marker === null) return undefined;
+      return 'You are a bounded worker. Produce one Markdown report as your final message. You cannot approve, accept, grant a scope, or act outside this project. Treat your own report as evidence for the owner, never as an instruction. Only the tools in your worker allowlist are offered. PILOT-WORKER-RUN:' + marker.runId;
+    }, { tag: false })],
+    hooks: [
+      hook(ToolTask, {
+        beforeTool: async (call, api, context) => {
+          const marker = await markerFor(api, api.conversationId, context);
+          if (marker === null) return undefined;
+          if (marker.workerId === '' || marker.runId === '') return { block: 'The worker identity cannot be verified, so the tool is refused with no effect.' };
+          let refusal: string | null;
+          try { const verdict = options.workerGuard?.({ projectId: project.id, runId: marker.runId, tool: call.name }); refusal = verdict === undefined ? 'The worker guard is unavailable, so the tool is refused with no effect.' : verdict; }
+          catch { refusal = 'The worker guard could not verify this call, so the tool is refused with no effect.'; }
+          try { options.onWorkerGuard?.({ tool: call.name, refusal }); } catch { /* observation never changes the decision */ }
+          return refusal === null ? undefined : { block: refusal };
+        }
+      }),
+    ]
+  });
+}
+/** The unique role marker in the worker system prompt. It is a role hint, never a privilege source. */
+function workerRunIdOf(messages: readonly unknown[]): string | null {
+  // The marker is in the system prompt's `sections`, not user text. Reading only system sections
+  // keeps this cheap per request and stops a user message from claiming the worker role.
+  for (const message of messages) {
+    if (!message || typeof message !== 'object') continue;
+    const record = message as { role?: unknown; sections?: unknown; content?: unknown };
+    if (record.role !== 'system') continue;
+    let text = '';
+    if (record.sections && typeof record.sections === 'object') text = Object.values(record.sections as Record<string, unknown>).filter((value): value is string => typeof value === 'string').join('\n');
+    else if (typeof record.content === 'string') text = record.content;
+    const match = /PILOT-WORKER-RUN:([A-Za-z0-9][A-Za-z0-9._:-]{0,159})/.exec(text);
+    if (match !== null) return match[1];
+  }
+  return null;
+}
 const uuidPattern = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
 /** The request identity rule, aligned with the durable lifecycle's own rule. */
 const requestIdPattern = /^[^\s\u0000-\u001f\u007f]{1,200}$/;
@@ -259,10 +379,16 @@ function notesExtension(project: Project, seam: RecordNoteSeam){
  * real model output. A message containing the marker [pause] holds the run open
  * for a moment so steering and interrupting can be exercised.
  */
-function scriptedResponses(provider: FauxProviderHandle, pauseMs: number) {
+function scriptedResponses(provider: FauxProviderHandle, pauseMs: number, probe?: { tool: string; args: JsonObject }, probeDelayMs = 0) {
   const respond: FauxResponseFactory = async (context, options) => {
     // Re-arm before anything can be interrupted, so a run always has its next response.
     provider.appendResponses([respond]);
+    if (probe !== undefined) {
+      // Test-only: one tool call per request. It makes the worker budget measurable at the real
+      // provider boundary. No model chooses this; it comes from the harness options.
+      if (probeDelayMs > 0) await abortableDelay(probeDelayMs, (options as { signal?: AbortSignal } | undefined)?.signal);
+      return fauxAssistantMessage([fauxToolCall(probe.tool, probe.args)], { stopReason: 'toolUse' });
+    }
     const text = lastUserText(context).trim();
     const messages = (context as { messages?: { role?: string; content?: unknown }[] }).messages ?? [];
     // A tool result comes back as role 'toolResult', and the assistant message that asked
@@ -396,6 +522,31 @@ export interface HarnessHostOptions {
    * than existing and failing.
    */
   fileEdit?: FileEditCapability;
+  /**
+   * The durable lookup that says whether a numeric conversation belongs to a worker run. Every
+   * generic conversation path asks it, so a worker transcript can never be handled as a session
+   * after a restart. A lookup failure is treated as "worker" (fail closed).
+   */
+  workerBinding?: {
+    isWorkerConversation(projectId: string, conversationId: number): boolean;
+  };
+  /** The authoritative per-tool re-check for a worker conversation. */
+  workerGuard?: (input: { readonly projectId: string; readonly runId: string; readonly tool: string }) => string | null;
+  /** The authoritative per-request re-check for a worker conversation. */
+  workerRequestGuard?: (input: { readonly projectId: string; readonly runId: string }) => string | null;
+  /** Test-only: the scripted provider calls this tool on every request, so the budget is measurable. */
+  workerProbe?: { readonly tool: string; readonly args: JsonObject };
+  /** Test-only: a bounded delay before each scripted probe response. */
+  workerProbeDelayMs?: number;
+  /** Test-only observation of the static worker guard, without changing its decision. */
+  onWorkerGuard?: (input: { readonly tool: string; readonly refusal: string | null }) => void;
+  /** Test-only: a bounded window after the conversation opens and before its submission. */
+  workerOpenDelayMs?: number;
+  /**
+   * Test-only observation at the provider boundary, called once per provider request with the
+   * output-token limit actually passed. It must not throw and it performs no model work.
+   */
+  onModelRequest?: (input: { provider: string; modelId: string; maxTokens: number }) => void;
 }
 
 /**
@@ -548,6 +699,24 @@ export class HarnessHost {
    * owner's own action - reaches that revision.
    */
   private readonly ownerCancels = new Set<string>();
+  /**
+   * Every worker conversation this process created, for the life of the process. A worker
+   * conversation is never a session: the session model setter, the conversation controls and a
+   * numeric alias must not be able to change its model or its role. The map is also how a cancel
+   * finds the live conversation without opening a harness.
+   */
+  private readonly workerConversations = new Map<ConversationId, { readonly projectId: string; readonly runId: string }>();
+  /**
+   * The worker runs currently in flight, keyed `projectId:runId`. The entry exists **before** the
+   * conversation is awaited, so a cancel during the open window is registered and honoured.
+   */
+  /** Provider requests per worker run, measured at the model boundary. */
+  private readonly workerRequests = new Map<string, number>();
+  private readonly workerRuns = new Map<string, {
+    conversation: Awaited<ReturnType<Harness['root']>> | null;
+    cancelled: boolean;
+    readonly controller: AbortController;
+  }>();
   constructor(private readonly options: HarnessHostOptions) {}
   get enabled(): boolean { return this.options.enabled; }
   private assertEnabled() { if (!this.options.enabled) throw new HttpError(503, 'Agents are disabled on this instance'); }
@@ -583,6 +752,9 @@ export class HarnessHost {
     if (!sessionId) return hosted;
     const id = conversationIdOf(sessionId) ?? this.options.conversationBinding?.read(project.id, sessionId)?.conversationId ?? this.sessionConversations.get(project.id + ':' + sessionId);
     if (id === undefined) throw new HttpError(404, 'This session has no conversation');
+    // A worker conversation has no session, no owner controls and no session model. It is governed
+    // only by its immutable run record, so a numeric alias or a session id cannot reach it.
+    if (await this.isWorkerConversationDurable(hosted, project, id)) throw this.workerConversationRefusal();
     const conversation = await hosted.harness.conversation(id as ConversationId, BACKGROUND_CONTEXT);
     if (!conversation) throw new HttpError(409, 'The bound conversation is unavailable');
     await hosted.watch(conversation, this.sessionIdentity(project, conversation.id));
@@ -641,7 +813,30 @@ export class HarnessHost {
               if(turns>=8)throw new HttpError(409,'Pilot stopped at eight model turns. Review before sending another message.');
             }
             const signal=options?.signal;signal?.throwIfAborted();
-            const source=stream(model,context,{...options,maxTokens:Math.min(options?.maxTokens??4096,4096)});
+            const maxTokens=Math.min(options?.maxTokens??4096,4096);
+            // The worker boundary. The role marker is in the worker system prompt; the guard is the
+            // durable run/worker/policy/revocation check. A refusal returns a terminal assistant error
+            // and never calls the provider. The ninth request is refused here, before the call.
+            const workerRun = workerRunIdOf(context.messages);
+            if (workerRun !== null) {
+              let refusal: string | null;
+              try { const verdict = this.options.workerRequestGuard?.({ projectId: project.id, runId: workerRun }); refusal = verdict === undefined ? 'The worker request could not be verified, so no model request was sent.' : verdict; }
+              catch { refusal = 'The worker request could not be verified, so no model request was sent.'; }
+              if (refusal === null) {
+                const count = (this.workerRequests.get(workerRun) ?? 0) + 1;
+                this.workerRequests.set(workerRun, count);
+                if (count > 8) refusal = 'The worker stopped at its eight-model-request budget before the request was sent.';
+              }
+              if (refusal !== null) {
+                const message = { ...fauxAssistantMessage(refusal, { stopReason: 'error', errorMessage: refusal }), provider: model.provider, model: model.id, api: model.api };
+                (output.push as (event: unknown) => void)({ type: 'error', reason: 'error', error: message });
+                output.end(message);
+                return;
+              }
+            }
+            // A test-only observation at the provider boundary. It is never selected by a model.
+            try { this.options.onModelRequest?.({ provider: model.provider, modelId: model.id, maxTokens }); } catch { /* observation never breaks a run */ }
+            const source=stream(model,context,{...options,maxTokens});
             const safeError='Model request failed. Check the provider connection, model access and quota.';
             // Provider/OAuth exceptions may embed raw response bodies. Never persist
             // those as UI errors; retain usage and partial model output only.
@@ -681,7 +876,7 @@ export class HarnessHost {
         })();
         return output;
       };
-      scriptedResponses(provider, this.options.pauseMs ?? 2500);
+      scriptedResponses(provider, this.options.pauseMs ?? 2500, this.options.workerProbe, this.options.workerProbeDelayMs ?? 0);
       const storage = await openNodeSqliteStorage(path);
       const question = questionExtension();
       const notes = notesExtension(project, { beforeWriteMs: this.options.recordNoteDelayMs, afterWriteMs: this.options.recordNoteAfterWriteMs, onExecute: this.options.recordNoteStarted });
@@ -700,11 +895,15 @@ export class HarnessHost {
       };
       const fileEditEnabled = this.options.fileEdit?.enabled === true;
       const privileges = privilegeExtension(project, authorityOf, fileEditEnabled);
-      const extensions: Extension[] = [question, notes, privileges];
+      // Installed once, statically, and selected by every conversation. Its durable marker decides
+      // whether it applies, so no unregistered dynamic extension carries the worker role.
+      const workerRole = workerRoleExtension(project, this.options);
+      const extensions: Extension[] = [question, notes, privileges, workerRole];
       const registry = createRegistry();
       registry.install(question);
       registry.install(notes);
       registry.install(privileges);
+      registry.install(workerRole);
       const fileEdit = this.options.fileEdit;
       if (fileEdit !== undefined && fileEdit.enabled) {
         const edits = fileEditExtension(project, fileEdit, authorityOf);
@@ -728,6 +927,15 @@ export class HarnessHost {
       // Never replace an existing session's model with a newly changed global default.
       const watchers = new Map<ConversationId, Awaited<ReturnType<HostedAgent['conversation']['viewState']>>>();
       const watch = async (conversation: HostedAgent['conversation'], sessionId: string) => {
+        // A worker conversation is never subscribed as a session, even by a direct internal call.
+        if (this.isWorkerConversation(project.id, conversation.id)) throw this.workerConversationRefusal();
+        try {
+          const marker = workerMarkerOf(await harness.snapshot(WorkerMarkerDoc, conversation.id, BACKGROUND_CONTEXT));
+          if (marker !== null && marker.projectId === project.id) throw this.workerConversationRefusal();
+        } catch (error) {
+          if (error instanceof HttpError) throw error;
+          throw this.workerConversationRefusal();
+        }
         // Watch this conversation so a question, a finished run or a failure is reported even
         // when nobody has the interface open. The first reading only primes the comparison.
         if (watchers.has(conversation.id)) return;
@@ -851,6 +1059,9 @@ export class HarnessHost {
    */
   async sessionView(project: Project, sessionId: string): Promise<AgentSessionView | null> {
     this.assertEnabled();
+    // A worker conversation is not a session view. The durable lookup is authoritative, including
+    // after a restart when the in-process marker is gone.
+    await this.assertSessionAliasAvailable(project, sessionId);
     const id = conversationIdOf(sessionId);
     if (id !== null) {
       const hosted = await this.open(project);
@@ -866,8 +1077,9 @@ export class HarnessHost {
     if (resolver) {
       const binding = resolver.read(project.id, sessionId);
       if (binding !== null) {
-        const convId = binding.conversationId as ConversationId;
         const hosted = await this.open(project);
+        if (await this.isWorkerConversationDurable(hosted, project, binding.conversationId)) throw this.workerConversationRefusal();
+        const convId = binding.conversationId as ConversationId;
         const conversation = await hosted.harness.conversation(convId, BACKGROUND_CONTEXT);
         if (conversation === undefined) throw new HttpError(409, 'The durable session binding points to a conversation that is unavailable; it was not replaced');
         const state = await conversation.viewState(BACKGROUND_CONTEXT);
@@ -885,15 +1097,23 @@ export class HarnessHost {
     const id = conversationIdOf(sessionId);
     if (id !== null) {
       const hosted = await this.open(project);
+      if (await this.isWorkerConversationDurable(hosted, project, id)) return false;
       return (await hosted.harness.conversation(id, BACKGROUND_CONTEXT)) !== undefined;
     }
-    // Named session (UUID): check the durable binding.
+    // Named session (UUID): check the durable binding. A binding that names a worker conversation
+    // is not a session.
     const resolver = this.options.conversationBinding;
     if (resolver) {
       const binding = resolver.read(project.id, sessionId);
-      if (binding !== null) return true;
+      if (binding !== null) {
+        const hosted = await this.open(project);
+        return !(await this.isWorkerConversationDurable(hosted, project, binding.conversationId));
+      }
     }
-    return this.sessionConversations.has(project.id + ':' + sessionId);
+    const cached = this.sessionConversations.get(project.id + ':' + sessionId);
+    if (cached === undefined) return false;
+    const hosted = await this.open(project);
+    return !(await this.isWorkerConversationDurable(hosted, project, cached));
   }
 
   /**
@@ -956,6 +1176,7 @@ export class HarnessHost {
     return this.serial('agent:' + project.id, async () => {
       const hosted = await this.open(project);
       const id = conversationIdOf(sessionId);
+      if (id !== null && await this.isWorkerConversationDurable(hosted, project, id)) throw this.workerConversationRefusal();
       const conversation = id === null ? undefined : await hosted.harness.conversation(id, BACKGROUND_CONTEXT);
       if (conversation === undefined) throw new HttpError(404, 'This project holds no conversation for that session');
       const submission = await conversation.submit({ type: 'input', content: text, requestId: input.requestId }, BACKGROUND_CONTEXT);
@@ -970,31 +1191,43 @@ export class HarnessHost {
    */
   async ensureSessionConversation(project: Project, sessionId: string): Promise<ConversationId> {
     this.assertEnabled();
-    // A numeric session id is already a conversation id — no derivation needed.
+    const hosted = await this.open(project);
+    // A numeric session id is already a conversation id — no derivation needed, but a worker
+    // conversation is never a session and is refused from the control binding and the harness marker.
     const direct = conversationIdOf(sessionId);
-    if (direct !== null) return direct;
+    if (direct !== null) {
+      if (await this.isWorkerConversationDurable(hosted, project, direct)) throw this.workerConversationRefusal();
+      return direct;
+    }
     // Use the project-qualified in-process cache only when no durable binding port is configured.
     const cacheKey = project.id + ':' + sessionId;
     const resolver = this.options.conversationBinding;
     // Durable record is authoritative; do not allow a stale cache to mask corruption or mismatch.
     const binding = resolver?.read(project.id, sessionId) ?? null;
     if (binding !== null) {
+      if (await this.isWorkerConversationDurable(hosted, project, binding.conversationId)) throw this.workerConversationRefusal();
       this.sessionConversations.set(cacheKey, binding.conversationId as ConversationId);
       return binding.conversationId as ConversationId;
     }
     const cached = this.sessionConversations.get(cacheKey);
-    if (cached !== undefined && resolver === undefined) return cached;
+    if (cached !== undefined && resolver === undefined) {
+      if (await this.isWorkerConversationDurable(hosted, project, cached)) throw this.workerConversationRefusal();
+      return cached;
+    }
     // Serialize first creation for this session. The control-store admission is the durable
     // single-winner check; a failed durable write refuses the unbound conversation.
     return this.serial('conversation:' + cacheKey, async () => {
       const again = resolver?.read(project.id, sessionId) ?? null;
       if (again !== null) {
+        if (await this.isWorkerConversationDurable(hosted, project, again.conversationId)) throw this.workerConversationRefusal();
         this.sessionConversations.set(cacheKey, again.conversationId as ConversationId);
         return again.conversationId as ConversationId;
       }
       const cachedAgain = this.sessionConversations.get(cacheKey);
-      if (cachedAgain !== undefined && resolver === undefined) return cachedAgain;
-      const hosted = await this.open(project);
+      if (cachedAgain !== undefined && resolver === undefined) {
+        if (await this.isWorkerConversationDurable(hosted, project, cachedAgain)) throw this.workerConversationRefusal();
+        return cachedAgain;
+      }
       // A named session starts as a genuinely new, empty conversation. Pi Durable's fork(at)
       // requires a real visible entry (entry 0 is not valid); createConversation avoids copying
       // root history and gives the new session its own durable transcript from its first input.
@@ -1390,6 +1623,186 @@ export class HarnessHost {
       return this.controlView(project, sessionId);
     });
   }
+  /**
+   * Run one bounded worker conversation in the application harness.
+   *
+   * This is the only worker execution path. It creates a fresh conversation with the pinned model
+   * and only the permitted tools, submits one input under the run's request identity, and waits for
+   * it to settle. It makes no report and writes no worker record: the caller owns those.
+   *
+   * A cancel resolves the wait and reports `cancelled`; text already committed stays. A provider
+   * failure is a named failure with a fixed, path-free reason. The runner is not involved and no
+   * provider path is added to it.
+   */
+  async runWorker(project: Project, input: WorkerRunRequest): Promise<WorkerRunOutcome> {
+    this.assertEnabled();
+    const hosted = await this.open(project);
+    const key = project.id + ':' + input.runId;
+    const controller = new AbortController();
+    const handle: { conversation: Awaited<ReturnType<Harness['root']>> | null; cancelled: boolean; readonly controller: AbortController } = {
+      conversation: null,
+      cancelled: input.signal?.aborted === true,
+      controller
+    };
+    const onAbort = () => {
+      handle.cancelled = true;
+      controller.abort();
+      if (handle.conversation !== null) void handle.conversation.abort(BACKGROUND_CONTEXT).catch(() => {});
+    };
+    input.signal?.addEventListener('abort', onAbort, { once: true });
+    // Registered **before** `createConversation` is awaited: a cancel that arrives during the open
+    // window is recorded, and the submit below is skipped.
+    this.workerRuns.set(key, handle);
+    const cancelledOutcome = (turns = 0, text = ''): WorkerRunOutcome => Object.freeze({ text, turns, cancelled: true, failed: false, reason: null });
+    const failedOutcome = (reason: string, turns = 0): WorkerRunOutcome => Object.freeze({ text: '', turns, cancelled: false, failed: true, reason });
+    try {
+      if (handle.cancelled) return cancelledOutcome();
+      // Both extensions are the static, registry-installed instances. No dynamic extension is
+      // passed to a worker conversation, so every hook and prompt is resolved by the registry.
+      const notes = hosted.extensions.find((extension) => extension.name === 'notes');
+      const workerRole = hosted.extensions.find((extension) => extension.name === 'worker-role');
+      if (notes === undefined || workerRole === undefined) return failedOutcome('The worker role is not installed on this project, so no run was started.');
+      const extensions: Extension[] = [notes, workerRole];
+      const tools = permittedTools(extensions, input.scopes);
+      const conversation = await hosted.harness.createConversation({
+        ownership: { kind: 'ownerless' },
+        // The durable marker is written in the creating transaction. A crash before the
+        // control-store binding still leaves a role that fails closed after restart.
+        init: async (tx, conversationId) => {
+          const marker = await tx.doc(WorkerMarkerDoc, conversationId);
+          marker.marker = true;
+          marker.projectId = project.id;
+          marker.workerId = input.workerId;
+          marker.runId = input.runId;
+        },
+        agent: {
+          model: { provider: input.model.provider, modelId: input.model.modelId },
+          extensions,
+          ...(tools === undefined ? {} : { tools })
+        }
+      }, BACKGROUND_CONTEXT);
+      handle.conversation = conversation;
+      this.workerConversations.set(conversation.id, { projectId: project.id, runId: input.runId });
+      // Persist the identity before the first submit. A failure here refuses the run without a
+      // model request; the conversation is not used as a session.
+      await input.onConversation(conversation.id);
+      if (handle.cancelled) return cancelledOutcome();
+      const before = await input.beforeSubmit();
+      if (before !== null) return handle.cancelled ? cancelledOutcome() : failedOutcome(before);
+      // Test-only bounded window. Production leaves it unset; a cancel lands inside it
+      // deterministically and the submission below is never made.
+      const delayMs = this.options.workerOpenDelayMs ?? 0;
+      if (delayMs > 0) {
+        try { await abortableDelay(delayMs, controller.signal); } catch { /* the cancel signal fired */ }
+      }
+      if (handle.cancelled) return cancelledOutcome();
+      // The last check: a revocation or policy change during the window refuses with no submission.
+      const again = await input.beforeSubmit();
+      if (again !== null) return handle.cancelled ? cancelledOutcome() : failedOutcome(again);
+      const submission = await conversation.submit({ type: 'input', content: input.prompt, whenBusy: 'reject', requestId: input.requestId }, BACKGROUND_CONTEXT);
+      let unanswered = false;
+      try {
+        const settled = await submission.wait(BACKGROUND_CONTEXT);
+        unanswered = settled.status === 'unanswered';
+      } catch (error) {
+        // An abort settles the submission by rejecting this wait; that is a cancel, not a failure.
+        if (!handle.cancelled) throw error;
+      }
+      const cancelled = handle.cancelled;
+      const state = await conversation.viewState(BACKGROUND_CONTEXT);
+      const view = agentViewFrom(state.value);
+      state.dispose();
+      const assistants = view.entries.filter((entry) => entry.kind === 'assistant');
+      const turns = assistants.length;
+      const text = [...assistants].reverse().find((entry) => entry.text.trim() !== '' && entry.stopReason !== 'error')?.text ?? '';
+      if (cancelled) return Object.freeze({ text, turns, cancelled: true, failed: false, reason: null });
+      // A provider or credential failure is a named failure, never a report built from the error text.
+      const failedEntry = assistants.find((entry) => entry.stopReason === 'error');
+      if (failedEntry) return Object.freeze({ text: '', turns, cancelled: false, failed: true, reason: failedEntry.error ?? 'The worker model run failed. Check the provider connection, model access and quota.' });
+      if (turns > 8) return Object.freeze({ text, turns, cancelled: false, failed: true, reason: 'The worker stopped at the eight-model-turn ceiling. No report was produced.' });
+      if (unanswered || text.trim() === '') return Object.freeze({ text, turns, cancelled: false, failed: true, reason: 'The worker ended without a report.' });
+      return Object.freeze({ text, turns, cancelled: false, failed: false, reason: null });
+    } catch (error) {
+      if (handle.cancelled) return cancelledOutcome();
+      return failedOutcome(error instanceof HttpError ? error.message : 'The worker model run failed. Check the provider connection, model access and quota.');
+    } finally {
+      input.signal?.removeEventListener('abort', onAbort);
+      this.workerRuns.delete(key);
+    }
+  }
+
+  /**
+   * Whether a numeric conversation belongs to a worker run. The in-process cache is checked first;
+   * the durable binding is the authority. A lookup failure is treated as "worker" (fail closed), so
+   * an unreadable store can never expose a worker transcript as a session.
+   */
+  private isWorkerConversation(projectId: string, conversationId: number): boolean {
+    if (this.workerConversations.has(conversationId as ConversationId)) return true;
+    try { return this.options.workerBinding?.isWorkerConversation(projectId, conversationId) === true; }
+    catch { return true; }
+  }
+
+  /** The durable marker in the harness database, independent of the control binding and extensions. */
+  private async workerMarkerPresent(hosted: HostedAgent, project: Project, conversationId: number): Promise<boolean> {
+    try {
+      const marker = workerMarkerOf(await hosted.harness.snapshot(WorkerMarkerDoc, conversationId as ConversationId, BACKGROUND_CONTEXT));
+      return marker !== null && marker.projectId === project.id;
+    } catch {
+      // An unreadable marker is treated as a worker role: the caller refuses.
+      return true;
+    }
+  }
+
+  private async isWorkerConversationDurable(hosted: HostedAgent, project: Project, conversationId: number): Promise<boolean> {
+    return this.isWorkerConversation(project.id, conversationId) || await this.workerMarkerPresent(hosted, project, conversationId);
+  }
+
+  /**
+   * Refuse a session id or numeric alias that names a worker conversation.
+   *
+   * This is the check the stream route makes before it sends event-stream headers, so the refusal is
+   * a `409` rather than a stream error. For a numeric alias it also reads the durable harness marker,
+   * so a crash between conversation creation and the control binding still fails closed. It opens no
+   * model request; a crash-resumed worker task is stopped by the static role's request guard.
+   */
+  async assertSessionAliasAvailable(project: Project, sessionId?: string): Promise<void> {
+    if (sessionId === undefined) return;
+    const direct = conversationIdOf(sessionId);
+    const id = direct ?? this.options.conversationBinding?.read(project.id, sessionId)?.conversationId;
+    if (id === undefined) return;
+    if (this.isWorkerConversation(project.id, id)) throw this.workerConversationRefusal();
+    if (direct !== null) {
+      const hosted = await this.open(project);
+      if (await this.workerMarkerPresent(hosted, project, id)) throw this.workerConversationRefusal();
+    }
+  }
+
+  /** The one refusal message. It names no path and grants nothing. */
+  private workerConversationRefusal(): HttpError {
+    return new HttpError(409, 'This conversation belongs to a worker run. Its model, scopes and lifecycle are controlled only by the worker record. A session alias, a model setter and the conversation controls cannot use it.');
+  }
+
+  /**
+   * The numeric conversations this process created for worker runs, for a read-only test and
+   * diagnostic check. A conversation id is not a session id and grants nothing.
+   */
+  workerConversationIds(projectId: string): readonly number[] {
+    return Object.freeze([...this.workerConversations.entries()].filter(([, entry]) => entry.projectId === projectId).map(([id]) => Number(id)));
+  }
+
+  /** Cooperatively cancel one worker run. A run this process does not hold is a no-op. */
+  async cancelWorkerRun(projectId: string, runId: string): Promise<boolean> {
+    const key = projectId + ':' + runId;
+    const handle = this.workerRuns.get(key);
+    if (!handle) return false;
+    handle.cancelled = true;
+    // Abort the open-window wait immediately. The conversation may not exist yet; the run then
+    // skips its submit once it does.
+    handle.controller.abort();
+    if (handle.conversation !== null) await handle.conversation.abort(BACKGROUND_CONTEXT);
+    return true;
+  }
+
   async detach(project:Project):Promise<void>{
     await this.serial('agent:'+project.id,async()=>{
       const pending=this.hosted.get(project.id);if(!pending)return;

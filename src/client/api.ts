@@ -6,6 +6,7 @@ import type { AgentAuditEntry,AgentModelChoice,AgentRecord } from '../shared/age
 import type { ImageCapability, MediaView } from '../shared/images';
 import type { AttentionByKind, AttentionCounts, AttentionItem, AttentionPage } from '../shared/attention';
 import type { ApprovalKind, ApprovalRecord, ApprovalScope, ApprovalState, ApprovalTarget } from '../shared/approvals';
+import type { WorkerLimits, WorkerRecord, WorkerRun, WorkerScope } from '../shared/workers';
 const token=document.querySelector<HTMLMetaElement>('meta[name="dashboard-token"]')?.content??'';
 let csrf='';
 export type ApiErrorKind = 'http' | 'session' | 'network';
@@ -59,6 +60,14 @@ export interface AgentScopeOption{scope:string;description:string;installed:bool
 /** The registry as the server offers it: every agent, the vocabulary, the offered models and the switch. */
 export interface AgentRegistryView{agents:AgentRecord[];scopes:AgentScopeOption[];models:AgentModelChoice[];fileEdit:{enabled:boolean;mode:string|null}}
 export interface AgentDetailView{agent:AgentRecord;history:AgentAuditEntry[]}
+/** One project's worker records, its runs, the owner policy and the fixed limits. */
+export interface WorkerView{
+  workers:WorkerRecord[];runs:WorkerRun[];
+  policy:{revision:number;allowedWorkerModels:{provider:string;modelId:string}[];defaultWorkerModel:{provider:string;modelId:string}|null}|null;
+  liveWorkers:number;activeRunId:string|null;limits:WorkerLimits;scopes:WorkerScope[];
+  /** Newest reports only, bounded: a changed or missing canonical file is reported, never hidden. */
+  reportIntegrity?:Record<string,{state:'intact'|'changed'|'missing'|'unsafe';expectedSha256:string;actualSha256:string|null;expectedBytes:number;actualBytes:number|null}>;
+}
 /** The actor a change is made by. The interface always declares the owner: it is the authenticated session. */
 export interface AgentActorBody{kind:'owner'|'agent';identity:string}
 /** The projects an agent may act in: every project explicitly, or a named set (never an empty one). */
@@ -187,6 +196,17 @@ export const api={
    * closed vocabulary, the offered model, the workspace scope, the budgets and the governance
    * decision — is decided by the server, and a refusal arrives with the server's own words.
    */
+  /**
+   * Bounded, owner-created workers (W1). The interface is not the enforcement point: it reads the
+   * server's own view and limits, and every refusal arrives in the server's words. No call here
+   * accepts a report automatically, queues work or creates a worker as an agent.
+   */
+  workers:(projectId:string)=>request<WorkerView>('/projects/'+projectId+'/workers'),
+  createWorker:(projectId:string,body:{name:string;model?:{provider:string;modelId:string};scopes?:string[]})=>request<{worker:WorkerRecord}>('/projects/'+projectId+'/workers','POST',body),
+  revokeWorker:(projectId:string,workerId:string,revision:number)=>request<{worker:WorkerRecord;run:WorkerRun|null;cancelled:boolean;outcome:string}>('/projects/'+projectId+'/workers/'+encodeURIComponent(workerId)+'/revoke','POST',{revision}),
+  startWorkerRun:(projectId:string,workerId:string)=>request<{run:WorkerRun}>('/projects/'+projectId+'/workers/'+encodeURIComponent(workerId)+'/runs','POST',{}),
+  workerRun:(projectId:string,runId:string)=>request<{run:WorkerRun}>('/projects/'+projectId+'/workers/runs/'+encodeURIComponent(runId)),
+  stopWorkerRun:(projectId:string,runId:string)=>request<{run:WorkerRun;cancelled:boolean;unchanged:boolean;outcome:string}>('/projects/'+projectId+'/workers/runs/'+encodeURIComponent(runId)+'/stop','POST',{}),
   agentRegistry:()=>request<AgentRegistryView>('/agents'),
   agent:(id:string)=>request<AgentDetailView>('/agents/'+encodeURIComponent(id)),
   createAgent:(body:{draft:AgentDraftBody;actor:AgentActorBody})=>request<{agent:AgentRecord}>('/agents','POST',body),

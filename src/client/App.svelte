@@ -19,6 +19,7 @@
  import ProviderSettings from './ProviderSettings.svelte';
  import ProjectConnection from './ProjectConnection.svelte';
  import AgentManager from './AgentManager.svelte';
+ import WorkersPanel from './WorkersPanel.svelte';
  import { api,session,ApiError,download,whenSessionExpires } from './api';
  import { HistoryStack,isHomeScreen,isView,narrowView,parseRoute,sameRoute,urlForRoute,type RouteSnapshot,type View } from './navigation';
  import { readSelectedSession,writeSelectedSession } from './drafts';
@@ -51,7 +52,7 @@
  let inbox=$state<{path:string;line:number;text:string;anchor:string|null;id:string}[]>([]),focusAnchor=$state<string|null>(null),inboxMenu=$state<HTMLDivElement>();
  let attentionCount=$state<number|null>(null),attentionCountComplete=$state(false),attentionChecked=$state(false),inboxRefresh=$state(0),attentionFocus=$state<string|null>(null),questionFocus=$state('');
  let alertState=$state<AlertState>('off'),alertBusy=$state(false),alertMessage=$state('');
- let sessionExpired=$state(false),providersOpen=$state(false),connectionOpen=$state(false),agentManagerOpen=$state(false),agentsVersion=$state(0);
+ let sessionExpired=$state(false),providersOpen=$state(false),workersOpen=$state(false),connectionOpen=$state(false),agentManagerOpen=$state(false),agentsVersion=$state(0);
  let docPathSet=$derived(new Set(docs.map(d=>d.path)));
  let shell=$state<HTMLDivElement>();
  let unlinked=$derived(snapshot?snapshot.board.tasks.filter(t=>t.scope==='active'&&!t.archived&&specState(t,docPathSet)==='unlinked').length:0);
@@ -68,7 +69,7 @@
   * owns what it means. The order puts a drawer under a panel, a panel under a menu, a menu under
   * a dialog and the palette on top, which is the order these can really be open in.
   */
- const LAYER_ORDER=['drawer:projects','drawer:docs','panel:inbox','menu:actions','menu:filters','panel:sessions','dialog:settings','dialog:import','dialog:add','dialog:providers','dialog:agentManager','dialog:connection','dialog:palette'] as const;
+ const LAYER_ORDER=['drawer:projects','drawer:docs','panel:inbox','menu:actions','menu:filters','panel:sessions','dialog:settings','dialog:import','dialog:add','dialog:providers','dialog:agentManager','dialog:workers','dialog:connection','dialog:palette'] as const;
  const VIEW_MODES:View[]=['Dependencies','Timeline','List','Wiki','Agents'];
  function currentLayers():string[]{
    const open:Record<string,boolean>={
@@ -83,6 +84,7 @@
      'dialog:add':adding,
      'dialog:providers':providersOpen,
      'dialog:agentManager':agentManagerOpen,
+     'dialog:workers':workersOpen,
      'dialog:connection':connectionOpen,
      'dialog:palette':paletteOpen,
    };
@@ -105,6 +107,7 @@
      case 'dialog:add': adding=open;break;
      case 'dialog:providers': providersOpen=open;break;
      case 'dialog:agentManager': agentManagerOpen=open;break;
+     case 'dialog:workers': if(open&&!project)return;workersOpen=open;break;
      case 'dialog:connection': if(open&&!project)return;connectionOpen=open;break;
      case 'dialog:palette': paletteOpen=open;break;
    }
@@ -463,6 +466,7 @@
   {#if project}<span class="authority-badge" class:adopted={snapshot?.board.adoption==='adopted'} title={snapshot?.board.adoption==='adopted'?'Adopted task planning; original specs/evidence remain authoritative.':'Original documents remain authoritative. This board is a planning mirror.'}>{snapshot?.board.adoption==='adopted'?'Adopted board':'Planning mirror'}</span>{/if}
   <div class="appbar-end">
    <button class="icon-button" aria-label="Agents and privileges" title="Agents &amp; privileges" onclick={()=>agentManagerOpen=true}><Icon name="agent"/></button>
+   <button class="icon-button" aria-label="Workers" title="Bounded workers" disabled={!project} onclick={()=>workersOpen=true}><Icon name="graph"/></button>
    <button class="icon-button" aria-label="Providers & models" title="Providers & models" onclick={()=>providersOpen=true}><Icon name="settings"/></button>
    <button class="icon-button" onclick={()=>theme=theme==='dark'?'light':'dark'} aria-label="Toggle theme" title="Toggle light / dark theme"><Icon name={theme==='dark'?'sun':'moon'}/></button>
    {#if project}
@@ -582,5 +586,6 @@
 {#if adding}<AddProjectDialog onclose={()=>adding=false} oncreated={created}/>{/if}
 {#if providersOpen}<ProviderSettings onclose={()=>providersOpen=false}/>{/if}
 {#if agentManagerOpen}<AgentManager onclose={()=>agentManagerOpen=false} onchanged={()=>{agentsVersion+=1;const id=project?.id;if(id)void loadInbox();}}/>{/if}
+{#if workersOpen&&project}<WorkersPanel projectId={project.id} onclose={()=>workersOpen=false}/>{/if}
 {#if connectionOpen&&project}<ProjectConnection {project} onclose={()=>connectionOpen=false} onconnected={()=>void connected()}/>{/if}
 {#if paletteOpen}<ActionPalette projectId={project?.id??null} onclose={()=>paletteOpen=false}/>{/if}

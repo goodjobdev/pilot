@@ -17,6 +17,11 @@ work for the current milestone, *Dependable from a phone*, is in [docs/PLAN.md](
   live transcript, steering, stopping, and questions the agent asks that you answer once.
   A run that dies mid-tool resumes from its last checkpoint, and a tool that may have
   partially run is reported as interrupted rather than repeated.
+- **Bounded owner-created workers.** The owner can create a worker with a pinned model from the
+  allowed worker set, a default-deny scope list and fixed budgets, then start one bounded run. Model
+  turns run in the application harness; the report is canonical Markdown at
+  `docs/workers/<workerId>/<runId>.md` and is untrusted evidence, never accepted automatically.
+  There is no queue and no agent-created worker. See [Workers](docs/WORKERS.md).
 - **Named sessions.** Each project's conversation is adopted as a named, durable session with
   links to the board task, the specification and the workspace it is about. Names are unique
   within a project, every change is revision-checked, and a link is only accepted when the board,

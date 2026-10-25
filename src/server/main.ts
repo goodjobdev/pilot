@@ -39,6 +39,9 @@ import { FORK_ROOT_DIRECTORY, ForkStore, createForkWorktreePort, type ForkTransc
 import { FORK_MAX_ENTRY_SCAN, ForkError } from '../shared/forks';
 import { AgentStore } from './state/agent-store';
 import { WorkerModelPolicyStore } from './state/model-policy-store';
+import { WorkerService, WorkerStore, type WorkerStoreOptions } from './workers/worker-store';
+import { harnessWorkerPort } from './workers/harness-port';
+import { WorkerError, WORKER_LIMITS, WORKER_SCOPES } from '../shared/workers';
 import { FileEditTool, FileEditError, type FileEditMode } from './state/file-edit-tool';
 import { AgentError, agentScopeVocabulary } from '../shared/agent-registry';
 import { WorkerModelPolicyError, type WorkerModelOption, type WorkerModelPolicyView } from '../shared/model-policy';
@@ -74,7 +77,7 @@ export type ReleasePromotionObservation =
   | {readonly state:'unreadable';readonly reason:string};
 /** What the running service reports about itself, and the one read-only seam that answers for promotion. */
 export interface ReleaseReportOptions {readonly version:string;readonly source:'manifest'|'unreleased-local';readonly buildId?:string;readonly sourceDigest?:string;readonly observe:()=>ReleasePromotionObservation}
-export interface AppOptions {dataRoot:string;browseRoots:string[];security:SecurityConfig;allowedHosts?:readonly string[];clientRoot?:string;registry?:string;agents?:'on'|'off';agentPauseMs?:number;recordNoteDelayMs?:number;recordNoteAfterWriteMs?:number;recordNoteStarted?:()=>void;alertTransport?:AlertTransport;alertSubject?:string;alertCooldownMs?:number;readiness?:ReadinessOptions;control?:ControlStore;runner?:{readonly enabled?:boolean;readonly port?:RunnerPort};fileEdit?:{readonly enabled?:boolean};release?:ReleaseReportOptions}
+export interface AppOptions {dataRoot:string;browseRoots:string[];security:SecurityConfig;allowedHosts?:readonly string[];clientRoot?:string;registry?:string;agents?:'on'|'off';agentPauseMs?:number;recordNoteDelayMs?:number;recordNoteAfterWriteMs?:number;recordNoteStarted?:()=>void;alertTransport?:AlertTransport;alertSubject?:string;alertCooldownMs?:number;readiness?:ReadinessOptions;control?:ControlStore;runner?:{readonly enabled?:boolean;readonly port?:RunnerPort};fileEdit?:{readonly enabled?:boolean};release?:ReleaseReportOptions;workerOpenDelayMs?:number;onModelRequest?:(input:{provider:string;modelId:string;maxTokens:number})=>void;workerProbe?:{tool:string;args:Record<string,unknown>};workerProbeDelayMs?:number;workerGuard?:(input:{projectId:string;runId:string;tool:string})=>string|null;workerRequestGuard?:(input:{projectId:string;runId:string})=>string|null;onWorkerGuard?:(input:{tool:string;refusal:string|null})=>void}
 /**
  * Approvals answer with a status that says what happened: an invalid request is 422, an approval
  * outside the caller's scope is 403, a missing one is 404, a storage fault is 500, and every
@@ -202,6 +205,21 @@ export function workerModelPolicyHttpStatus(code:WorkerModelPolicyError['code'])
   if(code==='NOT_PERMITTED')return 403;
   if(code==='CORRUPT'||code==='STORAGE')return 500;
   return 422;
+}
+/**
+ * Worker requests answer with the status that says what happened: an invalid request, a model that
+ * the owner policy does not allow, an unavailable model or an uninstalled scope is 422, a refused
+ * actor is 403, an unknown worker or run is 404, a busy project, a stale revision, the worker
+ * ceiling and a report collision are 409, an unavailable store or harness is 503, and a storage or
+ * corruption fault is 500. Every message is path-free.
+ */
+export function workerHttpStatus(code:WorkerError['code']):number {
+  if(code==='INVALID'||code==='MODEL_NOT_ALLOWED'||code==='MODEL_UNAVAILABLE'||code==='SCOPE_NOT_INSTALLED')return 422;
+  if(code==='NOT_PERMITTED')return 403;
+  if(code==='NOT_FOUND')return 404;
+  if(code==='CONFLICT'||code==='BUSY'||code==='LIMIT'||code==='REPORT_CONFLICT')return 409;
+  if(code==='UNAVAILABLE')return 503;
+  return 500;
 }
 /**
  * Map a policy storage failure without leaking internal details. The detail is logged on the
@@ -483,6 +501,9 @@ export async function createApp(options:AppOptions){
     // The mode comes from the acceptance policy in force, never from an assumption.
     policy:{mode:()=>fileEditModeHolder.mode()}
   }):undefined;
+  // The durable worker conversation lookup. The harness is constructed before the worker store, so
+  // the holder is read at call time and a store failure is treated as "worker" (fail closed).
+  const workerHolder:{store?:WorkerStore}={};
   // The agent harness is the only execution surface. It is off unless the instance enables it explicitly.
   const agents=new HarnessHost({
     dataRoot:options.dataRoot,providers,delivery,lifecycle:lifecycleHooks,
@@ -524,6 +545,14 @@ export async function createApp(options:AppOptions){
       }
     },
     fileEdit,
+    workerBinding:{isWorkerConversation:(projectId,conversationId)=>workerHolder.store?.isWorkerConversation(projectId,conversationId)??false},
+    workerOpenDelayMs:options.workerOpenDelayMs,
+    onModelRequest:options.onModelRequest,
+    workerProbe:options.workerProbe as never,
+    workerProbeDelayMs:options.workerProbeDelayMs,
+    onWorkerGuard:options.onWorkerGuard,
+    workerGuard:options.workerGuard??(({projectId,runId,tool})=>{const store=workerHolder.store;return store?store.guardTool(projectId,runId,tool):'The worker store is unavailable, so the tool is refused with no effect.';}),
+    workerRequestGuard:options.workerRequestGuard??(({projectId,runId})=>{const store=workerHolder.store;return store?store.workerRequestRefusal(projectId,runId):'The worker store is unavailable, so no model request was sent.';}),
     onEvent:event=>{
       // A question is notified by the ledger's own outbox step, which tags the notification by the
       // question id so a later re-send collapses onto the same one. Without a ledger the plain alert
@@ -780,6 +809,30 @@ export async function createApp(options:AppOptions){
   const workerModelPolicy=options.control?new WorkerModelPolicyStore(options.control,{
     models:()=>agents.offeredModels()
   }):undefined;
+  /**
+   * The bounded, owner-created workers (W1). The store is present only when a durable control store
+   * is open and the harness can run: without either, the routes refuse with 503 rather than invent
+   * a worker. Model turns run in this application's harness; the runner is not involved.
+   */
+  const workerStoreOptions:WorkerStoreOptions={
+    policy:()=>workerModelPolicy?.read()??null,
+    offered:()=>agents.offeredModels(),
+    projectRoot:(projectId)=>catalog.projects.find(candidate=>candidate.id===projectId)?.path,
+    dataRoot:options.dataRoot
+  };
+  const workerStore=options.control&&agents.enabled?new WorkerStore(options.control,workerStoreOptions):undefined;
+  workerHolder.store=workerStore;
+  const workerService=workerStore?new WorkerService(workerStore,harnessWorkerPort(agents,projectId=>catalog.projects.find(candidate=>candidate.id===projectId)),workerStoreOptions):undefined;
+  // The startup recovery of worker leases and runs. A crash can leave a held project lease and a
+  // running run; each is marked interrupted with a reason and the lease is released. Nothing is
+  // replayed, resumed or sent to a provider, the pass is deterministic and idempotent, and it runs
+  // before anything listens.
+  if(workerStore) {
+    try {
+      const recovery=await workerStore.recoverOnStartup();
+      if(recovery.recoveredRuns>0||recovery.releasedLeases>0||recovery.reportsUnavailable>0)console.log('Worker recovery: '+JSON.stringify(recovery));
+    } catch(error) {console.error('The worker recovery could not run (nothing was replayed): '+(error as Error).message);}
+  }
   /** One read-only projection: the stored policy plus every catalog entry it could choose. */
   const workerModelPolicyView=async():Promise<WorkerModelPolicyView>=>{
     const policy=workerModelPolicy?.read()??null;
@@ -945,6 +998,51 @@ export async function createApp(options:AppOptions){
           }
           throw new HttpError(405,'Method not allowed');
         }
+        // The bounded, owner-created workers (W1): list, create, revoke, start one bounded run,
+        // read a run and stop it. The owner actor is derived from this authenticated session and
+        // the body never supplies it. No route accepts a queue entry, a coding job or a report
+        // acceptance, and a report is never auto-accepted. Every message is path-free.
+        const workerRoute=path.match(/^\/api\/projects\/([a-f0-9-]{36})\/workers(?:\/(.*))?$/);
+        if(workerRoute){
+          if(!workerStore||!workerService)throw new HttpError(503,'Workers are unavailable: this instance has no durable control store or the agent harness is off','workers-unavailable');
+          const projectId=workerRoute[1];
+          catalog.get(projectId);
+          const rest=workerRoute[2]??'';
+          try{
+            if(rest===''){
+              if(req.method==='GET'){json({...workerStore.view(projectId),reportIntegrity:await workerStore.reportIntegrityFor(projectId),limits:WORKER_LIMITS,scopes:WORKER_SCOPES});return;}
+              if(req.method==='POST'){
+                const body=parseBody(z.strictObject({name:z.unknown(),model:z.unknown().optional(),scopes:z.unknown().optional()}),payload,'The worker request');
+                json({worker:await workerStore.create(projectId,ownerActor,body)},201);return;
+              }
+              throw new HttpError(405,'Method not allowed');
+            }
+            const parts=rest.split('/');
+            if(parts.length===2&&parts[1]==='revoke'&&req.method==='POST'){
+              const body=parseBody(z.strictObject({revision:z.unknown()}),payload,'The worker revocation request');
+              json(await workerService.revoke(projectId,parts[0],body.revision,ownerActor));return;
+            }
+            if(parts.length===2&&parts[1]==='runs'&&req.method==='POST'){
+              parseBody(z.strictObject({}),payload,'The worker run request');
+              json({run:await workerService.start(projectId,parts[0],ownerActor)},202);return;
+            }
+            if(parts[0]==='runs'&&parts.length===2&&req.method==='GET'){json({run:workerStore.readRun(projectId,parts[1])});return;}
+            if(parts[0]==='runs'&&parts.length===3&&parts[2]==='stop'&&req.method==='POST'){
+              parseBody(z.strictObject({}),payload,'The worker stop request');
+              json(await workerService.stop(projectId,parts[1],ownerActor));return;
+            }
+            // Pause and resume are deliberately absent in W1: there is no queue and an interrupted
+            // run is never replayed, so claiming a resumable pause would be dishonest. The refusal
+            // is explicit and writes nothing.
+            if(parts[0]==='runs'&&parts.length===3&&(parts[2]==='pause'||parts[2]==='resume')){
+              throw new HttpError(409,'A worker run cannot be paused or resumed in W1: there is no queue and an interrupted run is never replayed. Stop the run and start a new one if the owner wants another attempt. Nothing was changed.');
+            }
+            throw new HttpError(404,'Unknown API route');
+          }catch(error){
+            if(error instanceof WorkerError)throw new HttpError(workerHttpStatus(error.code),error.message);
+            throw error;
+          }
+        }
         const providerRoute=path.match(/^\/api\/settings\/providers\/([a-z0-9-]+)(?:\/(key|login))?$/);
         if(providerRoute){
           if(providerRoute[2]==='key'&&req.method==='POST'){await providers.saveKey(providerRoute[1],payload);json({ok:true});return;}
@@ -1073,6 +1171,8 @@ export async function createApp(options:AppOptions){
                 if(req.method!=='POST')throw new HttpError(405,'Method not allowed');
                 const bound=parseBody(z.strictObject({projectId:z.unknown(),revision:z.unknown(),agentId:z.unknown(),actor:z.unknown()}),payload,'The session binding request');
                 const project=catalog.get(String(bound.projectId));
+                // A worker conversation is never a session to bind, before or after a restart.
+                await agents.assertSessionAliasAvailable(project,identity);
                 // The running conversation of a project is Pi's reserved root conversation, which the
                 // legacy migration adopts as a named session only when its SQLite file already exists at
                 // start. A session that exists only as a live conversation is therefore adopted here, so
@@ -1106,11 +1206,15 @@ export async function createApp(options:AppOptions){
                 if(req.method!=='GET')throw new HttpError(405,'Method not allowed');
                 const projectId=url.searchParams.get('projectId');
                 if(projectId===null)throw new HttpError(422,'projectId is required');
+                const lifecycleProject=catalog.projects.find(candidate=>candidate.id===projectId);
+                if(lifecycleProject)await agents.assertSessionAliasAvailable(lifecycleProject,sessionId);
                 sessions.read(projectId,sessionId);
                 json({lifecycle:lifecycleService.read(projectId,sessionId)});return;
               }
               if(req.method!=='POST')throw new HttpError(405,'Method not allowed');
               const data=parseBody(z.strictObject({projectId:z.unknown(),revision:z.unknown().optional(),reason:z.unknown().optional()}),payload,'The lifecycle request');
+              const lifecycleProject=catalog.projects.find(candidate=>candidate.id===String(data.projectId));
+              if(lifecycleProject)await agents.assertSessionAliasAvailable(lifecycleProject,sessionId);
               sessions.read(data.projectId,sessionId);
               const result=await lifecycleService.run(data.projectId,sessionId,lifecycleAction,{revision:data.revision,reason:data.reason});
               json({lifecycle:result.record,dispatched:result.dispatched,cancelled:result.cancelled,unchanged:result.unchanged,outcome:result.outcome,reason:result.reason});return;
@@ -1128,12 +1232,16 @@ export async function createApp(options:AppOptions){
                 if(req.method!=='GET')throw new HttpError(405,'Method not allowed');
                 const projectId=url.searchParams.get('projectId');
                 if(projectId===null)throw new HttpError(422,'projectId is required');
+                const queueProject=catalog.projects.find(candidate=>candidate.id===projectId);
+                if(queueProject)await agents.assertSessionAliasAvailable(queueProject,sessionId);
                 sessions.read(projectId,sessionId);
                 json(queueView(queueStore.read(projectId,sessionId)));return;
               }
               if(req.method!=='POST')throw new HttpError(405,'Method not allowed');
               const queueBody=parseBody(QUEUE_BODY_SCHEMAS[queueOperation],payload,'The queue request') as Record<string,unknown>;
               const projectId=queueBody.projectId as string;
+              const queueProject=catalog.projects.find(candidate=>candidate.id===projectId);
+              if(queueProject)await agents.assertSessionAliasAvailable(queueProject,sessionId);
               sessions.read(projectId,sessionId);
               const queueScope={projectId,sessionId};
               // A fork's child transcript is a forked conversation of its own, and this project's queue
@@ -1552,6 +1660,9 @@ export async function createApp(options:AppOptions){
             if(streamSessionQuery!==null&&(streamSessionQuery.length<1||streamSessionQuery.length>200))
               throw new HttpError(422,'The sessionId query must be 1 to 200 characters');
             const streamSessionId=streamSessionQuery??undefined;
+            // Refuse a worker conversation alias before any event-stream header is sent, so the
+            // answer is a normal 409 rather than a stream error.
+            await agents.assertSessionAliasAvailable(p,streamSessionId);
             res.statusCode=200;res.setHeader('Content-Type','text/event-stream');res.setHeader('Cache-Control','no-store');res.setHeader('Connection','keep-alive');
             let closed=false,dispose:(()=>Promise<void>)|undefined;
             let keepAlive:ReturnType<typeof setInterval>|undefined;
@@ -1704,7 +1815,7 @@ export async function createApp(options:AppOptions){
     }
   });
   server.requestTimeout=30000;server.headersTimeout=10000;
-  return {server,catalog,boards,docs,agents,alerts,providers,repositories,sessions,lifecycle,actions,media,queue:queueStore,runner,acceptance,forks,agentStore,fileEdit,workerModelPolicy,close:async()=>{
+  return {server,catalog,boards,docs,agents,alerts,providers,repositories,sessions,lifecycle,actions,media,queue:queueStore,runner,acceptance,forks,agentStore,fileEdit,workerModelPolicy,workerStore,workerService,close:async()=>{
     // A server that never opened reports ERR_SERVER_NOT_RUNNING, which means "already closed", not
     // "close failed". A failed start (for example a port already in use) must still drain and
     // release the lock that this same start created, and must report the original failure instead.

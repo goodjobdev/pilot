@@ -971,13 +971,13 @@ deterministic delays are host-only test seams.
 
 ### Step 8 — Owner-configured models: orchestrator and workers
 
-**Status: Partial — owner worker model policy configured; worker execution not built.** A
-model can be chosen per instance, per agent and per conversation. The owner can now set an
-allowed worker model set and an optional default worker model in the durable control store.
-There is no worker entity, worker creation path or worker dispatch path, so the policy is
-not used at dispatch. The existing global default, per-session model and per-agent model
-remain the orchestrator controls; this step adds no allowed-orchestrator setting that would
-look functional but have no effect. Step 9 will add worker execution and enforcement.
+**Status: Partial — owner worker model policy configured, and enforced for the Step 9 W1
+workers.** A model can be chosen per instance, per agent and per conversation. The owner sets an
+allowed worker model set and an optional default worker model in the durable control store, and
+Step 9's W1 slice now pins and re-checks it at worker creation and run admission (see
+[Workers](WORKERS.md)). The existing global default, per-session model and per-agent model remain
+the orchestrator controls; this step adds no allowed-orchestrator setting that would look
+functional but have no effect. Owner acceptance of the combined step is not claimed.
 
 **The owner requirement**
 
@@ -1010,14 +1010,14 @@ milestone does not give it one.
 
 **Gaps**
 
-- No worker/subagent **execution** exists. The queue holds no per-worker model, and the runner
-  executes no model at all: its jobs are bounded tool execution. The owner worker model policy
-  is stored and shown, but nothing dispatches a worker yet.
-- The owner-defined allowed set and optional default worker model now exist. They configure
-  future owner-created workers; they are not enforced because no worker dispatch exists. An
-  agent has one model of its own, not a policy list.
-- The default worker model is configured but not used. No rule yet keeps a cheaper worker from
-  changing the orchestrator; Step 9 enforces that rule when it creates a worker.
+- W1 worker **execution** exists, in the application harness only, for an owner-created worker
+  with no queue. The queue still holds no per-worker model, and the runner executes no model at
+  all: its jobs are bounded tool execution.
+- The owner-defined allowed set and optional default worker model are enforced when W1 creates a
+  worker and admits a run: the model is pinned with no fallback and re-checked before dispatch.
+  An agent still has one model of its own, not a policy list.
+- The pinned worker model never changes the orchestrator. A worker run is a separate conversation
+  with its own model; the session model setter refuses a worker conversation.
 - Cost is shown per conversation, not per worker run or per tool.
 - A queued input has no recorded model. A model change while work is queued changes what
   the queued work runs under, without saying so.
@@ -1136,18 +1136,25 @@ milestone does not give it one.
   and `./node_modules/.bin/playwright test tests/browser/settings.spec.ts
   tests/browser/agent-manager.spec.ts tests/browser/model-policy.spec.ts` (9 passed). No install,
   remote call, live-data use, commit, push or deployment.
-- Still open in this step: worker execution, an effective worker model, per-worker cost, and a
-  queued input's model. These need the owner-created worker record and dispatch path in Step 9.
+- Still open in this step: the wider Step 9 execution scope (a queue, agent-requested bounded
+  work, and owner acceptance of reports), per-worker cost reporting, and a queued input's model.
+  The W1 worker record and dispatch path are built; see [Workers](WORKERS.md).
 
 ---
 
 ### Step 9 — Bounded, owner-created workers (worker model enforcement lives here)
 
-**Status: Deferred — waits for the worker execution design and owner acceptance of the worker
-policy.** The runner and queue exist, but there is no bounded worker entity, and no agent may
-create one. Step 8 now defines the owner's allowed worker set and optional default worker model.
-Step 9 will enforce that policy when it creates and dispatches an owner-created worker. No worker
-execution is built or claimed here.
+**Status: Partial — approved W1 slice built; the owner has not accepted it.** The owner-approved
+first slice is in this worktree: owner-created workers, a pinned model from the Step 8 policy with
+no fallback, fixed budgets (3 live workers per project, 1 active run per project, 8 model turns,
+4096 output tokens per turn), owner-only routes, a minimal phone interface, cooperative revocation
+and stop, a durable fenced project lease, startup recovery that never replays, and canonical
+Markdown reports at `docs/workers/<workerId>/<runId>.md`. Model turns run in the application's Pi
+Durable harness; the runner is unchanged. There is no queue, no coding job, no job request, no
+auto-accept and no agent-created worker. See [Workers](WORKERS.md) for the exact contract.
+
+This is **not** an owner acceptance, and it is not the whole of Step 9. The remaining scope is
+stated under *Still open in W1* below.
 
 **Required work**
 
@@ -1181,6 +1188,94 @@ execution is built or claimed here.
   application process or the host.
 - Tests cover creation authority, scope escalation refusal, budget refusal, model refusal,
   containment and the absence of provider access from the container.
+
+**W1 evidence (local).**
+
+- `src/shared/workers.ts` is the pure record, scope and report model. The worker scope set is
+  `record_note` and `read_notes`, each checked against the shared `scopeToolIsInstalled` rule.
+  `ask_question` is refused with its own explanation: a worker question has no bounded answer
+  path in W1. The worker model is pinned from `allowedWorkerModels` or the policy default; a
+  missing policy, an empty set, no default or a model outside the set each refuse with no
+  fallback. Budgets are fixed, turns are recorded as measured (never clamped), and the report
+  composition is deterministic and marked as untrusted evidence.
+- `src/server/workers/worker-store.ts` stores every worker, run, durable conversation binding and
+  project lease as one operation per revision in the existing `operations`/`outboxes` tables, in
+  the exact project scope and the reserved `workers` session bucket. No table or database was
+  added. The lease is durable and fenced; one unique index admits one holder even across two
+  store connections. The conversation binding is written before any submit and is the durable
+  authority after a restart. Revocation is a revision-checked write, admission is serialised with
+  it in the one owning process, and the dispatch path re-checks the worker, policy and model
+  immediately before the submission.
+- `src/server/agents/harness-host.ts` adds the one worker execution path. The worker role is a
+  static extension installed once in the project registry and selected by every conversation; its
+  durable `pilot.worker` marker is written in the conversation-creation transaction. No dynamic,
+  unregistered extension carries the role. The run is registered for cancellation before the
+  conversation is awaited, the abort signal is propagated, and the run/worker/policy/model are
+  rechecked before the one submit. At the provider boundary the ninth request is refused before
+  the provider call for every provider, the 4096-token limit applies to every provider, and every
+  request revalidates the run, worker, policy, model and revocation. Every generic path refuses a
+  worker conversation, live and after a restart, using the control binding and the harness marker:
+  view, event stream, model setter, input, abort, answer, dismiss, media, session binding,
+  lifecycle, queue, fork selection, `hasSession`, conversation creation and adoption. The
+  lifecycle/queue/stream routes check before sending their normal response.
+- `src/server/workers/report.ts` writes the canonical Markdown through the contained-path helper,
+  refuses a symlink or a non-regular file at any component, writes a temporary file and links it
+  into place without replacing an existing file. Existing report reads are bounded: a directory,
+  symlink or oversize file is refused without reading it. Identical content is idempotent;
+  different content is `REPORT_CONFLICT`. Startup settles a running run `completed` from a valid
+  existing report, or `interrupted` otherwise, and reports a changed finished report without
+  rewriting it. Report content is never stored in SQLite: the run record holds the path, SHA-256
+  and byte size only. Only report tracking can be rebuilt from Markdown; worker records, runs,
+  leases and bindings are not file-backed.
+- `src/server/main.ts` exposes owner-only `GET/POST /api/projects/:id/workers`,
+  `POST /api/projects/:id/workers/:workerId/revoke`,
+  `POST /api/projects/:id/workers/:workerId/runs`,
+  `GET /api/projects/:id/workers/runs/:runId`,
+  `POST /api/projects/:id/workers/runs/:runId/stop`, and explicit `pause`/`resume` refusals. The
+  actor is derived from the authenticated session. The routes refuse `503` when the control store
+  or harness is off. No cross-key transaction is claimed.
+- `src/client/WorkersPanel.svelte` is the minimal phone surface: create, run, stop, revoke, read
+  the report path and the fixed limits. It is not the enforcement point.
+- Tests: `tests/unit/workers.test.ts` (7), `tests/server/workers-store.test.ts` (19),
+  `tests/server/workers-http.test.ts` (8) and `tests/browser/workers.spec.ts` (2). They cover
+  owner/agent refusal, policy pin/default/mismatch/unavailable zero-submission, the live ceiling
+  (including two simultaneous creations for the last slot), duplicate name, concurrent admission,
+  a revocation that races a new run, revocation during a run, cancel before and after the effect,
+  a cancel inside the open window with zero provider requests, the ninth request refused at the
+  real provider boundary with eight measured calls, an offered tool denied by the static guard
+  with no write, a revocation after the first request with no further provider call, the
+  4096-token synthetic-provider boundary, measured (unclamped) turns, durable conversation
+  binding across restart, every generic route refusing a worker alias live and after restart, a
+  conversation created before a failed binding refusing adoption after restart, crash restart
+  with report-header reconciliation, a manual or foreign report refused as completion, a
+  symlinked report rejected, an existing report path read only as a bounded regular file, a
+  changed report as an owner-visible integrity warning, cross-instance lease admission, report canonicality, tamper, project isolation, no report content in SQLite, the
+  harness-off `503`, the unsupported `ask_question` refusal, the explicit `pause`/`resume`
+  refusal, the phone layout and a hostile report that stays inert in the document view.
+- Local validation in this worktree: `./node_modules/.bin/tsc --noEmit`,
+  `./node_modules/.bin/svelte-check --tsconfig ./tsconfig.json` (0 errors, 0 warnings),
+  `./node_modules/.bin/vite build` plus the `esbuild` server bundle,
+  `./node_modules/.bin/tsx --test tests/unit/*.test.ts tests/server/*.test.ts` (574 passed), and
+  the two worker browser scenarios (phone flow and hostile report). No install, live provider,
+  remote call, commit, push or deployment.
+
+**Still open in W1 (not claimed).**
+
+- There is no queue and no owner-supplied task text: a run reviews what its installed tools can
+  observe and writes a report. A worker cannot resume after an interruption; the owner starts a new
+  run.
+- Pause and resume are not implemented. Stop is terminal. A resumable pause would need a semantic
+  redesign of the run record and submission identity; that is deferred for owner acceptance.
+- The worker ceiling counts live workers; revoked records remain as history. Report content is
+  evidence only, and no route accepts it.
+- The single-active-run guarantee rests on the durable lease plus serialisation in the one process
+  that owns the data root, exactly like the named-session name rule. The control schema has no
+  cross-key transaction.
+- Worker conversations have no retention or deletion path; they stay in the agent session SQLite
+  as durable working state. A crash can leave an orphan `.md.<uuid>.tmp` report file; it is never
+  served or renamed, and no automatic external delete is performed.
+- Step 9's wider scope — agent-requested work that is still bounded, a coding/job path in the
+  contained runner, and owner acceptance of reports — is not built and is not approved here.
 
 **Risks**
 
@@ -1326,7 +1421,7 @@ and its passphrase as the only key to the captured state.
 | 5 Mobile Back stack and bottom controls | Gap |
 | 6 Attention surface | Partial |
 | 7 `record_note` cancellation audit | Built, pending owner acceptance |
-| 8 Owner-configured orchestrator and worker models | Partial — worker policy configured; no worker execution |
-| 9 Bounded owner-created workers | Deferred — waits for worker execution design and owner acceptance |
+| 8 Owner-configured orchestrator and worker models | Partial — worker policy enforced for the W1 worker path |
+| 9 Bounded owner-created workers | Partial — owner-approved W1 built and hardened; owner acceptance not claimed |
 | 10 Disconnect, cancel and crash tests | Partial |
 | Shared browser, runnable artifacts, unrestricted extensions, anonymous sharing | Deferred |
