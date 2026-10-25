@@ -38,8 +38,18 @@ assumes, and what it does not protect, so you can decide whether that fits.
   GitHub repository rules and a separate execution boundary before enabling general shell tools.
 - **Multi-user abuse.** There is one owner, no roles, no quotas and no rate limiting. It is not
   multi-tenant.
-- **Backups.** They deliberately exclude credentials, alert keys and agent sessions. Treat a
-  backup as documentation, not as a full restore of the working state.
+- **Backups.** An archive captures `catalog.json`, the documentation, media, settings, agent
+  session databases and `control.sqlite` (operations, receipts, outbox, approvals, named
+  sessions and lifecycle). For an external project it captures that project's
+  `docs/dashboard` tree only; the repository is its own backup. It deliberately excludes
+  `credentials/` (provider keys, sign-ins and project deploy keys), `alerts/` (the VAPID
+  signing key and device endpoints), `repositories/` and
+  `forks/` (derived git worktrees; the fork records themselves are rows of the captured
+  `control.sqlite`), `snapshots/` (the bounded board revision history the application
+  rebuilds) and `service.lock`. A restore therefore keeps transcripts and durable
+  control state, but it needs a fresh sign-in, new deploy keys and alerts enabled again, and
+  the derived worktrees and snapshots must be recreated. Treat the archive and its passphrase
+  as the only key to the captured state.
 - **The proxy in front.** If you use a third-party tunnel or proxy, that operator sees the
   traffic it forwards. Self-host the relay or keep it on a network you control.
 - **A stolen unlocked device** with an active session, and any credential you paste into a

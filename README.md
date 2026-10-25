@@ -5,7 +5,8 @@ agents work from it.
 
 Write the intent first — behaviour, decisions, open questions, diagrams — then let an agent
 implement against that page. Pilot keeps the plan, the conversation and the result in one
-place, reachable from your phone, with the repositories still owning the truth.
+place, reachable from your phone, with the repositories still owning the truth. The ordered
+work for the current milestone, *Dependable from a phone*, is in [docs/PLAN.md](docs/PLAN.md).
 
 ## What it does
 
@@ -108,8 +109,15 @@ exactly once.
 - **The agent harness is code execution.** Agent tools are bounded to a project's workspace,
   but a project you register is a directory the agent may write to. Run it in a container,
   not on a workstation.
-- **The backup script covers documentation, not sessions.** Agent transcripts, alert keys and
-  credentials are deliberately excluded, so a restore needs a fresh sign-in.
+- **The backup script covers documentation and working state, not credentials.** The archive
+  captures `catalog.json`, the agent session databases, the durable control store
+  (`control.sqlite`), managed projects' boards and documents, media, and settings. For an
+  external project it captures that project's `docs/dashboard` tree only. It deliberately
+  excludes `credentials/` (provider keys, sign-ins and project deploy keys) and `alerts/`
+  (the VAPID signing key and device endpoints). It also excludes the derived git worktrees
+  (`repositories/`, `forks/`), the rebuildable `snapshots/` board history and `service.lock`.
+  A restore needs a fresh sign-in, new deploy keys and alerts enabled again, and the
+  derived worktrees must be recreated.
 - **An unclean kill leaves a lock.** SIGKILL, OOM or power loss leaves `service.lock` and
   the application refuses to start until an operator confirms no writer remains and clears
   it — fail-closed, but with `restart: unless-stopped` that means a crash-loop until someone
