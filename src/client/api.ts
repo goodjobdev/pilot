@@ -145,7 +145,7 @@ export const api={
     const suffix=query.toString();
     return request<ActionListView>('/actions'+(suffix?'?'+suffix:''));
   },
-  actionActivity:(projectId:string)=>request<LiveActivity>('/actions/activity?projectId='+encodeURIComponent(projectId)),
+  actionActivity:(projectId:string,sessionId?:string)=>request<LiveActivity>('/actions/activity?projectId='+encodeURIComponent(projectId)+(sessionId?'&sessionId='+encodeURIComponent(sessionId):'')),
   /**
    * The agent registry and the bounded file-edit ledger. The interface reads and writes the same
    * authenticated routes as everything else and is never the enforcement point: every rule — the

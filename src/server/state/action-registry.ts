@@ -10,7 +10,8 @@ import {
   type ActionDescriptor, type ActionId, type ActionParamType, type ActionScopeDimension,
   type LiveActivity, type LiveRunState, type LiveSessionActivity, type LiveToolInvocation, type LiveToolProjection, type LiveToolResult
 } from '../../shared/actions';
-import type { AgentEntry, AgentView } from '../../shared/agent';
+import type { AgentView } from '../../shared/agent';
+import { toolEvents } from '../../shared/activity';
 import { agentScopeVocabulary } from '../../shared/agent-registry';
 import type { SessionMigrationReport, SessionRegistry } from './session-registry';
 import type { SessionLifecycleService } from './session-lifecycle';
@@ -122,8 +123,12 @@ export type ActionEnvironment = {
   readonly doctor: () => Promise<ActionObservation>;
   readonly agents: {
     readonly enabled: boolean;
-    /** The conversation view the harness really reports for one project. It may attach the conversation. */
-    readonly read: (projectId: string) => Promise<AgentView>;
+    /**
+     * The conversation view the harness really reports for one project or one named session. It may
+     * attach the conversation. A named session with no conversation answers null, which is reported as
+     * the named absence `no-conversation` rather than as an empty conversation.
+     */
+    readonly read: (projectId: string, sessionId?: string) => Promise<AgentView | null>;
   };
 };
 
@@ -733,30 +738,6 @@ export class ActionRegistry {
  *   `recorded: false`, a named `absenceReason` and no state, no reason and no instant at all.
  */
 
-const MAX_TOOL_NAME_LENGTH = 60;
-function toolEvents(entries: readonly AgentEntry[], cap: number): { invocations: LiveToolInvocation[]; results: LiveToolResult[]; truncated: boolean } {
-  const invocations: LiveToolInvocation[] = [], results: LiveToolResult[] = [];
-  for (const entry of entries) {
-    const at = typeof entry.at === 'number' ? entry.at : null;
-    for (const tool of entry.tools ?? []) {
-      if (typeof tool.name === 'string' && tool.name !== '') invocations.push(Object.freeze({ name: tool.name.slice(0, MAX_TOOL_NAME_LENGTH), at }));
-    }
-    if (entry.rawKind !== 'pi.tool-result') continue;
-    const diagnostics = entry.data === null ? null : entry.data.diagnostics;
-    let errors = 0, warnings = 0, notices = 0;
-    if (Array.isArray(diagnostics)) {
-      for (const diagnostic of diagnostics) {
-        const severity = diagnostic && typeof diagnostic === 'object' ? (diagnostic as { severity?: unknown }).severity : undefined;
-        if (severity === 'error') errors += 1;
-        else if (severity === 'warn') warnings += 1;
-        else notices += 1;
-      }
-    }
-    results.push(Object.freeze({ outcome: errors > 0 ? 'failed' as const : warnings > 0 ? 'warned' as const : 'ok' as const, errors, warnings, notices, at }));
-  }
-  const truncated = invocations.length > cap || results.length > cap;
-  return { invocations: invocations.slice(-cap), results: results.slice(-cap), truncated };
-}
 function runState(control: ActionControl, projectId: string, sessionId: string): LiveRunState {
   // The absence is checked first and is never read through the initial record: only a real row is
   // reported as a state, and a session without one is reported as having none.
@@ -791,24 +772,39 @@ function runState(control: ActionControl, projectId: string, sessionId: string):
 function unavailableTools(reason: string, detail: string): LiveToolProjection {
   return Object.freeze({
     state: 'unavailable' as const, reason, detail, source: null, conversationId: null, sessionId: null, working: null,
-    invocations: Object.freeze([]) as readonly LiveToolInvocation[], results: Object.freeze([]) as readonly LiveToolResult[], truncated: false
+    invocations: Object.freeze([]) as readonly LiveToolInvocation[], results: Object.freeze([]) as readonly LiveToolResult[], truncated: false,
+    omitted: Object.freeze({ invocations: 0, results: 0 })
   });
 }
 
 /**
+ * One applied cap. An absent value uses the documented default; a zero is a real empty bound. A
+ * negative or non-integer value is refused rather than coerced, and a value above the documented
+ * maximum is clamped to it, so `limits` always reports the cap that was really applied.
+ */
+function activityCap(value: unknown, fallback: number, maximum: number, label: string): number {
+  if (value === undefined) return fallback;
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < 0)
+    throw new ActionError('The live projection\'s ' + label + ' must be a non-negative integer', 'INVALID');
+  return Math.min(value, maximum);
+}
+
+/**
  * Read the live projection of one project: the durable run state of each of its named sessions, and
- * the tool activity the harness really reports for its conversation.
+ * the tool activity the harness really reports for the conversation asked for — the project's own
+ * conversation, or one named session's when `sessionId` is supplied.
  *
  * Reading the conversation view attaches that conversation exactly as the Agents view does — this
  * build exposes no other surface for reading tool activity — so the projection reports the source it
  * read. It writes no record of its own, replays nothing and acknowledges nothing.
  */
-export async function liveActivity(environment: ActionEnvironment, input: { projectId: unknown; sessions?: number; toolEvents?: number }): Promise<LiveActivity> {
+export async function liveActivity(environment: ActionEnvironment, input: { projectId: unknown; sessionId?: unknown; sessions?: unknown; toolEvents?: unknown }): Promise<LiveActivity> {
   if (!environment.control) throw new ActionError('The live projection needs the durable control store, which is not open on this instance', 'UNAVAILABLE');
-  const scope = normaliseActionScope({ projectId: input.projectId });
+  const scope = normaliseActionScope({ projectId: input.projectId, ...(input.sessionId === undefined ? {} : { sessionId: input.sessionId }) });
   if (scope.projectId === undefined) throw new ActionError('The live projection is scoped to one project; projectId is required', 'INVALID');
   const projectId = scope.projectId;
-  const sessionsCap = input.sessions ?? LIVE_ACTIVITY_MAX_SESSIONS, toolCap = input.toolEvents ?? LIVE_ACTIVITY_MAX_TOOL_EVENTS;
+  const sessionsCap = activityCap(input.sessions, LIVE_ACTIVITY_MAX_SESSIONS, LIVE_ACTIVITY_MAX_SESSIONS, 'sessions cap');
+  const toolCap = activityCap(input.toolEvents, LIVE_ACTIVITY_MAX_TOOL_EVENTS, LIVE_ACTIVITY_MAX_TOOL_EVENTS, 'toolEvents cap');
   const records = environment.control.sessions.list(projectId);
   const truncated = records.length > sessionsCap;
   const sessions: readonly LiveSessionActivity[] = Object.freeze(
@@ -820,18 +816,22 @@ export async function liveActivity(environment: ActionEnvironment, input: { proj
   if (!environment.agents.enabled) {
     harness = unavailableTools(LIVE_TOOL_REASONS.agentsDisabled, LIVE_TOOL_DETAILS.agentsDisabled);
   } else {
-    let view: AgentView | null = null;
-    try { view = await environment.agents.read(projectId); } catch { view = null; }
-    if (view === null) {
+    let view: AgentView | null = null, readFailed = false;
+    try { view = await environment.agents.read(projectId, scope.sessionId); } catch { readFailed = true; }
+    if (readFailed) {
       harness = Object.freeze({
         state: 'failed' as const, reason: LIVE_TOOL_REASONS.harnessReadFailed, detail: LIVE_TOOL_DETAILS.harnessReadFailed,
         source: null, conversationId: null, sessionId: null, working: null,
-        invocations: Object.freeze([]) as readonly LiveToolInvocation[], results: Object.freeze([]) as readonly LiveToolResult[], truncated: false
+        invocations: Object.freeze([]) as readonly LiveToolInvocation[], results: Object.freeze([]) as readonly LiveToolResult[], truncated: false,
+        omitted: Object.freeze({ invocations: 0, results: 0 })
       });
     } else {
-      const events = toolEvents(view.entries ?? [], toolCap);
-      const conversationId = typeof view.conversationId === 'string' && view.conversationId !== '' ? view.conversationId : null;
-      const known = conversationId === null ? undefined : sessions.find((session) => session.sessionId === conversationId);
+      const conversationId = view === null ? null : typeof view.conversationId === 'string' && view.conversationId !== '' ? view.conversationId : null;
+      const events = view === null ? { invocations: [], results: [], truncated: false, omitted: { invocations: 0, results: 0 } } : toolEvents(view.entries ?? [], toolCap);
+      // A requested session is the session whose conversation was read, whether or not the
+      // conversation id differs from the session id. Without a request, a conversation is mapped to a
+      // named session only when the view's own id names one.
+      const known = scope.sessionId !== undefined ? undefined : conversationId === null ? undefined : sessions.find((session) => session.sessionId === conversationId);
       const empty = events.invocations.length === 0 && events.results.length === 0;
       // Reported activity is reported whatever else is true; with nothing to report, the two
       // absences stay distinct: no conversation at all, or a conversation with nothing in it yet.
@@ -842,11 +842,12 @@ export async function liveActivity(environment: ActionEnvironment, input: { proj
         detail: state === 'reported' ? null : state === 'no-conversation' ? LIVE_TOOL_DETAILS.noConversation : LIVE_TOOL_DETAILS.noToolActivity,
         source: LIVE_TOOL_SOURCE,
         conversationId,
-        sessionId: known === undefined ? null : known.sessionId,
-        working: view.working === true,
+        sessionId: scope.sessionId ?? (known === undefined ? null : known.sessionId),
+        working: view === null ? null : view.working === true,
         invocations: Object.freeze(events.invocations),
         results: Object.freeze(events.results),
-        truncated: events.truncated
+        truncated: events.truncated,
+        omitted: Object.freeze(events.omitted)
       });
     }
   }

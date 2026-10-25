@@ -951,6 +951,12 @@ test('the live projection reports the durable run state and distinguishes none, 
   assert.equal(first.sessions[0].run.absenceDetail,LIVE_RUN_DETAILS.noRecord);
   assert.deepEqual([first.sessions[0].run.activityAt,first.sessions[0].run.updatedAt],[null,null],'no instant is invented for a row that does not exist');
   assert.equal(first.sessions[0].run.state,null,'an absent row is never reported as idle');
+  // A selected named session is the conversation that is read. This one has no conversation, so the
+  // projection reports that named absence and names the session it was asked about.
+  const scoped=await (await fetch(url+'/api/actions/activity?projectId='+project.id+'&sessionId='+session.id,{headers:token})).json();
+  assert.deepEqual([scoped.harness.state,scoped.harness.reason,scoped.harness.sessionId,scoped.harness.conversationId],['no-conversation',LIVE_TOOL_REASONS.noConversation,session.id,null]);
+  assert.equal((await fetch(url+'/api/actions/activity?projectId='+project.id+'&sessionId=../../etc',{headers:token})).status,422,'a session scope that is not an identifier is an invalid request');
+
   const lifecycle=new SessionLifecycleStore(store);
   lifecycle.markRunning({projectId:project.id,sessionId:session.id,requestId:'live-request'});
   lifecycle.markSettled({projectId:project.id,sessionId:session.id,outcome:'failed',reason:'the generation failed'});

@@ -3,6 +3,19 @@
 export type AgentEntryKind = 'user' | 'assistant' | 'tool' | 'system' | 'other';
 
 export interface AgentToolUse { name: string; args: string }
+/**
+ * What a tool result message records about itself, kept apart from any call it may answer.
+ *
+ * The transcript carries no reliable call identity in the view this build maps, so these fields are
+ * used as the result's own provenance: its tool name, the protocol's error flag and the harness's
+ * own measured execution time. No instant is derived here and no duration is computed from two
+ * timestamps.
+ */
+export interface AgentToolResultMeta {
+  name: string | null;
+  isError: boolean | null;
+  durationMs: number | null;
+}
 export interface AgentEntry {
   id: string;
   kind: AgentEntryKind;
@@ -16,6 +29,8 @@ export interface AgentEntry {
   error: string | null;
   /** Custom entry payload, if the entry is not a provider message. */
   data: Record<string, unknown> | null;
+  /** The result's own recorded metadata, or null when this entry is not a tool result. */
+  toolResult: AgentToolResultMeta | null;
 }
 export interface AgentQuestion {
   id: string;
@@ -62,6 +77,16 @@ function thinkingOf(content: unknown): string {
     .filter(Boolean)
     .join('\n');
 }
+function nonNegative(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null;
+}
+function toolResultOf(message: Record<string, unknown>): AgentToolResultMeta {
+  return {
+    name: typeof message.toolName === 'string' && message.toolName !== '' ? message.toolName : null,
+    isError: typeof message.isError === 'boolean' ? message.isError : null,
+    durationMs: nonNegative(message.durationMs)
+  };
+}
 function toolsOf(content: unknown): AgentToolUse[] {
   if (!Array.isArray(content)) return [];
   return content.flatMap(block => {
@@ -101,7 +126,8 @@ export function agentEntryView(entry: unknown): AgentEntry | null {
     tools: toolsOf(content),
     stopReason: typeof last.stopReason === 'string' ? last.stopReason : null,
     error: typeof last.errorMessage==='string'?last.errorMessage:null,
-    data
+    data,
+    toolResult: record.kind === 'pi.tool-result' ? toolResultOf(last) : null
   };
 }
 

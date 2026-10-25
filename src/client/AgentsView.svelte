@@ -13,6 +13,7 @@
  import type {ActionDescriptor} from '../shared/actions';
  import {slashMatches} from './slash';
  import SessionBar from './SessionBar.svelte';
+ import SessionActivity from './SessionActivity.svelte';
  let { projectId,onerror,onquestions,agentsVersion=0 }:{ projectId:string; onerror:(message:string)=>void; onquestions?:()=>void; agentsVersion?:number }=$props();
  let view=$state<AgentView|null>(null),enabled=$state(true),draft=$state(''),sending=$state(false),problem=$state('');
  // The stream's own state. `lastViewAt` is when a full snapshot was accepted, which is
@@ -514,6 +515,7 @@
 </script>
 <section class="agents">
  {#if view?.conversationId||selectedSessionId}<SessionBar {projectId} sessionId={selectedSessionId||view?.conversationId||''} {view} {agentsVersion} onerror={(message)=>onerror(message)} onsessionchange={(id)=>selectSession(id)}/>{/if}
+ {#if enabled}<SessionActivity {projectId} sessionId={selectedSessionId} {view}/>{/if}
  <header class="agents-head">
   <div>
    <span class="eyebrow">{!view?.model||view.model.provider==='faux'?'SCRIPTED TEST PROVIDER':'MODEL PROVIDER'}</span>

@@ -4,7 +4,7 @@ import { agentEntryView, agentQuestionViews, agentUsageView, agentViewFrom, empt
 
 test('transcript entries map to renderable text, thinking and tool calls', () => {
   const user = agentEntryView({ id: 1, kind: 'pi.user', model: [{ role: 'user', content: 'hello there', timestamp: 1700 }] });
-  assert.deepEqual(user, { id: '1', kind: 'user', rawKind: 'pi.user', at: 1700, text: 'hello there', thinking: '', tools: [], stopReason: null, error: null, data: null });
+  assert.deepEqual(user, { id: '1', kind: 'user', rawKind: 'pi.user', at: 1700, text: 'hello there', thinking: '', tools: [], stopReason: null, error: null, data: null, toolResult: null });
   const assistant = agentEntryView({
     id: 2,
     kind: 'pi.assistant',
@@ -21,6 +21,16 @@ test('transcript entries map to renderable text, thinking and tool calls', () =>
   assert.equal(agentEntryView({ id: 6 }), null);
   assert.equal(agentEntryView(null), null);
   assert.equal(agentEntryView({id:7,kind:'pi.assistant',model:[{role:'assistant',content:[],stopReason:'error',errorMessage:'Model connection required'}]})?.error,'Model connection required');
+});
+
+test('a tool result keeps only its own recorded name, error flag and measured duration', () => {
+  const result = agentEntryView({ id: 8, kind: 'pi.tool-result', model: [{ role: 'toolResult', toolCallId: 'call-1', toolName: 'record_note', isError: true, timestamp: 1701, durationMs: 12, content: [] }] });
+  assert.deepEqual(result?.toolResult, { name: 'record_note', isError: true, durationMs: 12 });
+  assert.equal(result?.at, 1701);
+  // A negative or non-finite duration is not a measurement and is not reported as one.
+  const negative = agentEntryView({ id: 9, kind: 'pi.tool-result', model: [{ role: 'toolResult', toolName: 'record_note', isError: false, timestamp: 1702, durationMs: -5, content: [] }] });
+  assert.equal(negative?.toolResult?.durationMs, null);
+  assert.equal(agentEntryView({ id: 10, kind: 'pi.assistant', model: [{ role: 'assistant', content: [] }] })?.toolResult, null);
 });
 
 test('the view reports working state, the inbox and usage', () => {

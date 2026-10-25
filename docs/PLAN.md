@@ -298,10 +298,13 @@ A product limit needs the owner's decision before it is implemented.
 
 ### Step 3 — Measured activity timeline and tool outcomes
 
-**Status: Partial.** `LiveActivity` already reports run state, tool invocations and results
-as two honest lists with named absences (`src/shared/actions.ts`), and the palette renders
-them. Durations, per-call outcome pairing, interrupted outcomes and a timeline view are
-missing.
+**Status: Built.** `LiveActivity` reports run state, tool invocations and results as two honest
+lists with named absences (`src/shared/actions.ts`). Results now carry a protocol-derived outcome
+(`ok`, `warned`, `failed`, `interrupted`, `cancelled`) with its certainty and the harness's own
+measured duration; a missing instant or duration is null with a named reason. The session view
+renders a compact, bounded activity timeline that says what it withholds. Calls and results are
+still not paired: the shared view carries no reliable call id, so pairing remains a future
+capability.
 
 **Required work**
 
@@ -310,8 +313,8 @@ missing.
 - Report each tool result's outcome (`ok`, `warned`, `failed`, `interrupted`, `cancelled`)
   from the diagnostics the harness carries. Do not pair a call with a result unless the data
   carries an identity for it.
-- Distinguish an interrupted tool from a failed one, and an uncertain interruption from a
-  known cancellation.
+- Distinguish an interrupted tool from a failed one, and an uncertain interruption or abort from a
+  phase-proven cancellation (`abandoned`, which never ran).
 - Render a compact timeline in the session view: newest activity, run state, and the last
   bounded tool events. Say when the list is truncated.
 - Keep the projection path-free and token-free.
@@ -328,9 +331,54 @@ missing.
 **Risks**
 
 - The current harness view does not carry call ids. Mitigation: keep the two lists and do
-  not fabricate pairing; treat pairing as a future capability.
-- Clock skew can make a duration negative. Mitigation: report a non-negative elapsed time
-  only when both instants come from the same source, otherwise report `not reported`.
+  not fabricate pairing; treat pairing as a future capability. Raw transcript messages do
+  carry the provider's call id, but exposing it would widen the shared view contract, so it
+  is not used here.
+- Clock skew can make a duration negative. Mitigation: report only the harness's own measured
+  `durationMs`, never a subtraction of two instants; a missing or negative duration is null
+  with the named reason `no-duration-reported-by-the-harness`.
+
+### Evidence (Step 3)
+
+- `src/shared/activity.ts` derives the two lists from the transcript. An instant is the entry's
+  recorded timestamp, or `null` with `no-instant-recorded-in-the-transcript`; a duration is the
+  result message's own `durationMs` when it is finite and non-negative, or `null` with
+  `no-duration-reported-by-the-harness`. Two instants are never subtracted. The invocation instant
+  is the assistant message's recorded timestamp, not a separately recorded tool start; `abandoned`
+  means the call was not started because its caller ended with a restart. An outcome and its
+  `certainty` come only from the result's `isError` flag and the harness diagnostic codes:
+  `interrupted` is `uncertain` (the effect may be partial); `aborted` is also `uncertain` because
+  the harness emits it after a non-restart abort even in the execute phase; only `abandoned` is a
+  phase-proven cancellation (`certain`) because the call was not started. An error flag or error
+  diagnostic is `failed`, a warning is `warned` (completed, not failed), and a clean result is `ok`.
+  Diagnostic messages, tool arguments and tool output are never copied. The lists are capped
+  independently and `omitted` reports exactly how many older calls and results were withheld.
+- `src/shared/agent.ts` reads only a tool result's own provenance from its message: its tool name,
+  `isError` and `durationMs`. It does not expose the call id, and a negative or non-finite
+  duration becomes `null`.
+- `src/server/state/action-registry.ts` reads the selected session's conversation when
+  `/api/actions/activity?projectId=…&sessionId=…` names one, and keeps `no-conversation`,
+  `none`, `unavailable` and `failed` distinct. A failed read still reports fixed text, never the
+  harness error. The palette and the session timeline both read this one projection.
+- `src/client/SessionActivity.svelte` is the compact session timeline: the durable run state of the
+  selected session, the newest recorded call or result instant, the last 2 calls and 2 results, and a
+  sentence naming the older events it withholds. It clears the old timeline on a session switch
+  and discards a late response for the previous session.
+- `tests/unit/activity.test.ts` drives a failed tool with its instants and duration, interruption,
+  abort and abandoned cancellation, `ok`/`warned`/unclassifiable results, missing instants and durations, a
+  negative duration, the two-list bound, a zero bound, invalid bounds and the shared outcome label,
+  and asserts that no path, argument or diagnostic message is carried.
+- `tests/server/action-registry.test.ts` drives the failed and interrupted outcomes through the
+  projection, the session-scoped read, the named `no-conversation` absence, a bad session scope,
+  the bounds and the exact contract fields, and asserts a path, argument or message never appears.
+  It also drives a zero cap as an empty list, a cap above the maximum as clamped, and a negative,
+  fractional or non-numeric cap as refused. `tests/server/http.test.ts` drives the same session
+  scope through the authenticated route.
+- `tests/browser/activity.spec.ts` runs on a phone-sized viewport: the named absence before any
+  tool, one `record_note` call and its `ok` result with the recorded instant and duration, three
+  tools over the view bound with the truncation sentence, no argument in the timeline, a session
+  switch that clears the root conversation's call, and a held response for the previous session that
+  is discarded after the switch.
 
 ---
 

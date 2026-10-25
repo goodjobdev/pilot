@@ -232,7 +232,7 @@ function view(overrides: Partial<AgentView> = {}): AgentView {
   return { conversationId: '1', working: false, attempt: null, entries: [], partial: '', inbox: [], usage: { input: 0, output: 0, cost: 0 }, model: null, questions: [], updatedAt: new Date(0).toISOString(), ...overrides };
 }
 function entry(overrides: Partial<AgentEntry> & { rawKind: string }): AgentEntry {
-  return { id: randomUUID(), kind: 'other', at: null, text: '', thinking: '', tools: [], stopReason: null, error: null, data: null, ...overrides };
+  return { id: randomUUID(), kind: 'other', at: null, text: '', thinking: '', tools: [], stopReason: null, error: null, data: null, toolResult: null, ...overrides };
 }
 function scopeOf(f: Fixture, sessionId?: string): ActionScope {
   return Object.freeze({ projectId: f.project.id, ...(sessionId === undefined ? {} : { sessionId }) });
@@ -976,7 +976,7 @@ test('every declared precondition matches a refusal the handlers really produce'
 
 const CALL_AT = 1700000000000, RESULT_AT = 1700000000001;
 const CALL = entry({ rawKind: 'pi.assistant', kind: 'assistant', at: CALL_AT, tools: [{ name: 'record_note', args: '{"text":"/etc/passwd is not prompt text this payload may carry"}' }] });
-const RESULT = entry({ rawKind: 'pi.tool-result', kind: 'tool', at: RESULT_AT, data: { diagnostics: [{ severity: 'error', message: '/Users/private/plan.md could not be read' }, { severity: 'warn', message: 'bounded' }] } });
+const RESULT = entry({ rawKind: 'pi.tool-result', kind: 'tool', at: RESULT_AT, toolResult: { name: 'record_note', isError: true, durationMs: 17 }, data: { diagnostics: [{ severity: 'error', code: 'blocked', message: '/Users/private/plan.md could not be read' }, { severity: 'warn', message: 'bounded' }] } });
 function environmentWith(f: Fixture, read: () => Promise<AgentView>): ActionEnvironment {
   return { control: f.environment.control, doctor: f.environment.doctor, agents: { enabled: true, read } };
 }
@@ -1046,8 +1046,8 @@ test('the live projection reports the durable run state per session and never in
     const live = await liveActivity(reported, { projectId: f.project.id });
     assert.deepEqual([live.harness.state, live.harness.reason], ['reported', null]);
     assert.deepEqual([live.harness.source, live.harness.sessionId, live.harness.working], [LIVE_TOOL_SOURCE, session.id, true]);
-    assert.deepEqual(live.harness.invocations, [{ name: 'record_note', at: CALL_AT }], 'a call is its name and its instant, never its arguments');
-    assert.deepEqual(live.harness.results, [{ outcome: 'failed', errors: 1, warnings: 1, notices: 0, at: RESULT_AT }], 'a result is its diagnostic counts and the outcome they imply');
+    assert.deepEqual(live.harness.invocations, [{ name: 'record_note', at: CALL_AT, atReason: null }], 'a call is its name and its instant, never its arguments');
+    assert.deepEqual(live.harness.results, [{ name: 'record_note', outcome: 'failed', certainty: 'certain', protocol: 'blocked', errors: 1, warnings: 1, notices: 0, at: RESULT_AT, atReason: null, durationMs: 17, durationReason: null }], 'a result is its own provenance, the diagnostic counts and the outcome they imply');
     const serialised = JSON.stringify(live);
     assert.ok(!serialised.includes('passwd'), 'the tool arguments are not carried');
     assert.ok(!serialised.includes('/Users/private'), 'a diagnostic message is not carried');
@@ -1056,8 +1056,70 @@ test('the live projection reports the durable run state per session and never in
     // A tool result with no diagnostic counts as a clean one; a tool call with no result is not given one.
     const partial = environmentWith(f, async () => view({ conversationId: session.id, entries: [CALL, entry({ rawKind: 'pi.tool-result', kind: 'tool', at: RESULT_AT })] }));
     const quiet = await liveActivity(partial, { projectId: f.project.id });
-    assert.deepEqual(quiet.harness.results, [{ outcome: 'ok', errors: 0, warnings: 0, notices: 0, at: RESULT_AT }]);
+    assert.deepEqual(quiet.harness.results, [{ name: null, outcome: 'ok', certainty: 'uncertain', protocol: 'unknown', errors: 0, warnings: 0, notices: 0, at: RESULT_AT, atReason: null, durationMs: null, durationReason: 'no-duration-reported-by-the-harness' }]);
     assert.equal(quiet.harness.invocations.length, 1, 'one call was reported, and no outcome is attributed to it');
+  } finally { await f.cleanup(); }
+});
+
+
+test('the live projection reports failed and interrupted outcomes with recorded timing, and never leaks a message or an argument', async () => {
+  const f = await fixture();
+  try {
+    const session = await newSession(f, 'Measured session');
+    const CALL_AT_2 = 1700000001000, RESULT_AT_2 = 1700000001023;
+    const call = entry({ rawKind: 'pi.assistant', kind: 'assistant', at: CALL_AT_2, tools: [{ name: 'record_note', args: '{"text":"/Users/private/arguments.md"}' }] });
+    const failed = entry({
+      rawKind: 'pi.tool-result', kind: 'tool', at: RESULT_AT_2,
+      toolResult: { name: 'record_note', isError: true, durationMs: 23 },
+      data: { diagnostics: [{ severity: 'error', code: 'blocked', message: '/Users/private/plan.md was blocked' }] }
+    });
+    const interrupted = entry({
+      rawKind: 'pi.tool-result', kind: 'tool', at: RESULT_AT_2 + 10,
+      toolResult: { name: 'record_note', isError: true, durationMs: null },
+      data: { diagnostics: [{ severity: 'error', code: 'interrupted', message: 'Tool record_note was interrupted and may have partially run' }] }
+    });
+    const aborted = entry({
+      rawKind: 'pi.tool-result', kind: 'tool', at: RESULT_AT_2 + 20,
+      toolResult: { name: 'record_note', isError: true, durationMs: 8 },
+      data: { diagnostics: [{ severity: 'error', code: 'aborted', message: 'Tool record_note was aborted' }] }
+    });
+    const skipped = entry({ rawKind: 'pi.tool-result', kind: 'tool', at: -1, toolResult: { name: 'read_notes', isError: true, durationMs: -1 }, data: null });
+    const reads: (string | undefined)[] = [];
+    const scoped: ActionEnvironment = {
+      control: f.environment.control, doctor: f.environment.doctor,
+      agents: { enabled: true, read: async (_projectId, sessionId) => { reads.push(sessionId); return view({ conversationId: 'conversation-of-' + session.id, working: false, entries: [call, failed, interrupted, aborted, skipped] }); } }
+    };
+    const live = await liveActivity(scoped, { projectId: f.project.id, sessionId: session.id });
+    assert.deepEqual(reads, [session.id], 'the selected session is the conversation that was read');
+    assert.deepEqual([live.harness.sessionId, live.harness.conversationId], [session.id, 'conversation-of-' + session.id]);
+    assert.deepEqual(live.harness.invocations, [{ name: 'record_note', at: CALL_AT_2, atReason: null }]);
+
+    const failedResult = live.harness.results[0];
+    assert.deepEqual([failedResult.outcome, failedResult.certainty, failedResult.protocol], ['failed', 'certain', 'blocked']);
+    assert.deepEqual([failedResult.at, failedResult.atReason, failedResult.durationMs, failedResult.durationReason], [RESULT_AT_2, null, 23, null], 'the recorded instants and the harness duration are reported unchanged');
+    const interruptedResult = live.harness.results[1];
+    assert.deepEqual([interruptedResult.outcome, interruptedResult.certainty], ['interrupted', 'uncertain'], 'a killed tool is interrupted, never failed or ok');
+    assert.deepEqual([interruptedResult.durationMs, interruptedResult.durationReason], [null, 'no-duration-reported-by-the-harness']);
+    const abortedResult = live.harness.results[2];
+    assert.deepEqual([abortedResult.outcome, abortedResult.certainty, abortedResult.protocol], ['cancelled', 'uncertain', 'aborted'], 'an abort is a cancellation whose effect is not proven; it never implies a safe replay');
+    const negative = live.harness.results[3];
+    assert.deepEqual([negative.at, negative.atReason, negative.durationMs], [null, 'no-instant-recorded-in-the-transcript', null], 'a negative instant or duration is never reported as measured');
+
+    const serialised = JSON.stringify(live);
+    assert.ok(!serialised.includes('/Users/private'), 'no diagnostic message or path is carried');
+    assert.ok(!serialised.includes('/Users/private/arguments.md'), 'no tool argument is carried');
+    assert.ok(!serialised.includes('was blocked'), 'no diagnostic message is carried');
+    assert.ok(!serialised.includes(f.root), 'the payload carries no filesystem path');
+
+    // A session-scoped read that reports no conversation is a named absence, not a failed read.
+    const missing: ActionEnvironment = { ...scoped, agents: { enabled: true, read: async () => null } };
+    const none = await liveActivity(missing, { projectId: f.project.id, sessionId: session.id });
+    assert.deepEqual([none.harness.state, none.harness.reason, none.harness.sessionId], ['no-conversation', LIVE_TOOL_REASONS.noConversation, session.id]);
+    assert.equal(none.harness.detail, LIVE_TOOL_DETAILS.noConversation);
+    assert.ok(!none.harness.detail!.includes('project conversation'), 'the named absence is scope-neutral for a named session and a root conversation');
+    // A scope that is not an identifier is refused before the harness is read.
+    const badScope = await refusal(liveActivity(scoped, { projectId: f.project.id, sessionId: '../../etc' }));
+    assert.ok(badScope instanceof ActionError && badScope.code === 'INVALID');
   } finally { await f.cleanup(); }
 });
 
@@ -1070,13 +1132,14 @@ test('the live projection is bounded, distinguishes not-knowing, and declares ex
     const capped = await liveActivity(twoCalls, { projectId: f.project.id, sessions: 1, toolEvents: 1 });
     assert.deepEqual([capped.truncated, capped.sessions.length], [true, 1]);
     assert.deepEqual([capped.harness.invocations.length, capped.harness.results.length, capped.harness.truncated], [1, 1, true], 'the bound keeps the most recent events and says it bit');
+    assert.deepEqual(capped.harness.omitted, { invocations: 1, results: 1 }, 'the payload says exactly how many older events each list withheld');
     assert.deepEqual(capped.limits, { sessions: 1, toolEvents: 1 });
     assert.equal(capped.sessions[0].sessionId, first.id);
     assert.notEqual(first.id, second.id);
 
     const full = await liveActivity(twoCalls, { projectId: f.project.id });
     assert.deepEqual(Object.keys(full).sort(), ['harness', 'limits', 'projectId', 'readOnly', 'sessions', 'truncated'], 'the payload declares exactly the contract fields and no others');
-    assert.deepEqual(Object.keys(full.harness).sort(), ['conversationId', 'detail', 'invocations', 'reason', 'results', 'sessionId', 'source', 'state', 'truncated', 'working']);
+    assert.deepEqual(Object.keys(full.harness).sort(), ['conversationId', 'detail', 'invocations', 'omitted', 'reason', 'results', 'sessionId', 'source', 'state', 'truncated', 'working']);
     assert.deepEqual(full.limits, { sessions: 200, toolEvents: 50 });
     assert.equal(full.sessions.length, 2, 'both named sessions are reported');
 
@@ -1085,6 +1148,25 @@ test('the live projection is bounded, distinguishes not-knowing, and declares ex
     assert.ok(missing instanceof ActionError && missing.code === 'INVALID');
     const malformed = await refusal(liveActivity(f.environment, { projectId: '../../etc' }));
     assert.ok(malformed instanceof ActionError && malformed.code === 'INVALID');
+    // A zero cap is a real empty bound, not `slice(-0)` returning everything. The applied limits and
+    // the exact omission counts are reported for both lists.
+    const zero = await liveActivity(twoCalls, { projectId: f.project.id, sessions: 0, toolEvents: 0 });
+    assert.deepEqual([zero.sessions.length, zero.truncated, zero.limits.sessions, zero.limits.toolEvents], [0, true, 0, 0]);
+    assert.deepEqual([zero.harness.invocations, zero.harness.results], [[], []]);
+    assert.deepEqual(zero.harness.omitted, { invocations: 2, results: 2 });
+    assert.equal(zero.harness.truncated, true);
+
+    // A cap above the documented maximum is normalized, and `limits` reports the cap really applied.
+    const clamped = await liveActivity(twoCalls, { projectId: f.project.id, sessions: 999, toolEvents: 999 });
+    assert.deepEqual(clamped.limits, { sessions: 200, toolEvents: 50 });
+    assert.equal(clamped.sessions.length, 2);
+
+    // A negative, fractional or non-numeric cap is refused rather than coerced.
+    for (const bad of [{ sessions: -1 }, { toolEvents: -1 }, { sessions: 1.5 }, { toolEvents: Number.NaN }, { sessions: '1' }]) {
+      const refused = await refusal(liveActivity(twoCalls, { projectId: f.project.id, ...bad } as { projectId: string }));
+      assert.ok(refused instanceof ActionError && refused.code === 'INVALID', 'a cap that is not a non-negative integer is refused: ' + JSON.stringify(bad));
+    }
+
     // A project this instance has no sessions for reports none: an empty list, never a fabricated entry.
     assert.deepEqual((await liveActivity(f.environment, { projectId: randomUUID() })).sessions, []);
   } finally { await f.cleanup(); }

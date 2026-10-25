@@ -512,7 +512,9 @@ publish stays a separate, explicit step that no action in this registry takes.
 
 ## The live projection
 
-`GET /api/actions/activity?projectId=<uuid>` answers what is actually happening, read-only. Its
+`GET /api/actions/activity?projectId=<uuid>&sessionId=<id>` answers what is actually happening,
+read-only. `sessionId` is optional: without it the project's own conversation is read, and with it the
+named session's conversation is read (or the named absence `no-conversation` when it has none). Its
 contract is declared in `src/shared/actions.ts` beside the registry, so the producer and the reader
 cannot disagree about a field.
 
@@ -525,12 +527,28 @@ cannot disagree about a field.
   is a legal value to write *at*, not a fact about a generation, so it is never reported as the state
   `idle`. `revision` is `0` there because a first write must claim revision 0, not because one
   happened.
-- **Tool activity is only ever what the harness reports.** The projection reads the project's
-  conversation view and reports the tool calls it carries and the diagnostic counts each result
-  carries. Nothing is invented to fill the view.
-- **A call and a result are not paired.** The view this build can read does not carry the call id, so
-  calls and results are reported as two ordered lists. No outcome is attributed to a call the data
-  does not attribute it to.
+- **Tool activity is only ever what the harness reports.** The projection reads the conversation view
+  it was asked for and reports the tool calls it carries and the result messages it carries. Nothing is
+  invented to fill the view.
+- **A call and a result are not paired.** The view this build maps carries no reliable call id, so
+  calls and results are reported as two ordered lists. No outcome is attributed to a call the data does
+  not attribute it to. Raw transcript messages do carry the provider's call id; exposing it would widen
+  the shared view contract, so pairing stays a future capability with its own spec change.
+- **Timing is recorded, never derived.** An instant is the entry's own timestamp, or `null` with the
+  named reason `no-instant-recorded-in-the-transcript`. A result's duration is only the harness's own
+  measured `durationMs`, or `null` with the named reason `no-duration-reported-by-the-harness`. Two
+  instants are never subtracted, so a recovered transcript with clock skew cannot produce a negative
+  elapsed time. A call's instant is the assistant message timestamp that carried it, not a separately
+  recorded tool start: this harness view records no such start.
+- **An outcome comes only from the protocol.** `ok`, `warned`, `failed`, `interrupted` and `cancelled`
+  are derived from the result's own error flag and the harness diagnostic codes. An `interrupted`
+  result is `certainty: uncertain` because it may have partially run. An `aborted` result is a
+  cancellation the owner knows about, but its effect is not proven, so its certainty is `uncertain`:
+  the harness emits `aborted` after a non-restart abort even in the execute phase. Only `abandoned`
+  is a phase-proven cancellation with no execution (`certainty: certain`). A `warned` result
+  completed with warnings; it is not a failure. A known protocol class (`completed`, `blocked`,
+  `tool-unavailable`, `invalid-arguments`, `error`, `unknown`) is carried; the diagnostic message
+  never is.
 - **Not knowing is a state, not an absence**, and the three non-answers are distinct:
 
   | `state` | means | `reason` |
@@ -542,20 +560,27 @@ cannot disagree about a field.
   | `failed` | the read was attempted and failed | `harness-could-not-be-read` |
 
   The first two absences are deliberately different states: "there is no conversation" is not
-  "the conversation has nothing in it yet", and neither is reported as the other. Reported activity
-  is reported whatever else is true, so a view that carries tool calls is never described as an
-  absence.
+  "the conversation has nothing in it yet", and neither is reported as the other. Their fixed
+  sentences name the scope that was asked about, so a named session is never described as the
+  project conversation. Reported activity is reported whatever else is true, so a view that carries
+  tool calls is never described as an absence.
 
   A failed read reports fixed text: a harness error may name a filesystem path, so it is never echoed
   into the payload.
 - **The payload is bounded and carries no path, token, request identity or conversation text.** A
-  call is a name and an instant (never its arguments), a result is its diagnostic counts and the
-  outcome they imply, and the two caps (200 sessions, 50 tool events per list) are echoed in
-  `limits` with a `truncated` flag when they bite.
-- **The owner can see it.** The palette renders this projection under *Live projection*: the run state
-  of the chosen session (or of the first few registered ones), and the tool activity or the named
-  absence the payload carries. It shows only what the payload contains — it adds no row for a session
-  the projection reports nothing about, and it presents an absence as the named absence it is.
+  call is a name and an instant (never its arguments), a result is its own name, diagnostic counts,
+  outcome, certainty and measured duration (never its output or message), and the two caps (200
+  sessions, 50 tool events per list) are echoed in `limits` with a `truncated` flag and exact
+  `omitted` counts when they bite. A cap is a non-negative integer: 0 is a real empty bound, a value
+  above the maximum is clamped to 200 or 50, and `limits` reports the value that was really applied.
+  A negative, fractional or non-numeric cap is refused as an invalid request rather than coerced.
+- **The owner can see it in two places.** The palette renders this projection under *Live projection*:
+  the run state of the chosen session (or of the first few registered ones), and the tool activity or
+  the named absence the payload carries. The session view renders a compact *Session activity*
+  timeline for the selected session: its durable run state, the newest recorded call or result instant, the last
+  bounded calls and results, and a sentence saying how many older events are not shown. Both show only
+  what the payload contains — they add no row for a session the projection reports nothing about, and
+  they present an absence as the named absence it is.
 
 One honest caveat: reading the conversation view **attaches** that conversation exactly as the
 Agents view does, because this build exposes no other surface for reading tool activity. The
@@ -568,7 +593,7 @@ nothing is attached at all.
 | Route | Method | What it does |
 |---|---|---|
 | `/api/actions` | GET | the implemented actions the caller can use in its scope (`?projectId=`, `?sessionId=`). Read-only. |
-| `/api/actions/activity` | GET | the live projection for one project (`?projectId=<uuid>`, required). Read-only. |
+| `/api/actions/activity` | GET | the live projection for one project (`?projectId=<uuid>`, required) and optionally one named session (`&sessionId=<id>`). Read-only. |
 | `/api/actions/execute` | POST | executes one action: `{ "id": "...", "params": {...}, "scope": {"projectId": "...", "sessionId": "..."} }`. |
 | `/api/sessions/:id/queue` | GET | the session's queue with its revision, entries and bounds (`?projectId=` required). Read-only. |
 | `/api/sessions/:id/queue/:operation` | POST | the ten queue writes — `append`, `edit`, `reorder`, `remove`, `clear`, `cancel`, `claim`, `release`, `submit`, `reconcile` — each with its own body, statuses and refusals (`docs/QUEUE.md`). |
@@ -716,7 +741,11 @@ parameters and preconditions. Nothing in the client lists a capability of its ow
   revision parameter declares the queue read it comes from, and a claim is refused before the instance
   that cannot dispatch is asked to; the live projection distinguishes `none`, `no-conversation`,
   `unavailable` and `failed`, reports a session with no lifecycle row as an absence rather than as
-  `idle`, never invents an entry and declares exactly the contract fields; all four `fork.*`
+  `idle`, derives a failed, an interrupted and an aborted outcome with their recorded instants and the
+  harness duration, refuses a negative instant or duration as measured data, treats a zero cap as an
+  empty list, clamps a cap above the maximum and refuses a negative, fractional or non-numeric one,
+  reports the exact omitted counts at its bounds, keeps paths, arguments and diagnostic messages out,
+  and declares exactly the contract fields; all four `fork.*`
   actions are driven through the registry against synthetic ports, with a paused child refusing a
   dispatch the port never sees; and all seven new actions are driven through the registry, with the
   eleven new precondition codes each matching a refusal a handler really produces.
@@ -777,6 +806,16 @@ parameters and preconditions. Nothing in the client lists a capability of its ow
   cutoff, an unknown parent, an escaping or symlinked target, a taken target) creating nothing; the
   documented fork bound; and a stored record that does not validate read as corruption. **No real
   provider is called and no container is started in this suite.** See `docs/FORKS.md`.
+- `tests/browser/activity.spec.ts` — the session view's compact timeline on a phone viewport: the
+  named absence before any tool, a `record_note` call and its `ok` result with a recorded instant and
+  duration, three tools over the view bound with the truncation sentence, no tool argument in the
+  timeline, a session switch that clears the root conversation's call, and a held response for the
+  previous session that is discarded after the switch.
+- `tests/unit/activity.test.ts` — the pure projection: failed, interrupted, cancelled, `ok`, `warned`
+  and unclassifiable outcomes, missing instants and durations with their named reasons, a negative
+  duration refused, the independent bounds, a zero bound and invalid bounds, the shared outcome
+  label (`warned · completed (not failed)`, `cancelled (uncertain) · aborted`), and no path, argument
+  or diagnostic message carried.
 - `tests/browser/actions.spec.ts` — the palette opens from the keyboard, lists exactly the registry's
   actions for its scope, executes real actions, shows the handler's results and shows a refusal;
   a declared model choice is parsed in the palette and recorded by the handler; a revision-bound action

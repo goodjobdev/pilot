@@ -773,7 +773,7 @@ export async function createApp(options:AppOptions){
     doctor:()=>doctorReport(process.env),
     // Reading the conversation view is the only surface this build exposes for tool activity, and it
     // attaches the conversation exactly as the Agents view does; the projection reports that source.
-    agents:{enabled:agents.enabled,read:(projectId:string)=>agents.view(catalog.get(projectId))}
+    agents:{enabled:agents.enabled,read:(projectId:string,sessionId?:string)=>sessionId?agents.sessionView(catalog.get(projectId),sessionId):agents.view(catalog.get(projectId))}
   };
   const actions=new ActionRegistry(actionEnvironment);
   const previews=new Map<string,{projectId:string;revision:string;preview:ImportPreview;documents:{name:string;content:string}[];expires:number}>();
@@ -1053,11 +1053,12 @@ export async function createApp(options:AppOptions){
               // instance that cannot answer at all, then a project this instance does not know.
               // Only the validated identifier reaches the projection: normaliseActionScope refuses a
               // value that is not an identifier, and there is no fallback to the raw query parameter.
-              const exact=normaliseActionScope({projectId:url.searchParams.get('projectId')});
+              const requestedSession=url.searchParams.get('sessionId');
+              const exact=normaliseActionScope({projectId:url.searchParams.get('projectId'),...(requestedSession===null||requestedSession===''?{}:{sessionId:requestedSession})});
               if(exact.projectId===undefined)throw new HttpError(422,'projectId is required');
               if(!actionEnvironment.control)throw new HttpError(503,'The live projection needs the durable control store, which is not open on this instance');
               catalog.get(exact.projectId);
-              json(await liveActivity(actionEnvironment,{projectId:exact.projectId}));return;
+              json(await liveActivity(actionEnvironment,{projectId:exact.projectId,...(exact.sessionId===undefined?{}:{sessionId:exact.sessionId})}));return;
             }
             if(path==='/api/actions/execute'&&req.method==='POST'){
               const envelope=parseBody(z.strictObject({id:z.unknown(),params:z.unknown().optional(),scope:z.unknown().optional()}),payload,'The action request');
