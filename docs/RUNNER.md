@@ -100,7 +100,7 @@ build (never by a caller) and every property is one flag:
 
 | Property | Flag | Why it matters |
 |---|---|---|
-| No network | `--network none` | A job must not reach the network, a provider or another service on the host. The container is created with **no interface at all**, not a filtered one. |
+| No network | `--network none` | A job must not reach the network, a provider or another service on the host. The container has only its own loopback interface and no external network interface. |
 | Read-only root | `--read-only` | The job must not be able to modify the image, or anything outside the one workspace it was given. |
 | Non-root user | `--user 10001:10001` | The job must not run as uid 0 inside its own namespace. The image's own `USER` says the same, and the flag makes it explicit and checkable. |
 | No capabilities | `--cap-drop ALL` | A job must not keep a capability the container runtime would otherwise keep by default. |
@@ -238,9 +238,10 @@ the process from serving.
   contained is left unclaimed and executes nothing; and a settled job is never run again.
 
 **No container is started in any unit test.** The broker's only execution path is its port, so the
-suite injects one; the single test that exercises the real port points it at a fake binary. A real
-container run is therefore *wired and unverified here*: it is exercised by hand, on the testing
-deployment, with `DASHBOARD_RUNNER=on`.
+suite injects one; the single test that exercises the real port points it at a fake binary.
+The explicit local acceptance script starts real containers only when an operator supplies a locally
+built image. See [Local runner validation](RUNNER-LOCAL-VALIDATION.md) for the command, observed
+results and limits. This local check does not verify any remote deployment.
 
 ## Honest limits
 
