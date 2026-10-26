@@ -50,11 +50,11 @@ owner has accepted it. Nothing in this plan authorises a commit, push or deploym
 
 ### Step 1 — Reliable reconnect with bounded backoff and honest states
 
-**Status: Partial — reconnect core built.** The server stream works and shutdown now closes it
-(`a3c4222`, `src/server/main.ts`). The bounded, heartbeat-aware reconnect client is now in
-`src/client/stream.ts` with tests in `tests/unit/stream.test.ts`,
-`tests/server/agents.test.ts` and `tests/browser/reconnect.spec.ts`. Evidence-based polling
-fallback and the client transcript-row cap remain.
+**Status: Partial — reconnect core built locally; owner acceptance pending.** The server stream works and shutdown now closes it
+(`a3c4222`, `src/server/main.ts`). The bounded, heartbeat-aware reconnect client is in
+`src/client/stream.ts`, with the unit, server and browser evidence below. The remaining
+transcript-row cap is not implemented. Evidence-based polling fallback is deferred: local loopback
+stays on streams, and no tunnel evidence or owner decision has been supplied.
 
 **Required work**
 
@@ -137,7 +137,7 @@ fallback and the client transcript-row cap remain.
 
 ### Step 2 — Per-session drafts and attachment recovery rules
 
-**Status: Partial — implemented after review, awaiting owner review.** A draft is stored per
+**Status: Built locally; owner acceptance pending.** A draft is stored per
 project and session (`src/client/drafts.ts`) and restored on switch and reload. Image references
 are recovered by server id, and every non-ready state is named. The review removed the
 unaccepted attachment-count policy and the age and clock deletion rules: there is **no attachment
@@ -298,7 +298,7 @@ A product limit needs the owner's decision before it is implemented.
 
 ### Step 3 — Measured activity timeline and tool outcomes
 
-**Status: Built.** `LiveActivity` reports run state, tool invocations and results as two honest
+**Status: Built locally; automated acceptance criteria pass. Real-phone owner acceptance is not claimed.** `LiveActivity` reports run state, tool invocations and results as two honest
 lists with named absences (`src/shared/actions.ts`). Results now carry a protocol-derived outcome
 (`ok`, `warned`, `failed`, `interrupted`, `cancelled`) with its certainty and the harness's own
 measured duration; a missing instant or duration is null with a named reason. The session view
@@ -508,7 +508,7 @@ done until the owner accepts it on a phone.
 
 ### Step 5 — Mobile Back stack and bottom controls
 
-**Status: Implemented — awaiting owner review.** The browser Back button now closes the newest
+**Status: Built locally; automated acceptance criteria pass. Real-phone owner acceptance is not claimed.** The browser Back button now closes the newest
 drawer, menu, panel, dialog, document or session before it leaves the app, and Forward restores
 the entry. The composer and its primary controls remain in normal flow with safe-area padding;
 they are not docked over the transcript.
@@ -685,7 +685,7 @@ they are not docked over the transcript.
 
 ### Step 6 — Attention: questions, approvals, failures and interrupted runs
 
-**Status: Built (local validation complete); owner acceptance pending.** One attention surface
+**Status: Built locally; automated acceptance criteria pass. Owner acceptance is pending.** One attention surface
 now ranks all four kinds, shows the exact open count apart from the capped list, and offers the
 explicit actions each kind allows from a phone. The 20-per-page and 100-listed limits are
 implemented as **proposed** defaults (`limits.policy: "proposed"`); they are not accepted policy
@@ -818,7 +818,7 @@ and changing them remains an owner decision. See [Attention](ATTENTION.md).
 
 ### Step 7 — `record_note` cancellation audit (delayed)
 
-**Status: Built (local validation complete); owner acceptance pending.** `record_note` remains
+**Status: Built locally; automated acceptance criteria pass. Owner acceptance is pending.** `record_note` remains
 `replay: 'unsafe'`. Its wait now observes the tool's abort signal, every side effect is guarded by
 a signal check, and an abort before the append writes nothing. A cancel after the append is
 reported as an uncertain abort and never as a rollback. A resume whose original identity is
@@ -1297,11 +1297,12 @@ worker feature. It does **not** claim acceptance on a real phone or through a tu
 
 ### Step 10 — Disconnect, cancel and crash tests
 
-**Status: Partial; local test evidence is in progress and owner acceptance is pending.** Existing
-matrices have named tests for visible states and durable records. New uncertain-recovery cases cover
-a real safe-tool execute checkpoint, SIGKILL recovery, input blocking and explicit verified
-acknowledgement. Final totals and full-batch validation remain for the orchestrator to record after
-its fresh run. No real-phone, tunnel, live-provider or owner acceptance is claimed.
+**Status: Automated local acceptance criteria pass; owner acceptance is pending.** The disconnect,
+cancel and crash matrices have test evidence for visible states and durable records. Uncertain-recovery
+cases cover a safe-tool execute checkpoint, SIGKILL recovery, input blocking and verified owner
+acknowledgement. At baseline `df2e1fe`, the full unit/server batch passed 586 tests, and the browser
+suite passed 85 tests in 2 shards (49 and 36). These results do not claim real-phone or tunnel
+acceptance. No live-provider or production acceptance is claimed.
 
 **Required work**
 
@@ -1398,7 +1399,7 @@ its fresh run. No real-phone, tunnel, live-provider or owner acceptance is claim
   submitted entries need reconciliation. It verifies the original identity is terminal and writes an audited
   lifecycle acknowledgement. It retains the original request identity and unsafe intent, and never
   replays or undoes the effect. These tests do not prove exactly-once behavior under power loss,
-  torn writes or other filesystem failures. The owner has not accepted this phone workflow.
+  torn writes or other filesystem failures. The owner has not accepted this workflow on a real phone. Automated phone-sized browser tests do not establish real-device acceptance.
 - `readFile`/`appendFile` cannot be interrupted deterministically inside `write(2)`, so "mid-write"
   is the post-append, pre-settle window, not a claim about a torn write.
 - Fresh local validation: the exact worktree-local TypeScript and Svelte checks pass (0 errors,
@@ -1518,16 +1519,39 @@ and its passphrase as the only key to the captured state.
 
 ## Status summary
 
-| Step | Status |
+Statuses below distinguish local implementation and automated evidence from acceptance by the
+owner on a real phone. A browser viewport sized like a phone is not a real phone. No status here
+claims tunnel, production or live-provider acceptance.
+
+| Step | Status at `df2e1fe` |
 |---|---|
-| 1 Reliable reconnect and honest states | Partial |
-| 2 Per-session drafts and attachments | Gap |
-| 3 Measured activity timeline | Partial |
-| 4 Follow-scroll and new activity | Built, pending owner acceptance |
-| 5 Mobile Back stack and bottom controls | Gap |
-| 6 Attention surface | Partial |
-| 7 `record_note` cancellation audit | Built, pending owner acceptance |
-| 8 Owner-configured orchestrator and worker models | Partial — worker policy enforced for the W1 worker path |
-| 9 Bounded owner-created workers | Partial — owner-approved W1 built and hardened; owner acceptance not claimed |
-| 10 Disconnect, cancel and crash tests | Partial |
-| Shared browser, runnable artifacts, unrestricted extensions, anonymous sharing | Deferred |
+| 1 Reliable reconnect and honest states | Partial — reconnect core built locally and tested. Transcript-row cap remains. Evidence-based polling fallback is deferred until there is tunnel evidence or an owner decision; local loopback uses streams. Owner acceptance pending. |
+| 2 Per-session drafts and attachments | Built locally; automated criteria tested. Owner acceptance pending. |
+| 3 Measured activity timeline | Built locally; automated criteria tested. Owner acceptance pending. |
+| 4 Follow-scroll and new activity | Built locally; automated phone-sized criteria tested. Real-phone owner acceptance pending. |
+| 5 Mobile Back stack and bottom controls | Built locally; automated criteria tested. Real-phone owner acceptance pending. |
+| 6 Attention surface | Built locally; automated criteria tested. Owner acceptance pending. Proposed paging limits remain unaccepted policy. |
+| 7 `record_note` cancellation audit | Built locally; automated criteria tested. Owner acceptance pending. Uncertain effects remain for operator review; no exactly-once claim. |
+| 8 Owner-configured orchestrator and worker models | Partial. Worker model policy is built and enforced for Step 9 W1; the remaining gaps above are open. Owner acceptance pending. |
+| 9 Bounded owner-created workers | Partial. W1 is owner-approved for **Stop-only** at local commit `80b1bea`, with tests and hardening. This is not whole-step acceptance or real-phone acceptance. Wider worker scope remains unbuilt. |
+| 10 Disconnect, cancel and crash tests | Automated local criteria pass: 586 unit/server tests and 85 browser tests in 2 shards at `df2e1fe`. Real-phone owner acceptance pending; no tunnel, live-provider or production acceptance. |
+| Shared browser, runnable artifacts, unrestricted extensions, anonymous sharing | Deferred pending a security design. |
+
+### Next manual owner checks
+
+Use a disposable synthetic-data demo only in local mode through the browser panel. The current
+preview uses `http://127.0.0.1:4398` while its local server runs; this is not a permanent endpoint.
+This loopback browser view is not a real phone, and it does not validate a tunnel.
+**Never tunnel or publicly expose local mode:** its page contains a session token. Do not use a
+live provider or production data for these checks.
+
+1. **Draft and reload:** enter synthetic text, reload, and confirm the draft returns in the same
+   project and session. Do not send it.
+2. **Back and follow-scroll:** move up in the transcript during synthetic activity; confirm the
+   view does not jump. Use Back and Forward to close and restore a layer. Check that the draft stays.
+3. **Uncertain recovery:** review the interrupted conversation and affected synthetic files. Confirm
+   the run is terminal, the conversation is idle and queues are clear before acknowledgement. Confirm
+   the UI states that acknowledgement does not replay or undo the effect. Do not create an uncertain
+   interruption in live data.
+
+Record these as browser-panel checks only. Real-phone acceptance remains a separate owner action.
