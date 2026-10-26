@@ -77,7 +77,7 @@ export type ReleasePromotionObservation =
   | {readonly state:'unreadable';readonly reason:string};
 /** What the running service reports about itself, and the one read-only seam that answers for promotion. */
 export interface ReleaseReportOptions {readonly version:string;readonly source:'manifest'|'unreleased-local';readonly buildId?:string;readonly sourceDigest?:string;readonly observe:()=>ReleasePromotionObservation}
-export interface AppOptions {dataRoot:string;browseRoots:string[];security:SecurityConfig;allowedHosts?:readonly string[];clientRoot?:string;registry?:string;agents?:'on'|'off';agentPauseMs?:number;recordNoteDelayMs?:number;recordNoteAfterWriteMs?:number;recordNoteStarted?:()=>void;alertTransport?:AlertTransport;alertSubject?:string;alertCooldownMs?:number;readiness?:ReadinessOptions;control?:ControlStore;runner?:{readonly enabled?:boolean;readonly port?:RunnerPort};fileEdit?:{readonly enabled?:boolean};release?:ReleaseReportOptions;workerOpenDelayMs?:number;onModelRequest?:(input:{provider:string;modelId:string;maxTokens:number})=>void;workerProbe?:{tool:string;args:Record<string,unknown>};workerProbeDelayMs?:number;workerGuard?:(input:{projectId:string;runId:string;tool:string})=>string|null;workerRequestGuard?:(input:{projectId:string;runId:string})=>string|null;onWorkerGuard?:(input:{tool:string;refusal:string|null})=>void}
+export interface AppOptions {dataRoot:string;browseRoots:string[];security:SecurityConfig;allowedHosts?:readonly string[];clientRoot?:string;registry?:string;agents?:'on'|'off';agentPauseMs?:number;recordNoteDelayMs?:number;recordNoteAfterWriteMs?:number;recordNoteStarted?:()=>void;readNotesSeam?:{delayMs?:number;onExecute?:()=>void};alertTransport?:AlertTransport;alertSubject?:string;alertCooldownMs?:number;readiness?:ReadinessOptions;control?:ControlStore;runner?:{readonly enabled?:boolean;readonly port?:RunnerPort};fileEdit?:{readonly enabled?:boolean};release?:ReleaseReportOptions;workerOpenDelayMs?:number;onModelRequest?:(input:{provider:string;modelId:string;maxTokens:number})=>void;workerProbe?:{tool:string;args:Record<string,unknown>};workerProbeDelayMs?:number;workerGuard?:(input:{projectId:string;runId:string;tool:string})=>string|null;workerRequestGuard?:(input:{projectId:string;runId:string})=>string|null;onWorkerGuard?:(input:{tool:string;refusal:string|null})=>void}
 /**
  * Approvals answer with a status that says what happened: an invalid request is 422, an approval
  * outside the caller's scope is 403, a missing one is 404, a storage fault is 500, and every
@@ -434,6 +434,11 @@ export async function createApp(options:AppOptions){
   // The same test-only seam validator the entrypoint uses before it creates the data root. A host
   // option is accepted directly; the environment form additionally requires the explicit switch.
   const { recordNoteDelayMs, recordNoteAfterWriteMs } = resolveNoteDelaySeams(options, process.env);
+  const readNotesDelayMs=options.readNotesSeam?.delayMs??0;
+  if(!Number.isInteger(readNotesDelayMs)||readNotesDelayMs<0||readNotesDelayMs>60_000)
+    throw new Error('readNotesSeam.delayMs must be a whole number from 0 to 60000');
+  if(options.readNotesSeam?.onExecute!==undefined&&typeof options.readNotesSeam.onExecute!=='function')
+    throw new Error('readNotesSeam.onExecute must be a function');
   // The release identity this process reports, and the read-only observation of which release the
   // store says is promoted. Both are reports: neither promotes, points or starts anything.
   const releaseReport=options.release??null;
@@ -507,6 +512,7 @@ export async function createApp(options:AppOptions){
   // The agent harness is the only execution surface. It is off unless the instance enables it explicitly.
   const agents=new HarnessHost({
     dataRoot:options.dataRoot,providers,delivery,lifecycle:lifecycleHooks,
+    recovery:lifecycle?{read:(projectId,sessionId)=>{const record=lifecycle.read(projectId,sessionId);return {state:record.state,uncertain:record.uncertain,requestId:record.requestId};}}:undefined,
     enabled:(options.agents??(process.env.DASHBOARD_AGENTS==='on'?'on':'off'))==='on',
     pauseMs:options.agentPauseMs??Number(process.env.DASHBOARD_AGENT_PAUSE_MS??2500),
     // Test-only seams for deterministic cancellation tests. The tool's parameters never carry a
@@ -514,6 +520,9 @@ export async function createApp(options:AppOptions){
     recordNoteDelayMs,
     recordNoteAfterWriteMs,
     recordNoteStarted:options.recordNoteStarted,
+    // Narrow createApp-only test seam: never read from the environment or an HTTP payload.
+    readNotesDelayMs,
+    readNotesStarted:options.readNotesSeam?.onExecute,
     // The authoritative dispatch path reads this on every tool call, so an agent's scopes are
     // re-checked server-side however a call was crafted. With no registry open, the owner's own
     // dispatch is in force and nothing is narrowed.
@@ -597,6 +606,12 @@ export async function createApp(options:AppOptions){
   // open rather than opening one. A dispatching action is checked for capability first and then writes
   // its transition before it dispatches, so the durable write is the single serialisation point; a
   // cancelling action cancels first and writes after, because its effect ends work rather than spending.
+  const refuseUncertainInput=(projectId:unknown,sessionId:unknown)=>{
+    if(!lifecycle||typeof sessionId!=='string')return;
+    const record=lifecycle.read(projectId,sessionId);
+    if(record.state==='interrupted'&&record.uncertain)
+      throw new HttpError(409,'This session has uncertain interrupted work. Review and acknowledge it before sending or queueing new owner input.');
+  };
   const lifecycleService=lifecycle?new SessionLifecycleService(lifecycle,{
     // Asked before a dispatching action writes anything, so an instance that cannot dispatch refuses
     // without claiming a revision. It performs no model work and opens no harness: opening one would
@@ -1198,7 +1213,7 @@ export async function createApp(options:AppOptions){
             // like every other route, behind the same Host check, with the same origin/CSRF
             // enforcement for writes. The session a write acts on is the one in the path; the body
             // carries only the revision it read and, for a pause, an optional reason.
-            const lifecycleRoute=path.match(/^\/api\/sessions\/([A-Za-z0-9][A-Za-z0-9._:-]{0,159})\/lifecycle(?:\/(reconnect|resume|retry|stop|pause))?$/);
+            const lifecycleRoute=path.match(/^\/api\/sessions\/([A-Za-z0-9][A-Za-z0-9._:-]{0,159})\/lifecycle(?:\/(reconnect|resume|retry|stop|pause|acknowledge-uncertainty))?$/);
             if(lifecycleRoute){
               if(!lifecycleService)throw new HttpError(503,'Session lifecycle is unavailable: no durable control store is open');
               const sessionId=lifecycleRoute[1],lifecycleAction=lifecycleRoute[2];
@@ -1212,6 +1227,34 @@ export async function createApp(options:AppOptions){
                 json({lifecycle:lifecycleService.read(projectId,sessionId)});return;
               }
               if(req.method!=='POST')throw new HttpError(405,'Method not allowed');
+              if(lifecycleAction==='acknowledge-uncertainty'){
+                if(!lifecycle||!sessions)throw new HttpError(503,'Session lifecycle is unavailable: no durable control store is open');
+                const lifecycleStore=lifecycle;
+                const sessionRegistry=sessions;
+                const data=parseBody(z.strictObject({projectId:z.unknown(),revision:z.unknown()}),payload,'The uncertainty acknowledgement');
+                const project=catalog.projects.find(candidate=>candidate.id===String(data.projectId));
+                if(!project)throw new HttpError(404,'Project not found');
+                sessionRegistry.read(data.projectId,sessionId);
+                await agents.assertSessionAliasAvailable(project,sessionId);
+                let acknowledged;
+                try{
+                  acknowledged=await lifecycleStore.acknowledgeUncertainty({projectId:data.projectId,sessionId,revision:data.revision,actor:'owner'},async({record:current})=>{
+                    if(!current.requestId||!queueStore)return false;
+                    // Pi Durable submission status is not the Pilot queue. Every Pilot entry must
+                    // also be settled or cancelled; claimed, submitted, queued and failed entries
+                    // require explicit owner reconciliation or cancellation first.
+                    const pilotQueue=queueStore.read(data.projectId,sessionId);
+                    if(pilotQueue.entries.some(entry=>entry.state!=='settled'&&entry.state!=='cancelled'))return false;
+                    const proof=await agents.readOriginalSubmissionStatus(project,sessionId,current.requestId);
+                    return (proof.status==='done'||proof.status==='unanswered')&&proof.conversationIdle===true&&proof.queuedSubmissions===0;
+                  });
+                }catch(error){
+                  if(error instanceof SessionLifecycleError&&error.code==='NEEDS_ATTENTION')
+                    throw new HttpError(409,'The original submission and Pilot queue could not be verified as terminal, idle and clear. Open the interrupted conversation in Agents and wait until it is idle. Clear queued or failed Pilot entries, release then cancel claimed entries, and reconcile submitted entries before trying again. Nothing was acknowledged.');
+                  throw error;
+                }
+                json({lifecycle:acknowledged,dispatched:false,outcome:'acknowledged'});return;
+              }
               const data=parseBody(z.strictObject({projectId:z.unknown(),revision:z.unknown().optional(),reason:z.unknown().optional()}),payload,'The lifecycle request');
               const lifecycleProject=catalog.projects.find(candidate=>candidate.id===String(data.projectId));
               if(lifecycleProject)await agents.assertSessionAliasAvailable(lifecycleProject,sessionId);
@@ -1244,6 +1287,7 @@ export async function createApp(options:AppOptions){
               if(queueProject)await agents.assertSessionAliasAvailable(queueProject,sessionId);
               sessions.read(projectId,sessionId);
               const queueScope={projectId,sessionId};
+              if(['append','edit','reorder','remove','clear','claim','submit'].includes(queueOperation??''))refuseUncertainInput(projectId,sessionId);
               // A fork's child transcript is a forked conversation of its own, and this project's queue
               // dispatcher submits into the project's root conversation. A child's queued input would
               // therefore reach the wrong transcript entirely, so claiming or submitting one is refused
@@ -1628,6 +1672,7 @@ export async function createApp(options:AppOptions){
             }).parse(payload);
             // The per-message count is a domain refusal with its own reason and code, like every other
             // media refusal: it is refused before any id is resolved, so nothing is looked up for it.
+            refuseUncertainInput(p.id,data.sessionId);
             const attached=data.images??[];
             if(attached.length>MAX_IMAGES_PER_MESSAGE)
               throw new HttpError(422,tooManyImagesReason(attached.length),TOO_MANY_IMAGES_CODE);
@@ -1641,6 +1686,7 @@ export async function createApp(options:AppOptions){
           }
           if(agentsRoute[2]==='answer'&&req.method==='POST'){
             const data=z.strictObject({sessionId:z.string().min(1).max(200).optional(),questionId:z.string().min(1).max(100),text:z.string().min(1).max(4000)}).parse(payload);
+            refuseUncertainInput(p.id,data.sessionId);
             json(await agents.answer(p,data));return;
           }
           if(agentsRoute[2]==='dismiss'&&req.method==='POST'){

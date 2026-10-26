@@ -12,7 +12,7 @@ async function waitFor<T>(check: () => Promise<T | undefined>, timeoutMs = 10000
   const until = Date.now() + timeoutMs;
   for (;;) {
     const value = await check();
-    if (value !== undefined) return value;
+    if (value !== undefined && value !== false) return value;
     if (Date.now() > until) throw Error(label);
     await sleep(25);
   }
@@ -22,7 +22,7 @@ async function waitFor<T>(check: () => Promise<T | undefined>, timeoutMs = 10000
  * A disposable instance with a durable control store when `durable` is true. The cancellation
  * seams are test-only harness options: the tool's own parameters never carry a delay.
  */
-async function instance(root: string, options: { durable?: boolean; beforeWriteMs?: number; afterWriteMs?: number; onExecute?: () => void; pauseMs?: number } = {}) {
+async function instance(root: string, options: { durable?: boolean; beforeWriteMs?: number; afterWriteMs?: number; onExecute?: () => void; pauseMs?: number; onModelRequest?: (input: { provider: string; modelId: string; maxTokens: number }) => void } = {}) {
   const security = localConfig('http://127.0.0.1:0');
   const control = options.durable ? new ControlStore(root) : undefined;
   const created = await createApp({
@@ -30,6 +30,7 @@ async function instance(root: string, options: { durable?: boolean; beforeWriteM
     ...(options.beforeWriteMs === undefined ? {} : { recordNoteDelayMs: options.beforeWriteMs }),
     ...(options.afterWriteMs === undefined ? {} : { recordNoteAfterWriteMs: options.afterWriteMs }),
     ...(options.onExecute === undefined ? {} : { recordNoteStarted: options.onExecute }),
+    ...(options.onModelRequest === undefined ? {} : { onModelRequest: options.onModelRequest }),
     ...(control ? { control } : {})
   });
   if (control) {
@@ -212,6 +213,64 @@ test('a stream disconnect neither cancels the run nor duplicates the work', asyn
   }
 });
 
+test('a stop withdraws a queued follow-up so it is never dispatched, and the durable record agrees', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pilot-cancel-queued-inputs-'));
+  const requests: string[] = [];
+  let app = await instance(root, { durable: true, pauseMs: 5000, onModelRequest: input => { requests.push(input.modelId); } });
+  try {
+    const named = await app.created.sessions!.create({ projectId: app.project.id, name: 'Queued inputs' });
+    assert.equal((await app.send({ sessionId: named.id, text: '[pause] hold the first turn', mode: 'followUp' })).status, 200);
+    await waitFor(async () => (await app.view(named.id)).view.working ? true : undefined, 5000, 'the first run did not start');
+    // A follow-up sent while the run is working is queued behind it, not dispatched.
+    assert.equal((await app.send({ sessionId: named.id, text: '[note queued behind the run]', mode: 'followUp' })).status, 200);
+    const busy = await waitFor(async () => {
+      const current = await app.view(named.id);
+      return current.view.inbox.some((item: any) => String(item.text).includes('queued behind')) ? current.view : undefined;
+    }, 5000, 'the queued input did not appear in the inbox');
+    assert.equal(users(busy).length, 1, 'the queued follow-up is not a transcript entry until it is dispatched');
+    const beforeStop = requests.length;
+
+    // The interface's Stop is this abort route. It is one recorded outcome, not a resubmission.
+    assert.equal((await fetch(app.base + '/abort', { method: 'POST', headers: app.writes, body: JSON.stringify({ sessionId: named.id }) })).status, 200);
+    const stopped = await waitFor(async () => {
+      const current = await app.view(named.id);
+      return current.view.working ? undefined : current.view;
+    }, 5000, 'the run did not settle after Stop');
+    assert.deepEqual(stopped.inbox, [], 'the queued input was withdrawn');
+    assert.equal(users(stopped).length, 1, 'the withdrawn input never reached the transcript');
+    assert.equal(requests.length, beforeStop, 'cancelling the run dispatched no further model request');
+    assert.equal(toolCalls(stopped).length, 0, 'the queued input never reached the tool');
+    assert.equal(await app.notes(), undefined, 'the queued input wrote nothing');
+    // The settle is a durable write that can follow the view's idle state, so wait for it.
+    const lifecycle = await waitFor(async () => {
+      const record = app.created.lifecycle!.read(app.project.id, named.id);
+      return record.state === 'idle' ? record : undefined;
+    }, 5000, 'the durable lifecycle did not record the settled outcome');
+    assert.equal(lifecycle.state, 'idle', 'the durable lifecycle records the settled outcome');
+
+    // Waiting past the pause cannot resurrect the withdrawn input.
+    await sleep(1000);
+    const later = (await app.view(named.id)).view;
+    assert.equal(later.working, false);
+    assert.equal(requests.length, beforeStop, 'no later dispatch started');
+    assert.equal(users(later).length, 1, 'the withdrawn input was never dispatched');
+    await app.created.close();
+
+    // The transcript and the lifecycle are durable, so a new process reads the same outcome.
+    app = await instance(root, { durable: true, pauseMs: 5000, onModelRequest: input => { requests.push(input.modelId); } });
+    const reopened = await waitFor(async () => {
+      const current = await app.view(named.id);
+      return current.view.entries.length ? current.view : undefined;
+    }, 5000, 'the reopened process did not read the transcript');
+    assert.equal(users(reopened).length, 1, 'the reopened transcript holds the one dispatched input');
+    assert.equal(reopened.inbox.length, 0, 'the withdrawn input did not come back');
+    assert.equal(app.created.lifecycle!.read(app.project.id, named.id).state, 'idle');
+    assert.equal(requests.length, beforeStop, 'the restart dispatched nothing');
+  } finally {
+    if (app.created.server.listening) await app.created.close();
+  }
+});
+
 test('an empty request identity becomes one durable identity, and a malformed one is refused before admission', async () => {
   const root = await mkdtemp(join(tmpdir(), 'pilot-cancel-request-id-'));
   const app = await instance(root, { durable: true });
@@ -302,7 +361,7 @@ test('the test-only note delay is bounded, whole, and needs the explicit test se
   const root = await mkdtemp(join(tmpdir(), 'pilot-cancel-delay-rules-'));
   const security = localConfig('http://127.0.0.1:0');
   const base = { dataRoot: root, browseRoots: [], security, agents: 'on' as const };
-  const saved = { seams: process.env.DASHBOARD_AGENT_TEST_SEAMS, delay: process.env.DASHBOARD_AGENT_NOTE_DELAY_MS };
+  const saved = { seams: process.env.DASHBOARD_AGENT_TEST_SEAMS, delay: process.env.DASHBOARD_AGENT_NOTE_DELAY_MS, afterWrite: process.env.DASHBOARD_AGENT_NOTE_AFTER_WRITE_MS };
   try {
     await assert.rejects(createApp({ ...base, recordNoteDelayMs: 1.5 }), /whole number/);
     await assert.rejects(createApp({ ...base, recordNoteDelayMs: 60001 }), /whole number/);
@@ -310,14 +369,21 @@ test('the test-only note delay is bounded, whole, and needs the explicit test se
     delete process.env.DASHBOARD_AGENT_TEST_SEAMS;
     process.env.DASHBOARD_AGENT_NOTE_DELAY_MS = '10';
     await assert.rejects(createApp({ ...base }), /test-only seam/);
+    delete process.env.DASHBOARD_AGENT_NOTE_DELAY_MS;
+    process.env.DASHBOARD_AGENT_NOTE_AFTER_WRITE_MS = '10';
+    await assert.rejects(createApp({ ...base }), /test-only seam/);
     process.env.DASHBOARD_AGENT_TEST_SEAMS = 'on';
     process.env.DASHBOARD_AGENT_NOTE_DELAY_MS = '1.5';
     await assert.rejects(createApp({ ...base }), /whole number/);
     process.env.DASHBOARD_AGENT_NOTE_DELAY_MS = '60001';
     await assert.rejects(createApp({ ...base }), /whole number/);
+    delete process.env.DASHBOARD_AGENT_NOTE_DELAY_MS;
+    process.env.DASHBOARD_AGENT_NOTE_AFTER_WRITE_MS = '1.5';
+    await assert.rejects(createApp({ ...base }), /whole number/);
   } finally {
     if (saved.seams === undefined) delete process.env.DASHBOARD_AGENT_TEST_SEAMS; else process.env.DASHBOARD_AGENT_TEST_SEAMS = saved.seams;
     if (saved.delay === undefined) delete process.env.DASHBOARD_AGENT_NOTE_DELAY_MS; else process.env.DASHBOARD_AGENT_NOTE_DELAY_MS = saved.delay;
+    if (saved.afterWrite === undefined) delete process.env.DASHBOARD_AGENT_NOTE_AFTER_WRITE_MS; else process.env.DASHBOARD_AGENT_NOTE_AFTER_WRITE_MS = saved.afterWrite;
     await rm(root, { recursive: true, force: true });
   }
 });

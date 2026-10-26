@@ -700,8 +700,11 @@ and changing them remains an owner decision. See [Attention](ATTENTION.md).
 - Approvals: show kind, exact target, scope, expiry and whether it is pending, consumed,
   revoked or expired. Consuming performs nothing by itself; say so.
 - Failures: show the provider or run reason, and offer `retry` only for a failed session.
-- Interrupted: show the reason and `uncertain`; offer `resume` only where it is safe, and
-  name the operator-attention case instead of replaying.
+- Interrupted: show the reason and `uncertain`; offer `resume` only where it is safe. For
+  uncertainty, offer explicit owner acknowledgement only after the exact original submission is
+  terminal, the conversation is idle, Pi Durable has no queued submissions, and Pilot queue entries
+  are all `settled` or `cancelled`. Tell the owner to review the conversation and affected files;
+  acknowledgement does not undo or replay the effect.
 - Push notifications deep-link to the exact attention item, not only the project.
 - Sort by severity, then age, then a deterministic id tie-break. Page the list with these
   conservative limits (proposed defaults, not implemented): 20 items per page, a stable cursor,
@@ -715,9 +718,10 @@ and changing them remains an owner decision. See [Attention](ATTENTION.md).
   count query reports the exact open count, including when it is above the 100-item list cap,
   and the list states when it is capped.
 - An expired or consumed approval cannot be consumed again and says why.
-- An uncertain interrupted run offers no replay; the refusal is visible.
-- No attention action dispatches a model request except `resume` or `retry`, as already
-  specified.
+- An uncertain interrupted run offers no replay; it offers acknowledgement after verified terminal,
+  idle, queue-free proof. The owner sees that the effect is not undone and that review is required.
+- Acknowledgement and all attention reads dispatch no model request. Only explicit `resume` or
+  `retry` may dispatch, under their existing lifecycle rules.
 - Browser tests cover all four kinds and the deep link.
 
 **Risks**
@@ -757,7 +761,8 @@ and changing them remains an owner decision. See [Attention](ATTENTION.md).
   attributed to neither, while a unique UUID session is attributed only to its own project and a
   foreign project's consume is refused; an open question that leaves after an answer and a dismissed
   question whose reason stays in the transcript; a failed session offering `retry`, an uncertain
-  interruption offering no action and refusing `resume` with the operator-attention refusal; a fresh
+  interruption offering acknowledgement but no replay action and refusing `resume` with operator
+  attention; a fresh
   process reading attention twice with the transcript and its sidecars byte-identical; a stale cursor
   after a consumption; an unreadable transcript reported as `unavailable` with `complete: false`
   rather than as no questions; a synthetic transcript whose head marker hides an older question and
@@ -768,8 +773,7 @@ and changing them remains an owner decision. See [Attention](ATTENTION.md).
   ids are unchanged: `1` still exists in every project, which is exactly why it proves nothing.
 - `tests/browser/attention.spec.ts` (4 tests, 390×844) covers all four kinds in severity order with
   the exact `4 open` count, only `GET` requests while the panel opens, no approval nonce or path in
-  the panel, the uncertain item's visible operator-attention refusal and no `Resume`, the full
-  exact approval target before an explicit consumption (which says it performs nothing), `Retry`
+  the panel, the uncertain item's review prompt and no `Resume`, successful explicit acknowledgement after terminal, idle, queue-free proof, the full exact approval target before an explicit consumption (which says it performs nothing), `Retry`
   for a failure, opening the exact question, Back closing the layer and staying in the app, a
   push-style `&attention=question:<id>` deep link, a 25-approval project paging 20 then 25 with the
   count unchanged and the proposed-defaults note, an unreadable transcript that makes the badge say
@@ -937,6 +941,11 @@ deterministic delays are host-only test seams.
 - A crash during `appendFile` can leave a complete or partial line. The same interrupted/uncertain
   rule applies; this build does not add a write-ahead journal, a temporary file swap or an
   automatic reconciliation of note text.
+- **A reported post-append replay in Step 10 was a test fault, not a harness window.** The first
+  version of that test did not wait for the append (`false` is not `undefined`), so the kill could
+  precede it and the restart performed the only append. The corrected test waits for the append,
+  kills immediately, and observes `interrupted` and one line. The report is withdrawn; see Step 10's
+  *Evidence*.
 - SIGKILL still leaves `service.lock`, so the next start fails closed until an operator clears it.
   The test deliberately proves that refusal rather than weakening it.
 - A cancellation that lands after the tool's final check but before the harness settles is a race:
@@ -1144,17 +1153,19 @@ milestone does not give it one.
 
 ### Step 9 — Bounded, owner-created workers (worker model enforcement lives here)
 
-**Status: Partial — approved W1 slice built; the owner has not accepted it.** The owner-approved
-first slice is in this worktree: owner-created workers, a pinned model from the Step 8 policy with
-no fallback, fixed budgets (3 live workers per project, 1 active run per project, 8 model turns,
-4096 output tokens per turn), owner-only routes, a minimal phone interface, cooperative revocation
-and stop, a durable fenced project lease, startup recovery that never replays, and canonical
-Markdown reports at `docs/workers/<workerId>/<runId>.md`. Model turns run in the application's Pi
-Durable harness; the runner is unchanged. There is no queue, no coding job, no job request, no
-auto-accept and no agent-created worker. See [Workers](WORKERS.md) for the exact contract.
+**Status: Partial — W1 accepted as Stop-only at local commit `80b1bea`; the rest of Step 9 is not
+built.** The owner accepted the W1 slice in this worktree at local commit `80b1bea`, limited to
+**Stop only**: owner-created workers, a pinned model from the Step 8 policy with no fallback, fixed
+budgets (3 live workers per project, 1 active run per project, 8 model turns, 4096 output tokens
+per turn), owner-only routes, a minimal phone interface, cooperative revocation and stop, a durable
+fenced project lease, startup recovery that never replays, and canonical Markdown reports at
+`docs/workers/<workerId>/<runId>.md`. Model turns run in the application's Pi Durable harness; the
+runner is unchanged. There is no queue, no coding job, no job request, no auto-accept and no
+agent-created worker. See [Workers](WORKERS.md) for the exact contract.
 
-This is **not** an owner acceptance, and it is not the whole of Step 9. The remaining scope is
-stated under *Still open in W1* below.
+The owner also approved proceeding with **tests and hardening only**; this approval adds no new
+worker feature. It does **not** claim acceptance on a real phone or through a tunnel, and it is
+**not** the whole of Step 9. The remaining scope is stated under *Still open in W1* below.
 
 **Required work**
 
@@ -1286,9 +1297,11 @@ stated under *Still open in W1* below.
 
 ### Step 10 — Disconnect, cancel and crash tests
 
-**Status: Partial.** There is a real kill-mid-tool recovery test and browser coverage for
-sessions and actions. There is no dedicated matrix for disconnect, cancel and crash across
-the new UI states.
+**Status: Partial; local test evidence is in progress and owner acceptance is pending.** Existing
+matrices have named tests for visible states and durable records. New uncertain-recovery cases cover
+a real safe-tool execute checkpoint, SIGKILL recovery, input blocking and explicit verified
+acknowledgement. Final totals and full-batch validation remain for the orchestrator to record after
+its fresh run. No real-phone, tunnel, live-provider or owner acceptance is claimed.
 
 **Required work**
 
@@ -1311,8 +1324,99 @@ the new UI states.
 - No test leaves a server, stream, socket or timer open after it finishes.
 - A failure names the state and the reason.
 
+**Evidence (local).**
+
+- **Disconnect matrix.** `tests/browser/reconnect.spec.ts` keeps the existing drop, `401`, slow
+  first snapshot and session-switch cases, and adds two: a reload while the network is down shows
+  `server-error`, sends only `GET`, and recovers through the owner's **Reconnect** to one live
+  view with no message; two tabs keep exactly one stream request each, one send reaches both
+  transcripts once with zero input requests from the second tab, and closing one leaves the other
+  live with no second subscription. `tests/unit/stream.test.ts` adds a network-failure case: every
+  attempt is a `GET`, the client stops after the initial attempt plus `maxAttempts` retries,
+  reports `offline` with the bounded-attempt sentence, and no snapshot is invented. The bounded
+  backoff, stable-budget reset and late-generation cases stay in the existing stream tests.
+  `tests/server/agents.test.ts` adds the server half: two live streams create two subscriptions,
+  closing one disposes exactly one, the survivor receives a new frame with no extra subscription,
+  and the transcript holds one input. The existing no-dispatch and late-subscription-disposal
+  tests still cover the reconnect path.
+- **Cancel matrix.** `tests/browser/agents.spec.ts` still covers the visible side of Stop during a
+  working run with a queued steer. `tests/server/record-note-cancellation.test.ts` keeps the
+  before-write, after-append, named-session pause/stop and stream-disconnect cases, and adds a
+  queued-input case: a follow-up sent while a run works is visible in the inbox and is not a transcript entry;
+  the interface's `Stop` route withdraws it, dispatches no further model request, writes no note,
+  settles the lifecycle to `idle`, and a closed-and-reopened process still holds one input, an
+  empty inbox and `idle`. The existing worker tests already prove Stop is the only supported
+  outcome: stop before the effect writes nothing, stop after keeps the report, a second stop is
+  `terminal`/`unchanged`, and `pause`/`resume` are `409` with nothing written.
+- **Crash matrix.** `tests/server/recovery.test.ts` keeps the real SIGKILL mid-tool test and adds
+  two on the same disposable-root, same-bundle harness. The mid-tool case now waits read-only for
+  the tool's durable `execute` checkpoint before the kill, so the pre-write window is deterministic:
+  - a kill immediately after the append, with no checkpoint wait and no sleep (the pre-write
+    checkpoint wait is deliberately not used here). The next start
+    refuses the retained lock until it is deliberately removed, adopts the named session as
+    `interrupted`/`uncertain` with its reason and identity, refuses `resume` with operator
+    attention, reports the tool `interrupted`, and leaves exactly one line. The test's wait uses
+    `true`/`undefined`; an earlier version used `false`, which the helper treated as a result, so a
+    kill could land before the append and the restarted process performed the only append. That
+    looked like a replay but was one execution. The corrected test passed 11 isolated runs and the
+    full suites, with one line and `interrupted` every time.
+  - a kill between a queue claim and its submission. The restart keeps one `claimed` entry with
+    the same stable request identity, records `idle` (no false `running`), dispatches nothing, and
+    reconciliation reports `attention`/`submission-not-readable`, then refreshes the same named
+    reason. A failed entry is never re-sent.
+- **Waiting helpers.** Every test waiting helper now skips a `false` result, so a condition that
+  returns `false` keeps waiting instead of ending at once. This is the fault that produced the
+  withdrawn replay report.
+- **Seam.** `DASHBOARD_AGENT_NOTE_AFTER_WRITE_MS` joins the existing pre-write seam in
+  `src/server/agent-test-seams.ts`. Both need `DASHBOARD_AGENT_TEST_SEAMS=on`, are whole
+  milliseconds from 0 to 60000, are validated by the entrypoint before the data root is touched
+  and again by `createApp`, and are unreachable from a model, provider, tool argument or HTTP
+  request. An ordinary deployment leaves them unset. `tests/server/entrypoint.test.ts` proves the
+  post-append value refuses a start before the data root exists, both without the test switch and
+  out of range.
+- **Correction to an earlier report in this worktree.** An unsafe-append replay was reported here
+  after a run returned `Recorded:` from the restarted process. That run came from a test wait that
+  did not wait: its condition returned `false`, and `false` is not `undefined`, so the helper
+  returned immediately and the kill could precede the append. The restarted process then performed
+  the only append. The test helpers now skip `false`. The report is withdrawn: no duplicate append
+  and no unsafe replay was observed with the corrected condition, and `record_note` remains
+  `replay: 'unsafe'`.
+- **Recovery gates and actual harness order.** Pi Durable commits a tool call's intent before
+  `execute()` runs. `tests/server/uncertain-recovery-gates.test.ts` (3 integration tests) covers
+  blocked uncertain admission, SIGKILL after an unsafe append with zero recovery provider calls,
+  and SIGKILL at a registered safe `read_notes` execute checkpoint with zero execute-body calls.
+  The checkpoint case uses the typed `createApp`-only `readNotesSeam` to observe and delay the real
+  safe tool body; `createApp` validates the delay before catalog initialization. Recovery can
+  journal and terminalize blocked scheduler work without a model request. These process-kill tests
+  do not simulate power loss, and this build makes no exactly-once claim for power loss or torn writes.
+- **Uncertain work gate and owner acknowledgement.** Uncertain named and root lifecycle state blocks
+  model requests and tool execution. Recovery can journal and terminalize the blocked scheduler task
+  without a provider call. A cold acknowledgement check does not open the harness: the owner must
+  open the interrupted conversation in Agents and wait until it is idle. The dedicated owner action
+  also requires an empty Pi Durable queue and Pilot queue entries only in `settled` or `cancelled`
+  states; queued/failed entries need owner resolution, claimed entries need release then cancel, and
+  submitted entries need reconciliation. It verifies the original identity is terminal and writes an audited
+  lifecycle acknowledgement. It retains the original request identity and unsafe intent, and never
+  replays or undoes the effect. These tests do not prove exactly-once behavior under power loss,
+  torn writes or other filesystem failures. The owner has not accepted this phone workflow.
+- `readFile`/`appendFile` cannot be interrupted deterministically inside `write(2)`, so "mid-write"
+  is the post-append, pre-settle window, not a claim about a torn write.
+- Fresh local validation: the exact worktree-local TypeScript and Svelte checks pass (0 errors,
+  0 warnings); Vite and the server bundle build successfully. The full unit/server batch passes
+  **586 tests** and exits normally. All **85 Playwright tests** pass against the fresh build in
+  two sequential shards (`--shard=1/2`: 49; `--shard=2/2`: 36). A fresh unsharded browser run hit
+  its 120-second bound after 48 passing cases; its leftover disposable test server was terminated,
+  and that incomplete run is not passing evidence. Earlier unit/server runs hit their bounded
+  timeout while the recovery integration and worker-extension wiring were incomplete; they are
+  not passing evidence. The corrected full unit/server batch exits in about 20 seconds. Automated phone-sized scenarios do not claim owner phone or
+  tunnel acceptance. No install, live provider, real project, remote call, push or deployment
+  was made.
+
 **Risks**
 
+- A crash between the append and the process's own observation of it cannot be reproduced by an
+  outside test with absolute precision; the test asserts the documented post-append condition and
+  the durable `interrupted` result. The guarantee is for process death (SIGKILL), not power loss.
 - Timing-based browser tests can flake. Mitigation: assert states and records, not sleeps;
   use Playwright's own waiting.
 - A crash test can leave a stale lock. Mitigation: each case uses a disposable root and an
@@ -1368,7 +1472,9 @@ Repository evidence in this worktree:
 - `docs/ARCHITECTURE.md`, `docs/SESSIONS.md`, `docs/RECOVERY.md`, `docs/QUEUE.md`,
   `docs/RUNNER.md` — invariants and existing acceptance rules.
 - `tests/server/agents.test.ts`, `tests/server/recovery.test.ts`,
-  `tests/browser/session-ux.spec.ts`, `tests/browser/agents.spec.ts` — current coverage.
+  `tests/server/record-note-cancellation.test.ts`, `tests/unit/stream.test.ts`,
+  `tests/browser/reconnect.spec.ts`, `tests/browser/session-ux.spec.ts`,
+  `tests/browser/agents.spec.ts` — current coverage, including the Step 10 matrices.
 
 Pocket source evidence (paths relative to the Pi Pocket repository):
 

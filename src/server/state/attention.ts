@@ -199,7 +199,7 @@ export function buildAttention(input: AttentionBuildInput): AttentionBuildResult
             sessionId: record.sessionId,
             at: instant(record.activityAt),
             context: reason,
-            actions: record.uncertain ? actionsOf() : actionsOf('resume'),
+            actions: record.uncertain ? actionsOf('acknowledge-uncertainty') : actionsOf('resume'),
             lifecycleRevision: record.revision,
             reason,
             uncertain: record.uncertain

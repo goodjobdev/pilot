@@ -16,7 +16,7 @@ async function waitFor<T>(check: () => Promise<T | undefined>, timeoutMs = 10000
   const until = Date.now() + timeoutMs;
   for (;;) {
     const value = await check();
-    if (value !== undefined) return value;
+    if (value !== undefined && value !== false) return value;
     if (Date.now() > until) throw Error('condition was not met in time');
     await sleep(50);
   }
@@ -959,6 +959,63 @@ test('P0: the legacy numeric session still works as before (conversationIdOf pat
     assert.ok(assistantReplies.some((r: any) => r.text?.includes('legacy message')), 'legacy root conversation works after restart');
   } finally {
     if (app) await app.created.close();
+  }
+});
+
+test('two live streams hold one subscription each, and closing one leaves the other subscribed and dispatch-free', { timeout: 10000 }, async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agents-stream-two-tabs-'));
+  const app = await instance('on', root);
+  const original = app.created.agents.subscribe.bind(app.created.agents);
+  let subscribes = 0, disposed = 0;
+  app.created.agents.subscribe = async (...args: Parameters<typeof original>) => {
+    subscribes += 1;
+    const close = await original(...args);
+    return async () => { disposed += 1; await close(); };
+  };
+  /** Read from one stream until a chunk holds the text, so the test waits on a frame, not on a sleep. */
+  const readUntil = async (reader: ReadableStreamDefaultReader<Uint8Array>, text: string) => {
+    const decoder = new TextDecoder();
+    let seen = '';
+    for (let index = 0; index < 100; index += 1) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      seen += decoder.decode(value, { stream: true });
+      if (seen.includes(text)) return seen;
+    }
+    throw new Error('the stream never carried ' + text);
+  };
+  try {
+    const first = await fetch(app.base + '/stream', { headers: app.token });
+    assert.equal(first.status, 200);
+    const firstReader = first.body!.getReader();
+    const second = await fetch(app.base + '/stream', { headers: app.token });
+    assert.equal(second.status, 200);
+    const secondReader = second.body!.getReader();
+    await waitFor(async () => subscribes === 2 ? true : undefined);
+
+    // Closing one tab disposes exactly its own subscription and leaves the other one in place.
+    await firstReader.cancel();
+    await waitFor(async () => disposed === 1 ? true : undefined);
+    assert.equal(subscribes, 2, 'the surviving stream did not open a second subscription');
+
+    const sent = await fetch(app.base + '/input', {
+      method: 'POST',
+      headers: app.writes,
+      body: JSON.stringify({ text: 'seen by the remaining tab', mode: 'followUp' })
+    });
+    assert.equal(sent.status, 200);
+    const frame = await readUntil(secondReader, 'seen by the remaining tab');
+    assert.match(frame, /seen by the remaining tab/);
+    assert.equal(subscribes, 2, 'a frame needs no additional subscription');
+    assert.equal(disposed, 1);
+
+    await secondReader.cancel();
+    await waitFor(async () => disposed === 2 ? true : undefined);
+    const current = (await app.view()).view;
+    assert.equal(current.entries.filter((entry: { kind: string }) => entry.kind === 'user').length, 1, 'closing a stream dispatched nothing and duplicated nothing');
+    assert.equal(current.working, false);
+  } finally {
+    await app.created.close();
   }
 });
 

@@ -310,6 +310,36 @@ test('a silent transport goes stale and then reconnects', async () => {
   assert.equal(h.views[0].partial, 'after-stale');
 });
 
+test('a network failure retries a bounded number of times, GET only, then reports offline', async () => {
+  const h = harness();
+  const methods: string[] = [];
+  const lifetime = new AbortController();
+  await openAgentStream({
+    projectId: 'p',
+    signal: lifetime.signal,
+    fetchImpl: async (_input, init) => {
+      methods.push(init?.method ?? 'GET');
+      throw new TypeError('fetch failed: the network is unreachable');
+    },
+    minDelayMs: 2,
+    maxDelayMs: 4,
+    maxAttempts: 3,
+    random: () => 0,
+    onView: next => h.views.push(next),
+    onStatus: status => h.statuses.push(status)
+  });
+  assert.equal(methods.length, 4, 'the initial attempt and three bounded retries');
+  assert.deepEqual([...new Set(methods)], ['GET'], 'a reconnect never sends anything but a GET');
+  assert.equal(h.views.length, 0, 'no snapshot was invented from a failed request');
+  assert.equal(h.statuses.at(-1)?.state, 'offline');
+  assert.equal(h.statuses.at(-1)?.attempt, 4);
+  assert.match(h.statuses.at(-1)?.detail ?? '', /Reconnect when the server is reachable/);
+  // The loop has stopped: no attempt follows the terminal state.
+  await new Promise(resolve => setTimeout(resolve, 25));
+  assert.equal(methods.length, 4, 'the loop stops at the bounded attempt count');
+  lifetime.abort();
+});
+
 test('a snapshot followed immediately by a drop cannot reset the retry budget', async () => {
   const h = harness();
   let calls = 0;

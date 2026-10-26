@@ -463,7 +463,7 @@ test('the session lifecycle routes are owner-only, revision-checked and honest a
  const url=security.origin,token={'x-dashboard-token':security.token},writes={...token,'content-type':'application/json',origin:url};
  const post=(p:string,body:unknown)=>fetch(url+p,{method:'POST',headers:writes,body:JSON.stringify(body)});
  const read=(p:string)=>fetch(url+p,{headers:token});
- const waitFor=async<T>(check:()=>Promise<T|undefined>,timeoutMs=10000):Promise<T>=>{const until=Date.now()+timeoutMs;for(;;){const value=await check();if(value!==undefined)return value;if(Date.now()>until)throw Error('condition was not met in time');await new Promise(res=>setTimeout(res,50));}};
+ const waitFor=async<T>(check:()=>Promise<T|undefined>,timeoutMs=10000):Promise<T>=>{const until=Date.now()+timeoutMs;for(;;){const value=await check();if(value!==undefined&&value!==false)return value;if(Date.now()>until)throw Error('condition was not met in time');await new Promise(res=>setTimeout(res,50));}};
  try{
   const project=await (await post('/api/projects',{name:'Lifecycle',managed:true,confirm:true})).json();
   const session=(await (await post('/api/sessions',{projectId:project.id,name:'Lifecycle session'})).json()).session;
@@ -556,7 +556,7 @@ test('two concurrent retries at one lifecycle revision dispatch one generation, 
  await listen(app,security);
  const url=security.origin,token={'x-dashboard-token':security.token},writes={...token,'content-type':'application/json',origin:url};
  const post=(p:string,body:unknown)=>fetch(url+p,{method:'POST',headers:writes,body:JSON.stringify(body)});
- const waitFor=async<T>(check:()=>Promise<T|undefined>,timeoutMs=10000):Promise<T>=>{const until=Date.now()+timeoutMs;for(;;){const value=await check();if(value!==undefined)return value;if(Date.now()>until)throw Error('condition was not met in time');await new Promise(res=>setTimeout(res,25));}};
+ const waitFor=async<T>(check:()=>Promise<T|undefined>,timeoutMs=10000):Promise<T>=>{const until=Date.now()+timeoutMs;for(;;){const value=await check();if(value!==undefined&&value!==false)return value;if(Date.now()>until)throw Error('condition was not met in time');await new Promise(res=>setTimeout(res,25));}};
  try{
   const project=await (await post('/api/projects',{name:'Retry race',managed:true,confirm:true})).json();
   const session=(await (await post('/api/sessions',{projectId:project.id,name:'Retry race session'})).json()).session;
@@ -609,7 +609,7 @@ test('an owner pause of a genuinely running generation is the only writer at its
  await listen(app,security);
  const url=security.origin,token={'x-dashboard-token':security.token},writes={...token,'content-type':'application/json',origin:url};
  const post=(p:string,body:unknown)=>fetch(url+p,{method:'POST',headers:writes,body:JSON.stringify(body)});
- const waitFor=async<T>(check:()=>Promise<T|undefined>,timeoutMs=10000):Promise<T>=>{const until=Date.now()+timeoutMs;for(;;){const value=await check();if(value!==undefined)return value;if(Date.now()>until)throw Error('condition was not met in time');await new Promise(res=>setTimeout(res,25));}};
+ const waitFor=async<T>(check:()=>Promise<T|undefined>,timeoutMs=10000):Promise<T>=>{const until=Date.now()+timeoutMs;for(;;){const value=await check();if(value!==undefined&&value!==false)return value;if(Date.now()>until)throw Error('condition was not met in time');await new Promise(res=>setTimeout(res,25));}};
  try{
   const project=await (await post('/api/projects',{name:'Pause race',managed:true,confirm:true})).json();
   // The named session the harness's own lifecycle hooks record against: Pi's reserved root

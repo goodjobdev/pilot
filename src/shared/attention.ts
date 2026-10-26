@@ -49,7 +49,7 @@ export const ATTENTION_LIMITS = Object.freeze({
 });
 
 /** What a person can do with one item. Every entry names an explicit owner action, never a read. */
-export const ATTENTION_ACTIONS = ['open', 'consume', 'revoke', 'retry', 'resume'] as const;
+export const ATTENTION_ACTIONS = ['open', 'consume', 'revoke', 'retry', 'resume', 'acknowledge-uncertainty'] as const;
 export type AttentionAction = (typeof ATTENTION_ACTIONS)[number];
 
 export interface AttentionItemBase {

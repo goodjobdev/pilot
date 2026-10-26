@@ -87,9 +87,18 @@ the agent's own choices).
   use a request id derived from the question, so a retry cannot answer twice, and an
   already-answered question is refused.
 - **Interruption.** A tool is either safe to replay or not. After a crash, an unsafe tool
-  returns an interrupted result to the model instead of running again; a safe tool may rerun.
-- **Resumption.** Opening a harness resumes unfinished work from its checkpoint, which is how
-  a run survives the process that started it.
+  returns an interrupted result to the model instead of running again. A safe tool may rerun only
+  when the owning session is not marked uncertain. Uncertain lifecycle guards block model requests
+  and tool execution for named and root conversations. Recovery can journal and terminalize a
+  blocked scheduler task without making a model request.
+- **Resumption.** Opening a harness can resume unfinished work from its checkpoint only when the
+  uncertainty guards permit it. An uncertain interruption is not automatically continued. The
+  owner must review the conversation and project files, then acknowledge only after the exact
+  original submission is terminal, the conversation is idle and no submission is queued. A cold
+  acknowledgement check does not open the harness; the owner must first open the conversation in
+  Agents and wait for it to settle. Acknowledgement retains the original request identity and unsafe
+  tool intent, clears lifecycle uncertainty, and dispatches nothing. It does not undo effects or
+  establish exactly-once execution.
 - **Named sessions.** Each project's conversation is adopted into a durable, project-scoped
   session registry: a stable id, an owner-visible name, created and updated times, an optional
   *declared* model choice, and links to a board task, a documentation path or spec reference, and a
@@ -114,8 +123,9 @@ the agent's own choices).
   `terminal`/`dispatched:false` instead of claiming new work, `retry` starts a **new attempt with a
   new identity** only for a failed session, `stop` cancels idempotently, and `pause` cancels but
   keeps a still-pending session resumable. Only `resume` and `retry` may dispatch a model request,
-  and only for pending or new work; an uncertain interruption is refused with operator attention
-  rather than replayed. See [Session recovery](RECOVERY.md).
+  and only for pending or new work. An uncertain interruption blocks model and tool execution until
+  explicit owner acknowledgement proves terminal status, idle conversation and an empty queue.
+  Acknowledgement does not replay or undo the original effect. See [Session recovery](RECOVERY.md).
 
 ## The alert model
 

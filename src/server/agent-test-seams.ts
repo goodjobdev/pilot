@@ -1,9 +1,11 @@
 /**
  * The test-only `record_note` delay seams.
  *
- * These values open deterministic cancellation windows in tests. They are never reachable from a
- * model, a provider, a tool argument or an HTTP request. The environment form additionally needs
- * `DASHBOARD_AGENT_TEST_SEAMS=on`, so an ordinary deployment cannot enable it with one variable.
+ * These values open deterministic cancellation windows in tests: `beforeWriteMs` holds the call
+ * before the append and `afterWriteMs` holds it after the append, before the harness settles. They
+ * are never reachable from a model, a provider, a tool argument or an HTTP request. The environment
+ * form additionally needs `DASHBOARD_AGENT_TEST_SEAMS=on`, so an ordinary deployment cannot enable
+ * it with one variable.
  *
  * The same validator is used by the entrypoint before it creates the data root and by `createApp`,
  * so a bad value fails closed on startup and a direct caller cannot bypass the bound.
@@ -39,7 +41,7 @@ export function resolveNoteDelaySeams(
       ? noteDelayFromEnvironment(env, 'DASHBOARD_AGENT_NOTE_DELAY_MS')
       : noteDelayMs(options.recordNoteDelayMs, 'recordNoteDelayMs'),
     recordNoteAfterWriteMs: options.recordNoteAfterWriteMs === undefined
-      ? 0
+      ? noteDelayFromEnvironment(env, 'DASHBOARD_AGENT_NOTE_AFTER_WRITE_MS')
       : noteDelayMs(options.recordNoteAfterWriteMs, 'recordNoteAfterWriteMs')
   });
 }

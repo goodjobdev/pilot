@@ -22,7 +22,7 @@ import { SessionLifecycleStore } from '../../src/server/state/session-lifecycle'
 import { newTask } from '../../src/shared/model';
 
 /** The entrypoint validates the whole environment, so a test must not inherit deployment values. */
-const DEPLOYMENT_VARIABLES=['DASHBOARD_MODE','DASHBOARD_EXPOSURE','DASHBOARD_BIND','DASHBOARD_ALLOWED_HOSTS','DASHBOARD_RELEASE','DASHBOARD_RELEASE_MANIFEST','DASHBOARD_ROOT_ID','DASHBOARD_SHUTDOWN_DEADLINE_MS','DASHBOARD_ORIGIN','CF_ACCESS_TEAM','CF_ACCESS_AUD','DASHBOARD_OWNER','DASHBOARD_DATA','DASHBOARD_ROOTS','DASHBOARD_REGISTRY','DASHBOARD_AGENT_TEST_SEAMS','DASHBOARD_AGENT_NOTE_DELAY_MS','PORT'];
+const DEPLOYMENT_VARIABLES=['DASHBOARD_MODE','DASHBOARD_EXPOSURE','DASHBOARD_BIND','DASHBOARD_ALLOWED_HOSTS','DASHBOARD_RELEASE','DASHBOARD_RELEASE_MANIFEST','DASHBOARD_ROOT_ID','DASHBOARD_SHUTDOWN_DEADLINE_MS','DASHBOARD_ORIGIN','CF_ACCESS_TEAM','CF_ACCESS_AUD','DASHBOARD_OWNER','DASHBOARD_DATA','DASHBOARD_ROOTS','DASHBOARD_REGISTRY','DASHBOARD_AGENT_TEST_SEAMS','DASHBOARD_AGENT_NOTE_DELAY_MS','DASHBOARD_AGENT_NOTE_AFTER_WRITE_MS','PORT'];
 function testEnv(overrides:NodeJS.ProcessEnv):NodeJS.ProcessEnv {
   const env:{[name:string]:string|undefined}={...process.env};
   for(const name of DEPLOYMENT_VARIABLES)delete env[name];
@@ -76,7 +76,7 @@ async function waitFor<T>(check:()=>Promise<T|undefined>,timeoutMs=10000):Promis
  const until=Date.now()+timeoutMs;
  for(;;){
   const value=await check();
-  if(value!==undefined)return value;
+  if(value!==undefined&&value!==false)return value;
   if(Date.now()>until)throw Error('condition was not met in time');
   await sleep(100);
  }
@@ -93,7 +93,9 @@ test('an invalid test-only note delay refuses before the data root is created', 
   const root=await releaseRoot();
   const cases=[
     { label: 'missing test switch', env: { DASHBOARD_AGENT_NOTE_DELAY_MS: '10' }, message: /test-only seam/ },
-    { label: 'out of range', env: { DASHBOARD_AGENT_TEST_SEAMS: 'on', DASHBOARD_AGENT_NOTE_DELAY_MS: '60001' }, message: /whole number/ }
+    { label: 'out of range', env: { DASHBOARD_AGENT_TEST_SEAMS: 'on', DASHBOARD_AGENT_NOTE_DELAY_MS: '60001' }, message: /whole number/ },
+    { label: 'post-append seam without its switch', env: { DASHBOARD_AGENT_NOTE_AFTER_WRITE_MS: '10' }, message: /test-only seam/ },
+    { label: 'post-append seam out of range', env: { DASHBOARD_AGENT_TEST_SEAMS: 'on', DASHBOARD_AGENT_NOTE_AFTER_WRITE_MS: '-1' }, message: /whole number/ }
   ];
   try {
     for (const [index, one] of cases.entries()) {

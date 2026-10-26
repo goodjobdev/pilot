@@ -3,6 +3,12 @@
 This page describes the **first approved slice** of Step 9. It is deliberately small. The
 owner approved these decisions; they are recorded here before the code that implements them.
 
+**Approval status.** The owner accepted this W1 slice at local commit `80b1bea`, **Stop only**, and
+approved further work on tests and hardening only. That approval adds no worker feature beyond this
+page: no queue, no resume, no pause, no coding job, no agent-created worker. It is a local
+acceptance of the committed code and its tests; it does **not** claim acceptance on a real phone or
+through a tunnel, and it does not accept a real provider run.
+
 A worker is a durable, owner-created record with a pinned model, an explicit scope allowlist
 and fixed budgets. A worker **run** is one bounded model conversation in the application's
 harness that produces one canonical Markdown report. A worker is not an agent that can create
@@ -181,7 +187,13 @@ index admits only one.
   file's hash and size, and no model work is repeated.
 - Canonical Markdown is not a signature. An owner who edits the project can forge a matching
   header; this build discloses that and does not claim cryptographic proof. The hash and size in
-  the tracking record show that a finished report changed.
+  the tracking record show that a finished report changed. **The integrity reading is a change
+  marker, not a signature and not a protection at rest.**
+- **Worker state is not encrypted at rest.** Reports, the control store (`control.sqlite`) and the
+  worker conversations in the project's agent SQLite file are ordinary files readable by the same
+  user and by a same-container shell, exactly as `docs/SECURITY.md` states for the rest of the
+  application. The worker limit is authority and scope, not file encryption. Reports are
+  working evidence in the project and follow the project's own permissions.
 - The worker view reports a bounded integrity reading for the newest **20** reports: intact,
   changed, missing or unsafe. A changed report is shown as an owner-visible warning in the run
   view and the interface; it is never only a log line. Older reports are not scanned by that view,

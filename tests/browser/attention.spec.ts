@@ -66,6 +66,8 @@ test('attention ranks all four kinds on a phone, is read-only, and resolves only
   await waitForAgentIdle(page, projectId, failedSession.session.id);
   // One named session that was running when its process went away: an uncertain interruption.
   const interruptedSession = (await api(page, '/sessions', 'POST', { projectId, name: 'Interrupted attention run' })).body as { session: { id: string } };
+  await api(page, '/projects/' + projectId + '/agents/input', 'POST', { text: 'completed original request', mode: 'followUp', requestId: 'ack-terminal-request', sessionId: interruptedSession.session.id });
+  await waitForAgentIdle(page, projectId, interruptedSession.session.id);
 
   const root = await browserDataRoot();
   const control = new ControlStore(root);
@@ -73,7 +75,9 @@ test('attention ranks all four kinds on a phone, is read-only, and resolves only
     const lifecycle = new SessionLifecycleStore(control);
     lifecycle.markRunning({ projectId, sessionId: failedSession.session.id, requestId: 'request-failed' });
     lifecycle.markSettled({ projectId, sessionId: failedSession.session.id, outcome: 'failed', reason: 'The provider refused the request.' });
-    lifecycle.markRunning({ projectId, sessionId: interruptedSession.session.id, requestId: 'request-interrupted' });
+    // The original request has terminal `done` status and the conversation is idle. The UI action
+    // still requires an explicit owner click; rendering the panel alone is read-only.
+    lifecycle.markRunning({ projectId, sessionId: interruptedSession.session.id, requestId: 'ack-terminal-request' });
     adoptRunningSessions(lifecycle, new Date());
   } finally {
     control.close();
@@ -139,6 +143,14 @@ test('attention ranks all four kinds on a phone, is read-only, and resolves only
   const interruptedItem = panel.locator('.attention-item[data-kind="interrupted"]');
   await expect(interruptedItem).toContainText('Operator attention');
   await expect(interruptedItem.getByRole('button', { name: /Resume/ })).toHaveCount(0);
+  await expect(interruptedItem).toContainText('does not undo the effect');
+  await expect(interruptedItem).toContainText('Review the conversation and the affected project files first');
+  const acknowledge = interruptedItem.getByRole('button', { name: /Acknowledge interrupted work/ });
+  await expect(acknowledge).toBeVisible();
+  await acknowledge.click();
+  await expect(panel).toContainText(/Acknowledged after terminal status/);
+  await expect(panel.locator('.attention-item[data-kind="interrupted"]')).toHaveCount(0);
+  expect(page.url()).toBe(beforeUrl);
 
   // An approval shows its full exact target before any action, then consumes only when asked.
   await panel.locator('.attention-item[data-kind="approval"]').getByRole('button', { name: /Review approval/ }).click();
@@ -151,7 +163,7 @@ test('attention ranks all four kinds on a phone, is read-only, and resolves only
   await expect(review).toContainText('This approval is consumed and cannot be consumed again.');
   await expect(review.getByRole('button', { name: 'Consume approval grant' })).toHaveCount(0);
   await expect(panel.locator('.attention-item[data-kind="approval"]')).toHaveCount(0);
-  await expect(panel.locator('.attention-count')).toContainText('3 open');
+  await expect(panel.locator('.attention-count')).toContainText('2 open');
   expect(page.url()).toBe(beforeUrl);
 
   // A failure offers retry, and only the explicit click dispatches.

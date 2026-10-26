@@ -15,8 +15,10 @@ work for the current milestone, *Dependable from a phone*, is in [docs/PLAN.md](
   Edits are revision-checked, so a second writer gets a conflict instead of losing work.
 - **Durable agents.** One Pi Durable session per project, committed to SQLite as it runs:
   live transcript, steering, stopping, and questions the agent asks that you answer once.
-  A run that dies mid-tool resumes from its last checkpoint, and a tool that may have
-  partially run is reported as interrupted rather than repeated.
+  Certain work can continue from its last checkpoint. An uncertain interruption blocks model
+  and tool execution until the owner reviews the conversation and affected files, then acknowledges
+  only after terminal status, an idle conversation and an empty queue are verified. Acknowledgement
+  does not replay or undo the original effect. See [Session recovery](docs/RECOVERY.md).
 - **Bounded owner-created workers.** The owner can create a worker with a pinned model from the
   allowed worker set, a default-deny scope list and fixed budgets, then start one bounded run. Model
   turns run in the application harness; the report is canonical Markdown at

@@ -17,7 +17,7 @@ async function waitFor<T>(check: () => Promise<T | undefined>, timeoutMs = 10000
   const until = Date.now() + timeoutMs;
   for (;;) {
     const value = await check();
-    if (value !== undefined) return value;
+    if (value !== undefined && value !== false) return value;
     if (Date.now() > until) throw Error('condition was not met in time');
     await sleep(50);
   }
@@ -192,7 +192,7 @@ test('a question appears while open, leaves after it is answered, and a dismissa
   }
 });
 
-test('a failed run offers retry, and an uncertain interruption offers no replay and refuses resume', async () => {
+test('a failed run offers retry, and an uncertain interruption offers only verified acknowledgement, never replay', async () => {
   const root = await mkdtemp(join(tmpdir(), 'pilot-attention-lifecycle-'));
   const app = await instance(root);
   try {
@@ -222,7 +222,7 @@ test('a failed run offers retry, and an uncertain interruption offers no replay 
     assert.deepEqual(failure.actions, ['retry']);
     assert.match(failure.context, /provider refused/);
     assert.equal(interruptedItem.uncertain, true);
-    assert.deepEqual(interruptedItem.actions, [], 'an uncertain interruption offers no replay');
+    assert.deepEqual(interruptedItem.actions, ['acknowledge-uncertainty'], 'the uncertain item offers owner acknowledgement, never resume or retry');
 
     const resume = await fetch(app.security.origin + '/api/sessions/' + interruptedSession.id + '/lifecycle/resume', { method: 'POST', headers: app.writes, body: JSON.stringify({ projectId: project.id, revision: interruptedItem.lifecycleRevision }) });
     assert.equal(resume.status, 409);

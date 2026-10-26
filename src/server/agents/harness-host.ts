@@ -9,6 +9,7 @@ import { Harness, ToolTask, ROOT_CONVERSATION_ID, createRegistry, defineDoc, def
 import type { ConversationId, DocumentReader, EntryId, Extension, JsonObject } from '@earendil-works/pi-durable';
 import type { Context } from '@earendil-works/chord/context';
 import { openNodeSqliteStorage } from '@earendil-works/pi-durable/storage/sqlite/node';
+import { GenerationTask } from '@earendil-works/pi-durable';
 import { Type } from 'typebox';
 import { safePath } from '../paths';
 import { abortableDelay } from './abortable';
@@ -114,6 +115,29 @@ function workerMarkerOf(value: unknown): WorkerMarker | null {
  * The generation hook revalidates the run, worker, policy and revocation before every provider
  * request, and refuses the ninth request. The tool hook revalidates before every tool call.
  */
+function recoveryExtension(project: Project, options: HarnessHostOptions, sessionForConversation: (conversationId: number) => string) {
+  const refusalFor = (conversationId: number): string | null => {
+    if (!options.recovery) return null;
+    let sessionId: string;
+    try { sessionId = sessionForConversation(conversationId); }
+    catch { return 'The session mapping is ambiguous, so this action is refused until an operator reviews it.'; }
+    try {
+      return options.recovery.read(project.id, sessionId).uncertain
+        ? 'This session has an uncertain interrupted effect. The original request is blocked until an operator reviews it.'
+        : null;
+    } catch { return 'The recovery state cannot be verified, so this action is refused until an operator reviews it.'; }
+  };
+  return {
+    extension: defineExtension({ name: 'uncertain-recovery-guard', hooks: [hook(ToolTask, {
+      beforeTool: async (_call, api) => {
+        const refusal = refusalFor(Number(api.conversationId));
+        return refusal === null ? undefined : { block: refusal };
+      }
+    })] }),
+    refusalFor
+  };
+}
+
 function workerRoleExtension(project: Project, options: HarnessHostOptions) {
   const markerFor = async (read: DocumentReader, conversationId: ConversationId, context: Context): Promise<WorkerMarker | null> => {
     try {
@@ -186,6 +210,8 @@ interface HostedAgent {
   provider: FauxProviderHandle;
   /** The extensions installed for this project's agent harness. */
   extensions: Extension[];
+  /** Retained durable storage for original-submission status inspection. */
+  storage: Awaited<ReturnType<typeof openNodeSqliteStorage>>;
   /** The tools the root conversation's authority permits, or undefined for owner dispatch. */
   permittedTools: readonly any[] | undefined;
   watch(conversation: HostedAgent["conversation"], sessionId: string): Promise<void>;
@@ -320,7 +346,14 @@ export interface RecordNoteSeam {
  * that dies during it must be told the call was interrupted rather than repeating the write.
  * `read_notes` only reads and is safe to replay.
  */
-function notesExtension(project: Project, seam: RecordNoteSeam){
+export interface ReadNotesSeam {
+  /** Test-only delay before the safe read completes, allowing deterministic checkpoint interruption. */
+  readonly delayMs?: number;
+  /** Test-only observer called when the read body starts, after the central recovery guard passes. */
+  readonly onExecute?: () => void;
+}
+
+function notesExtension(project: Project, seam: RecordNoteSeam, readSeam: ReadNotesSeam = {}){
   return defineExtension({
     name: 'notes',
     sections: [section('notes-protocol', () => 'Use record_note to append a short note to this project documentation, and read_notes to read the notes back.', { tag: false })],
@@ -359,7 +392,9 @@ function notesExtension(project: Project, seam: RecordNoteSeam){
         description: 'Read this project notes file.',
         parameters: Type.Object({}),
         replay: 'safe',
-        execute: async () => {
+        execute: async (_args, _api, context) => {
+          readSeam.onExecute?.();
+          await abortableDelay(readSeam.delayMs ?? 0, context.abortSignal);
           try {
             const file = await safePath(project.path,notesPath);
             return { output: [{ type: 'text', text: await readFile(file,'utf8') }] };
@@ -478,6 +513,10 @@ export interface HarnessHostOptions {
    */
   recordNoteDelayMs?: number;
   recordNoteAfterWriteMs?: number;
+  /** Test-only bounded delay in the safe `read_notes` tool body, after the recovery guard. */
+  readNotesDelayMs?: number;
+  /** Test-only observer called when the guarded `read_notes` body starts. */
+  readNotesStarted?: () => void;
   /** Test-only: resolves when `record_note` execution begins, so a test can abort inside its wait. */
   recordNoteStarted?: () => void;
   providers?: ProviderStore;
@@ -491,6 +530,10 @@ export interface HarnessHostOptions {
   delivery?: AgentDeliveryPort;
   /** Where a live generation becomes visible to the durable session lifecycle, when one exists. */
   lifecycle?: SessionLifecycleHooks;
+  /** Read-only authority for uncertain recovery gates. */
+  recovery?: {
+    read(projectId: string, sessionId: string): { readonly state: string; readonly uncertain: boolean; readonly requestId: string | null };
+  };
   /**
    * Where this harness learns the privilege scopes in force. Absent, every tool it exposes belongs
    * to the owner's own dispatch and no agent allowlist applies.
@@ -672,6 +715,30 @@ function fileEditExtension(project: Project, capability: FileEditCapability, aut
  */
 export class HarnessHost {
   private hosted = new Map<string, Promise<HostedAgent>>();
+  /** Inspect an already-open harness only; acknowledging a session must not open a scheduler. */
+  async readOriginalSubmissionStatus(project: Project, sessionId: string, requestId: string) {
+    const existing = this.hosted.get(project.id);
+    if (!existing) throw new HttpError(409, 'Open the interrupted conversation to read its settled recovery result before acknowledging');
+    const hosted = await existing;
+    const binding = this.options.conversationBinding?.read(project.id, sessionId);
+    const id = (binding?.conversationId as ConversationId | undefined)
+      ?? (conversationIdOf(sessionId) ?? undefined)
+      ?? (sessionId === String(ROOT_CONVERSATION_ID) ? ROOT_CONVERSATION_ID : undefined)
+      ?? this.sessionConversations.get(project.id + ':' + sessionId);
+    if (id === undefined) throw new HttpError(404, 'Session conversation not found');
+    const submission = await hosted.storage.submissionByRequest(id, requestId, BACKGROUND_CONTEXT);
+    const inspection = await hosted.harness.inspect(BACKGROUND_CONTEXT);
+    const conversation = await hosted.harness.conversation(id, BACKGROUND_CONTEXT);
+    if (!conversation) throw new HttpError(409, 'The session conversation is unavailable');
+    const view = await conversation.viewState(BACKGROUND_CONTEXT);
+    try {
+      return {
+        status: submission?.status ?? null,
+        conversationIdle: !agentViewFrom(view.value).working && agentViewFrom(view.value).inbox.length === 0,
+        queuedSubmissions: inspection.submissions.filter((item) => item.conversationId === id && item.status === 'queued').length
+      };
+    } finally { view.dispose(); }
+  }
   private tails = new Map<string, Promise<unknown>>();
   /**
    * The mapping from a named session's ID to its conversation ID in the harness.
@@ -717,7 +784,10 @@ export class HarnessHost {
     cancelled: boolean;
     readonly controller: AbortController;
   }>();
-  constructor(private readonly options: HarnessHostOptions) {}
+  constructor(private readonly options: HarnessHostOptions) {
+    if (options.readNotesDelayMs !== undefined && (!Number.isInteger(options.readNotesDelayMs) || options.readNotesDelayMs < 0 || options.readNotesDelayMs > 60_000))
+      throw new RangeError('readNotesDelayMs must be an integer from 0 to 60000');
+  }
   get enabled(): boolean { return this.options.enabled; }
   private assertEnabled() { if (!this.options.enabled) throw new HttpError(503, 'Agents are disabled on this instance'); }
   /**
@@ -730,6 +800,13 @@ export class HarnessHost {
    * every call. `authority(projectId, sessionId)` is the per-session read; a port that only knows
    * the project is still honoured (it is handed the project and the harness's own root session id).
    */
+  private assertNotUncertain(projectId: string, sessionId: string): void {
+    if (!this.options.recovery) return;
+    let recovery: ReturnType<NonNullable<HarnessHostOptions['recovery']>['read']>;
+    try { recovery = this.options.recovery.read(projectId, sessionId); }
+    catch { throw new HttpError(409, 'Session recovery state cannot be verified; no work was admitted.'); }
+    if (recovery.uncertain) throw new HttpError(409, 'This session has an uncertain interrupted effect. Operator review is required before new work.');
+  }
   private async dispatchAuthority(project: Project, sessionId: string): Promise<DispatchAuthority> {
     if (!this.options.privileges) return Object.freeze({ agentId: null, scopes: null, projects: null, emptyReason: null });
     const authority = await this.options.privileges.authority({ projectId: project.id, sessionId });
@@ -799,12 +876,21 @@ export class HarnessHost {
       for(const p of this.options.providers?.models.getProviders()??[])models.setProvider(p);
       models.setProvider(provider.provider);
       const stream=models.streamSimple.bind(models);
+      const conversationBySignal = new WeakMap<AbortSignal, ConversationId>();
       // Generation hooks are advisory: ordinary exceptions are reported then ignored.
       // Enforce policy at dispatch, including queued inputs and checkpoint recovery.
       models.streamSimple=(model,context,options)=>{
         const output=createAssistantMessageEventStream();
         void (async()=>{
           try{
+            const signal=options?.signal;
+            signal?.throwIfAborted();
+            const conversationId = signal ? conversationBySignal.get(signal) : undefined;
+            if (this.options.recovery) {
+              if (conversationId === undefined) throw new HttpError(409, 'The model request session cannot be verified; no provider request was sent.');
+              const refusal = recoveryGuard.refusalFor(conversationId);
+              if (refusal !== null) throw new HttpError(409, refusal);
+            }
             if(model.provider!==provider.provider.id){
               if(!this.options.providers)throw new HttpError(409,'Real providers are not configured');
               await this.options.providers.assertUsable({provider:model.provider,modelId:model.id});
@@ -812,7 +898,6 @@ export class HarnessHost {
               for(const message of [...context.messages].reverse()){if(message.role==='user')break;if(message.role==='assistant')turns++;}
               if(turns>=8)throw new HttpError(409,'Pilot stopped at eight model turns. Review before sending another message.');
             }
-            const signal=options?.signal;signal?.throwIfAborted();
             const maxTokens=Math.min(options?.maxTokens??4096,4096);
             // The worker boundary. The role marker is in the worker system prompt; the guard is the
             // durable run/worker/policy/revocation check. A refusal returns a terminal assistant error
@@ -878,8 +963,36 @@ export class HarnessHost {
       };
       scriptedResponses(provider, this.options.pauseMs ?? 2500, this.options.workerProbe, this.options.workerProbeDelayMs ?? 0);
       const storage = await openNodeSqliteStorage(path);
+      const recoveryGuard = recoveryExtension(project, this.options, (conversationId) => this.sessionIdentity(project, conversationId as ConversationId));
+      const recoveryBoundary = defineExtension({
+        name: 'uncertain-recovery-provider-boundary',
+        hooks: [hook(GenerationTask, {
+          beforeRequest: async (_request, api, context) => {
+            const signal = context.abortSignal;
+            if (!signal) throw new HttpError(409, 'The model request session cannot be verified; no provider request was sent.');
+            conversationBySignal.set(signal, api.conversationId);
+            const refusal = recoveryGuard.refusalFor(api.conversationId);
+            if (refusal !== null) throw new HttpError(409, refusal);
+            return undefined;
+          }
+        })]
+      });
+      const guardTools = (extension: Extension): Extension => ({
+        ...extension,
+        tools: extension.tools?.map((tool) => {
+          const execute = tool.execute;
+          return {
+            ...tool,
+            execute: async (args, api, context) => {
+              const refusal = recoveryGuard.refusalFor(Number(api.conversationId));
+              if (refusal !== null) throw new HttpError(409, refusal);
+              return execute(args, api, context);
+            }
+          };
+        })
+      });
       const question = questionExtension();
-      const notes = notesExtension(project, { beforeWriteMs: this.options.recordNoteDelayMs, afterWriteMs: this.options.recordNoteAfterWriteMs, onExecute: this.options.recordNoteStarted });
+      const notes = notesExtension(project, { beforeWriteMs: this.options.recordNoteDelayMs, afterWriteMs: this.options.recordNoteAfterWriteMs, onExecute: this.options.recordNoteStarted }, { delayMs: this.options.readNotesDelayMs, onExecute: this.options.readNotesStarted });
       // The scopes in force are read once here, so the tools the model is offered are the permitted
       // ones, and again on every call by the privilege hook, which is the authority. Nothing about
       // the owner's own dispatch changes: with no privilege port the authority is null and every
@@ -898,15 +1011,12 @@ export class HarnessHost {
       // Installed once, statically, and selected by every conversation. Its durable marker decides
       // whether it applies, so no unregistered dynamic extension carries the worker role.
       const workerRole = workerRoleExtension(project, this.options);
-      const extensions: Extension[] = [question, notes, privileges, workerRole];
+      const extensions: Extension[] = [question, notes, privileges, recoveryGuard.extension, recoveryBoundary, workerRole].map(guardTools);
       const registry = createRegistry();
-      registry.install(question);
-      registry.install(notes);
-      registry.install(privileges);
-      registry.install(workerRole);
+      for (const extension of extensions) registry.install(extension);
       const fileEdit = this.options.fileEdit;
       if (fileEdit !== undefined && fileEdit.enabled) {
-        const edits = fileEditExtension(project, fileEdit, authorityOf);
+        const edits = guardTools(fileEditExtension(project, fileEdit, authorityOf));
         extensions.push(edits);
         registry.install(edits);
       }
@@ -998,6 +1108,7 @@ export class HarnessHost {
         conversation,
         provider,
         extensions: sessionExtensions,
+        storage,
         permittedTools: sessionPermittedTools,
         watch,
         close: async () => {
@@ -1155,6 +1266,7 @@ export class HarnessHost {
     return this.serial('agent:' + project.id, async () => {
       const hosted = await this.selected(project, parentSessionId);
       const parent = hosted.conversation;
+      this.assertNotUncertain(project.id, this.sessionIdentity(project, parent.id));
       const child = await parent.fork(cutoffEntryId as EntryId, { ownership: { kind: 'ownerless' } }, BACKGROUND_CONTEXT);
       return { childSessionId: String(child.id) };
     });
@@ -1179,6 +1291,8 @@ export class HarnessHost {
       if (id !== null && await this.isWorkerConversationDurable(hosted, project, id)) throw this.workerConversationRefusal();
       const conversation = id === null ? undefined : await hosted.harness.conversation(id, BACKGROUND_CONTEXT);
       if (conversation === undefined) throw new HttpError(404, 'This project holds no conversation for that session');
+      const actualSessionId = this.sessionIdentity(project, conversation.id);
+      this.assertNotUncertain(project.id, actualSessionId);
       const submission = await conversation.submit({ type: 'input', content: text, requestId: input.requestId }, BACKGROUND_CONTEXT);
       return { submissionId: String(submission.id) };
     });
@@ -1292,7 +1406,9 @@ export class HarnessHost {
       const conversationId = input.sessionId ? await this.ensureSessionConversation(project, input.sessionId) : hosted.conversation.id;
       const conversation = conversationId === hosted.conversation.id ? hosted.conversation : await hosted.harness.conversation(conversationId, BACKGROUND_CONTEXT);
       if (!conversation) throw new HttpError(409, 'The session is bound to a conversation that is unavailable; no replacement was created');
-      await hosted.watch(conversation, this.sessionIdentity(project, conversation.id));
+      const sessionId = this.sessionIdentity(project, conversation.id);
+      await hosted.watch(conversation, sessionId);
+      this.assertNotUncertain(project.id, sessionId);
       const selected=(await conversation.agent(BACKGROUND_CONTEXT)).model;
       // The dispatch-time vision check. It reads the model this submission will actually run under, so
       // an image is refused outright — before anything is admitted — rather than dropped, or sent as
@@ -1306,6 +1422,7 @@ export class HarnessHost {
       // submission instead of appending the same user input a second time (which could make the
       // model repeat a non-idempotent tool call).
       try {
+        this.assertNotUncertain(project.id, sessionId);
         const submission = await conversation.submit({ type: 'input', content, ...(whenBusy ? { whenBusy } : {}), requestId }, BACKGROUND_CONTEXT);
         // The generation is visible in the durable lifecycle under the identity it was submitted with,
         // so a start that finds it running adopts it as interrupted. A hook failure never fails a run.
@@ -1313,8 +1430,10 @@ export class HarnessHost {
           const status = await submission.status(BACKGROUND_CONTEXT);
           // A repeated request can return a completed submission. It starts no generation and
           // must not create another lifecycle attempt, including while another input is running.
-          if (status.status !== 'done' && status.status !== 'unanswered')
-            await this.options.lifecycle?.began({ projectId: project.id, sessionId: this.sessionIdentity(project, conversationId), requestId });
+          if (status.status !== 'done' && status.status !== 'unanswered') {
+            this.assertNotUncertain(project.id, sessionId);
+            await this.options.lifecycle?.began({ projectId: project.id, sessionId, requestId });
+          }
           await this.reconcileIdleLifecycle(project, { ...hosted, conversation });
         }
         catch (error) { console.error('The session lifecycle could not record that a generation began for project ' + project.id + ': ' + (error as Error).message); }
@@ -1353,14 +1472,17 @@ export class HarnessHost {
     return this.serial('agent:' + project.id, async () => {
       const hosted = await this.selected(project, input.sessionId);
       const sessionId = this.sessionIdentity(project, hosted.conversation.id);
+      this.assertNotUncertain(project.id, sessionId);
       const question = await this.openQuestion(hosted, input.questionId);
       const dismissedAt = Date.now();
       const dismissedBy = (input.dismissedBy ?? 'owner').slice(0, 160);
+      this.assertNotUncertain(project.id, sessionId);
       await hosted.conversation.submit({ type: 'write', entry: { kind: 'app.question.dismissed', data: { questionId: question.id, reason, dismissedBy, dismissedAt } }, requestId: 'dismiss:' + question.id }, BACKGROUND_CONTEXT);
       // Telling the agent is a second, best-effort step: the transcript entry above is the durable
       // record, and a delivery that fails leaves the dismissal visible rather than hiding it.
       let submissionId: string | null = null;
       try {
+        this.assertNotUncertain(project.id, sessionId);
         const submission = await hosted.conversation.submit({ type: 'input', content: 'The owner dismissed your question' + (question.text ? ' ("' + question.text + '")' : '') + ' for this reason: ' + reason + '. Do not proceed with it; wait for a new instruction.', requestId: 'dismiss-input:' + question.id }, BACKGROUND_CONTEXT);
         submissionId = String(submission.id);
       } catch (error) {
@@ -1390,13 +1512,17 @@ export class HarnessHost {
     return this.serial('agent:' + project.id, async () => {
       const hosted = await this.selected(project, input.sessionId);
       const sessionId = this.sessionIdentity(project, hosted.conversation.id);
+      this.assertNotUncertain(project.id, sessionId);
       const question = await this.openQuestion(hosted, input.questionId);
       const answeredAt = Date.now();
+      this.assertNotUncertain(project.id, sessionId);
       if (this.options.delivery) await this.options.delivery.answerRecorded({
         projectId: project.id, sessionId, questionId: question.id,
         question: { text: question.text, askedAt: question.askedAt }, text, answeredAt
       });
+      this.assertNotUncertain(project.id, sessionId);
       await hosted.conversation.submit({ type: 'write', entry: { kind: 'app.answer', data: { questionId: question.id, text, answeredAt } }, requestId: 'answer:' + question.id }, BACKGROUND_CONTEXT);
+      this.assertNotUncertain(project.id, sessionId);
       const submission = await hosted.conversation.submit({ type: 'input', content: text, requestId: 'answer-input:' + question.id }, BACKGROUND_CONTEXT);
       const submissionId = String(submission.id);
       // The answer's outbox step is the answer reaching the agent. A failure to acknowledge leaves
@@ -1427,6 +1553,7 @@ export class HarnessHost {
     this.assertEnabled();
     return this.serial('agent:' + project.id, async () => {
       const hosted = await this.selected(project, sessionId);
+      this.assertNotUncertain(project.id, this.sessionIdentity(project, hosted.conversation.id));
       const state = await hosted.conversation.viewState(BACKGROUND_CONTEXT);
       const view = this.shape(hosted, state.value);
       state.dispose();
@@ -1434,6 +1561,7 @@ export class HarnessHost {
       if (!question) throw new HttpError(409, 'The transcript holds no question with this id, so the delivery needs an operator');
       const text = question.answer?.text ?? recorded?.text;
       if (text === undefined) throw new HttpError(409, 'The transcript holds no recorded answer for this question, so the delivery needs an operator');
+      this.assertNotUncertain(project.id, this.sessionIdentity(project, hosted.conversation.id));
       if (!question.answer) {
         // The ledger already holds this answer, so completing its transcript write is recording the
         // answer it committed to, not a second one: the same question-derived request id collapses a
@@ -1441,6 +1569,7 @@ export class HarnessHost {
         const answeredAt = recorded ? (typeof recorded.answeredAt === 'number' ? recorded.answeredAt : Date.parse(recorded.answeredAt)) : Date.now();
         await hosted.conversation.submit({ type: 'write', entry: { kind: 'app.answer', data: { questionId, text, answeredAt } }, requestId: 'answer:' + questionId }, BACKGROUND_CONTEXT);
       }
+      this.assertNotUncertain(project.id, this.sessionIdentity(project, hosted.conversation.id));
       const submission = await hosted.conversation.submit({ type: 'input', content: text, requestId: 'answer-input:' + questionId }, BACKGROUND_CONTEXT);
       return { submissionId: String(submission.id), requestId: 'answer-input:' + questionId };
     });
@@ -1548,8 +1677,10 @@ export class HarnessHost {
     this.assertEnabled();
     return this.serial('agent:' + project.id, async () => {
       const hosted = await this.selected(project, sessionId);
+      this.assertNotUncertain(project.id, this.sessionIdentity(project, hosted.conversation.id));
       const input = await this.lastInput(hosted);
       if (input.images.length > 0) this.assertVision(await this.visionFor(hosted));
+      this.assertNotUncertain(project.id, this.sessionIdentity(project, hosted.conversation.id));
       const submission = await hosted.conversation.submit({ type: 'input', content: inputContent(input.text, input.images), requestId }, BACKGROUND_CONTEXT);
       const status = await submission.status(BACKGROUND_CONTEXT);
       // A planned identity can already name a terminal submission (a resume after a cancelled or
@@ -1661,8 +1792,11 @@ export class HarnessHost {
       // passed to a worker conversation, so every hook and prompt is resolved by the registry.
       const notes = hosted.extensions.find((extension) => extension.name === 'notes');
       const workerRole = hosted.extensions.find((extension) => extension.name === 'worker-role');
-      if (notes === undefined || workerRole === undefined) return failedOutcome('The worker role is not installed on this project, so no run was started.');
-      const extensions: Extension[] = [notes, workerRole];
+      const recoveryGuard = hosted.extensions.find((extension) => extension.name === 'uncertain-recovery-guard');
+      const recoveryBoundary = hosted.extensions.find((extension) => extension.name === 'uncertain-recovery-provider-boundary');
+      if (notes === undefined || workerRole === undefined || recoveryGuard === undefined || recoveryBoundary === undefined)
+        return failedOutcome('The worker role or recovery guards are not installed on this project, so no run was started.');
+      const extensions: Extension[] = [notes, recoveryGuard, recoveryBoundary, workerRole];
       const tools = permittedTools(extensions, input.scopes);
       const conversation = await hosted.harness.createConversation({
         ownership: { kind: 'ownerless' },
@@ -1699,6 +1833,7 @@ export class HarnessHost {
       // The last check: a revocation or policy change during the window refuses with no submission.
       const again = await input.beforeSubmit();
       if (again !== null) return handle.cancelled ? cancelledOutcome() : failedOutcome(again);
+      this.assertNotUncertain(project.id, String(conversation.id));
       const submission = await conversation.submit({ type: 'input', content: input.prompt, whenBusy: 'reject', requestId: input.requestId }, BACKGROUND_CONTEXT);
       let unanswered = false;
       try {

@@ -678,18 +678,21 @@ test('every declared precondition matches a refusal the handlers really produce'
     assert.deepEqual([uncertain.state, uncertain.uncertain], ['interrupted', true]);
     error = await refusal(f.actions.run('session.lifecycle.resume', { revision: uncertain.revision }, scope));
     assert.ok(error instanceof SessionLifecycleError && error.code === 'NEEDS_ATTENTION'); covered.add('INTERRUPTION_CERTAIN');
-    // DISPATCH_AVAILABLE: a port that cannot dispatch refuses before the record is touched.
-    f.lifecycleStore.markRunning({ projectId: f.project.id, sessionId: session.id, requestId: 'dispatch-1' });
-    const running = f.lifecycleStore.read(f.project.id, session.id);
-    await f.actions.run('session.lifecycle.pause', { revision: running.revision }, scope);
-    const paused = f.lifecycleStore.read(f.project.id, session.id);
+    // DISPATCH_AVAILABLE: use a separate certain session. An uncertain lifecycle cannot be
+    // overwritten to manufacture a dispatch-capability fixture; it remains operator attention.
+    const dispatchSession=await newSession(f,'Dispatch capability session');
+    const dispatchScope=scopeOf(f,dispatchSession.id);
+    f.lifecycleStore.markRunning({ projectId: f.project.id, sessionId: dispatchSession.id, requestId: 'dispatch-1' });
+    const running = f.lifecycleStore.read(f.project.id, dispatchSession.id);
+    await f.actions.run('session.lifecycle.pause', { revision: running.revision }, dispatchScope);
+    const paused = f.lifecycleStore.read(f.project.id, dispatchSession.id);
     f.port.refusal = new HttpError(503, 'Agents are disabled on this instance');
-    error = await refusal(f.actions.run('session.lifecycle.resume', { revision: paused.revision }, scope));
+    error = await refusal(f.actions.run('session.lifecycle.resume', { revision: paused.revision }, dispatchScope));
     assert.ok(error instanceof HttpError && error.status === 503); covered.add('DISPATCH_AVAILABLE');
-    assert.equal(f.lifecycleStore.read(f.project.id, session.id).state, 'paused', 'a refused dispatch claimed no revision');
+    assert.equal(f.lifecycleStore.read(f.project.id, dispatchSession.id).state, 'paused', 'a refused dispatch claimed no revision');
     f.port.refusal = null;
     // REASON_BOUNDED: enforced by the published parameter schema, before the handler runs.
-    error = await refusal(f.actions.run('session.lifecycle.pause', { revision: paused.revision, reason: 'x'.repeat(400) }, scope));
+    error = await refusal(f.actions.run('session.lifecycle.pause', { revision: paused.revision, reason: 'x'.repeat(400) }, dispatchScope));
     assert.ok(error instanceof ActionError && error.code === 'INVALID' && /the reason field/.test(error.message)); covered.add('REASON_BOUNDED');
     // NAME_VALID: the same, for the documented name rule.
     error = await refusal(f.actions.run('session.create', { name: 'not a name#' }, scopeOf(f)));

@@ -24,7 +24,7 @@ async function until<T>(read: () => Promise<T | undefined>, timeoutMs = 5000): P
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const value = await read();
-    if (value !== undefined) return value;
+    if (value !== undefined && value !== false) return value;
     await sleep();
   }
   throw new Error('condition was not met in time');

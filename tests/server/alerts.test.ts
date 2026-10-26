@@ -12,7 +12,7 @@ async function waitFor<T>(check: () => T | undefined | Promise<T | undefined>, t
   const until = Date.now() + timeoutMs;
   for (;;) {
     const value = await check();
-    if (value !== undefined) return value;
+    if (value !== undefined && value !== false) return value;
     if (Date.now() > until) throw Error('condition was not met in time');
     await sleep(50);
   }

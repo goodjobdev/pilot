@@ -52,6 +52,15 @@ import { ControlStore, ControlStoreError } from './control-store';
  */
 
 const OPERATION_KIND = 'session.lifecycle';
+/** Closed durable audit marker stored in the same lifecycle operation admission as its state change. */
+export const SESSION_LIFECYCLE_UNCERTAINTY_ACK_KIND = 'owner-uncertainty-ack' as const;
+export type SessionLifecycleUncertaintyAcknowledgement = {
+  readonly kind: typeof SESSION_LIFECYCLE_UNCERTAINTY_ACK_KIND;
+  readonly actor: 'owner';
+  readonly fromRevision: number;
+  readonly requestId: string;
+};
+const LIFECYCLE_OUTBOX_PAYLOAD_VERSION = 1 as const;
 const OUTBOX_KIND = 'session.lifecycle';
 
 function storage(message: string): SessionLifecycleError {
@@ -227,6 +236,49 @@ export class SessionLifecycleStore {
   }
 
   /**
+   * Record owner acknowledgement after an injected verifier proves the exact interrupted submission
+   * is terminal. Verification runs before the final read/CAS; no request or effect is replayed.
+   */
+  async acknowledgeUncertainty(
+    input: { projectId: unknown; sessionId: unknown; revision: unknown; actor: unknown },
+    verifier?: (input: { readonly record: SessionLifecycleRecord }) => Promise<boolean>
+  ): Promise<SessionLifecycleRecord> {
+    const projectId = parseSessionLifecycleIdentifier(input.projectId, 'projectId');
+    const sessionId = parseSessionLifecycleIdentifier(input.sessionId, 'sessionId');
+    if (input.actor !== 'owner') throw new SessionLifecycleError('Only the owner can acknowledge an uncertain interruption', 'INVALID');
+    if (typeof input.revision !== 'number' || !Number.isInteger(input.revision) || input.revision < 0)
+      throw new SessionLifecycleError('revision must be a whole number, 0 before the first write', 'INVALID');
+    const initial = this.read(projectId, sessionId);
+    if (initial.revision !== input.revision)
+      throw new SessionLifecycleError('Session ' + sessionId + ' is at lifecycle revision ' + initial.revision + ', not ' + input.revision + '; the acknowledgement wrote nothing and the record is unchanged', 'CONFLICT');
+    if (initial.state === 'idle' && initial.requestId !== null && initial.reason === null) {
+      const latest = this.latestWithOutbox(projectId, sessionId);
+      if (latest?.acknowledgement?.kind === SESSION_LIFECYCLE_UNCERTAINTY_ACK_KIND) return initial;
+    }
+    if (initial.state !== 'interrupted' || !initial.uncertain || initial.requestId === null)
+      throw new SessionLifecycleError('Only an uncertain interrupted session with its original request identity can be acknowledged', 'ILLEGAL');
+    if (typeof verifier !== 'function')
+      throw new SessionLifecycleError('A server-side terminal submission verifier is required; nothing was acknowledged', 'NEEDS_ATTENTION');
+    let terminal: boolean;
+    try { terminal = await verifier({ record: initial }); }
+    catch { throw new SessionLifecycleError('The original submission could not be verified as terminal; nothing was acknowledged', 'NEEDS_ATTENTION'); }
+    if (terminal !== true)
+      throw new SessionLifecycleError('The original submission is not verified terminal; nothing was acknowledged', 'NEEDS_ATTENTION');
+    const current = this.read(projectId, sessionId);
+    if (current.revision !== input.revision)
+      throw new SessionLifecycleError('Session ' + sessionId + ' changed during verification; the acknowledgement wrote nothing and the record is unchanged', 'CONFLICT');
+    if (current.state !== 'interrupted' || !current.uncertain || current.requestId !== initial.requestId)
+      throw new SessionLifecycleError('The interrupted submission changed during verification; nothing was acknowledged', 'CONFLICT');
+    const next = buildLifecycleRecord(current, { state: 'idle', reason: null, uncertain: false, now: this.clock() });
+    return this.writeAcknowledgement(next, {
+      kind: SESSION_LIFECYCLE_UNCERTAINTY_ACK_KIND,
+      actor: 'owner',
+      fromRevision: current.revision,
+      requestId: current.requestId
+    });
+  }
+
+  /**
    * The administrative "a generation started" transition the harness reports. It is not an owner
    * action: it exists so a run that the live process starts is visible in the durable record, which
    * is exactly what the next start's adoption reads. It is a no-op while the session is already
@@ -237,6 +289,8 @@ export class SessionLifecycleStore {
     const session = parseSessionLifecycleIdentifier(input.sessionId, 'sessionId');
     const requestId = parseSessionLifecycleRequestId(input.requestId);
     const current = this.read(project, session);
+    if (current.state === 'interrupted' && current.uncertain)
+      throw new SessionLifecycleError('A new generation cannot overwrite an uncertain interrupted session; an owner must verify and acknowledge the original submission first', 'NEEDS_ATTENTION');
     if (current.state === 'running') return current;
     return this.write(
       buildLifecycleRecord(current, {
@@ -279,7 +333,9 @@ export class SessionLifecycleStore {
         idempotencyKey: 'lifecycle.r' + validated.revision,
         kind: OPERATION_KIND,
         input: validated,
-        outbox: { kind: OUTBOX_KIND, payload: { version: 1, sessionId: validated.sessionId, revision: validated.revision } }
+        outbox: { kind: OUTBOX_KIND, payload: this.pendingAcknowledgement
+          ? { version: LIFECYCLE_OUTBOX_PAYLOAD_VERSION, sessionId: validated.sessionId, revision: validated.revision, acknowledgement: this.pendingAcknowledgement }
+          : { version: LIFECYCLE_OUTBOX_PAYLOAD_VERSION, sessionId: validated.sessionId, revision: validated.revision } }
       });
     } catch (error) {
       if (error instanceof ControlStoreError && error.code === 'CONFLICT')
@@ -299,6 +355,28 @@ export class SessionLifecycleStore {
         'CONFLICT'
       );
     return validated;
+  }
+
+  private pendingAcknowledgement: SessionLifecycleUncertaintyAcknowledgement | null = null;
+  private writeAcknowledgement(record: SessionLifecycleRecord, acknowledgement: SessionLifecycleUncertaintyAcknowledgement): SessionLifecycleRecord {
+    this.pendingAcknowledgement = acknowledgement;
+    try { return this.write(record); }
+    finally { this.pendingAcknowledgement = null; }
+  }
+
+  private latestWithOutbox(projectId: string, sessionId: string): { record: SessionLifecycleRecord; acknowledgement: SessionLifecycleUncertaintyAcknowledgement | null } | null {
+    const rows = this.rows('SELECT id FROM operations WHERE project_id=? AND session_id=? AND kind=? ORDER BY rowid', [projectId, sessionId, OPERATION_KIND]);
+    let latest: { record: SessionLifecycleRecord; acknowledgement: SessionLifecycleUncertaintyAcknowledgement | null } | null = null;
+    for (const row of rows) {
+      const record = this.decode(String(row.id), { projectId, sessionId });
+      if (latest === null || record.revision > latest.record.revision) {
+        const operation = this.store.getOperation(String(row.id), { projectId, sessionId });
+        const outbox = this.outboxFor(operation.id, { projectId, sessionId });
+        const payload = outbox.payload as { acknowledgement?: SessionLifecycleUncertaintyAcknowledgement };
+        latest = { record, acknowledgement: payload.acknowledgement ?? null };
+      } else if (record.revision === latest.record.revision) throw storage('Corrupt lifecycle storage: two records share a revision');
+    }
+    return latest;
   }
 
   private latest(projectId: string, sessionId: string): SessionLifecycleRecord | null {
@@ -330,11 +408,42 @@ export class SessionLifecycleStore {
     const outbox = this.outboxFor(operation.id, scope);
     if (outbox.kind !== OUTBOX_KIND) throw storage('Session lifecycle storage holds an unexpected outbox kind');
     if (outbox.state !== 'pending') throw storage('A session lifecycle outbox must stay pending for the life of the record');
-    const payload = outbox.payload as { version?: unknown; sessionId?: unknown; revision?: unknown } | null;
-    if (!payload || typeof payload !== 'object' || payload.version !== 1 || payload.sessionId !== record.sessionId || payload.revision !== record.revision)
+    const payload = outbox.payload as { version?: unknown; sessionId?: unknown; revision?: unknown; acknowledgement?: unknown } | null;
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload) || payload.version !== LIFECYCLE_OUTBOX_PAYLOAD_VERSION || payload.sessionId !== record.sessionId || payload.revision !== record.revision)
       throw storage('The stored session lifecycle outbox payload does not describe its record');
+    const payloadKeys = Object.keys(payload).sort().join(',');
+    if (payload.acknowledgement === undefined) {
+      if (payloadKeys !== 'revision,sessionId,version') throw storage('The stored session lifecycle outbox payload has unknown fields');
+    } else {
+      if (payloadKeys !== 'acknowledgement,revision,sessionId,version') throw storage('The stored lifecycle acknowledgement payload has unknown fields');
+      this.validateAcknowledgement(operation, record, payload.acknowledgement, scope);
+    }
     return record;
   }
+  private validateAcknowledgement(
+    operation: OperationRecord,
+    record: SessionLifecycleRecord,
+    value: unknown,
+    scope: ControlScope
+  ): asserts value is SessionLifecycleUncertaintyAcknowledgement {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) throw storage('The stored lifecycle acknowledgement marker is invalid');
+    const marker = value as Record<string, unknown>;
+    if (Object.keys(marker).sort().join(',') !== 'actor,fromRevision,kind,requestId' ||
+        marker.kind !== SESSION_LIFECYCLE_UNCERTAINTY_ACK_KIND || marker.actor !== 'owner' ||
+        !Number.isInteger(marker.fromRevision) || (marker.fromRevision as number) < 1 ||
+        typeof marker.requestId !== 'string' || marker.requestId !== record.requestId ||
+        record.state !== 'idle' || record.revision !== (marker.fromRevision as number) + 1)
+      throw storage('The stored lifecycle acknowledgement marker does not match its owner transition');
+    const previous = this.rows('SELECT id FROM operations WHERE project_id=? AND session_id=? AND idempotency_key=? AND kind=?', [scope.projectId, scope.sessionId, 'lifecycle.r' + marker.fromRevision, OPERATION_KIND]);
+    if (previous.length !== 1) throw storage('The stored lifecycle acknowledgement has no unique interrupted source record');
+    const sourceOperation = this.store.getOperation(String(previous[0].id), scope);
+    const source = validateSessionLifecycleRecord(sourceOperation.input, 'CORRUPT');
+    if (source.state !== 'interrupted' || !source.uncertain || source.requestId !== marker.requestId || source.revision !== marker.fromRevision)
+      throw storage('The stored lifecycle acknowledgement source is not the same uncertain interruption');
+    if (operation.projectId !== scope.projectId || operation.sessionId !== scope.sessionId)
+      throw storage('The stored lifecycle acknowledgement is outside its own scope');
+  }
+
   private outboxFor(operationId: string, scope: ControlScope): OutboxRecord {
     const rows = this.rows('SELECT id FROM outboxes WHERE operation_id=? LIMIT 2', [operationId]);
     if (rows.length !== 1) throw storage('Session lifecycle storage holds no unambiguous outbox row for one of its operations');

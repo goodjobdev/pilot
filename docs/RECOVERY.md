@@ -120,6 +120,23 @@ decide. It is a `409` whose reason names what cannot be proven; nothing is writt
 and nothing is replayed. It is deliberately distinct from an ordinary conflict, which only means
 "re-read and retry".
 
+The same no-replay rule is carried by the harness for a tool call: Pi Durable commits the tool
+call's intent before `execute()` runs, and a restart with that checkpoint reports an `interrupted`
+result for an unsafe tool rather than running it again. The crash test kills the process immediately
+after the note append, with no checkpoint wait, and observes that result and one committed line. An
+earlier report of a replay in this worktree came from a test that did not wait for the append; Step
+10 records the correction.
+
+These tests use SIGKILL. They prove the process-death path; they do not simulate power loss, and
+this build makes no exactly-once claim for a power loss or a torn filesystem write.
+
+Two consequences of the current model need an owner decision, not an automatic change. First, the
+first view after a restart opens the harness and `resume()` continues the generation after the
+interrupted tool result. The model can then request a fresh tool call with a new call id, which is a
+new effect, not a durable replay. Second, the adopted lifecycle stays `interrupted` and `uncertain`
+after that resumed generation settles. This build does not retry an interrupted call with a fresh
+identity and does not clear the uncertainty automatically.
+
 ## Startup adoption: recovering a session whose process is gone
 
 On start - before the server listens - every session whose **durable state says `running`** but whose
@@ -184,6 +201,12 @@ refusal never contains a filesystem path.
 An invalid body is refused with `422` and a reason in this application's own words (which field is
 missing, or that the body carries a field the route does not accept) - never the raw schema-library
 message, and never a generic `400`.
+
+## Owner acknowledgement of verified terminal uncertainty
+
+An uncertain interruption has one additional explicit owner action: **Acknowledge interrupted work**. Before it is available, the owner must review the conversation and affected project files. The server verifies the original request identity is `done` or `unanswered`, the conversation is idle, no Pi Durable submission is queued, and every Pilot queue entry is `settled` or `cancelled`. A Pilot entry in `queued`, `claimed`, `submitted` or `failed` state blocks acknowledgement: cancel queued entries; release then cancel claimed entries; reconcile submitted entries; resolve or cancel failed entries. The request is owner-authenticated, CSRF-protected, project-scoped, strict (`projectId`, `revision` only), and compare-and-swap checked.
+
+On success, the lifecycle becomes `idle`, clears uncertainty, retains the original request identity and history, and returns `outcome: "acknowledged"` with `dispatched: false`. This does not undo any effect, retry it, or claim exactly-once behavior. New owner input is allowed only after acknowledgement. A missing request, unknown/nonterminal status, busy conversation, either queue holding nonterminal work, stale revision, or failed proof refuses without acknowledgement. If the harness is cold, verification does not open it; open the interrupted conversation in Agents, wait until it is idle, and resolve the Pilot queue before trying again. No submit, abort, or replay is performed by verification.
 
 ## Failure semantics
 

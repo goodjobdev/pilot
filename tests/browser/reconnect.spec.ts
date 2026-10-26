@@ -70,6 +70,105 @@ test('a sign-in refusal stops the stream loop and names the sign-in state',async
  expect(states).not.toContain('offline');
 });
 
+test('a reload while the network is down shows the failure and recovers with one fresh snapshot, sending nothing',async({page})=>{
+ let offline=false;
+ // Every agent GET is recorded, so the final assertion cannot pass on an empty list. Every non-GET
+ // is recorded after the project exists, so a write during the offline phase or the reconnect
+ // would be named rather than missed.
+ const agentGets:string[]=[];
+ const nonGet:string[]=[];
+ page.on('request',request=>{
+  const url=request.url();
+  if(url.includes('/agents')&&request.method()==='GET')agentGets.push(url);
+  if(request.method()!=='GET')nonGet.push(request.method()+' '+url);
+ });
+ // While offline, both the view snapshot and the stream fail. When the owner reconnects after the
+ // network returns, a normal stream answers again.
+ await page.route(/\/api\/projects\/[^/]+\/agents(\?.*)?$/,async route=>{
+  if(offline){await route.abort('failed');return;}
+  await route.continue();
+ });
+ await page.route('**/api/projects/*/agents/stream*',async route=>{
+  if(offline){await route.abort('failed');return;}
+  await route.continue();
+ });
+ await addProject(page,'Reload offline fixture');
+ nonGet.length=0;
+ await page.getByRole('button',{name:'Agents',exact:true}).click();
+ const status=page.locator('[data-connection]');
+ await expect(status).toHaveAttribute('data-connection','live',{timeout:15000});
+
+ offline=true;
+ await page.reload();
+ await page.getByRole('button',{name:'Agents',exact:true}).click();
+ await expect(status).toHaveAttribute('data-connection','server-error',{timeout:15000});
+ // The failure is named on the connection status; nothing is sent while the view is unusable.
+ expect(nonGet).toEqual([]);
+
+ // The network returns. One owner action is one fresh snapshot and one stream subscription, and
+ // only a GET is sent. The live state and the fresh transcript are the awaited events.
+ offline=false;
+ await page.getByRole('button',{name:'Reconnect the agent stream'}).click();
+ await expect(status).toHaveAttribute('data-connection','live',{timeout:15000});
+ await expect(page.getByLabel('Agent transcript')).toContainText('No messages yet');
+ expect(agentGets.length).toBeGreaterThan(0);
+ expect(agentGets.some(url=>url.includes('/agents/stream'))).toBe(true);
+ expect(nonGet).toEqual([]);
+});
+
+test('two tabs keep one subscription each, one send reaches both once, and closing one leaves the other live',async({page,context})=>{
+ await addProject(page,'Two tabs fixture');
+ const streams=new Map<string,string[]>();
+ const posts=new Map<string,number>();
+ const watch=(tab:Page,label:string)=>{
+  const urls:string[]=[];streams.set(label,urls);posts.set(label,0);
+  tab.on('request',request=>{
+   if(request.url().includes('/agents/stream'))urls.push(request.url());
+   if(request.method()==='POST'&&request.url().includes('/agents/input'))posts.set(label,(posts.get(label)??0)+1);
+  });
+ };
+ watch(page,'first');
+ await page.getByRole('button',{name:'Agents',exact:true}).click();
+ const first=page.locator('[data-connection]');
+ await expect(first).toHaveAttribute('data-connection','live',{timeout:15000});
+ const other=await context.newPage();
+ watch(other,'second');
+ try{
+  await other.goto('/');
+  await other.getByRole('button',{name:'Agents',exact:true}).click();
+  const second=other.locator('[data-connection]');
+  await expect(second).toHaveAttribute('data-connection','live',{timeout:15000});
+  await expect(page.getByLabel('Agent transcript')).toBeVisible();
+
+  // One view owns one stream. The send and its delivery in both tabs are the awaited events, so
+  // the request counts are read after real traffic, not after a fixed sleep.
+  await page.getByLabel('Message the agent').fill('one message from the first tab');
+  await page.getByRole('button',{name:'Send message'}).click();
+  await expect(page.getByLabel('Agent transcript')).toContainText('one message from the first tab');
+  await expect(other.getByLabel('Agent transcript')).toContainText('one message from the first tab');
+  expect(streams.get('first')?.length).toBe(1);
+  expect(streams.get('second')?.length).toBe(1);
+  expect(posts.get('second')).toBe(0);
+  expect(posts.get('first')).toBe(1);
+
+  // Closing the second tab disposes its own subscription on the server; the server test
+  // `two live streams hold one subscription each` asserts that disposal count directly. Here the
+  // awaited event is the tab's close, then a message that the first tab still receives.
+  const closed=new Promise<void>(resolve=>{other.once('close',()=>resolve());});
+  await other.close();
+  await closed;
+  await expect(first).toHaveAttribute('data-connection','live');
+  await page.getByLabel('Message the agent').fill('after the other tab closed');
+  await page.getByRole('button',{name:'Send message'}).click();
+  await expect(page.getByLabel('Agent transcript')).toContainText('after the other tab closed');
+  await expect(page.getByLabel('Agent transcript')).toContainText('one message from the first tab');
+  expect(streams.get('first')?.length).toBe(1);
+  expect(posts.get('first')).toBe(2);
+ }finally{
+  if(!other.isClosed())await other.close();
+ }
+});
+
 /** A full view the interface could render, used to prove an old response never reaches it. */
 const lateView={
  conversationId:'late-a',working:false,attempt:null,

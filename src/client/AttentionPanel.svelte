@@ -162,6 +162,17 @@
      if(e instanceof ApiError&&e.status===409)await load(run);
    }finally{if(run===generation)busy='';}
  }
+ async function acknowledge(item:AttentionItem){
+   if(item.kind!=='interrupted'||!item.uncertain||!item.sessionId)return;
+   const run=generation;busy=item.id+':acknowledge';problem='';message='';
+   try{
+     const result=await api.acknowledgeUncertainty(projectId,item.sessionId,item.lifecycleRevision);
+     if(run!==generation)return;
+     message='Acknowledged after terminal status and conversation-idle verification. This does not undo the interrupted effect or replay it. New owner input is now allowed.';
+     await load(run);onchanged?.();
+   }catch(e){if(run===generation){problem=(e as Error).message;if(e instanceof ApiError&&e.status===409)await load(run);}}
+   finally{if(run===generation)busy='';}
+ }
  function openQuestion(item:AttentionItem){if(item.kind!=='question')return;onopenquestion(item.sessionId,item.questionId);}
 </script>
 <div class="popover-panel inbox-panel attention-panel" data-project={projectId} role="group" aria-label="Needs me">
@@ -200,7 +211,8 @@
    </div>
   {:else if item.kind==='interrupted'}
    {#if item.uncertain}
-    <p class="attention-refusal" role="note">Operator attention: the effect cannot be proven, so it is not replayed. Retry becomes available only after a new attempt is established.</p>
+    <p class="attention-refusal" role="note">Operator attention: the effect cannot be proven, so it is not replayed. Review the conversation and the affected project files first. Acknowledgement only records that review; it does not undo the effect. New owner input is allowed only after acknowledgement. If verification fails, open this conversation in Agents and wait for it to settle. Clear or cancel queued and failed Pilot entries, release then cancel claimed entries, and reconcile submitted entries before you try again.</p>
+    <div class="row"><button class="compact-button" aria-label={'Acknowledge interrupted work for session '+item.sessionId} disabled={busy!==''} onclick={()=>void acknowledge(item)}>Acknowledge interrupted work</button></div>
    {:else}
     <div class="row"><button class="compact-button" aria-label={'Resume session '+item.sessionId} disabled={busy!==''} onclick={()=>void lifecycle(item,'resume')}>Resume</button></div>
    {/if}

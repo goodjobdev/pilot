@@ -63,7 +63,7 @@ async function waitFor<T>(read: () => Promise<T | undefined>, timeoutMs = 15_000
   const deadline = Date.now() + timeoutMs;
   for (;;) {
     const value = await read();
-    if (value !== undefined) return value;
+    if (value !== undefined && value !== false) return value;
     if (Date.now() > deadline) throw new Error('the condition was not met in time');
     await new Promise((resolve) => setTimeout(resolve, 20));
   }
