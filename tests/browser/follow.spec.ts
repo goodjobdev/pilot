@@ -90,6 +90,118 @@ async function expectTranscriptUncovered(page:Page,g:Geometry){
  expect(hit).toBe(true);
 }
 
+test('client caps a synthetic 507-row stream snapshot, marks the gap, and preserves stats and questions',async({page})=>{
+ const ids=Array.from({length:507},(_,i)=>'synthetic-'+i);
+ await page.route('**/api/projects/*/agents/stream',async route=>{
+  const snapshot={conversationId:'synthetic-conversation',working:false,attempt:null,entries:ids.map((id,i)=>({id,kind:'user',rawKind:'pi.user',at:null,text:'synthetic row '+i,thinking:'',tools:[],stopReason:null,error:null,data:null,toolResult:null})),partial:'',inbox:[],usage:{input:123,output:456,cost:7},model:null,questions:[{id:'pending-outside-window',text:'Still actionable?',askedAt:null,answer:null}],updatedAt:new Date().toISOString()};
+  await route.fulfill({status:200,contentType:'text/event-stream',body:'data: '+JSON.stringify(snapshot)+'\n\n'});
+ });
+ await addProject(page,'Transcript cap fixture');
+ const transcript=transcriptOf(page);
+ await expect(transcript).toContainText('synthetic row 506',{timeout:10000});
+ await expect(transcript).toContainText('7 older rows are not shown');
+ await expect(transcript.locator('.agent-entry')).toHaveCount(500);
+ await expect(transcript.locator('.agent-text').filter({hasText:/^synthetic row 6$/})).toHaveCount(0);
+ await expect(transcript).toContainText('synthetic row 123');
+ await expect(page.getByRole('region',{name:'Questions for me'})).toContainText('Still actionable?');
+
+ // Reload opens a fresh snapshot. The same cap and honest gap must remain, with no send or replay.
+ await page.reload();
+ await page.getByRole('button',{name:'Agents',exact:true}).click();
+ const reconnected=transcriptOf(page);
+ await expect(reconnected.locator('.agent-entry')).toHaveCount(500);
+ await expect(reconnected).toContainText('7 older rows are not shown');
+ await expect(page.getByRole('region',{name:'Questions for me'})).toContainText('Still actionable?');
+});
+
+test('a paused reader keeps a visible anchor when a 500-row window evicts 20 rows and appends 20',async({page})=>{
+ const makeView=(last:number)=>({conversationId:'synthetic-eviction-session',working:false,attempt:null,entries:Array.from({length:last+1},(_,i)=>({id:'evict-'+i,kind:'user',rawKind:'pi.user',at:null,text:'transcript row '+String(i).padStart(3,'0'),thinking:'',tools:[],stopReason:null,error:null,data:null,toolResult:null})),partial:'',inbox:[],usage:{input:12,output:34,cost:0.5},model:null,questions:[],updatedAt:new Date().toISOString()});
+ await page.addInitScript(({first,second}:{first:ReturnType<typeof makeView>;second:ReturnType<typeof makeView>})=>{
+  const global=window as typeof window&{__emitTranscriptNext?:()=>void};
+  const original=window.fetch.bind(window);
+  window.fetch=async(input,init)=>{
+   const url=typeof input==='string'?input:input instanceof Request?input.url:String(input);
+   if(!url.includes('/agents/stream'))return original(input,init);
+   let controller:ReadableStreamDefaultController<Uint8Array>;
+   const encoder=new TextEncoder();
+   const stream=new ReadableStream<Uint8Array>({start(next){
+    controller=next;
+    next.enqueue(encoder.encode('data: '+JSON.stringify(first)+'\n\n'));
+    global.__emitTranscriptNext=()=>controller.enqueue(encoder.encode('data: '+JSON.stringify(second)+'\n\n'));
+   }});
+   return new Response(stream,{status:200,headers:{'content-type':'text/event-stream'}});
+  };
+ },{first:makeView(506),second:makeView(526)});
+ await addProject(page,'Capped eviction fixture');
+ const transcript=transcriptOf(page),scroller=scrollerOf(page),rows=transcript.locator('.agent-entry');
+ await expect(rows).toHaveCount(500);
+ await expect(transcript).toContainText('7 older rows are not shown');
+ const anchor=transcript.locator('[data-entry-id="evict-100"]');
+ await anchor.evaluate(row=>{
+  const scroller=row.closest('.agent-transcript') as HTMLElement;
+  scroller.scrollTop+=row.getBoundingClientRect().top-scroller.getBoundingClientRect().top-40;
+  scroller.dispatchEvent(new Event('scroll'));
+ });
+ await expect(indicatorOf(page)).toContainText('Jump to newest');
+ const before=await anchor.boundingBox();
+ expect(before).not.toBeNull();
+ await page.evaluate(()=>{
+  const global=window as typeof window&{__emitTranscriptNext?:()=>void};
+  global.__emitTranscriptNext?.();
+ });
+ await expect(transcript).toContainText('transcript row 526');
+ await expect(rows).toHaveCount(500);
+ await expect(transcript).toContainText('27 older rows are not shown');
+ const after=await anchor.boundingBox();
+ expect(after).not.toBeNull();
+ expect(Math.abs(after!.y-before!.y)).toBeLessThanOrEqual(1);
+ await expect(indicatorOf(page)).toContainText('20 new activities');
+ await expect(page.getByText('12 in / 34 out')).toBeVisible();
+ expect(await scroller.evaluate(element=>(element as HTMLElement).scrollTop)).toBeGreaterThan(0);
+});
+
+test('more than 500 pending questions warn on omission and keep an omitted inbox item answerable by exact id',async({page})=>{
+ const questions=Array.from({length:505},(_,i)=>({id:'synthetic-question-'+i,text:'Synthetic pending question '+i+'?',askedAt:null,answer:null}));
+ const snapshot={conversationId:'synthetic-question-session',working:false,attempt:null,entries:[],partial:'',inbox:[],usage:{input:5,output:6,cost:0},model:null,questions,updatedAt:new Date().toISOString()};
+ let answerBody:Record<string,unknown>|null=null,answerPosts=0;
+ await page.route('**/api/projects/*/agents/stream',async route=>{
+  await route.fulfill({status:200,contentType:'text/event-stream',body:'data: '+JSON.stringify(snapshot)+'\n\n'});
+ });
+ await page.route('**/api/projects/*/agents',async route=>{
+  if(new URL(route.request().url()).pathname.endsWith('/agents'))await route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({enabled:true,view:snapshot,vision:null})});
+  else await route.continue();
+ });
+ await page.route('**/api/projects/*/attention*',async route=>{
+  if(new URL(route.request().url()).pathname.endsWith('/attention')){
+   const projectId=new URL(route.request().url()).pathname.split('/')[3]!;
+   const item={id:'question:synthetic-question-0',kind:'question',severity:3,projectId,sessionId:null,at:null,context:'Synthetic pending question 0?',actions:['open'],questionId:'synthetic-question-0'};
+   const count={open:1,byKind:{question:1,approval:0,failure:0,interrupted:0},capped:false,complete:true};
+   await route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({projectId,items:[item],count,page:{limit:20,returned:1,hasMore:false,nextCursor:null,listedCap:100,capped:false},limits:{perPage:20,listedCap:100,policy:'proposed'},sources:{questions:'read',approvals:'empty',lifecycle:'read'}})});
+  }else await route.continue();
+ });
+ await page.route('**/api/projects/*/agents/answer',async route=>{
+  answerPosts++;answerBody=route.request().postDataJSON() as Record<string,unknown>;
+  await route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({submissionId:'synthetic-answer'})});
+ });
+ await addProject(page,'Question window fixture');
+ const warning=page.getByRole('alert').filter({hasText:'5 questions are outside'});
+ await expect(warning).toBeVisible();
+ await expect(warning).toContainText('do not treat this view as showing no other questions');
+ const attention=page.getByRole('button',{name:/Needs me/});
+ await attention.click();
+ const omittedItem=page.locator('[data-attention-id="question:synthetic-question-0"]');
+ await expect(omittedItem).toBeVisible();
+ await omittedItem.click();
+ const question=page.locator('#question-synthetic-question-0');
+ await expect(question).toBeVisible();
+ expect(answerPosts).toBe(0);
+ await question.getByLabel(/^Answer to:/).fill('Keep this question identity');
+ await question.getByRole('button',{name:'Send answer'}).click();
+ await expect.poll(()=>answerPosts).toBe(1);
+ expect(answerBody).toMatchObject({questionId:'synthetic-question-0',text:'Keep this question identity'});
+ await expect(question.getByLabel(/^Answer to:/)).toHaveValue('');
+});
+
 test.beforeEach(async({page})=>{
  await page.setViewportSize({width:390,height:844});
 });

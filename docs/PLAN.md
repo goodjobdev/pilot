@@ -52,9 +52,11 @@ owner has accepted it. Nothing in this plan authorises a commit, push or deploym
 
 **Status: Partial — reconnect core built locally; owner acceptance pending.** The server stream works and shutdown now closes it
 (`a3c4222`, `src/server/main.ts`). The bounded, heartbeat-aware reconnect client is in
-`src/client/stream.ts`, with the unit, server and browser evidence below. The remaining
-transcript-row cap is not implemented. Evidence-based polling fallback is deferred: local loopback
-stays on streams, and no tunnel evidence or owner decision has been supplied.
+`src/client/stream.ts`. A technical client-retained transcript bound is now implemented in
+`src/client/transcript-window.ts`: at most 500 newest rows and 500 question projections. These are
+technical view-memory bounds, not accepted retention policy. The server transcript and durable
+history remain unchanged. Evidence-based polling fallback is deferred: local loopback stays on
+streams, and no tunnel evidence or owner decision has been supplied.
 
 **Required work**
 
@@ -117,12 +119,42 @@ stays on streams, and no tunnel evidence or owner decision has been supplied.
   frame, which waits for the in-flight frame to drain instead of being written behind it. The
   existing drain order is preserved: `end()` clears the timer and pending frame, disposes one
   subscription, and shutdown still waits for it.
+- `src/client/transcript-window.ts` caps client-retained rows at 500 and separately caps question
+  projections at 500. It retains newest entries with original ids and reports exact omitted counts.
+  The UI says omitted rows are hidden only in the client view and durable history is unchanged. If
+  the separate question projection reaches its technical bound, the UI names the omitted count and
+  warns against treating the current view as a complete question list. The pure projection preserves
+  `usage`, working state, inbox, and all other totals as supplied; it never derives them from rows.
+  `appendedTranscriptRows()` uses stable-id suffix/prefix overlap to count multiple arrivals in a
+  full window. A reorder or a view with no proven overlap is reported as `New activity; count
+  unavailable`, not as a guessed exact count. Each stream's first full snapshot establishes a
+  baseline, so a reconnect history shift does not create a fabricated activity count. A paused
+  reader keeps the first still-visible entry at the same screen offset when a snapshot drops older
+  rows. The full snapshot and JSON parse still exist transiently before this client cap. The existing
+  4 MiB frame/parser bound is unchanged; this is a retained row-count bound, not a per-row byte,
+  wire or transient-payload bound.
+- `tests/unit/transcript-window.test.ts` covers 507 rows, exact omission, stable ids, unchanged
+  usage, pending-question identities separate from the row window, question projection omissions,
+  exact 20-row rolling-window appends, no-overlap and reorder uncertainty, and same-identity streamed
+  text updates. `tests/unit/follow.test.ts` covers the honest unknown-count state. Browser fixtures
+  feed a synthetic 507-row SSE snapshot and verify 500 rendered rows, the exact gap, unchanged view
+  totals, and fresh bounded state after reload. A held-open synthetic SSE fixture pauses over a
+  stable row, then adds 20 equal-height rows while the 500-row window evicts 20. It verifies that
+  the same row stays within 1 CSS pixel, the window remains 500, the gap rises from 7 to 27, and the
+  badge says exactly 20 new activities. A 505-question fixture verifies the omission warning, opens
+  an omitted question from the authoritative `Needs me` inbox, reloads the full session projection
+  while preserving that exact question inside the 500-item cap, then posts an answer with its
+  original id. Neither fixture calls a provider. Unit tests cover exact overlap and focused-question
+  preservation. Owner and real-phone acceptance remain pending.
 - The 600 ms delayed-first-snapshot browser test proves only that the state remains
   `connecting`; the 45-second stale boundary is covered by the unit test, not by that browser
   test.
-- Passing evidence in this worktree: `pnpm check`; `pnpm test` (421 tests, including 18 stream
-  client tests and 5 new stream server tests); `pnpm test:browser` (34 tests, including 5 new
-  reconnect browser tests); `pnpm build`. No commit, push, deployment or live-data use.
+- Current transcript-bound verification: TypeScript and Svelte diagnostics pass (0 errors and
+  warnings); fresh client and server builds succeed. Independent review reran the final full
+  unit/server suite: **597 tests passed**. All **88 browser tests** pass against the fresh build
+  in two sequential bounded shards (52 and 36), including all 13 follow scenarios and the
+  eviction-anchor and omitted-question inbox cases. Independent review found no code blocker.
+  Owner and real-phone acceptance remain pending. No push, deployment or live-data use.
 
 **Risks**
 

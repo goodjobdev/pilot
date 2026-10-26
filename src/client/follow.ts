@@ -29,6 +29,8 @@ export interface ScrollMetrics {
 export interface FollowState {
   following: boolean;
   missed: number;
+  /** True when new activity arrived, but the snapshot does not prove an exact append count. */
+  countUnknown?: boolean;
 }
 
 /**
@@ -42,6 +44,12 @@ export function followIdentity(projectId: string, session: string): string {
 /** The state a newly opened transcript starts from: follow, nothing counted. */
 export function initialFollow(): FollowState {
   return { following: true, missed: 0 };
+}
+
+/** Keep the reader paused and name activity without inventing a count. */
+export function activityCountUnknown(state: FollowState): FollowState {
+  if (state.following) return state;
+  return state.countUnknown ? state : { ...state, countUnknown: true };
 }
 
 /**
@@ -94,7 +102,7 @@ export function readerScrolled(
   threshold: number = NEAR_BOTTOM_PX
 ): FollowState {
   if (isNearBottom(metrics, threshold)) {
-    return state.following && state.missed === 0 ? state : initialFollow();
+    return state.following && state.missed === 0 && !state.countUnknown ? state : initialFollow();
   }
   return state.following ? { following: false, missed: 0 } : state;
 }
@@ -117,6 +125,7 @@ export function activityArrived(
   const growth = count - previousCount;
   if (growth <= 0) return state;
   if (state.following) return state;
+  if (state.countUnknown) return state;
   const ceiling = Number.isFinite(cap) ? Math.max(0, Math.floor(cap)) + 1 : NEW_ACTIVITY_CAP + 1;
   const missed = Math.min(ceiling, state.missed + growth);
   return missed === state.missed ? state : { following: false, missed };
@@ -154,6 +163,7 @@ export function countLabel(missed: number, cap: number = NEW_ACTIVITY_CAP): stri
 /** The control's short visible text and its accessible name: what tapping it will do. */
 export function indicatorLabel(state: FollowState, cap: number = NEW_ACTIVITY_CAP): string {
   const label = countLabel(state.missed, cap);
+  if (state.countUnknown) return 'New activity; count unavailable';
   if (label === '') return 'Jump to newest';
   return 'Show ' + label;
 }

@@ -147,7 +147,7 @@ export interface OpenAgentStreamOptions {
   projectId: string;
   sessionId?: string;
   signal: AbortSignal;
-  onView: (view: AgentView) => void;
+  onView: (view: AgentView, meta: { initialSnapshot: boolean }) => void;
   onStatus: (status: ConnectionStatus) => void;
   /** Called once when the server answers as a sign-in layer rather than the application. */
   onAuthExpired?: () => void;
@@ -362,8 +362,9 @@ async function runAttempt(
         }
         lastViewAt = now();
         firstSnapshotAt ??= lastFrameAt;
+        const initialSnapshot = !sawSnapshot;
         if (!sawSnapshot) sawSnapshot = true;
-        options.onView(view);
+        options.onView(view, { initialSnapshot });
         emit({ state: 'live', detail: 'Live', attempt: 0, lastFrameAt, lastViewAt });
       }
     }

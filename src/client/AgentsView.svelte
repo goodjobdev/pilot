@@ -1,4 +1,5 @@
 <script lang="ts">
+ import {tick} from 'svelte';
  import { api,ApiError,download,reportSessionExpired } from './api';
  import { openAgentStream,type ConnectionStatus } from './stream';
  import type { AgentView } from '../shared/agent';
@@ -12,7 +13,8 @@
  import {modelKey,type ProviderSettings} from '../shared/settings';
  import type {ActionDescriptor} from '../shared/actions';
  import {slashMatches} from './slash';
- import {activityArrived,arrivalAfterFrame,countLabel,followIdentity,indicatorLabel,initialFollow,isNearBottom,readerScrolled,readerStillFollowing,type FollowState} from './follow';
+ import {activityArrived,activityCountUnknown,arrivalAfterFrame,countLabel,followIdentity,indicatorLabel,initialFollow,isNearBottom,readerScrolled,readerStillFollowing,type FollowState} from './follow';
+ import {appendedTranscriptRows,retainedAgentView} from './transcript-window';
  import SessionBar from './SessionBar.svelte';
  import SessionActivity from './SessionActivity.svelte';
  let { projectId,sessionId='',onsessionchange=()=>{},sessionListOpen=false,onsessionlistchange=()=>{},onmissing=()=>{},onerror,onquestions,agentsVersion=0,focusQuestion='' }:{
@@ -23,9 +25,25 @@
    focusQuestion?:string;
  }=$props();
  let view=$state<AgentView|null>(null),enabled=$state(true),draft=$state(''),sending=$state(false),problem=$state('');
- // A deep link names one exact question. It is only a scroll target: it opens nothing and answers
- // nothing, and an id this transcript does not hold simply has no target.
- $effect(()=>{const id=focusQuestion,loaded=view;if(!id||!loaded)return;const target=document.getElementById('question-'+id);target?.scrollIntoView({block:'center'});});
+ // A deep link names one exact question. If the bounded projection omitted it, read the
+ // authoritative session view and retain that identity within the same 500-question cap.
+ let focusedQuestionRequest='',focusedQuestionGeneration=0;
+ $effect(()=>{
+   const id=focusQuestion,project=projectId,session=selectedSessionId,loaded=view;
+   if(!id){focusedQuestionRequest='';return;}
+   if(loaded?.questions.some(question=>question.id===id)){
+     document.getElementById('question-'+id)?.scrollIntoView({block:'center'});
+     return;
+   }
+   const key=project+'\u0000'+session+'\u0000'+id;
+   if(key===focusedQuestionRequest)return;
+   focusedQuestionRequest=key;
+   const generation=++focusedQuestionGeneration;
+   void api.agents(project,session||undefined).then(snapshot=>{
+     if(generation!==focusedQuestionGeneration||projectId!==project||selectedSessionId!==session||focusQuestion!==id||!snapshot.view)return;
+     view=retainedAgentView(snapshot.view,id);
+   }).catch(()=>{});
+ });
  // The stream's own state. `lastViewAt` is when a full snapshot was accepted, which is
  // different from transport freshness: an idle session stays `live` on keep-alives.
  let connection=$state<ConnectionStatus>({state:'connecting',detail:'Connecting…',attempt:0,lastFrameAt:null,lastViewAt:null});
@@ -339,6 +357,7 @@
  let followKey='';
  let followGeneration=0;
  let seenEntryCount=0;
+ let seenEntryIds:string[]=[];
  /** The position this page last scrolled the transcript to, or null when it never has. */
  let lastFollowScrollTop:number|null=null;
  /** Set while this page's own scroll is in flight, so its event is never read as reader input. */
@@ -355,6 +374,23 @@
  const COMPACT_WIDTH=620,COMPACT_HEIGHT=700;
  function metricsOf(element:HTMLElement):{scrollTop:number;clientHeight:number;scrollHeight:number}{
    return {scrollTop:element.scrollTop,clientHeight:element.clientHeight,scrollHeight:element.scrollHeight};
+ }
+ type TranscriptAnchor={id:string;offset:number};
+ function captureTranscriptAnchor(nextIds:readonly string[]):TranscriptAnchor|null{
+   const element=transcript;
+   if(!element)return null;
+   const allowed=new Set(nextIds),top=element.getBoundingClientRect().top;
+   const rows=[...element.querySelectorAll<HTMLElement>('[data-entry-id]')];
+   const visible=rows.find(row=>row.getBoundingClientRect().bottom>top&&allowed.has(row.dataset.entryId??''));
+   return visible?{id:visible.dataset.entryId??'',offset:visible.getBoundingClientRect().top-top}:null;
+ }
+ function restoreTranscriptAnchor(anchor:TranscriptAnchor):void{
+   const element=transcript;
+   if(!element)return;
+   const row=[...element.querySelectorAll<HTMLElement>('[data-entry-id]')].find(item=>item.dataset.entryId===anchor.id);
+   if(!row)return;
+   const offset=row.getBoundingClientRect().top-element.getBoundingClientRect().top;
+   element.scrollTop+=offset-anchor.offset;
  }
  /** Scroll the transcript to its newest content. Always instant: no jump is ever animated. */
  function scrollToBottom():void{
@@ -424,7 +460,7 @@
     // The response carries the capability of the model now in force, so the composer does not
     // keep an older reading after a model change.
     const next=await request<AgentView&{vision:ImageCapability|null}>('/projects/'+projectId+'/agents/model','POST',{sessionId:selectedSessionId||undefined,model:m?{provider:m.provider,modelId:m.modelId}:null});
-    view=next;
+    view=retainedAgentView(next);
     applyCapability(next.vision??null);
   }
   catch(e){problem=(e as Error).message;}
@@ -451,7 +487,7 @@
        const snapshot=await api.agents(id,sessionId||undefined);
        if(!current())return;
        enabled=snapshot.enabled;
-       if(sessionId===''){view=snapshot.view;}
+       if(snapshot.view){view=retainedAgentView(snapshot.view);}
        applyCapability(snapshot.vision??null);
        selectedModel=view?.model?.provider==='faux'?'':view?.model?modelKey(view.model):'';
        await loadModels();
@@ -466,9 +502,18 @@
          projectId:id,
          sessionId:sessionId||undefined,
          signal:controller.signal,
-         onView:next=>{
+         onView:async(next,meta)=>{
            if(!current())return;
-           view=next;
+           const retained=retainedAgentView(next,focusQuestion);
+           const anchor=!follow.following?captureTranscriptAnchor(retained.entries.map(entry=>entry.id)):null;
+           if(meta.initialSnapshot){
+             // A fresh reconnect snapshot can shift its history window. Establish a new baseline;
+             // it is not a live row arrival and must not fabricate an activity badge.
+             seenEntryCount=retained.entries.length;
+             seenEntryIds=retained.entries.map(entry=>entry.id);
+           }
+           view=retained;
+           if(anchor){await tick();if(current())restoreTranscriptAnchor(anchor);}
            // A model chosen by another client changes the model in the streamed view. Read the
            // capability once for that model through the same view request: no model dispatch, no
            // retry loop (the key is attempted once per stream run), and no capability guess.
@@ -505,20 +550,25 @@
  // reset the follow state and the count, so the previous session's number can never appear here.
  $effect(()=>{
    const key=followIdentity(projectId,sessionKeyOf(selectedSessionId));
-   const count=view?.entries.length??0;
+   const currentIds=view?.entries.map(entry=>entry.id)??[];
+   const count=currentIds.length;
    const element=transcript;
    if(key!==followKey){
-     followKey=key;followGeneration+=1;
-     follow=initialFollow();seenEntryCount=count;lastFollowScrollTop=null;
+       followKey=key;followGeneration+=1;
+     follow=initialFollow();seenEntryCount=count;seenEntryIds=currentIds;lastFollowScrollTop=null;
      // A newly selected conversation opens at its newest entry. This is not a jump inside it.
      if(count>0&&element)scrollToBottom();
      return;
    }
-   if(count===seenEntryCount)return;
    const previous=seenEntryCount;
+   const previousIds=seenEntryIds;
+   if(count===previous&&currentIds.every((id,index)=>id===previousIds[index]))return;
    seenEntryCount=count;
+   seenEntryIds=currentIds;
+   const appended=appendedTranscriptRows(previousIds,currentIds);
    const live=element?metricsOf(element):null;
-   const next=live?arrivalAfterFrame(follow,previous,count,live,lastFollowScrollTop):activityArrived(follow,previous,count);
+   let next=live?arrivalAfterFrame(follow,previous,previous+appended.count,live,lastFollowScrollTop):activityArrived(follow,previous,previous+appended.count);
+   if(!appended.exact)next=activityCountUnknown(next);
    if(next!==follow)follow=next;
    if(next.following)scrollToBottom();
  });
@@ -545,12 +595,16 @@
  });
  // Tell the application inbox when the set of open questions changes, so its badge and
  // list never count a question that has just been answered.
- let notified=$state<number|null>(null);
+ let notified=$state<string|null>(null);
  $effect(()=>{
    const dismissed=(view as unknown as {dismissals?:Record<string,unknown>})?.dismissals??{};
    const open=(view?.questions??[]).filter(question=>!question.answer&&!(question.id in dismissed)).length;
-   if(notified===open)return;
-   notified=open;
+   const omitted=view?.transcriptWindow?.questionsOmitted??0;
+   const signature=open+':'+omitted;
+   if(notified===signature)return;
+   notified=signature;
+   // An incomplete client projection always asks the parent to refresh its authoritative inbox;
+   // this row count is not presented as the complete pending-question count.
    onquestions?.();
  });
  async function send(mode:'followUp'|'steer'){
@@ -685,6 +739,9 @@
 <section class="agents" class:compact={chromeCompact} bind:this={shell}>
  {#if view?.conversationId||selectedSessionId}<SessionBar {projectId} sessionId={selectedSessionId||view?.conversationId||''} {view} {agentsVersion} compact={chromeCompact} listOpen={sessionListOpen} onlistchange={onsessionlistchange} onerror={(message)=>onerror(message)} onsessionchange={(id)=>selectSession(id)}/>{/if}
  {#if sessionFallback}<p class="error agents-problem" role="alert">{sessionFallback}</p>{/if}
+ {#if view?.transcriptWindow?.questionsOmitted}
+  <p class="agent-gap" role="alert">{view.transcriptWindow.questionsOmitted} questions are outside this client's 500-question action window. The full durable question state is unchanged; do not treat this view as showing no other questions.</p>
+ {/if}
  {#snippet modelIdentity()}
  <div class="model-identity">
   <span class="eyebrow">{!view?.model||view.model.provider==='faux'?'SCRIPTED TEST PROVIDER':'MODEL PROVIDER'}</span>
@@ -757,9 +814,12 @@
        scroller simply becomes shorter while it is shown. -->
   <div class="agent-transcript" role="region" aria-label="Agent transcript" bind:this={transcript} tabindex="0" onscroll={onTranscriptScroll}>
   <div class="agent-transcript-body">
+  {#if view?.transcriptWindow?.omitted}
+   <p class="agent-gap" role="note">Showing the newest {view.transcriptWindow.limit} transcript rows. {view.transcriptWindow.omitted} older rows are not shown in this client view. The durable transcript and its history are unchanged.</p>
+  {/if}
   {#if !view?.entries.length}<p class="agent-empty">No messages yet. The scripted provider is free. A real model uses the connected provider account; existing tools are question and note operations only.</p>{/if}
   {#each view?.entries??[] as entry (entry.id)}
-  <article class="agent-entry {entry.kind}">
+  <article class="agent-entry {entry.kind}" data-entry-id={entry.id}>
    <span class="agent-role">{entry.kind==='user'?'You':entry.kind==='assistant'?'Agent':entry.kind==='tool'?'Tool':entry.kind}</span>
    {#if entry.thinking}<details class="agent-thinking"><summary>Reasoning</summary><pre>{entry.thinking}</pre></details>{/if}
    {#if entry.tools.length}<div class="agent-tools">{#each entry.tools as tool}<span class="pill">{tool.name}</span>{/each}</div>{/if}
@@ -773,10 +833,10 @@
   <!-- A live region that exists from the first frame, so both a count and a plain jump are announced
        when they appear. The control is outside it, because an interactive element inside a live
        region is re-announced by some screen readers. -->
-  <span class="sr-only" role="status" aria-live="polite" data-follow-status>{follow.following?'':(follow.missed>0?countLabel(follow.missed)+' while scrolled up':'Newer activity is below')}</span>
+  <span class="sr-only" role="status" aria-live="polite" data-follow-status>{follow.following?'':(follow.countUnknown?'New activity arrived; its count is unavailable':follow.missed>0?countLabel(follow.missed)+' while scrolled up':'Newer activity is below')}</span>
   {#if !follow.following}
   <div class="new-activity-row">
-   <button class="new-activity" data-follow="indicator" aria-label={indicatorLabel(follow)+' and resume following'} onclick={()=>showNewest()}>{follow.missed>0?'↓ '+countLabel(follow.missed):'↓ Jump to newest'}</button>
+   <button class="new-activity" data-follow="indicator" aria-label={indicatorLabel(follow)+' and resume following'} onclick={()=>showNewest()}>{follow.countUnknown?'↓ New activity · count unavailable':follow.missed>0?'↓ '+countLabel(follow.missed):'↓ Jump to newest'}</button>
   </div>
   {/if}
  </div>
@@ -867,6 +927,7 @@
  .sr-only{position:absolute;width:1px;height:1px;margin:-1px;padding:0;overflow:hidden;clip-path:inset(50%);white-space:nowrap}
  .new-activity{min-height:44px;min-width:44px;border:1px solid color-mix(in srgb,var(--accent) 45%,var(--line));border-radius:999px;background:var(--raised);color:var(--ink);font:12px var(--mono);padding:10px 18px}
  .agent-empty{color:var(--muted);font-size:12px;line-height:1.7}
+ .agent-gap{margin:0;padding:10px 12px;border:1px solid var(--border);border-radius:10px;color:var(--muted);font-size:12px;line-height:1.6;background:var(--surface)}
  .agent-entry{border:1px solid var(--line);border-left:2px solid var(--muted);border-radius:5px;background:var(--panel);padding:10px 12px}
  .agent-entry.user{border-left-color:var(--accent)}
  .agent-entry.assistant{border-left-color:#7aafff}

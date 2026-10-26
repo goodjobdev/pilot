@@ -167,6 +167,21 @@ test('a fragmented stream yields one full snapshot and a live state', async () =
   assert.ok(h.statuses.every(status => status.state !== 'auth-required'));
 });
 
+test('each connection marks its first full snapshot as a fresh baseline', async () => {
+  const meta: { initialSnapshot: boolean }[] = [];
+  let calls = 0;
+  await openAgentStream({
+    projectId: 'p', signal: new AbortController().signal,
+    fetchImpl: async () => {
+      calls += 1;
+      return calls === 1 ? responseFrom([snapshotFrame('first')]) : responseFrom([snapshotFrame('reconnect')]);
+    },
+    random: () => 0, minDelayMs: 1, maxDelayMs: 1, maxAttempts: 1,
+    onView: (_view, value) => meta.push(value), onStatus: () => undefined
+  });
+  assert.deepEqual(meta, [{ initialSnapshot: true }, { initialSnapshot: true }]);
+});
+
 test('a 401 stops the loop and reports the sign-in state', async () => {
   const h = harness();
   let calls = 0;

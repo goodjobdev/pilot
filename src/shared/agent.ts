@@ -40,6 +40,8 @@ export interface AgentQuestion {
 }
 export interface AgentInboxItem { id: string; mode: string; text: string }
 export interface AgentView {
+  /** Client transcript-window metadata. It describes only retained rows, not transcript retention. */
+  transcriptWindow?: { omitted: number; limit: number; questionsOmitted?: number };
   conversationId: string;
   working: boolean;
   attempt: number | null;

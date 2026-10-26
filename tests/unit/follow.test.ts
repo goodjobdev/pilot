@@ -4,6 +4,7 @@ import {
   NEAR_BOTTOM_PX,
   NEW_ACTIVITY_CAP,
   activityArrived,
+  activityCountUnknown,
   arrivalAfterFrame,
   countLabel,
   distanceFromBottom,
@@ -149,6 +150,13 @@ test('the count label is exact at 99 and says 99+ only above it', () => {
   assert.equal(countLabel(400), '99+ new activities');
   assert.equal(countLabel(Number.NaN), '');
   assert.equal(countLabel(-3), '');
+});
+
+test('unknown new activity is named without inventing a count', () => {
+  const paused = activityCountUnknown({ following: false, missed: 0 });
+  assert.deepEqual(paused, { following: false, missed: 0, countUnknown: true });
+  assert.equal(indicatorLabel(paused), 'New activity; count unavailable');
+  assert.deepEqual(activityCountUnknown(initialFollow()), initialFollow());
 });
 
 test('the indicator names what tapping it will do', () => {
