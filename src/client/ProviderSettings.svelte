@@ -64,7 +64,7 @@
     policy:{allowedWorkerModels:$state.snapshot(policyAllowed),defaultWorkerModel:policyDefault?{...policyDefault}:null}
    });
    applyPolicy(next);
-   policyMessage='Worker model policy saved. No worker runs exist in this build; this configures future owner-created workers only.';
+   policyMessage='Worker model policy saved. Owner-created workers use this allowed set and default. Existing workers keep their pinned model.';
   }catch(e){
    const detail=(e as Error).message;
    if(e instanceof ApiError&&e.status===409){
@@ -143,7 +143,7 @@
  {#if settings}
  <fieldset disabled={busy} class="worker-policy">
   <legend>Worker model policy</legend>
-  <p class="muted">The <strong>default for new sessions</strong> above is the model a new session starts with. An existing session or a bound agent may use a different model. The worker values below are reserved for future owner-created workers. No worker runs exist in this build, so no worker cost is reported and no worker model is claimed as effective.</p>
+  <p class="muted">The <strong>default for new sessions</strong> above is the model a new session starts with. An existing session or a bound agent may use a different model. Owner-created workers use the allowed set and default below. Existing workers keep their pinned model. This view does not measure worker cost or perform a provider health probe.</p>
   <p>New-session default: <strong>{settings.preferences.defaultModel?modelKey(settings.preferences.defaultModel):'Scripted test provider (built-in default)'}</strong></p>
   <p class="muted">A model marked available means only that a provider credential is saved, or that it is the built-in scripted provider. It is not a health check, and this page makes no provider probe.</p>
   {#if policyView}

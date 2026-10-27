@@ -246,6 +246,10 @@ conversation alias or a session model setter:
   every provider including the scripted stand-in. The output-token limit is 4096 at that same
   boundary, and every request revalidates the run, worker, policy, model and revocation.
 
+## Acceptance-only Faux pre-submit delay
+
+Operators can set `DASHBOARD_ACCEPTANCE_FAUX_WORKER_DELAY_MS` to an integer from `0` to `15000` milliseconds. Unset or `0` keeps normal behavior. Invalid, fractional, signed, whitespace-padded, non-finite or over-limit values fail startup closed. The setting delays submission only for worker model `{provider: "faux", modelId: "faux-1"}`. It never delays real providers or ordinary sessions. Cancellation during the window is abortable and must prevent every model request. This is an acceptance-test aid, not a UI setting; do not treat its presence as phone acceptance.
+
 ## Phone interface
 
 The **Workers** dialog (app header) lists the project's workers and runs, creates a worker from

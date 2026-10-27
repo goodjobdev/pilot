@@ -2,7 +2,7 @@ import { test, expect, type Page } from '@playwright/test';
 import { WORKER_MODEL_POLICY_READBACK_UNCERTAIN } from '../../src/shared/model-policy-codes';
 
 /**
- * The worker model policy is configuration for future owner-created workers only.
+ * The worker model policy configures allowed models and the default for new owner-created workers.
  *
  * These scenarios use the real settings route and the real control store. They make no provider
  * call, open no harness and start no worker. They prove the separate choices, the explicit
@@ -65,8 +65,10 @@ test('the owner can configure worker models separately from the orchestrator def
   await resetPolicy(page);
   const worker = await openPolicy(page);
   await expect(worker).toBeVisible();
-  await expect(worker).toContainText('reserved for future owner-created workers');
-  await expect(worker).toContainText('No worker runs exist in this build');
+  await expect(worker).toContainText('Owner-created workers use the allowed set and default below');
+  await expect(worker).toContainText('Existing workers keep their pinned model');
+  await expect(worker).toContainText('This view does not measure worker cost or perform a provider health probe');
+  await expect(worker).not.toContainText('No worker runs exist in this build');
   await expect(worker).toContainText('A model marked available means only that a provider credential is saved');
   await expect(worker).toContainText('An existing session or a bound agent may use a different model');
 
@@ -77,7 +79,7 @@ test('the owner can configure worker models separately from the orchestrator def
   await expect(modelRow(worker, key)).toBeVisible();
   await worker.getByLabel('Default worker model').selectOption(key);
   await worker.getByRole('button', { name: 'Save worker model policy' }).click();
-  await expect(worker.getByRole('status')).toContainText('this configures future owner-created workers only');
+  await expect(worker.getByRole('status')).toContainText('Worker model policy saved. Owner-created workers use this allowed set and default. Existing workers keep their pinned model.');
 
   // The policy survives a reload, so the choice is durable and not a view-only value.
   await page.reload();
@@ -95,7 +97,7 @@ test('the owner can configure worker models separately from the orchestrator def
   // The explicit clear is the owner decision, and then the empty set saves as an empty set.
   await reopened.getByRole('button', { name: 'Clear worker default' }).click();
   await reopened.getByRole('button', { name: 'Save worker model policy' }).click();
-  await expect(reopened.getByRole('status')).toContainText('this configures future owner-created workers only');
+  await expect(reopened.getByRole('status')).toContainText('Worker model policy saved.');
   await expect(reopened).toContainText('No worker model is allowed yet');
 });
 
@@ -108,7 +110,7 @@ test('a stale save keeps the draft, and explicit adoption saves it over the newe
     const workerB = await openPolicy(other);
     // Both tabs read the same revision before either writes.
     await addAndSave(workerA, keyA);
-    await expect(workerA.getByRole('status')).toContainText('this configures future owner-created workers only');
+    await expect(workerA.getByRole('status')).toContainText('Worker model policy saved.');
 
     await addAndSave(workerB, keyB);
     await expect(workerB.getByRole('alert').filter({ hasText: 'Revision conflict. Your draft is preserved.' })).toBeVisible();
@@ -127,7 +129,7 @@ test('a stale save keeps the draft, and explicit adoption saves it over the newe
 
     // The explicit confirmation moves the CAS base and saves the draft over the newer choice.
     await workerB.getByRole('button', { name: 'Use latest revision and save my choices' }).click();
-    await expect(workerB.getByRole('status')).toContainText('this configures future owner-created workers only');
+    await expect(workerB.getByRole('status')).toContainText('Worker model policy saved.');
     await expect(modelRow(workerB, keyB)).toBeVisible();
     await expect(modelRow(workerB, keyA)).toHaveCount(0);
   } finally {
@@ -145,7 +147,7 @@ test('a third writer during the review makes the rebase conflict again and prese
     const workerB = await openPolicy(second);
     // Both tabs read revision 0. A writes first.
     await addAndSave(workerA, keyA);
-    await expect(workerA.getByRole('status')).toContainText('this configures future owner-created workers only');
+    await expect(workerA.getByRole('status')).toContainText('Worker model policy saved.');
     await addAndSave(workerB, keyB);
     await expect(workerB.getByRole('alert').filter({ hasText: 'Revision conflict. Your draft is preserved.' })).toBeVisible();
 
@@ -154,7 +156,7 @@ test('a third writer during the review makes the rebase conflict again and prese
     await expect(workerB.getByRole('group', { name: 'Latest revision review' })).toBeVisible();
     const workerC = await openPolicy(third);
     await addAndSave(workerC, keyC);
-    await expect(workerC.getByRole('status')).toContainText('this configures future owner-created workers only');
+    await expect(workerC.getByRole('status')).toContainText('Worker model policy saved.');
 
     // B's base is still revision 1, so the confirmation is refused again. The draft is preserved.
     await workerB.getByRole('button', { name: 'Use latest revision and save my choices' }).click();
@@ -166,7 +168,7 @@ test('a third writer during the review makes the rebase conflict again and prese
     await expect(workerB.getByRole('group', { name: 'Latest revision review' })).toBeVisible();
     await expect(workerB.getByText(/Server choices not in your draft:/)).toContainText(keyC);
     await workerB.getByRole('button', { name: 'Use latest revision and save my choices' }).click();
-    await expect(workerB.getByRole('status')).toContainText('this configures future owner-created workers only');
+    await expect(workerB.getByRole('status')).toContainText('Worker model policy saved.');
     await expect(modelRow(workerB, keyB)).toBeVisible();
     await expect(modelRow(workerB, keyC)).toHaveCount(0);
   } finally {
@@ -184,7 +186,7 @@ test('phone settings keep save, conflict and controls inside the viewport', asyn
     const phoneWorker = await openPolicy(page);
     const desktopWorker = await openPolicy(desktop);
     await addAndSave(desktopWorker, keyA);
-    await expect(desktopWorker.getByRole('status')).toContainText('this configures future owner-created workers only');
+    await expect(desktopWorker.getByRole('status')).toContainText('Worker model policy saved.');
 
     await addAndSave(phoneWorker, keyB);
     await expect(phoneWorker.getByRole('alert').filter({ hasText: 'Revision conflict. Your draft is preserved.' })).toBeVisible();
@@ -196,7 +198,7 @@ test('phone settings keep save, conflict and controls inside the viewport', asyn
     await phoneWorker.getByRole('button', { name: 'Reload current policy and discard my draft' }).click();
     await expect(modelRow(phoneWorker, keyA)).toBeVisible();
     await addAndSave(phoneWorker, keyB);
-    await expect(phoneWorker.getByRole('status')).toContainText('this configures future owner-created workers only');
+    await expect(phoneWorker.getByRole('status')).toContainText('Worker model policy saved.');
   } finally {
     await desktop.close();
   }

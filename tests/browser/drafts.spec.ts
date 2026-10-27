@@ -45,9 +45,8 @@ async function newSession(page:import('@playwright/test').Page,name:string){
  await page.getByRole('button',{name:'New session'}).click();
  await page.getByLabel('New session name').fill(name);
  await page.getByRole('button',{name:'Create session'}).click();
- // Creating a session registers it; opening its row is what makes the transcript and composer
- // follow it, and therefore what restores that session's own draft.
- await openSession(page,name);
+ // Creation now navigates to the new session. Wait for that navigation instead of opening
+ // the list during its pending callback, which can close the list before its row is clicked.
  await expect(page.getByRole('region',{name:'Session',exact:true})).toContainText(name);
  await expect(page.getByLabel('Message the agent')).toHaveValue('');
 }

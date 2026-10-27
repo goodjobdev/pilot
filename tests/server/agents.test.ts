@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp,readFile,stat } from 'node:fs/promises';
+import { mkdtemp,readFile,rm,stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -74,6 +74,34 @@ async function deliveryInstance(root:string,sent:AlertPayload[],options:{failAll
 }
 /** The ledger operations this instance holds, by kind: the count is the "recorded exactly once" proof. */
 const ledgerCounts=(store:ControlStore)=>(store.db.prepare('SELECT kind,count(*) AS n FROM operations GROUP BY kind ORDER BY kind').all() as {kind:string;n:number}[]).map(row=>({kind:String(row.kind),n:Number(row.n)}));
+
+test('ordinary Faux sessions ignore the configured worker acceptance delay',async()=>{
+  const root=await mkdtemp(join(tmpdir(),'dashboard-agent-worker-delay-'));
+  const security=localConfig('http://127.0.0.1:0');
+  const store=new ControlStore(root);
+  const app=await createApp({dataRoot:root,browseRoots:[],security,agents:'on',control:store,acceptanceFauxWorkerDelayMs:5000});
+  await new Promise<void>(ok=>app.server.listen(0,'127.0.0.1',ok));
+  security.origin='http://127.0.0.1:'+(app.server.address() as {port:number}).port;
+  const headers={'x-dashboard-token':security.token,origin:security.origin,'content-type':'application/json'};
+  try {
+    const start=Date.now();
+    const created=await fetch(security.origin+'/api/projects',{method:'POST',headers,body:JSON.stringify({name:'Ordinary session',managed:true,confirm:true})});
+    assert.equal(created.status,201);
+    const project=await created.json() as {id:string};
+    const response=await fetch(security.origin+'/api/projects/'+project.id+'/agents/input',{method:'POST',headers,body:JSON.stringify({text:'fast faux response'})});
+    assert.equal(response.status,200);
+    let view:{view:{entries:{text?:string}[]}}|undefined;
+    const replyDeadline=Date.now()+3000;
+    while(Date.now()<replyDeadline){
+      const current=await (await fetch(security.origin+'/api/projects/'+project.id+'/agents',{headers:{'x-dashboard-token':security.token}})).json() as {view:{entries:{text?:string}[]}};
+      view=current;
+      if(current.view.entries.some(entry=>entry.text?.includes('Scripted test reply')))break;
+      await sleep(20);
+    }
+    assert.ok(view?.view.entries.some(entry=>entry.text?.includes('Scripted test reply')));
+    assert.ok(Date.now()-start<4000,'ordinary Faux session did not wait for the worker acceptance delay');
+  } finally { await app.close(); store.close(); await rm(root,{recursive:true,force:true}); }
+});
 
 test('the agent harness is off unless the instance enables it',async()=>{
   const root=await mkdtemp(join(tmpdir(),'dashboard-agents-off-'));

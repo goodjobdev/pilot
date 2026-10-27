@@ -105,6 +105,7 @@ message naming the problem; nothing is created and nothing listens.
 | `DASHBOARD_RELEASE_MANIFEST` | Optional path to the immutable release manifest. Defaults to `release.json` beside the built server. See [Release identity and readiness](#release-identity-and-readiness). |
 | `DASHBOARD_ROOT_ID` | Optional logical root id recorded in the lock, bounded the same way. Defaults to the first 16 hex characters of sha256 of the canonical data root path. |
 | `DASHBOARD_SHUTDOWN_DEADLINE_MS` | Optional. How long one drain may take, 1-60000; 10000 by default. Reaching it retains the lock. |
+| `DASHBOARD_ACCEPTANCE_FAUX_WORKER_DELAY_MS` | Optional acceptance aid for W1 workers. Strict integer 0-15000 milliseconds; unset or 0 adds no delay. It applies only to Faux `faux-1` workers, never real workers or ordinary sessions. Invalid values refuse startup. See [Workers](WORKERS.md#acceptance-only-faux-pre-submit-delay). |
 | `PORT`, `DASHBOARD_DATA`, `DASHBOARD_ROOTS` | Listen port (4317 by default), data root, and approved roots. |
 
 `DASHBOARD_RELEASE`, `DASHBOARD_ROOT_ID` and `DASHBOARD_SHUTDOWN_DEADLINE_MS` are not part of

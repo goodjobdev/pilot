@@ -20,7 +20,7 @@ import { RepositoryStore } from './repositories';
 import { browse,within } from './paths';
 import { authorize,headers,establishSession,type SecurityConfig } from './security';
 import { effectiveConfig } from './effective-config';
-import { resolveNoteDelaySeams } from './agent-test-seams';
+import { ACCEPTANCE_FAUX_WORKER_DELAY_MAX_MS, acceptanceFauxWorkerDelayFromEnvironment, resolveNoteDelaySeams } from './agent-test-seams';
 import { acquireServiceLock,inspectServiceLock,type ServiceLockHandle } from './service-lock';
 import { loadReleaseManifest,observeStorageSchema,resolveRelease,schemaVersionForId,SUPPORTED_SCHEMA_IDS,RELEASE_MANIFEST_ENV,RELEASE_MANIFEST_FILENAME,UNRELEASED_LOCAL,type StorageSchemaObservation } from './release';
 import { ControlStore,CONTROL_SCHEMA_VERSION } from './state/control-store';
@@ -77,7 +77,7 @@ export type ReleasePromotionObservation =
   | {readonly state:'unreadable';readonly reason:string};
 /** What the running service reports about itself, and the one read-only seam that answers for promotion. */
 export interface ReleaseReportOptions {readonly version:string;readonly source:'manifest'|'unreleased-local';readonly buildId?:string;readonly sourceDigest?:string;readonly observe:()=>ReleasePromotionObservation}
-export interface AppOptions {dataRoot:string;browseRoots:string[];security:SecurityConfig;allowedHosts?:readonly string[];clientRoot?:string;registry?:string;agents?:'on'|'off';agentPauseMs?:number;recordNoteDelayMs?:number;recordNoteAfterWriteMs?:number;recordNoteStarted?:()=>void;readNotesSeam?:{delayMs?:number;onExecute?:()=>void};alertTransport?:AlertTransport;alertSubject?:string;alertCooldownMs?:number;readiness?:ReadinessOptions;control?:ControlStore;runner?:{readonly enabled?:boolean;readonly port?:RunnerPort};fileEdit?:{readonly enabled?:boolean};release?:ReleaseReportOptions;workerOpenDelayMs?:number;onModelRequest?:(input:{provider:string;modelId:string;maxTokens:number})=>void;workerProbe?:{tool:string;args:Record<string,unknown>};workerProbeDelayMs?:number;workerGuard?:(input:{projectId:string;runId:string;tool:string})=>string|null;workerRequestGuard?:(input:{projectId:string;runId:string})=>string|null;onWorkerGuard?:(input:{tool:string;refusal:string|null})=>void}
+export interface AppOptions {dataRoot:string;browseRoots:string[];security:SecurityConfig;allowedHosts?:readonly string[];clientRoot?:string;registry?:string;agents?:'on'|'off';agentPauseMs?:number;recordNoteDelayMs?:number;recordNoteAfterWriteMs?:number;recordNoteStarted?:()=>void;readNotesSeam?:{delayMs?:number;onExecute?:()=>void};alertTransport?:AlertTransport;alertSubject?:string;alertCooldownMs?:number;readiness?:ReadinessOptions;control?:ControlStore;runner?:{readonly enabled?:boolean;readonly port?:RunnerPort};fileEdit?:{readonly enabled?:boolean};release?:ReleaseReportOptions;workerOpenDelayMs?:number;acceptanceFauxWorkerDelayMs?:number;onModelRequest?:(input:{provider:string;modelId:string;maxTokens:number})=>void;workerProbe?:{tool:string;args:Record<string,unknown>};workerProbeDelayMs?:number;workerGuard?:(input:{projectId:string;runId:string;tool:string})=>string|null;workerRequestGuard?:(input:{projectId:string;runId:string})=>string|null;onWorkerGuard?:(input:{tool:string;refusal:string|null})=>void}
 /**
  * Approvals answer with a status that says what happened: an invalid request is 422, an approval
  * outside the caller's scope is 403, a missing one is 404, a storage fault is 500, and every
@@ -434,6 +434,8 @@ export async function createApp(options:AppOptions){
   // The same test-only seam validator the entrypoint uses before it creates the data root. A host
   // option is accepted directly; the environment form additionally requires the explicit switch.
   const { recordNoteDelayMs, recordNoteAfterWriteMs } = resolveNoteDelaySeams(options, process.env);
+  const acceptanceFauxWorkerDelayMs = options.acceptanceFauxWorkerDelayMs === undefined ? acceptanceFauxWorkerDelayFromEnvironment(process.env) : options.acceptanceFauxWorkerDelayMs;
+  if (!Number.isInteger(acceptanceFauxWorkerDelayMs) || acceptanceFauxWorkerDelayMs < 0 || acceptanceFauxWorkerDelayMs > ACCEPTANCE_FAUX_WORKER_DELAY_MAX_MS) throw new Error('acceptanceFauxWorkerDelayMs must be an integer from 0 to ' + ACCEPTANCE_FAUX_WORKER_DELAY_MAX_MS + ' milliseconds');
   const readNotesDelayMs=options.readNotesSeam?.delayMs??0;
   if(!Number.isInteger(readNotesDelayMs)||readNotesDelayMs<0||readNotesDelayMs>60_000)
     throw new Error('readNotesSeam.delayMs must be a whole number from 0 to 60000');
@@ -556,6 +558,7 @@ export async function createApp(options:AppOptions){
     fileEdit,
     workerBinding:{isWorkerConversation:(projectId,conversationId)=>workerHolder.store?.isWorkerConversation(projectId,conversationId)??false},
     workerOpenDelayMs:options.workerOpenDelayMs,
+    acceptanceFauxWorkerDelayMs,
     onModelRequest:options.onModelRequest,
     workerProbe:options.workerProbe as never,
     workerProbeDelayMs:options.workerProbeDelayMs,
@@ -2174,6 +2177,7 @@ async function main(){
   // The test-only note-delay seam is validated here, before the data root is created. `createApp`
   // runs the same validator again, so a direct caller cannot bypass the bound either.
   resolveNoteDelaySeams({}, env);
+  acceptanceFauxWorkerDelayFromEnvironment(env);
   // A manifest's releaseId/schemaId become the lock record's values; the bounded DASHBOARD_RELEASE
   // and 'pilot-state-1' remain the durable identity for the unreleased case. The fallback identity
   // is computed only when no manifest supplied one, so an invalid DASHBOARD_RELEASE cannot abort a

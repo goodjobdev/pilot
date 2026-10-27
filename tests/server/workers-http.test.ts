@@ -4,6 +4,7 @@ import { appendFile, mkdtemp, readFile, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createApp } from '../../src/server/main';
+import { ACCEPTANCE_FAUX_WORKER_DELAY_MAX_MS, acceptanceFauxWorkerDelayFromEnvironment, selectWorkerPreSubmitDelay } from '../../src/server/agent-test-seams';
 import { localConfig } from '../../src/server/security';
 import { ControlStore } from '../../src/server/state/control-store';
 import { modelKey, type ModelChoice } from '../../src/shared/settings';
@@ -17,7 +18,7 @@ import { modelKey, type ModelChoice } from '../../src/shared/settings';
  * provider request.
  */
 
-async function instance(extra: { workerOpenDelayMs?: number; onModelRequest?: (input: { provider: string; modelId: string; maxTokens: number }) => void; workerProbe?: { tool: string; args: Record<string, string | number | boolean | null> }; workerProbeDelayMs?: number; onWorkerGuard?: (input: { tool: string; refusal: string | null }) => void } = {}) {
+async function instance(extra: { workerOpenDelayMs?: number; acceptanceFauxWorkerDelayMs?: number; onModelRequest?: (input: { provider: string; modelId: string; maxTokens: number }) => void; workerProbe?: { tool: string; args: Record<string, string | number | boolean | null> }; workerProbeDelayMs?: number; onWorkerGuard?: (input: { tool: string; refusal: string | null }) => void } = {}) {
   const root = await mkdtemp(join(tmpdir(), 'pilot-workers-api-'));
   const store = new ControlStore(root);
   const security = localConfig('http://127.0.0.1:0');
@@ -32,6 +33,45 @@ async function instance(extra: { workerOpenDelayMs?: number; onModelRequest?: (i
   const close = async () => { await app.close(); store.close(); await rm(root, { recursive: true, force: true }); };
   return { root, store, app, base, token, headers, post, get, close };
 }
+
+test('acceptance Faux worker delay parses strictly, defaults to zero, and has a bounded range', () => {
+  assert.equal(acceptanceFauxWorkerDelayFromEnvironment({}), 0);
+  assert.equal(acceptanceFauxWorkerDelayFromEnvironment({ DASHBOARD_ACCEPTANCE_FAUX_WORKER_DELAY_MS: '0' }), 0);
+  assert.equal(acceptanceFauxWorkerDelayFromEnvironment({ DASHBOARD_ACCEPTANCE_FAUX_WORKER_DELAY_MS: String(ACCEPTANCE_FAUX_WORKER_DELAY_MAX_MS) }), ACCEPTANCE_FAUX_WORKER_DELAY_MAX_MS);
+  for (const value of ['', ' 1', '1 ', '1\n', '1\r\n', '+1', '1.0', '1e2', 'NaN', 'Infinity', '-1', '15001', '999999999999999999999'])
+    assert.throws(() => acceptanceFauxWorkerDelayFromEnvironment({ DASHBOARD_ACCEPTANCE_FAUX_WORKER_DELAY_MS: value }), /integer/);
+  assert.throws(() => acceptanceFauxWorkerDelayFromEnvironment({ DASHBOARD_ACCEPTANCE_FAUX_WORKER_DELAY_MS: '' }), /integer/);
+});
+
+test('worker pre-submit delay selects only Faux faux-1 and preserves legacy seam precedence', () => {
+  assert.equal(selectWorkerPreSubmitDelay({ provider: 'faux', modelId: 'faux-1' }, undefined, 5000), 5000);
+  assert.equal(selectWorkerPreSubmitDelay({ provider: 'openai', modelId: 'gpt' }, undefined, 5000), 0);
+  assert.equal(selectWorkerPreSubmitDelay({ provider: 'faux', modelId: 'other' }, undefined, 5000), 0);
+  assert.equal(selectWorkerPreSubmitDelay({ provider: 'faux', modelId: 'faux-1' }, 17, 5000), 17);
+  assert.equal(selectWorkerPreSubmitDelay({ provider: 'faux', modelId: 'faux-1' }, 0, 5000), 0);
+});
+
+test('createApp rejects invalid direct acceptance-delay options and reads the environment setting', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pilot-worker-delay-config-'));
+  const store = new ControlStore(root);
+  const security = localConfig('http://127.0.0.1:0');
+  for (const value of [-1, 1.5, Number.NaN, 15001]) {
+    await assert.rejects(createApp({ dataRoot: root, browseRoots: [], security, control: store, acceptanceFauxWorkerDelayMs: value }), /integer/);
+  }
+  const previous = process.env.DASHBOARD_ACCEPTANCE_FAUX_WORKER_DELAY_MS;
+  try {
+    process.env.DASHBOARD_ACCEPTANCE_FAUX_WORKER_DELAY_MS = '15000';
+    const app = await createApp({ dataRoot: root, browseRoots: [], security, control: store });
+    await app.close();
+    process.env.DASHBOARD_ACCEPTANCE_FAUX_WORKER_DELAY_MS = '';
+    await assert.rejects(createApp({ dataRoot: root, browseRoots: [], security, control: store }), /integer/);
+  } finally {
+    if (previous === undefined) delete process.env.DASHBOARD_ACCEPTANCE_FAUX_WORKER_DELAY_MS;
+    else process.env.DASHBOARD_ACCEPTANCE_FAUX_WORKER_DELAY_MS = previous;
+    store.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
 async function project(f: Awaited<ReturnType<typeof instance>>) {
   const created = await f.post('/projects', { name: 'Worker fixture', managed: true, confirm: true });
@@ -281,7 +321,7 @@ test('workers: every generic agent/session route refuses a worker conversation a
   } finally { await f.close(); }
 });
 
-test('workers: a cancel inside the open window sends no model request, and the synthetic provider is bounded to 4096 tokens', async () => {
+test('workers: the legacy open-window seam cancels before a request, and Faux provider budget remains intact', async () => {
   const requests: { provider: string; modelId: string; maxTokens: number }[] = [];
   const f = await instance({ workerOpenDelayMs: 250, onModelRequest: (input) => { requests.push(input); } });
   try {
@@ -290,20 +330,51 @@ test('workers: a cancel inside the open window sends no model request, and the s
     const scripted = policyView.models.find((model) => model.provider === 'faux' && model.available)!;
     const model = { provider: scripted.provider, modelId: scripted.modelId };
     await f.post('/settings/model-policy', { revision: policyView.revision, policy: { allowedWorkerModels: [model], defaultWorkerModel: model } });
-    const worker = (await (await f.post('/projects/' + projectRecord.id + '/workers', { name: 'Window worker', scopes: ['read_notes'] })).json() as { worker: { id: string } }).worker;
-
-    // The run is admitted, then stopped while the conversation is still opening. The deterministic
-    // window means the stop lands before the submission: zero provider requests, no report.
+    const worker = (await (await f.post('/projects/' + projectRecord.id + '/workers', { name: 'Legacy window worker', scopes: ['read_notes'] })).json() as { worker: { id: string } }).worker;
     const run = (await (await f.post('/projects/' + projectRecord.id + '/workers/' + worker.id + '/runs', {})).json() as { run: { id: string } }).run;
     const stopped = await f.post('/projects/' + projectRecord.id + '/workers/runs/' + run.id + '/stop', {});
     assert.equal(stopped.status, 200);
     const settled = await waitForRun(f, projectRecord.id, run.id);
     assert.equal(settled.state, 'cancelled');
     assert.equal(settled.report, null);
-    assert.equal(requests.length, 0, 'a cancel inside the open window sends no provider request');
-    // If the open window had already created a conversation, its identity is durable; a cancel
-    // before the conversation opens creates none. Either way no model request is made.
+    assert.equal(requests.length, 0);
     assert.ok(f.app.workerStore!.workerConversationIds(projectRecord.id).length <= 1);
+    assert.equal(f.app.workerStore!.view(projectRecord.id).activeRunId, null);
+
+    const second = (await (await f.post('/projects/' + projectRecord.id + '/workers/' + worker.id + '/runs', {})).json() as { run: { id: string } }).run;
+    const finished = await waitForRun(f, projectRecord.id, second.id);
+    assert.equal(finished.state, 'completed');
+    assert.ok(requests.length >= 1);
+    assert.ok(requests.every((request) => request.maxTokens === 4096));
+    assert.equal(requests[0].provider, 'faux');
+  } finally { await f.close(); }
+});
+
+test('workers: configured Faux acceptance delay is cancellable after durable binding; provider budget remains intact', async () => {
+  const requests: { provider: string; modelId: string; maxTokens: number }[] = [];
+  const f = await instance({ acceptanceFauxWorkerDelayMs: 5000, onModelRequest: (input) => { requests.push(input); } });
+  try {
+    const projectRecord = await project(f);
+    const policyView = await (await f.get('/settings/model-policy')).json() as { revision: number; models: { provider: string; modelId: string; available: boolean }[] };
+    const scripted = policyView.models.find((model) => model.provider === 'faux' && model.available)!;
+    const model = { provider: scripted.provider, modelId: scripted.modelId };
+    await f.post('/settings/model-policy', { revision: policyView.revision, policy: { allowedWorkerModels: [model], defaultWorkerModel: model } });
+    const worker = (await (await f.post('/projects/' + projectRecord.id + '/workers', { name: 'Window worker', scopes: ['read_notes'] })).json() as { worker: { id: string } }).worker;
+
+    const run = (await (await f.post('/projects/' + projectRecord.id + '/workers/' + worker.id + '/runs', {})).json() as { run: { id: string } }).run;
+    const bindingDeadline = Date.now() + 3000;
+    while (f.app.workerStore!.workerConversationIds(projectRecord.id).length === 0 && Date.now() < bindingDeadline)
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(f.app.workerStore!.workerConversationIds(projectRecord.id).length, 1, 'durable conversation binding exists before stop');
+    assert.equal(requests.length, 0, 'no provider request has started during the configured window');
+    const stopped = await f.post('/projects/' + projectRecord.id + '/workers/runs/' + run.id + '/stop', {});
+    assert.equal(stopped.status, 200);
+    const settled = await waitForRun(f, projectRecord.id, run.id);
+    assert.equal(settled.state, 'cancelled');
+    assert.equal(settled.report, null);
+    assert.equal(requests.length, 0, 'a cancel during the configured window sends no provider request');
+    assert.equal(f.app.workerStore!.workerConversationIds(projectRecord.id).length, 1, 'conversation was durably bound before cancellation');
+    assert.equal(f.app.workerStore!.view(projectRecord.id).activeRunId, null, 'cancellation releases the project lease');
 
     // A normal worker run through the synthetic provider reaches the provider boundary with the
     // worker budget, including its output-token limit.

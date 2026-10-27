@@ -1,5 +1,5 @@
 /**
- * The test-only `record_note` delay seams.
+ * The operator-configured Faux acceptance delay and restricted `record_note` test seams.
  *
  * These values open deterministic cancellation windows in tests: `beforeWriteMs` holds the call
  * before the append and `afterWriteMs` holds it after the append, before the harness settles. They
@@ -7,10 +7,27 @@
  * form additionally needs `DASHBOARD_AGENT_TEST_SEAMS=on`, so an ordinary deployment cannot enable
  * it with one variable.
  *
- * The same validator is used by the entrypoint before it creates the data root and by `createApp`,
- * so a bad value fails closed on startup and a direct caller cannot bypass the bound.
+ * The note seam validator is used by startup and `createApp`. The Faux acceptance setting is a
+ * supported operator setting and is validated by the same startup and app paths.
  */
 export const NOTE_DELAY_MAX_MS = 60000;
+export const ACCEPTANCE_FAUX_WORKER_DELAY_MAX_MS = 15000;
+
+/** Choose the pre-submit delay. The programmatic worker seam takes precedence. */
+export function selectWorkerPreSubmitDelay(model: { provider: string; modelId: string }, workerOpenDelayMs: number | undefined, acceptanceDelayMs: number | undefined): number {
+  return workerOpenDelayMs ?? (model.provider === 'faux' && model.modelId === 'faux-1' ? acceptanceDelayMs ?? 0 : 0);
+}
+/** Parse the operator-configured acceptance setting. Unset means zero; empty is invalid. */
+export function acceptanceFauxWorkerDelayFromEnvironment(env: NodeJS.ProcessEnv): number {
+  const raw = env.DASHBOARD_ACCEPTANCE_FAUX_WORKER_DELAY_MS;
+  if (raw === undefined) return 0;
+  if (!/^(0|[1-9][0-9]*)$/.test(raw))
+    throw new Error('DASHBOARD_ACCEPTANCE_FAUX_WORKER_DELAY_MS must be an integer from 0 to ' + ACCEPTANCE_FAUX_WORKER_DELAY_MAX_MS + ' milliseconds');
+  const parsed = Number(raw);
+  if (String(parsed) !== raw || !Number.isSafeInteger(parsed) || parsed > ACCEPTANCE_FAUX_WORKER_DELAY_MAX_MS)
+    throw new Error('DASHBOARD_ACCEPTANCE_FAUX_WORKER_DELAY_MS must be an integer from 0 to ' + ACCEPTANCE_FAUX_WORKER_DELAY_MAX_MS + ' milliseconds');
+  return parsed;
+}
 
 /** One delay value: a whole number from 0 to 60000 milliseconds. */
 export function noteDelayMs(value: unknown, name: string): number {

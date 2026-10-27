@@ -13,6 +13,7 @@ import { GenerationTask } from '@earendil-works/pi-durable';
 import { Type } from 'typebox';
 import { safePath } from '../paths';
 import { abortableDelay } from './abortable';
+import { selectWorkerPreSubmitDelay } from '../agent-test-seams';
 import { modelAcceptsImages } from '../../shared/images';
 import { projectStoredImage } from './image-projection';
 import { authorizeToolUse, installedAgentScopes, unavailableAgentScopes, scopeToolIsInstalled, type AgentPrivilegePort, type AgentScope, type DispatchAuthority } from '../../shared/agent-registry';
@@ -586,6 +587,7 @@ export interface HarnessHostOptions {
   onWorkerGuard?: (input: { readonly tool: string; readonly refusal: string | null }) => void;
   /** Test-only: a bounded window after the conversation opens and before its submission. */
   workerOpenDelayMs?: number;
+  acceptanceFauxWorkerDelayMs?: number;
   /**
    * Test-only observation at the provider boundary, called once per provider request with the
    * output-token limit actually passed. It must not throw and it performs no model work.
@@ -1835,9 +1837,10 @@ export class HarnessHost {
       if (handle.cancelled) return cancelledOutcome();
       const before = await input.beforeSubmit();
       if (before !== null) return handle.cancelled ? cancelledOutcome() : failedOutcome(before);
-      // Test-only bounded window. Production leaves it unset; a cancel lands inside it
-      // deterministically and the submission below is never made.
-      const delayMs = this.options.workerOpenDelayMs ?? 0;
+      // The legacy programmatic test seam and the operator-opt-in Faux acceptance setting open a
+      // bounded cancellation window. Production leaves the acceptance setting unset; cancellation
+      // during the window prevents the submission below.
+      const delayMs = selectWorkerPreSubmitDelay(input.model, this.options.workerOpenDelayMs, this.options.acceptanceFauxWorkerDelayMs);
       if (delayMs > 0) {
         try { await abortableDelay(delayMs, controller.signal); } catch { /* the cancel signal fired */ }
       }
