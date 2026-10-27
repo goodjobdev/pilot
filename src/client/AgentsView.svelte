@@ -14,7 +14,7 @@
  import {modelKey,type ProviderSettings} from '../shared/settings';
  import type {ActionDescriptor} from '../shared/actions';
  import {slashMatches} from './slash';
- import {activityArrived,activityCountUnknown,arrivalAfterFrame,countLabel,followIdentity,indicatorLabel,initialFollow,isNearBottom,readerScrolled,readerStillFollowing,type FollowState} from './follow';
+ import {activityArrived,activityCountUnknown,arrivalAfterFrame,countLabel,followIdentity,indicatorLabel,initialFollow,isNearBottom,readerScrolled,readerStillFollowing,NEAR_BOTTOM_PX,type FollowState} from './follow';
  import {appendedTranscriptRows,retainedAgentView} from './transcript-window';
  import SessionBar from './SessionBar.svelte';
  import SessionActivity from './SessionActivity.svelte';
@@ -357,6 +357,9 @@
  let follow=$state<FollowState>(initialFollow());
  let followKey='';
  let followGeneration=0;
+ // Reader intent changes on every transcript scroll, including one during a pending send.
+ // A send may follow only if that intent is unchanged when its admission response arrives.
+ let readerIntentRevision=0;
  let seenEntryCount=0;
  let seenEntryIds:string[]=[];
  /** The position this page last scrolled the transcript to, or null when it never has. */
@@ -420,8 +423,10 @@
  function onTranscriptScroll():void{
    const element=transcript;
    if(!element)return;
-   if(programmaticScroll){programmaticScroll=false;return;}
    const live=metricsOf(element);
+   if(programmaticScroll&&Math.abs(live.scrollTop-(lastFollowScrollTop??live.scrollTop))<=1){programmaticScroll=false;return;}
+   readerIntentRevision+=1;
+   if(programmaticScroll)programmaticScroll=false;
    if(isNearBottom(live)){
      lastFollowScrollTop=live.scrollTop;
      if(!follow.following)follow=initialFollow();
@@ -621,6 +626,9 @@
    if(checkingImages){problem='A stored image is still being checked with the server. Wait for it to finish, then send.';return;}
    if(images.length>0&&capability.state==='known'&&capability.acceptsImages===false){problem='The model '+capability.provider+' / '+capability.modelId+' does not accept images, so this message is not sent with them. Remove the images or choose a model that accepts images.';return;}
    const generation=draftGeneration,identityAtSend=identityKey;
+   const followIdentityAtSend=followKey,followGenerationAtSend=followGeneration;
+   const readerIntentAtSend=readerIntentRevision;
+   const sendScrollTop=transcript?.scrollTop??null;
    const sentText=text,sentKeys=media.filter(item=>item.status==='ready'&&item.id).map(item=>item.key),sentImages=[...images];
    // The same message retries under the same request identity, so an ambiguous network failure
    // cannot become two admissions. An edited message is a new message and a new identity.
@@ -642,9 +650,12 @@
      // A switch while this was in flight means the result belongs to the old identity, and the new
      // session's draft, text and images are not touched.
      if(generation!==draftGeneration||identityKey!==identityAtSend)return;
-     // Only an admitted message returns the reader to the newest content and resumes following. A
-     // refused or failed send leaves the reading position exactly where the person left it.
-     showNewest();
+     // The response belongs to the original transcript, and it may follow only if the reader has
+     // not moved since send began. In particular, a deliberate scroll during the request wins.
+     const element=transcript;
+     const live=element?metricsOf(element):null;
+     const measuredMovement=live!==null&&sendScrollTop!==null&&Number.isFinite(live.scrollTop)&&live.scrollTop<sendScrollTop-NEAR_BOTTOM_PX;
+     if(followKey===followIdentityAtSend&&followGeneration===followGenerationAtSend&&readerIntentRevision===readerIntentAtSend&&!measuredMovement)showNewest();
      // Text typed while the send awaited is the person's work, not part of what was admitted.
      if(draft.trim()===sentText)draft='';
      else restoredNotice='The message was sent. The text you typed while it was sending was kept.';

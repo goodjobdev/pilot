@@ -368,6 +368,65 @@ test('an admitted send returns to the bottom and a refused send does not move th
  await page.unroute('**/api/projects/*/agents/input');
 });
 
+test('a reader scroll during a held successful send response stays anchored and gets new activity',async({page})=>{
+ await addProject(page,'Follow delayed response fixture');
+ await seed(page,5);
+ await expectAtBottom(page);
+ let release!:()=>void;
+ const held=new Promise<void>(resolve=>{release=resolve;});
+ let admitted!:()=>void;
+ const wasAdmitted=new Promise<void>(resolve=>{admitted=resolve;});
+ await page.route('**/api/projects/*/agents/input',async route=>{
+  const response=await route.fetch();
+  admitted();
+  await held;
+  await route.fulfill({response});
+ });
+ const releaseScrollEvent=()=>page.evaluate(()=>{
+  const testWindow=window as typeof window&{__releasePendingReaderScroll?:()=>void};
+  testWindow.__releasePendingReaderScroll?.();
+ });
+ try{
+  const composer=page.getByLabel('Message the agent');
+  await composer.fill('[pause] delayed response');
+  await composer.press('Enter');
+  await wasAdmitted;
+  const anchor=page.locator('.agent-entry').nth(1);
+  await page.evaluate(()=>{
+   const element=document.querySelector('.agent-transcript') as HTMLElement;
+   const hold=(event:Event)=>{if(event.target===element)event.stopPropagation();};
+   window.addEventListener('scroll',hold,true);
+   const testWindow=window as typeof window&{__releasePendingReaderScroll?:()=>void};
+   testWindow.__releasePendingReaderScroll=()=>{
+    window.removeEventListener('scroll',hold,true);
+    element.dispatchEvent(new Event('scroll'));
+    delete testWindow.__releasePendingReaderScroll;
+   };
+   const row=element.querySelectorAll('.agent-entry')[1] as HTMLElement;
+   element.scrollTop+=row.getBoundingClientRect().top-element.getBoundingClientRect().top-24;
+  });
+  await expect(indicatorOf(page)).toBeVisible();
+  const before=await anchor.boundingBox();
+  const scrollTopBefore=(await geometry(page)).scroller.scrollTop;
+  expect(before).not.toBeNull();
+  release();
+  await expect(composer).toHaveValue('',{timeout:10000});
+  await releaseScrollEvent();
+  await expect(transcriptOf(page)).toContainText('You said: delayed response',{timeout:20000});
+  await expect(indicatorOf(page)).toContainText(/new activit/);
+  const after=await anchor.boundingBox();
+  expect(after).not.toBeNull();
+  expect(Math.abs(after!.y-before!.y)).toBeLessThanOrEqual(1);
+  expect(Math.abs((await geometry(page)).scroller.scrollTop-scrollTopBefore)).toBeLessThanOrEqual(1);
+  await indicatorOf(page).click();
+  await expectAtBottom(page);
+ }finally{
+  release();
+  await releaseScrollEvent();
+  await page.unroute('**/api/projects/*/agents/input');
+ }
+});
+
 test('a keyboard-short screen scrolls the section in normal flow and never covers the transcript',async({page})=>{
  await addProject(page,'Follow short fixture');
  await seed(page,5);
