@@ -60,6 +60,7 @@ test('a session is created with per-field validation, listed with its work, and 
  await page.getByLabel('New session name').fill('Quarterly review');
  await page.getByRole('button',{name:'Create session'}).click();
  await expect(page.getByText('Created session Quarterly review')).toBeVisible();
+ await expect(page.getByLabel('Agent transcript')).toContainText('No messages yet');
 
  // A name outside the documented rule is refused, and the refusal lands beside the field.
  await page.getByRole('button',{name:'New session'}).click();
@@ -81,6 +82,59 @@ test('a session is created with per-field validation, listed with its work, and 
  await expect(details).toContainText('Scopes in effect');
  await expect(details).toContainText('Cache hits');
  await expect(details).toContainText('Cost');
+});
+
+test('creating a session navigates to it and the phone session list scrolls without hiding the composer',async({page})=>{
+ await addProject(page,'Phone sessions fixture');
+ await page.setViewportSize({width:390,height:844});
+ await page.getByRole('button',{name:'Hide project sidebar'}).click();
+ const bar=page.getByRole('region',{name:'Session',exact:true});
+ for(let i=1;i<=8;i++){
+  await page.getByRole('button',{name:'New session'}).click();
+  await page.getByLabel('New session name').fill('Phone session '+i);
+  await page.getByRole('button',{name:'Create session'}).click();
+  await expect(page.getByText('Created session Phone session '+i)).toBeVisible();
+ }
+ await expect(page.getByLabel('Agent transcript')).toContainText('No messages yet');
+ await expect(bar.locator('strong')).toHaveText('Phone session 8');
+ await expect(page).toHaveURL(/session=/);
+ for(const height of [844,500]){
+  await page.setViewportSize({width:390,height});
+  const listButton=page.getByRole('button',{name:'Sessions'});
+  await listButton.click();
+  const list=page.getByLabel('Named sessions');
+  const row=page.getByRole('button',{name:/Phone session 8/}).last();
+  await expect(list).toBeVisible();
+  await row.scrollIntoViewIfNeeded();
+  const geometry=await page.evaluate(()=>{
+   const list=document.querySelector<HTMLElement>('[aria-label="Named sessions"]')!;
+   const row=[...list.querySelectorAll<HTMLElement>('.session-row')].find(item=>item.textContent?.includes('Phone session 8'))!;
+   const l=list.getBoundingClientRect(),r=row.getBoundingClientRect();
+   return {listHeight:list.clientHeight,listScrollHeight:list.scrollHeight,rowY:r.y,rowBottom:r.bottom,listY:l.y,listBottom:l.bottom,overflowX:document.documentElement.scrollWidth>innerWidth};
+  });
+  expect(geometry.listHeight).toBeGreaterThan(geometry.rowBottom-geometry.rowY);
+  expect(geometry.rowY).toBeGreaterThanOrEqual(geometry.listY);
+  expect(geometry.rowBottom).toBeLessThanOrEqual(geometry.listBottom);
+  expect(geometry.listScrollHeight).toBeGreaterThan(geometry.listHeight);
+  expect(geometry.overflowX).toBe(false);
+  await row.click();
+  await expect(page.getByLabel('Named sessions')).toHaveCount(0);
+  const composer=page.getByLabel('Message the agent');
+  await expect(composer).toBeVisible();
+  await composer.click();
+  await expect(composer).toBeFocused();
+  if(height===844){
+   await page.getByLabel('Message the agent').fill('draft in phone session');
+   await page.getByRole('button',{name:'Sessions'}).click();
+   await page.getByRole('button',{name:/Phone session 7/}).last().click();
+   await page.getByLabel('Message the agent').fill('draft in previous session');
+   await page.goBack();
+   await expect(page.getByLabel('Message the agent')).toHaveValue('draft in phone session');
+   await page.goForward();
+   await expect(page.getByLabel('Message the agent')).toHaveValue('draft in previous session');
+   await expect(page.getByLabel('Agent transcript')).toContainText('No messages yet');
+  }
+ }
 });
 
 test('the session bar binds an agent to the live session and shows the scopes in effect, including the empty case',async({page})=>{

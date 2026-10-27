@@ -79,8 +79,10 @@
   if(busy)return;busy=true;nameError='';problem='';message='';
   try{
    const created=await api.createSession({projectId,name:newName});
-   newName='';creating=false;selectedId=created.session.id;
+   newName='';creating=false;
+   selectedId=created.session.id;
    await load();await loadBinding(created.session.id);
+   onlistchange(false);onsessionchange(created.session.id);
    message='Created session '+created.session.name+'.';
   }catch(error){
    const text=(error as Error).message;
@@ -163,7 +165,7 @@
  .session-problem{margin:6px 12px}
  .session-create{display:flex;align-items:flex-end;gap:8px;flex-wrap:wrap;padding:8px 12px;border-bottom:1px solid var(--line)}
  .session-create label{min-width:220px}
- .session-list{border-bottom:1px solid var(--line);padding:8px 12px;display:flex;flex-direction:column;gap:6px;max-height:30dvh;overflow:auto}
+ .session-list{flex:0 0 auto;min-height:0;border-bottom:1px solid var(--line);padding:8px 12px;display:flex;flex-direction:column;gap:6px;max-height:30dvh;overflow-y:auto;overflow-x:hidden}
  .session-row{display:flex;flex-direction:column;gap:3px;width:100%;text-align:left;background:transparent;border:1px solid transparent;border-radius:4px;padding:7px 8px}
  .session-row.active{border-color:var(--accent);background:color-mix(in srgb,var(--accent) 8%,transparent)}
  .session-name{font-size:12px;font-weight:600;overflow-wrap:anywhere}
