@@ -14,6 +14,7 @@ import { Type } from 'typebox';
 import { safePath } from '../paths';
 import { abortableDelay } from './abortable';
 import { modelAcceptsImages } from '../../shared/images';
+import { projectStoredImage } from './image-projection';
 import { authorizeToolUse, installedAgentScopes, unavailableAgentScopes, scopeToolIsInstalled, type AgentPrivilegePort, type AgentScope, type DispatchAuthority } from '../../shared/agent-registry';
 import { FILE_EDIT_MAX_FILE_BYTES, FILE_EDIT_MAX_PATH_LENGTH, type FileEditCapability } from '../state/file-edit-tool';
 import { agentViewFrom, type AgentQuestion, type AgentView } from '../../shared/agent';
@@ -1122,8 +1123,19 @@ export class HarnessHost {
     this.hosted.set(project.id, pending);
     try { return await pending; } catch (error) { this.hosted.delete(project.id); throw error; }
   }
+  // Durable user blocks are immutable. Weak keys reuse validated refs across stream updates
+  // without retaining historical image payloads after their source snapshots are released.
+  private readonly projectedImages = new WeakMap<object, { id: string; mimeType: string } | null>();
+  private resolveStoredImage(block: unknown): { id: string; mimeType: string } | null {
+    if (!block || typeof block !== 'object') return null;
+    if (this.projectedImages.has(block)) return this.projectedImages.get(block) ?? null;
+    const image = block as { data?: unknown; mimeType?: unknown };
+    const result = projectStoredImage(image.data,image.mimeType);
+    this.projectedImages.set(block, result);
+    return result;
+  }
   private shape(hosted: HostedAgent, value: unknown, conversationId?: ConversationId): AgentSessionView {
-    const view = agentViewFrom(value);
+    const view = agentViewFrom(value, undefined, block => this.resolveStoredImage(block));
     return {
       ...view,
       conversationId: String(conversationId ?? hosted.conversation.id),

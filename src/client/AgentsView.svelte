@@ -5,6 +5,7 @@
  import type { AgentView } from '../shared/agent';
  import { uniqueImageFiles,type ImageCapability,type ImageDraft } from '../shared/images';
  import ImageComposer from './ImageComposer.svelte';
+ import TranscriptImage from './TranscriptImage.svelte';
  import { DraftStore,attemptFor,clearSaveFailure,draftSaveMessage,droppedFailureMessage,markSaveFailure,readSaveFailure,restoredImageItems,sessionKeyOf,storedAttachments,type StoredAttempt,type StoredDraft } from './drafts';
  type Capability={state:'known';provider:string;modelId:string;acceptsImages:boolean}|{state:'unknown';reason:string};
  type CachedDraft={text:string;media:ImageDraft[];attempt:StoredAttempt|null;savedAt:number|null;unsaved:boolean};
@@ -823,7 +824,8 @@
    <span class="agent-role">{entry.kind==='user'?'You':entry.kind==='assistant'?'Agent':entry.kind==='tool'?'Tool':entry.kind}</span>
    {#if entry.thinking}<details class="agent-thinking"><summary>Reasoning</summary><pre>{entry.thinking}</pre></details>{/if}
    {#if entry.tools.length}<div class="agent-tools">{#each entry.tools as tool}<span class="pill">{tool.name}</span>{/each}</div>{/if}
-   <pre class="agent-text">{entry.text || (entry.tools.length?'(tool call)':'(no text)')}</pre>
+   <pre class="agent-text">{entry.text || (entry.tools.length?'(tool call)':(entry.images?.length?'':'(no text)'))}</pre>
+   {#each entry.images??[] as image, imageIndex (`${image.id}-${imageIndex}`)}<TranscriptImage id={image.id}/>{/each}
    {#if entry.stopReason&&entry.stopReason!=='stop'}<small class="agent-note">stopped: {entry.stopReason}</small>{/if}
    {#if entry.error}<small class="agent-note error-inline">{entry.error}</small>{/if}
   </article>

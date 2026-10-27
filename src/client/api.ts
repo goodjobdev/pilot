@@ -3,7 +3,7 @@ import type { DocEntry,DocSnapshot } from '../shared/docs';
 import type { AgentView } from '../shared/agent';
 import type { ActionDescriptor,LiveActivity } from '../shared/actions';
 import type { AgentAuditEntry,AgentModelChoice,AgentRecord } from '../shared/agent-registry';
-import type { ImageCapability, MediaView } from '../shared/images';
+import { ACCEPTED_IMAGE_TYPES, type ImageCapability, type MediaView } from '../shared/images';
 import type { AttentionByKind, AttentionCounts, AttentionItem, AttentionPage } from '../shared/attention';
 import type { ApprovalKind, ApprovalRecord, ApprovalScope, ApprovalState, ApprovalTarget } from '../shared/approvals';
 import type { WorkerLimits, WorkerRecord, WorkerRun, WorkerScope } from '../shared/workers';
@@ -223,9 +223,15 @@ export function assetUrl(id:string,path:string){return '/api/projects/'+id+'/doc
  * Stored media is served owner-only, so it is fetched with the session header and shown as a blob
  * URL: an <img src> request cannot carry that header. The URL is the caller's to revoke.
  */
-export async function mediaBlobUrl(id:string):Promise<string>{
-  const res=await fetch('/api/media/'+id,{headers:{'x-dashboard-token':token}});
+export async function mediaBlobUrl(id:string,signal?:AbortSignal):Promise<string>{
+  const res=await fetch('/api/media/'+encodeURIComponent(id),{redirect:'manual',headers:{'x-dashboard-token':token},signal});
+  if(res.type==='opaqueredirect'||res.status===0||(res.status>=300&&res.status<400)){
+    reportSessionExpired();
+    throw new ApiError(res.status,'Your sign-in has expired. Reload to view the attachment.','session');
+  }
   if(!res.ok)throw new ApiError(res.status,'Image unavailable');
+  const mime=res.headers.get('content-type')?.split(';',1)[0].trim().toLowerCase();
+  if(!(ACCEPTED_IMAGE_TYPES as readonly string[]).includes(mime??''))throw new ApiError(res.status,'Image unavailable');
   return URL.createObjectURL(await res.blob());
 }
 /**

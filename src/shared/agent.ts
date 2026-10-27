@@ -1,3 +1,4 @@
+import { MAX_IMAGES_PER_MESSAGE } from './images';
 /** Shapes the agent view is rendered from. Pure: no Node and no Durable import. */
 
 export type AgentEntryKind = 'user' | 'assistant' | 'tool' | 'system' | 'other';
@@ -27,6 +28,8 @@ export interface AgentEntry {
   tools: AgentToolUse[];
   stopReason: string | null;
   error: string | null;
+  /** Authenticated media identifiers projected by the server; never image bytes or URLs. */
+  images?: { id: string; mimeType: string }[];
   /** Custom entry payload, if the entry is not a provider message. */
   data: Record<string, unknown> | null;
   /** The result's own recorded metadata, or null when this entry is not a tool result. */
@@ -101,14 +104,26 @@ function toolsOf(content: unknown): AgentToolUse[] {
   });
 }
 
+function imageRefsOf(content: unknown, resolve?: (block: unknown) => { id: string; mimeType: string } | null): { id: string; mimeType: string }[] {
+  if (!resolve || !Array.isArray(content)) return [];
+  const images: { id: string; mimeType: string }[] = [];
+  for (const block of content) {
+    if (!block || typeof block !== 'object' || (block as { type?: unknown }).type !== 'image') continue;
+    const image = resolve(block);
+    if (image) images.push(image);
+    if (images.length === MAX_IMAGES_PER_MESSAGE) break;
+  }
+  return images;
+}
+
 /**
  * Maps one stored transcript entry to something renderable.
  *
- * Durable stores a provider-facing message list on each entry; only text,
- * thinking and tool-call blocks are surfaced, and nothing is interpreted as
- * markup by the server.
+ * Durable stores a provider-facing message list on each entry. Text, thinking and tool calls
+ * are surfaced directly; user images require a server resolver that returns only media references.
+ * Provider image bytes are never included in the view, and nothing is interpreted as markup.
  */
-export function agentEntryView(entry: unknown): AgentEntry | null {
+export function agentEntryView(entry: unknown, imageResolver?: (block: unknown) => { id: string; mimeType: string } | null): AgentEntry | null {
   if (!entry || typeof entry !== 'object') return null;
   const record = entry as { id?: unknown; kind?: unknown; model?: unknown; data?: unknown };
   if (typeof record.kind !== 'string') return null;
@@ -128,6 +143,7 @@ export function agentEntryView(entry: unknown): AgentEntry | null {
     tools: toolsOf(content),
     stopReason: typeof last.stopReason === 'string' ? last.stopReason : null,
     error: typeof last.errorMessage==='string'?last.errorMessage:null,
+    images: record.kind === 'pi.user' ? imageRefsOf(content, imageResolver) : [],
     data,
     toolResult: record.kind === 'pi.tool-result' ? toolResultOf(last) : null
   };
@@ -170,9 +186,9 @@ export function emptyAgentView(conversationId = '', model: AgentView['model'] = 
 }
 
 /** Maps a Durable conversation view (entries plus built-in documents) to the client shape. */
-export function agentViewFrom(value: unknown, updatedAt = new Date().toISOString()): AgentView {
+export function agentViewFrom(value: unknown, updatedAt = new Date().toISOString(), imageResolver?: (block: unknown) => { id: string; mimeType: string } | null): AgentView {
   const state = (value ?? {}) as { entries?: unknown[]; docs?: Record<string, unknown> };
-  const entries = (state.entries ?? []).map(agentEntryView).filter((entry): entry is AgentEntry => entry !== null);
+  const entries = (state.entries ?? []).map(entry => agentEntryView(entry, imageResolver)).filter((entry): entry is AgentEntry => entry !== null);
   const live = (state.docs?.['pi.live'] ?? {}) as { run?: unknown; generation?: { attempt?: number } };
   const inboxDoc = (state.docs?.['pi.inbox'] ?? {}) as { items?: { id?: unknown; mode?: unknown; content?: unknown }[] };
   const agentDoc = (state.docs?.['pi.agent'] ?? {}) as { model?: { provider?: string; modelId?: string } };

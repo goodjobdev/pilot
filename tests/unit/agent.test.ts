@@ -4,7 +4,7 @@ import { agentEntryView, agentQuestionViews, agentUsageView, agentViewFrom, empt
 
 test('transcript entries map to renderable text, thinking and tool calls', () => {
   const user = agentEntryView({ id: 1, kind: 'pi.user', model: [{ role: 'user', content: 'hello there', timestamp: 1700 }] });
-  assert.deepEqual(user, { id: '1', kind: 'user', rawKind: 'pi.user', at: 1700, text: 'hello there', thinking: '', tools: [], stopReason: null, error: null, data: null, toolResult: null });
+  assert.deepEqual(user, { id: '1', kind: 'user', rawKind: 'pi.user', at: 1700, text: 'hello there', thinking: '', tools: [], stopReason: null, error: null, images: [], data: null, toolResult: null });
   const assistant = agentEntryView({
     id: 2,
     kind: 'pi.assistant',
@@ -21,6 +21,16 @@ test('transcript entries map to renderable text, thinking and tool calls', () =>
   assert.equal(agentEntryView({ id: 6 }), null);
   assert.equal(agentEntryView(null), null);
   assert.equal(agentEntryView({id:7,kind:'pi.assistant',model:[{role:'assistant',content:[],stopReason:'error',errorMessage:'Model connection required'}]})?.error,'Model connection required');
+});
+
+test('image transcript projection returns only resolved ids and never provider bytes', () => {
+ const payload='synthetic-base64-payload';
+ const raw={id:'image-row',kind:'pi.user',model:[{role:'user',content:[{type:'image',data:payload,mimeType:'image/png'}]}]};
+ assert.deepEqual(agentEntryView(raw)?.images,[]);
+ const entry=agentEntryView(raw,block=>{assert.notEqual(block,payload);return {id:'a'.repeat(64),mimeType:'image/png'};})!;
+ assert.deepEqual(entry.images,[{id:'a'.repeat(64),mimeType:'image/png'}]);
+ assert.equal(JSON.stringify(entry).includes(payload),false);
+ assert.deepEqual(agentEntryView({...raw,kind:'pi.assistant'},()=>({id:'b'.repeat(64),mimeType:'image/png'}))?.images,[]);
 });
 
 test('a tool result keeps only its own recorded name, error flag and measured duration', () => {
@@ -63,7 +73,7 @@ test('questions pair with answers by id, so one answer resolves one question',()
     { id: 3, kind: 'app.answer', data: { questionId: 'q1', text: 'Stripe', answeredAt: 1900 } },
     { id: 4, kind: 'pi.user', model: [{ role: 'user', content: 'unrelated' }] }
   ];
-  const entries=raw.map(agentEntryView).filter((entry): entry is AgentEntry => entry !== null);
+  const entries=raw.map(entry=>agentEntryView(entry)).filter((entry): entry is AgentEntry => entry !== null);
   assert.deepEqual(agentQuestionViews(entries),[
     { id: 'q1', text: 'Which provider?', askedAt: 1700, answer: { text: 'Stripe', answeredAt: 1900 } },
     { id: 'q2', text: 'Ship it now?', askedAt: 1800, answer: null }

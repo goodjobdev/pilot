@@ -181,6 +181,91 @@ test('a send is held until an image that is still uploading has been stored',asy
  * A preview fetch and an upload are two conditions. A preview that cannot be fetched is reported as
  * its own condition, is never described as a refusal, and never removes an image the server accepted.
  */
+test('an attachment-only draft sends once and renders from authenticated stored bytes after reload',async({page})=>{
+  const directory=await mkdtemp(join(tmpdir(),'pilot-browser-transcript-image-'));
+  const imagePath=join(directory,'transcript.png');
+  await writeFile(imagePath,png(8,6));
+  await withAgents(page,'Transcript image fixture');
+  const composer=page.getByLabel('Message the agent');
+  const inputRequests:Record<string,unknown>[]=[];
+  const apiBodies:string[]=[];
+  page.on('request',request=>{
+    const path=new URL(request.url()).pathname;
+    if(request.method()==='POST'&&path.endsWith('/agents/input'))inputRequests.push(request.postDataJSON() as Record<string,unknown>);
+  });
+  page.on('response',async response=>{
+    if(!/\/api\/projects\/.*\/agents(?:\/stream)?/.test(new URL(response.url()).pathname))return;
+    try{apiBodies.push(await response.text());}catch{/* A stream can close during a reload. */}
+  });
+  await expect(composer).toHaveValue('');
+  await page.locator('input[type=file]').setInputFiles(imagePath);
+  await expect(page.locator('.image-item .image-facts')).toContainText('8×6');
+  await page.reload();
+  await expect(composer).toHaveValue('');
+  await expect(page.locator('.image-item .image-facts')).toContainText('8×6');
+  expect(inputRequests,'reload restores the draft without submitting').toHaveLength(0);
+
+  await page.getByRole('button',{name:'Send message'}).click();
+  const transcript=page.getByLabel('Agent transcript');
+  await expect.poll(()=>inputRequests.length).toBe(1);
+  expect(inputRequests[0].text).toBe('');
+  expect(inputRequests[0].images).toHaveLength(1);
+  await expect(transcript.locator('.agent-entry.user')).toHaveCount(1);
+  await expect(transcript.locator('.agent-entry.user')).not.toContainText('(no text)');
+  await expect(transcript.getByRole('img',{name:'User attachment'})).toHaveCount(1);
+  const attachment=transcript.getByRole('img',{name:'User attachment'}).first();
+  await expect.poll(()=>attachment.evaluate((img:HTMLImageElement)=>img.complete&&img.naturalWidth>0)).toBe(true);
+  expect(await attachment.getAttribute('src')).toMatch(/^blob:/);
+  const mediaResponses=page.waitForResponse(response=>response.request().method()==='GET'&&new URL(response.url()).pathname.startsWith('/api/media/'));
+  // Force a fresh transcript projection and authenticated media fetch from persisted server data.
+  await page.reload();
+  await expect(page.getByLabel('Agent transcript').locator('.agent-entry.user')).toHaveCount(1);
+  const restored=page.getByLabel('Agent transcript').getByRole('img',{name:'User attachment'});
+  await expect(restored).toHaveCount(1);
+  await expect.poll(()=>restored.evaluate((img:HTMLImageElement)=>img.complete&&img.naturalWidth>0)).toBe(true);
+  expect(await restored.getAttribute('src')).toMatch(/^blob:/);
+  const mediaResponse=await mediaResponses;
+  expect(mediaResponse.status()).toBe(200);
+  expect(inputRequests,'reloading the admitted transcript does not resend').toHaveLength(1);
+  await expect(page.getByLabel('Agent transcript').locator('.agent-entry.user')).toHaveCount(1);
+  const mediaId=(inputRequests[0].images as string[])[0];
+  await expect.poll(()=>apiBodies.some(body=>body.includes(mediaId))).toBe(true);
+  for(const body of apiBodies){expect(body).not.toContain(Buffer.from(png(8,6)).toString('base64'));}
+});
+
+test('a media redirect to another origin is not followed or rendered as a transcript image',async({page})=>{
+  const directory=await mkdtemp(join(tmpdir(),'pilot-browser-media-redirect-'));
+  const imagePath=join(directory,'redirect.png');
+  await writeFile(imagePath,png(8,6));
+  await withAgents(page,'Media redirect fixture');
+  const mediaResponse=page.waitForResponse(response=>response.request().method()==='GET'&&new URL(response.url()).pathname.startsWith('/api/media/'));
+  const composer=page.getByLabel('Message the agent');
+  await page.locator('input[type=file]').setInputFiles(imagePath);
+  await expect(page.locator('.image-item .image-facts')).toContainText('8×6');
+  await composer.fill('image whose media lookup redirects');
+  await page.getByRole('button',{name:'Send message'}).click();
+  const transcript=page.getByLabel('Agent transcript');
+  await expect(transcript).toContainText('image whose media lookup redirects');
+  const attachment=transcript.getByRole('img',{name:'User attachment'});
+  await expect(attachment).toHaveCount(1);
+  await expect.poll(()=>attachment.evaluate((img:HTMLImageElement)=>img.complete&&img.naturalWidth>0)).toBe(true);
+  const mediaUrl=await attachment.getAttribute('src');
+  expect(mediaUrl).toMatch(/^blob:/);
+  const path=new URL((await mediaResponse).url()).pathname;
+  const destination='https://redirect-target.invalid/stolen-image';
+  let destinationRequests=0;
+  await page.route('https://redirect-target.invalid/**',route=>{
+    destinationRequests++;
+    return route.fulfill({status:200,contentType:'image/png',body:Buffer.from(png(8,6))});
+  });
+  await page.route(`**${path}`,route=>route.fulfill({status:302,headers:{location:destination}}));
+  await page.reload();
+  await expect(transcript).toContainText('image whose media lookup redirects');
+  await expect(transcript.getByRole('img',{name:'User attachment'})).toHaveCount(0);
+  await expect(transcript).toContainText(/unavailable|sign-in|expired/i);
+  expect(destinationRequests,'browser must not follow cross-origin media redirect').toBe(0);
+});
+
 test('a preview that cannot be fetched is its own condition and never removes the accepted image',async({page})=>{
   const directory=await mkdtemp(join(tmpdir(),'dashboard-browser-images-preview-'));
   const good=join(directory,'kept.png');
