@@ -13,6 +13,8 @@ work for the current milestone, *Dependable from a phone*, is in [docs/PLAN.md](
 - **A documentation wiki.** Browse, edit, search and render any Markdown in a registered
   project: diagrams, images, static HTML mockups, spec links and an open-questions inbox.
   Edits are revision-checked, so a second writer gets a conflict instead of losing work.
+  Fold every folder with Collapse all. A right-side Files / Changes panel previews code,
+  documents, images, uncommitted patches and local commit history.
 - **Durable agents.** One Pi Durable session per project, committed to SQLite as it runs:
   live transcript, steering, stopping, and questions the agent asks that you answer once.
   Certain work can continue from its last checkpoint. An uncertain interruption blocks model
@@ -30,14 +32,17 @@ work for the current milestone, *Dependable from a phone*, is in [docs/PLAN.md](
   the documentation or the approved roots actually contain it. See
   [Sessions](docs/SESSIONS.md) and [Migrating the legacy conversation](docs/MIGRATION.md).
 - **Repository connections.** Generate a project deploy key in the UI and explicitly connect
-  an isolated review worktree; no automatic installs, commits or pushes.
+  an isolated review worktree; provisioning performs no installs, commits or pushes.
+  Subsequent documentation saves attempt narrow local commits, never automatic pushes.
 - **Providers and models.** Add API keys or sign in from settings, pick a default for new
   sessions, and star favourites so they appear first. The scripted provider remains the free
   initial default; real calls require explicit opt-in.
 - **Phone alerts.** Web Push for questions, finished runs and failures, with a link that
   opens the exact project.
 - **A planning board.** The dependency canvas, milestone timeline and task list this app
-  started as, with spec links from work items into the wiki.
+  started as, with spec links from work items into the wiki. Board views and the Wiki plan
+  share `docs/dashboard/board.md`. Sync plan previews selected repository checklists before
+  applying a revision-checked, locally committed batch. See [Plan, files and local history](docs/PLAN-SYNC.md).
 
 ## How it fits together
 

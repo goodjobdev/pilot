@@ -58,20 +58,22 @@ branch-scoped**: a write key is not technically limited to the review branch.
 Use repository rules for main protection.
 
 Keys are not encrypted at rest. A shell-capable agent in the same container
-could read them. The current agent tools remain question/note tools; adding
-general coding tools needs an execution-boundary review and is not done by
-connecting a repository.
+could read them. Current default tools include bounded documentation reads and planning
+updates, not a general coding suite. Adding general coding tools needs an execution-boundary
+review and is not done by connecting a repository.
 
 ## Backup and rollback
 
 Uncommitted files are **not backed up by GitHub**. A branch is not a backup until
-its work is deliberately committed and pushed. Pilot does not do either
-automatically.
+its work is deliberately committed and pushed. Pilot now attempts narrow local commits
+for documentation saves and board operations on its project branch; it never pushes or
+merges automatically. See [Plan, files and local history](PLAN-SYNC.md).
+Local commits in a derived worktree are not a remote or independent backup.
 
-The ordinary offline backup copies managed-project Markdown (including Wiki and
-board files); it excludes image assets, Git history, agent SQLite state, keys
-and provider credentials. Back up the full working repository separately for
-code, assets and uncommitted changes.
+The ordinary offline backup captures documentation and working state as described in
+[Security](SECURITY.md), but excludes derived repository worktrees, Git objects and
+credentials. Back up the full working repository separately for local history, code,
+assets and uncommitted changes.
 
 Before a real migration, record the remote/local base SHAs, preserve uncommitted
 and untracked files, and make an independent verified backup. Rollback means

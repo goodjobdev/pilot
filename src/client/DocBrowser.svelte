@@ -28,6 +28,9 @@
    oncreate(path.trim());
  }
  function pick(path:string){matches=[];onselect(path);onclose?.();}
+ const allCollapsed=$derived(groups.length>0&&groups.every(([folder])=>collapsed[folder]));
+ function foldAll(){collapsed=allCollapsed?{}:Object.fromEntries(docs.map(doc=>[doc.path.includes('/')?doc.path.split('/')[0]:'(root)',true]));}
+ $effect(()=>{void projectId;collapsed={};});
 </script>
 <div class="doc-browser">
  <div class="doc-controls">
@@ -35,7 +38,7 @@
   <button class="compact-button" aria-label="New page" title="Create a Markdown page" onclick={create}><Icon name="plus" size={14}/></button>
   {#if onclose}<button class="compact-button wiki-tree-close" aria-label="Hide documents" onclick={onclose}><Icon name="close" size={14}/></button>{/if}
  </div>
- <div class="doc-actions"><button class="text-button" onclick={()=>void search()} disabled={searching}>{searching?'Searching…':'Search contents'}</button>{#if query}<button class="text-button" onclick={clear}>Clear</button>{/if}</div>
+ <div class="doc-actions"><button class="text-button" aria-label={allCollapsed?'Expand all folders':'Collapse all folders'} onclick={foldAll}>{allCollapsed?'Expand all':'Collapse all'}</button><button class="text-button" onclick={()=>void search()} disabled={searching}>{searching?'Searching…':'Search contents'}</button>{#if query}<button class="text-button" onclick={clear}>Clear</button>{/if}</div>
  {#if message}<small class="doc-message">{message}</small>{/if}
  {#if matches.length}
   <div class="doc-matches" aria-label="Content search results">

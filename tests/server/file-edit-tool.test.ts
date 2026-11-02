@@ -219,3 +219,14 @@ test('the record names the agent when an agent made the change, and every edit i
     assert.equal((f.store.db.prepare("SELECT count(*) AS n FROM operations WHERE kind='agent.file-edit'").get() as { n: number }).n, 1);
   } finally { await f.cleanup(); }
 });
+
+for(const change of ['cancel','external edit'] as const)test('queued Markdown apply respects '+change+' before its disk effect',async t=>{
+ const f=await fixture('auto-apply');t.after(f.cleanup);let enter!:()=>void,release!:()=>void;
+ const entered=new Promise<void>(ok=>enter=ok),gate=new Promise<void>(ok=>release=ok),controller=new AbortController();
+ const tool=new FileEditTool(f.store,{enabled:true,projectRoot:()=>f.worktree,dataRoot:f.dataRoot,policy:{mode:()=> 'auto-apply'},saveMarkdown:async(_id,_path,write)=>{enter();await gate;await write();return {status:'unchanged',message:'Fixture'};}});
+ const file=join(f.worktree,'src/spec.md');await writeFile(file,'# Original\n');
+ const pending=tool.edit({projectId:f.projectId,agentId:null,path:'src/spec.md',content:'# Proposed\n',actor:OWNER,signal:controller.signal});
+ const refusal=assert.rejects(pending,error=>change==='cancel'?(error as Error).name==='AbortError':error instanceof FileEditError&&error.code==='CONFLICT');
+ await entered;if(change==='cancel')controller.abort();else await writeFile(file,'# External\n');release();await refusal;
+ assert.equal(await readFile(file,'utf8'),change==='cancel'?'# Original\n':'# External\n');
+});

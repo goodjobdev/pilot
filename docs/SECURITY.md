@@ -18,10 +18,10 @@ assumes, and what it does not protect, so you can decide whether that fits.
 | Cross-site writes | Session-bound CSRF plus same-origin and JSON content-type checks |
 | Host confusion | The Host header must match the configured origin |
 | Exposure | `host-loopback` — the default, and the only profile local mode allows — binds `127.0.0.1`. A container may bind its own interface only with hosted mode plus `container-private-interface`, which serves the published port inside its private network namespace; the host still publishes on `127.0.0.1` only, and the surrounding network stays an operator-attested fact |
-| Path escape | One containment helper refuses absolute paths, `..` and symlinks; generated folders and app-managed paths are never served or edited |
+| Path escape | One containment helper refuses absolute paths, `..` and symlinks; generated and app-managed paths are excluded from ordinary browsing; the canonical plan uses a validated Wiki bridge and source snapshots use their existing read-only source-reference route |
 | Resource abuse | Read and write size caps, a document-count cap, a bounded subscription list, and bounded search/inbox scans |
 | Untrusted rendering | Markdown is sanitised; assets are limited to images and static HTML/SVG; mockups render in a sandboxed frame with no scripts and no same-origin access; a strict Content-Security-Policy covers the application |
-| Agent execution | No general shell/file API exists. Current agent tools are questions and project notes. Fixed Git/SSH-keygen operations are available only through explicit repository provisioning, with no hooks, installs, commits or pushes |
+| Agent execution | No general shell/file API exists. Agent tools include bounded documentation/planning operations. Fixed Git/SSH-keygen provisioning installs or pushes nothing. Documentation saves separately attempt path-scoped local commits only on the project Pilot branch, with hooks, filters, signing and network disabled; no branch switch, push or merge |
 | Credentials | Provider credentials and project deploy keys live outside project roots in 0600 files/0700 folders, excluded from ordinary backups; settings reads return status/public keys only. Login and Git failures do not echo raw credential response bodies or command output |
 | Host escape | The container drops all capabilities, runs non-root with a read-only root filesystem, has no Docker socket and no host mounts |
 

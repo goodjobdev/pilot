@@ -31,7 +31,8 @@ test('two projects keep their documentation and their agent sessions apart',asyn
  // matters: an empty state shown before the list loads would prove nothing.
  await selectProject('Isolation Beta');
  await page.getByRole('button',{name:'Wiki',exact:true}).click();
- await expect(page.getByText('No Markdown documents in this project yet')).toBeVisible();
+ await expect(page.locator('.doc-item')).toHaveCount(1);
+ await expect(page.getByRole('button',{name:/dashboard\/board\.md/})).toBeVisible();
  await expect(page.getByRole('button',{name:/alpha\.md/})).toHaveCount(0);
  await page.getByRole('button',{name:'Agents',exact:true}).click();
  const betaTranscript=page.getByLabel('Agent transcript');

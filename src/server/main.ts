@@ -11,6 +11,10 @@ import { join,resolve,extname } from 'node:path';
 import { fileURLToPath,pathToFileURL } from 'node:url';
 import { BoardStore,HttpError } from './board-store';
 import { DocStore } from './docs-store';
+import { WorkspaceStore } from './workspace';
+import { writeWorkerReport } from './workers/report';
+import { PLAN_PATH } from '../shared/workspace';
+import { isMarkdownPath } from '../shared/docs';
 import { HarnessHost,type AgentDeliveryPort,type AgentImage,type SessionLifecycleHooks } from './agents/harness-host';
 import { MEDIA_CONTAINER_CODE, MediaContainerError, MediaStore } from './media-store';
 import { AlertStore,type AlertPayload,type AlertTransport } from './alerts';
@@ -470,7 +474,7 @@ export async function createApp(options:AppOptions){
   // createApp directly reads the same single value from its security config per request, so
   // the allowed set never widens and a late origin assignment still applies.
   const allowedHosts=()=>options.allowedHosts??[new URL(options.security.origin).host];
-  const boards=new BoardStore(options.dataRoot),docs=new DocStore(),catalog=new Catalog(options.dataRoot,options.browseRoots,boards);await catalog.init();
+  const workspace=new WorkspaceStore(),boards=new BoardStore(options.dataRoot,workspace),docs=new DocStore({}, {boards,workspace}),catalog=new Catalog(options.dataRoot,options.browseRoots,boards);await catalog.init();
   // The immutable media store: accepted images live under the data root, keyed by the hash of their
   // stored bytes. It validates and processes (decode, orient, resize, re-encode) with the documented
   // ImageProcessor the pinned packages ship; see docs/MEDIA.md for the rules and the honest limits.
@@ -506,14 +510,15 @@ export async function createApp(options:AppOptions){
     projectRoot:(projectId:string)=>catalog.projects.find(candidate=>candidate.id===projectId)?.path,
     dataRoot:options.dataRoot,
     // The mode comes from the acceptance policy in force, never from an assumption.
-    policy:{mode:()=>fileEditModeHolder.mode()}
+    policy:{mode:()=>fileEditModeHolder.mode()},
+    saveMarkdown:async(projectId,path,write)=>(await workspace.save(catalog.get(projectId),[path],async()=>{await write();return {};})).commit
   }):undefined;
   // The durable worker conversation lookup. The harness is constructed before the worker store, so
   // the holder is read at call time and a store failure is treated as "worker" (fail closed).
   const workerHolder:{store?:WorkerStore}={};
   // The agent harness is the only execution surface. It is off unless the instance enables it explicitly.
   const agents=new HarnessHost({
-    dataRoot:options.dataRoot,providers,delivery,lifecycle:lifecycleHooks, docs, boards,
+    dataRoot:options.dataRoot,providers,delivery,lifecycle:lifecycleHooks, docs, boards, workspace,
     recovery:lifecycle?{read:(projectId,sessionId)=>{const record=lifecycle.read(projectId,sessionId);return {state:record.state,uncertain:record.uncertain,requestId:record.requestId};}}:undefined,
     enabled:(options.agents??(process.env.DASHBOARD_AGENTS==='on'?'on':'off'))==='on',
     pauseMs:options.agentPauseMs??Number(process.env.DASHBOARD_AGENT_PAUSE_MS??2500),
@@ -836,7 +841,8 @@ export async function createApp(options:AppOptions){
     policy:()=>workerModelPolicy?.read()??null,
     offered:()=>agents.offeredModels(),
     projectRoot:(projectId)=>catalog.projects.find(candidate=>candidate.id===projectId)?.path,
-    dataRoot:options.dataRoot
+    dataRoot:options.dataRoot,
+    persistReport:async(projectId,input)=>workspace.save(catalog.get(projectId),[input.path],()=>writeWorkerReport(input))
   };
   const workerStore=options.control&&agents.enabled?new WorkerStore(options.control,workerStoreOptions):undefined;
   workerHolder.store=workerStore;
@@ -947,7 +953,7 @@ export async function createApp(options:AppOptions){
     agents:{enabled:agents.enabled,read:(projectId:string,sessionId?:string)=>sessionId?agents.sessionView(catalog.get(projectId),sessionId):agents.view(catalog.get(projectId))}
   };
   const actions=new ActionRegistry(actionEnvironment);
-  const previews=new Map<string,{projectId:string;revision:string;preview:ImportPreview;documents:{name:string;content:string}[];expires:number}>();
+  const previews=new Map<string,{projectId:string;revision:string;preview:ImportPreview;documents:{name:string;content:string}[];sourceRevisions?:Record<string,string>;expires:number}>();
   let closing=false;
   const streams=new Set<{end:()=>void;done:Promise<void>}>();
   const streamFailures:unknown[]=[];
@@ -980,6 +986,8 @@ export async function createApp(options:AppOptions){
           let body='';for await(const chunk of req){body+=chunk.toString();if(Buffer.byteLength(body)>8*1024*1024)throw new HttpError(413,'Request too large');}
           try{payload=JSON.parse(body);}catch{throw new HttpError(400,'Invalid JSON');}
         }
+        const scopedProject=path.match(/^\/api\/projects\/([a-f0-9-]{36})(?:\/|$)/)?.[1];
+        if(scopedProject&&repositories.isConnecting(scopedProject)&&!/^\/api\/projects\/[a-f0-9-]{36}\/repository(?:\/|$)/.test(path))throw new HttpError(409,'Repository connection in progress. Retry after it finishes.');
         // The release identity this process runs as, the storage schema it expects and which
         // candidate the durable store says is promoted. Read-only, authenticated, path-free.
         if(path==='/api/release'&&req.method==='GET'){json(releaseView());return;}
@@ -1082,11 +1090,9 @@ export async function createApp(options:AppOptions){
           if(action==='test'&&req.method==='POST'){json(await repositories.test(p));return;}
           if(action==='connect'&&req.method==='POST'){
             if(payload.confirm!==true)throw new HttpError(422,'Explicit confirmation required');
-            json(await repositories.connect(p,async()=>{await boards.drain();await docs.drain();await agents.detach(p);},async()=>catalog.attachWorktree(p.id)));return;
+            json(await repositories.connect(p,async()=>{if(workerStore?.view(p.id).activeRunId)throw new HttpError(409,'Stop the worker and wait for its report before connecting a repository');await agents.detach(p);await boards.drain();await docs.drain();await workspace.drain();},async()=>catalog.attachWorktree(p.id)));return;
           }
         }
-        const scopedProject=path.match(/^\/api\/projects\/([a-f0-9-]{36})(?:\/|$)/)?.[1];
-        if(scopedProject&&repositories.isConnecting(scopedProject))throw new HttpError(409,'Repository connection in progress. Retry after it finishes.');
         if(path==='/api/session' && req.method==='GET'){json(establishSession(req,res,options.security,subject));return;}
         if(path==='/api/roots' && req.method==='GET'){json(options.browseRoots);return;}
         // Media: owner-only like every other route, behind the same Host check. A media id is the hex
@@ -1788,6 +1794,31 @@ export async function createApp(options:AppOptions){
             return;
           }
         }
+        const workspaceRoute=path.match(/^\/api\/projects\/([a-f0-9-]{36})\/workspace(?:\/(file|diff|commit-files|commit))?$/);
+        if(workspaceRoute){
+          const p=catalog.get(workspaceRoute[1]),action=workspaceRoute[2],target=url.searchParams.get('path')??'';
+          if(!action&&req.method==='GET'){json(await workspace.state(p));return;}
+          if(action==='file'&&req.method==='GET'){json(await workspace.read(p,target));return;}
+          if(action==='diff'&&req.method==='GET'){json(await workspace.diff(p,target,url.searchParams.get('commit')??undefined));return;}
+          if(action==='commit-files'&&req.method==='GET'){json(await workspace.commitPaths(p,url.searchParams.get('commit')??''));return;}
+          if(action==='commit'&&req.method==='POST'){
+            const data=z.strictObject({path:z.string().min(1).max(500),revision:z.string().length(64)}).parse(payload);
+            if(!isMarkdownPath(data.path))throw new HttpError(403,'Only an explicitly reviewed saved Markdown file can be committed here');
+            json(await workspace.save(p,[data.path],async()=>{const file=await workspace.read(p,data.path);if(file.revision!==data.revision)throw new HttpError(409,'File changed since review; reopen it before committing');return {}; }));return;
+          }
+        }
+        const planPreview=path.match(/^\/api\/projects\/([a-f0-9-]{36})\/plan\/preview$/);
+        if(planPreview&&req.method==='POST'){
+          const p=catalog.get(planPreview[1]),data=z.strictObject({paths:z.array(z.string().min(1).max(500)).min(1).max(100)}).parse(payload);
+          if(data.paths.includes(PLAN_PATH)||new Set(data.paths).size!==data.paths.length)throw new HttpError(422,'Choose unique source documents, not the canonical plan itself');
+          const documents:{name:string;content:string}[]=[],sourceRevisions:Record<string,string>={};let bytes=0;
+          for(const name of data.paths){const file=await docs.read(p,name);bytes+=Buffer.byteLength(file.text);if(bytes>8*1024*1024)throw new HttpError(413,'Source documents exceed the sync limit');documents.push({name,content:file.text});sourceRevisions[name]=file.revision;}
+          const current=await boards.read(p),preview=previewImport(current.board,documents),token=randomUUID();
+          for(const candidate of preview.candidates)candidate.task.specs=[...candidate.task.specs.filter(ref=>ref.path!==candidate.documentName),{path:candidate.documentName,anchor:null}];
+          for(const [id,item] of previews)if(item.expires<Date.now())previews.delete(id);
+          if(previews.size>=5)throw new HttpError(429,'Too many pending previews');
+          previews.set(token,{projectId:p.id,revision:current.revision,preview,documents,sourceRevisions,expires:Date.now()+900000});json({preview,token});return;
+        }
         const docsRoute=path.match(/^\/api\/projects\/([a-f0-9-]{36})\/docs(?:\/(document|search|asset|inbox))?$/);
         if(docsRoute){
           const p=catalog.get(docsRoute[1]);
@@ -1823,12 +1854,17 @@ export async function createApp(options:AppOptions){
           const data=z.strictObject({token:z.string().uuid(),selected:z.array(z.string()).max(5000),edgeIds:z.array(z.string().uuid()).max(20000)}).parse(payload),pending=previews.get(data.token);
           if(!pending||pending.projectId!==p.id||pending.expires<Date.now())throw new HttpError(409,'Import preview expired; preview again');
           const current=await boards.read(p);if(current.revision!==pending.revision)throw new HttpError(409,'Board changed since preview');
+          const verifySources=async()=>{if(pending.sourceRevisions)for(const [name,revision] of Object.entries(pending.sourceRevisions))if((await docs.read(p,name)).revision!==revision)throw new HttpError(409,'Source document changed since preview; preview again');};
+          await verifySources();
           const board=applyImport(current.board,pending.preview,data.selected,data.edgeIds);
-          for(const candidate of pending.preview.candidates.filter(c=>data.selected.includes(c.id))){
-            const doc=pending.documents.find(d=>d.name===candidate.documentName)!;
-            const file=await safePath(p.path,candidate.source.path,true);await atomicWrite(file,doc.content);
-          }
-          const result=await boards.mutate(p,current.revision,{op:'restore',board});previews.delete(data.token);json(result);return;
+          const candidates=pending.preview.candidates.filter(c=>data.selected.includes(c.id)),sourcePaths=[...new Set(candidates.map(candidate=>candidate.source.path))];
+          const materializeSources=async()=>{for(const path of sourcePaths){
+            const candidate=candidates.find(candidate=>candidate.source.path===path)!,doc=pending.documents.find(d=>d.name===candidate.documentName)!;
+            const file=await safePath(p.path,path,true);
+            try{if(await readFile(file,'utf8')!==doc.content)throw new HttpError(409,'A retained source snapshot differs; operator review is required');}
+            catch(e){if((e as NodeJS.ErrnoException).code!=='ENOENT')throw e;await atomicWrite(file,doc.content);}
+          }};
+          const result=await boards.mutate(p,current.revision,{op:'restore',board},sourcePaths,verifySources,materializeSources);previews.delete(data.token);json(result);return;
         }
         const sourceRoute=path.match(/^\/api\/projects\/([a-f0-9-]{36})\/sources\/([a-f0-9-]{36})$/);
         if(sourceRoute&&req.method==='GET'){
@@ -1876,7 +1912,7 @@ export async function createApp(options:AppOptions){
     for(const stream of streams)stream.end();
     await Promise.all([httpClosed,...Array.from(streams,stream=>stream.done)]);
     if(streamFailures.length)throw streamFailures[0];
-    await repositories.close();await boards.drain();await docs.drain();await agents.close();await providers.close();await catalog.close();}};
+    await repositories.close();await boards.drain();await docs.drain();await agents.close();await workspace.drain();await providers.close();await catalog.close();}};
 }
 /** A server that cannot drain must not be able to hold the data root forever. */
 const DEFAULT_SHUTDOWN_DEADLINE_MS=10_000;

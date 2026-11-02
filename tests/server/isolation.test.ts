@@ -38,8 +38,8 @@ test('two projects share no documents, no agent session and no credential materi
     assert.equal(created.status,201);
     const alphaDocs=await (await fetch(base+'/projects/'+alpha.id+'/docs',{headers:token})).json() as { documents: { path: string }[] };
     const betaDocs=await (await fetch(base+'/projects/'+beta.id+'/docs',{headers:token})).json() as { documents: { path: string }[] };
-    assert.deepEqual(alphaDocs.documents.map(document=>document.path),['docs/alpha.md']);
-    assert.deepEqual(betaDocs.documents,[],'the other project sees no documents');
+    assert.deepEqual(alphaDocs.documents.map(document=>document.path),['docs/alpha.md','docs/dashboard/board.md']);
+    assert.deepEqual(betaDocs.documents.map(document=>document.path),['docs/dashboard/board.md'],'the other project sees only its own canonical plan');
     const crossRead=await fetch(base+'/projects/'+beta.id+'/docs/document?path='+encodeURIComponent('docs/alpha.md'),{headers:token});
     assert.equal(crossRead.status,404,'a path from one project is not readable in another');
 

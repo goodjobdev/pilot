@@ -93,13 +93,13 @@ test('document routes enforce authentication, origin, containment and revisions'
  assert.equal((await fetch(base+'/document',{method:'POST',headers:{...token,'content-type':'application/json',origin:'https://evil.example'},body:'{}'})).status,403);
  const saved=await fetch(base+'/document',{method:'POST',headers:writes,body:JSON.stringify({path:'docs/spec/product.md',text:'# Product\\n\\nIntent.\\n'})});
  assert.equal(saved.status,201);const snapshot=await saved.json();assert.equal(snapshot.kind,'spec');
- const listed=await (await fetch(base,{headers:token})).json();assert.deepEqual(listed.documents.map((d:any)=>d.path),['docs/spec/product.md']);
+ const listed=await (await fetch(base,{headers:token})).json();assert.deepEqual(listed.documents.map((d:any)=>d.path),['docs/dashboard/board.md','docs/spec/product.md']);
  const read=await (await fetch(base+'/document?path='+encodeURIComponent('docs/spec/product.md'),{headers:token})).json();assert.equal(read.revision,snapshot.revision);
  const conflict=await fetch(base+'/document',{method:'POST',headers:writes,body:JSON.stringify({path:'docs/spec/product.md',text:'# Rewritten\\n',revision:'0'.repeat(64)})});
  assert.equal(conflict.status,409);
  assert.equal((await fetch(base+'/document?path='+encodeURIComponent('../outside.md'),{headers:token})).status,400);
  assert.equal((await fetch(base+'/document?path='+encodeURIComponent('notes.txt'),{headers:token})).status,400);
- assert.equal((await fetch(base+'/document?path='+encodeURIComponent('docs/dashboard/board.md'),{headers:token})).status,400);
+ assert.equal((await fetch(base+'/document?path='+encodeURIComponent('docs/dashboard/board.md'),{headers:token})).status,200);
  assert.equal((await fetch(base+'/document',{method:'POST',headers:writes,body:JSON.stringify({path:'docs/spec/other.md',text:'x'.repeat(3*1024*1024)})})).status,400);
  assert.equal((await fetch(url+'/api/projects/'+randomUUID()+'/docs',{headers:token})).status,404);
  const search=await (await fetch(base+'/search?q='+encodeURIComponent('Intent'),{headers:token})).json();

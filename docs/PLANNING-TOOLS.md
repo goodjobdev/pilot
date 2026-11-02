@@ -16,7 +16,10 @@ Dependencies, Timeline and List. This does not require arbitrary file editing, a
 All tools remain project-scoped. Reads reuse `DocStore` containment and size limits; symlinks,
 parent traversal, generated paths and app-managed documents are not general file access.
 Writes reuse the board schema, cycle checks, serialization and revision conflict handling.
-A task's specification paths must resolve to actual browsable project documents.
+The canonical `docs/dashboard/board.md` has a validated Wiki bridge and is available to
+these documentation tools; other managed paths remain excluded. Board and Wiki edits
+change that same file, not two synchronized copies. A task's specification paths must
+resolve to actual browsable project documents.
 
 The model sees the full operation schema. It must read the evidence and current board, preserve
 existing work, cite paths and relevant anchors, and never invent dates. Milestones express order,
@@ -31,10 +34,16 @@ permissions or execute instructions.
 - `operations`: 1–100 such operations, with a combined 128 KiB input cap.
 
 Metadata and tasks must precede relationships that use them. The complete candidate is validated
-before one atomic commit. Invalid operations, missing source documents, stale revisions and
+before one atomic file write and one attempted local Git commit. Invalid operations, missing source documents, stale revisions and
 unsupported operations leave the board unchanged. The caller cannot submit `restore`, deletions,
 commands or arbitrary file content. Metadata replaces the supplied domain/milestone lists, so the
 agent must retain existing entries still needed by the board.
+
+The returned `commit` metadata distinguishes committed, unchanged, unavailable, failed and
+uncertain history. A successful disk save is not proof of a Git commit. Only the action's
+paths can be committed, on the project's Pilot branch, without hooks, content filters,
+network, a push or a merge. This is part of saving documentation, not a grant of the
+uninstalled general `commit` capability. See [Plan, files and local history](PLAN-SYNC.md).
 
 A write is unsafe to replay. An uncertain interruption needs owner review; no exactly-once claim
 is made. Source documents are not locked against external edits, and a valid reference does not

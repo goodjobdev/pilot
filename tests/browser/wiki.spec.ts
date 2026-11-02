@@ -66,7 +66,7 @@ test('wiki browse, render, edit, search and conflict-safe saving',async({page})=
  await page.getByRole('button',{name:'＋ Task',exact:true}).click();
  await page.getByLabel('Task title',{exact:true}).fill('Implement checkout');
  await page.getByRole('button',{name:'Save task',exact:true}).click();
- await expect(page.getByRole('status')).toHaveText('Saved');
+ await expect(page.getByRole('status')).toHaveText('Saved · Git unavailable');
  await page.getByRole('button',{name:'Close inspector'}).click();
  await expect(page.locator('.spec-chip.none').first()).toHaveText('no spec');
  await page.getByRole('button',{name:/Implement checkout/}).first().click();
@@ -74,7 +74,7 @@ test('wiki browse, render, edit, search and conflict-safe saving',async({page})=
  await page.getByLabel('Specification 1').fill('docs/spec/alpha.md#acceptance');
  await page.getByLabel('Specification 1').blur();
  await page.getByRole('button',{name:'Save task',exact:true}).click();
- await expect(page.getByRole('status')).toHaveText('Saved');
+ await expect(page.getByRole('status')).toHaveText('Saved · Git unavailable');
  await page.getByRole('button',{name:'Close inspector'}).click();
  await expect(page.locator('.spec-chip').first()).toHaveText('alpha.md#acceptance');
  // The questions inbox opens the document that asked.

@@ -5,6 +5,8 @@ import { canonicalJson, type ControlScope } from '../../shared/control-state';
 import { ControlStore, ControlStoreError } from './control-store';
 import { atomicWrite } from '../board-store';
 import { safePath } from '../paths';
+import { isLockedDocPath,isMarkdownPath } from '../../shared/docs';
+import type { SaveCommit } from '../../shared/workspace';
 
 /**
  * The bounded file-edit capability the 'file_edit' scope governs.
@@ -76,7 +78,7 @@ export type FileEditRecord = {
 };
 
 /** What one edit answers with: the durable record, and whether a file was really written. */
-export type FileEditOutcome = { readonly record: FileEditRecord; readonly written: boolean };
+export type FileEditOutcome = { readonly record: FileEditRecord; readonly written: boolean; readonly commit?:SaveCommit };
 
 /** The read side: the mode in force, whether the tool is enabled, and every recorded change. */
 export type FileEditView = {
@@ -105,6 +107,7 @@ export interface FileEditCapability {
     readonly path: string;
     readonly content: string;
     readonly mode?: FileEditMode | null;
+    readonly signal?: AbortSignal;
     readonly actor: { readonly kind: 'owner' | 'agent'; readonly identity: string };
   }): Promise<FileEditOutcome>;
 }
@@ -119,6 +122,7 @@ export type FileEditToolOptions = {
   readonly policy: { readonly mode: () => FileEditMode | Promise<FileEditMode> };
   readonly clock?: () => Date;
   readonly id?: () => string;
+  readonly saveMarkdown?: (projectId:string,path:string,write:()=>Promise<void>)=>Promise<SaveCommit>;
 };
 
 const OPERATION_KIND = 'agent.file-edit';
@@ -287,6 +291,7 @@ export class FileEditTool implements FileEditCapability {
     readonly path: string;
     readonly content: string;
     readonly mode?: FileEditMode | null;
+    readonly signal?: AbortSignal;
     readonly actor: { readonly kind: 'owner' | 'agent'; readonly identity: string };
   }): Promise<FileEditOutcome> {
     if (!this.options.enabled)
@@ -299,6 +304,7 @@ export class FileEditTool implements FileEditCapability {
     const rawPath = input?.path;
     if (typeof rawPath !== 'string' || rawPath === '' || rawPath.length > FILE_EDIT_MAX_PATH_LENGTH)
       throw new FileEditError('path must be a relative path of 1-' + FILE_EDIT_MAX_PATH_LENGTH + ' characters inside the connected worktree', 'INVALID');
+    if(isLockedDocPath(rawPath))throw new FileEditError('The canonical plan and source snapshots use the validated planning tools, not file_edit','NOT_PERMITTED');
     const content = input?.content;
     if (typeof content !== 'string') throw new FileEditError('content must be text', 'INVALID');
     const contentBytes = byteLength(content);
@@ -315,6 +321,7 @@ export class FileEditTool implements FileEditCapability {
 
     const before = await this.readExisting(file);
     const diff = unifiedDiff(before, content);
+    input.signal?.throwIfAborted();
     const record = this.materialize({ projectId, agentId, path: rawPath, mode, content, before, diff, actor });
     const existing = this.byKey(projectId, agentId, record.id);
     if (existing !== null) return Object.freeze({ record: existing, written: false });
@@ -323,11 +330,12 @@ export class FileEditTool implements FileEditCapability {
     // that was proposed and never applied — which is exactly what the record says — rather than a
     // changed file nothing accounts for.
     this.write(record);
+    let commit:SaveCommit|undefined;
     if (mode === 'auto-apply') {
-      await mkdir(dirname(file), { recursive: true, mode: 0o755 });
-      await atomicWrite(file, content);
+      const write=async()=>{input.signal?.throwIfAborted();if(await this.readExisting(file)!==before)throw new FileEditError('The file changed while this edit waited; review it before trying again','CONFLICT');await mkdir(dirname(file), { recursive: true, mode: 0o755 });input.signal?.throwIfAborted();await atomicWrite(file, content);};
+      if(this.options.saveMarkdown&&isMarkdownPath(rawPath))commit=await this.options.saveMarkdown(projectId,rawPath,write);else await write();
     }
-    return Object.freeze({ record, written: mode === 'auto-apply' });
+    return Object.freeze({ record, written: mode === 'auto-apply',...(commit?{commit}:{}) });
   }
 
   /** The mode one request leaves in force: the request's own, or the policy's, and never a widening. */

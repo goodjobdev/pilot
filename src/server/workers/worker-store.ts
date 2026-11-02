@@ -54,6 +54,7 @@ export type WorkerStoreOptions = {
   /** The registered project's own root, or undefined when it is not registered here. */
   readonly projectRoot: (projectId: string) => string | undefined;
   readonly dataRoot: string;
+  readonly persistReport?: (projectId:string,input:Parameters<typeof writeWorkerReport>[0])=>Promise<Awaited<ReturnType<typeof writeWorkerReport>>&{commit?:import('../../shared/workspace').SaveCommit}>;
 };
 
 export type WorkerPortResult = {
@@ -906,7 +907,7 @@ export class WorkerService {
       return;
     }
     const measured = { ...run, turns: result.turns };
-    let report: { path: string; sha256: string; bytes: number };
+    let report: { path: string; sha256: string; bytes: number },commitWarning:string|null=null;
     try {
       const content = composeWorkerReport({
         worker: current,
@@ -916,7 +917,9 @@ export class WorkerService {
         dataRoot: this.options.dataRoot,
         endedAt: new Date()
       });
-      const written = await writeWorkerReport({ projectRoot, path: workerReportPath(current.id, runId), content });
+      const input={projectRoot,path:workerReportPath(current.id,runId),content};
+      const written:Awaited<ReturnType<typeof writeWorkerReport>>&{commit?:import('../../shared/workspace').SaveCommit}=this.options.persistReport?await this.options.persistReport(projectId,input):await writeWorkerReport(input);
+      if(written.commit&&['failed','uncertain'].includes(written.commit.status))commitWarning='Report saved; Git history needs review: '+written.commit.message;
       report = { path: written.path, sha256: written.sha256, bytes: written.bytes };
     } catch (error) {
       const code = error instanceof WorkerError ? error.code : 'STORAGE';
@@ -924,7 +927,7 @@ export class WorkerService {
       await this.store.settleRun(projectId, runId, { state: 'failed', turns: result.turns, reason: (code === 'REPORT_CONFLICT' ? 'Report conflict: ' : '') + reason.slice(0, REASON_MAX) });
       return;
     }
-    await this.store.settleRun(projectId, runId, { state: 'completed', turns: result.turns, report });
+    await this.store.settleRun(projectId, runId, { state: 'completed', turns: result.turns, report, ...(commitWarning?{reason:commitWarning}:{}) });
   }
 
   /** Stop one run cooperatively. Idempotent; a terminal run is unchanged and never resumed. */

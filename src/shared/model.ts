@@ -11,7 +11,7 @@ export interface Relationship { id: string; source: string; target: string; kind
 export interface Placement { x: number; y: number; pinned: boolean }
 export interface Board { version: 1; adoption: 'mirror' | 'adopted'; domains: Domain[]; milestones: Milestone[]; tasks: Task[]; relationships: Relationship[]; sources: Source[]; layout: Record<string, Placement>; summary: string }
 export interface Project { id: string; name: string; path: string; managed: boolean; repository: string; created: string; state?: 'available' | 'missing' | 'read-only' }
-export interface Snapshot { board: Board; revision: string }
+export interface Snapshot { board: Board; revision: string; commit?: import('./workspace').SaveCommit }
 export type Operation =
   | { op: 'putTask'; task: Task }
   | { op: 'removeTask'; id: string; confirmEdges: boolean }

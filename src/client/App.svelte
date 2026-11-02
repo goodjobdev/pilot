@@ -20,6 +20,8 @@
  import ProjectConnection from './ProjectConnection.svelte';
  import AgentManager from './AgentManager.svelte';
  import WorkersPanel from './WorkersPanel.svelte';
+ import WorkspaceSidebar from './WorkspaceSidebar.svelte';
+ import { PLAN_PATH,commitMessage } from '../shared/workspace';
  import { api,session,ApiError,download,whenSessionExpires } from './api';
  import { HistoryStack,isHomeScreen,isView,narrowView,parseRoute,sameRoute,urlForRoute,type RouteSnapshot,type View } from './navigation';
  import { readSelectedSession,writeSelectedSession } from './drafts';
@@ -36,7 +38,7 @@
  let view=$state<View>(window.innerWidth<750?'List':'Dependencies'),search=$state(''),domain=$state('all'),status=$state('all'),scope=$state('all'),selected=$state('');
  // The selected named session ('' is the project's root conversation) and the session list. Both
  // are part of the route or its layers, so Back and Forward move through them like any other layer.
- let sessionId=$state(''),sessionListOpen=$state(false);
+ let sessionId=$state(''),sessionListOpen=$state(false),workspaceOpen=$state(false),syncingPlan=$state(false);
  let narrowProjects=$state(window.innerWidth<=650),narrowDocs=$state(window.innerWidth<=900);
  let booted=$state(false);
  let stack:HistoryStack|null=null;
@@ -48,6 +50,7 @@
  // The document the route names while its read is still pending. The address and the history
  // entry use this path from the first frame, so a direct document link writes one entry, not two.
  let requestedDoc=$state<string|null>(null);
+ let docLoadGeneration=0,docSaveGeneration=0;
  let actionsOpen=$state(false),filtersOpen=$state(false),inboxOpen=$state(false),paletteOpen=$state(false);
  let inbox=$state<{path:string;line:number;text:string;anchor:string|null;id:string}[]>([]),focusAnchor=$state<string|null>(null),inboxMenu=$state<HTMLDivElement>();
  let attentionCount=$state<number|null>(null),attentionCountComplete=$state(false),attentionChecked=$state(false),inboxRefresh=$state(0),attentionFocus=$state<string|null>(null),questionFocus=$state('');
@@ -69,7 +72,7 @@
   * owns what it means. The order puts a drawer under a panel, a panel under a menu, a menu under
   * a dialog and the palette on top, which is the order these can really be open in.
   */
- const LAYER_ORDER=['drawer:projects','drawer:docs','panel:inbox','menu:actions','menu:filters','panel:sessions','dialog:settings','dialog:import','dialog:add','dialog:providers','dialog:agentManager','dialog:workers','dialog:connection','dialog:palette'] as const;
+ const LAYER_ORDER=['drawer:projects','drawer:docs','panel:inbox','menu:actions','menu:filters','panel:sessions','panel:workspace','dialog:settings','dialog:import','dialog:add','dialog:providers','dialog:agentManager','dialog:workers','dialog:connection','dialog:palette'] as const;
  const VIEW_MODES:View[]=['Dependencies','Timeline','List','Wiki','Agents'];
  function currentLayers():string[]{
    const open:Record<string,boolean>={
@@ -79,6 +82,7 @@
      'menu:actions':actionsOpen,
      'menu:filters':filtersOpen,
      'panel:sessions':sessionListOpen,
+     'panel:workspace':workspaceOpen,
      'dialog:settings':settings,
      'dialog:import':importing,
      'dialog:add':adding,
@@ -102,6 +106,7 @@
      case 'menu:actions': actionsOpen=open;break;
      case 'menu:filters': filtersOpen=open;break;
      case 'panel:sessions': sessionListOpen=open;break;
+     case 'panel:workspace': workspaceOpen=open;break;
      case 'dialog:settings': if(open&&!snapshot)return;settings=open;break;
      case 'dialog:import': if(open&&!project)return;importing=open;break;
      case 'dialog:add': adding=open;break;
@@ -289,7 +294,7 @@
    }
    if((e.metaKey||e.ctrlKey)&&!e.altKey&&!e.shiftKey&&e.key.toLowerCase()==='b'&&!(e.target instanceof Element&&e.target.closest('input,textarea,select,[contenteditable]:not([contenteditable="false"])'))){e.preventDefault();toggleSidebar();}
  }
- function leave(){return !(saving||failed||inspectorDirty||docUnsaved())||confirm('There are unsaved edits. Export your draft before leaving. Discard these edits?');}
+ function leave(){return !(saving||docSaving||failed||inspectorDirty||docUnsaved())||confirm('There are unsaved edits. Export your draft before leaving. Discard these edits?');}
  interface SelectOptions {view?:View;doc?:string|null;session?:string|null;confirmed?:boolean;fromRoute?:boolean}
  async function boot(){
    try{
@@ -318,7 +323,7 @@
    }
  }
  async function select(p:Project,opts:SelectOptions={}){
-   if(!opts.confirmed&&!leave())return;project=p;snapshot=null;error='';missingBoard=false;loading=true;selected='';failed=false;inspectorDirty=false;saveState='Saved';undoStack=[];redoStack=[];doc=null;docDraft='';docEditing=false;docDirty=false;docConflict=false;docMessage='';docsError='';docs=[];requestedDoc=null;inbox=[];attentionCount=null;attentionCountComplete=false;attentionChecked=false;attentionFocus=null;questionFocus='';inboxRefresh+=1;if(!opts.fromRoute){treeOpen=false;sessionListOpen=false;}localStorage.setItem('dashboard.project',p.id);
+   if(!opts.confirmed&&!leave())return;project=p;docLoadGeneration++;docSaveGeneration++;docSaving=false;snapshot=null;error='';missingBoard=false;loading=true;selected='';failed=false;inspectorDirty=false;saveState='Saved';undoStack=[];redoStack=[];doc=null;docDraft='';docEditing=false;docDirty=false;docConflict=false;docMessage='';docsError='';docs=[];requestedDoc=null;inbox=[];attentionCount=null;attentionCountComplete=false;attentionChecked=false;attentionFocus=null;questionFocus='';inboxRefresh+=1;if(!opts.fromRoute){treeOpen=false;sessionListOpen=false;}localStorage.setItem('dashboard.project',p.id);
    let remembered:View|undefined;
    try{const filters=JSON.parse(localStorage.getItem('dashboard.filters.'+p.id)??'null');if(filters){search=filters.search??'';domain=filters.domain??'all';status=filters.status??'all';scope=filters.scope??'all';if(isView(filters.view))remembered=filters.view;}else{search='';domain='all';status='all';scope='all';}}catch{/* defaults */}
    const narrow=window.innerWidth<750;
@@ -341,7 +346,7 @@
    let board:Board;try{board=applyOperation(snapshot.board,op);}catch(e){error=(e as Error).message;return;}
    const previous=structuredClone($state.snapshot(snapshot.board)),revision=snapshot.revision,pid=project.id;
    saving=true;saveState='Saving…';error='';snapshot={board,revision};inspectorDirty=false;
-   try{const saved=await api.mutate(pid,revision,op);if(project?.id===pid){snapshot=saved;saveState='Saved';if(record){undoStack=[...undoStack.slice(-49),previous];redoStack=[];}if(selected&&!saved.board.tasks.some(t=>t.id===selected))selected='';}}
+   try{const saved=await api.mutate(pid,revision,op);if(project?.id===pid){snapshot=saved;saveState=commitMessage(saved.commit);if(saved.commit&&(saved.commit.status==='failed'||saved.commit.status==='uncertain'))error=saved.commit.message;if(record){undoStack=[...undoStack.slice(-49),previous];redoStack=[];}if(selected&&!saved.board.tasks.some(t=>t.id===selected))selected='';}}
    catch(e){failed=true;saveState=e instanceof ApiError&&e.status===409?'Conflict':'Unsaved';error=(e as Error).message;}
    finally{saving=false;}
  }
@@ -349,7 +354,11 @@
  async function undo(){if(!snapshot||!undoStack.length)return;const before=structuredClone($state.snapshot(snapshot.board)),target=undoStack.at(-1)!;await mutate({op:'restore',board:target},false);if(!failed){undoStack=undoStack.slice(0,-1);redoStack=[...redoStack,before];}}
  async function redo(){if(!snapshot||!redoStack.length)return;const before=structuredClone($state.snapshot(snapshot.board)),target=redoStack.at(-1)!;await mutate({op:'restore',board:target},false);if(!failed){redoStack=redoStack.slice(0,-1);undoStack=[...undoStack,before];}}
  function exported(){if(snapshot)download(failed?'unsaved-board.md':'board.md',serializeBoard($state.snapshot(snapshot.board)),'text/markdown');}
- function imported(s:Snapshot){snapshot=s;undoStack=[];redoStack=[];saveState='Saved';selected='';}
+ function closeImport(id:string){if(project?.id===id){importing=false;syncingPlan=false;}}
+ function imported(id:string,s:Snapshot){if(project?.id!==id)return;snapshot=s;undoStack=[];redoStack=[];saveState=commitMessage(s.commit);error=s.commit&&['failed','uncertain'].includes(s.commit.status)?s.commit.message:'';selected='';void loadDocs();}
+ onMount(()=>{const timer=setInterval(()=>{if(document.visibilityState!=='visible'||!project)return;if(view==='Dependencies'||view==='Timeline'||view==='List')void refreshBoard();else if(view==='Wiki'&&!docEditing&&!docUnsaved()&&!docSaving&&doc)void refreshDocument();},2500);return()=>clearInterval(timer);});
+ async function refreshDocument(){if(!project||!doc)return;const id=project.id,path=doc.path,revision=doc.revision;try{const fresh=await api.doc(id,path);if(project?.id===id&&doc?.path===path&&doc.revision===revision&&!docEditing&&!docUnsaved()&&!docSaving&&fresh.revision!==revision){doc=fresh;docDraft=fresh.text;docMessage='Updated from disk';}}catch(e){if(project?.id===id&&doc?.path===path)docsError=(e as Error).message;}}
+ function openWorkspaceDoc(path:string){if(!leave())return;inspectorDirty=false;selected='';workspaceOpen=false;setView('Wiki',{openTree:false});void openDoc(path,{force:true});}
  /** Pick up board changes made by the agent or another client without overwriting local edits. */
  async function refreshBoard(){
    if(!project||!snapshot||saving||failed||inspectorDirty)return;
@@ -386,8 +395,9 @@
  }
  async function loadDocs(){
    if(!project)return;
-   try{docsError='';docs=(await api.docs(project.id)).documents;}
-   catch(e){docsError=(e as Error).message;docs=[];}
+   const id=project.id;
+   try{const loaded=(await api.docs(id)).documents;if(project?.id===id){docsError='';docs=loaded;}}
+   catch(e){if(project?.id===id){docsError=(e as Error).message;docs=[];}}
  }
  /** The documentation questions of the project, and the count of the attention projection. */
  async function loadDocInbox(){
@@ -435,41 +445,47 @@
  async function openDoc(path:string,opts:{force?:boolean}={}){
    if(!project)return;
    if(!opts.force&&docUnsaved()&&!confirm('Discard unsaved document edits?'))return;
-   requestedDoc=path;
-   try{docsError='';const loaded=await api.doc(project.id,path);doc=loaded;docDraft=loaded.text;docEditing=false;docDirty=false;docConflict=false;docMessage='';treeOpen=false;requestedDoc=null;}
-   catch(e){docsError=(e as Error).message;/* the address keeps the requested path, and the error says why */}
+   requestedDoc=path;const id=project.id,mine=++docLoadGeneration;
+   try{docsError='';const loaded=await api.doc(id,path);if(project?.id!==id||mine!==docLoadGeneration)return;doc=loaded;docDraft=loaded.text;docEditing=false;docDirty=false;docConflict=false;docMessage='';treeOpen=false;requestedDoc=null;}
+   catch(e){if(project?.id===id&&mine===docLoadGeneration)docsError=(e as Error).message;/* retain the requested path and its error */}
  }
  function clearDoc(){doc=null;requestedDoc=null;docDraft='';docEditing=false;docDirty=false;docConflict=false;docMessage='';focusAnchor=null;}
  function editDoc(){if(doc){docEditing=true;docMessage='';}}
  function discardDoc(){docEditing=false;docDirty=false;docConflict=false;docDraft=doc?.text??'';}
  async function reloadDoc(){
    if(!doc||!project)return;
-   try{const loaded=await api.doc(project.id,doc.path);doc=loaded;docDraft=loaded.text;docEditing=false;docDirty=false;docConflict=false;docMessage='Reloaded from disk.';}
-   catch(e){docsError=(e as Error).message;}
+   const id=project.id,path=doc.path,mine=++docLoadGeneration;
+   try{const loaded=await api.doc(id,path);if(project?.id!==id||doc?.path!==path||mine!==docLoadGeneration)return;doc=loaded;docDraft=loaded.text;docEditing=false;docDirty=false;docConflict=false;docMessage='Reloaded from disk.';}
+   catch(e){if(project?.id===id&&mine===docLoadGeneration)docsError=(e as Error).message;}
  }
  async function saveDoc(text:string){
    if(!doc||!project)return;
+   const id=project.id,path=doc.path,revision=doc.revision,mine=++docSaveGeneration,load=docLoadGeneration;
    docSaving=true;docConflict=false;docMessage='';
    try{
-     const saved=await api.saveDoc(project.id,{path:doc.path,text,revision:doc.revision});
-     doc=saved;docDraft=saved.text;docEditing=false;docDirty=false;docMessage='Saved '+saved.path;
+     const saved=await api.saveDoc(id,{path,text,revision});
+     if(project?.id!==id||doc?.path!==path||mine!==docSaveGeneration||load!==docLoadGeneration)return;
+     doc=saved;docDraft=saved.text;docEditing=false;docDirty=false;docMessage='Saved '+saved.path+' · '+commitMessage(saved.commit)+(saved.commit&&(saved.commit.status==='failed'||saved.commit.status==='uncertain')?': '+saved.commit.message:'');
+     if(saved.path===PLAN_PATH)await refreshBoard();
      await loadDocs();
    }
    catch(e){
+     if(project?.id!==id||doc?.path!==path||mine!==docSaveGeneration||load!==docLoadGeneration)return;
      if(e instanceof ApiError&&e.status===409){docConflict=true;docMessage='This document changed on disk. Your draft is still here.';}
      else docMessage=(e as Error).message;
    }
-   finally{docSaving=false;}
+   finally{if(mine===docSaveGeneration)docSaving=false;}
  }
  async function createDoc(path:string){
    if(!project)return;
    const title=path.split('/').pop()?.replace(/\.mdx?$/i,'')??'Document';
-   try{await api.saveDoc(project.id,{path,text:'# '+title+'\n\n'});await loadDocs();await openDoc(path);editDoc();}
-   catch(e){docsError=(e as Error).message;}
+   const id=project.id;
+   try{const created=await api.saveDoc(id,{path,text:'# '+title+'\n\n'});if(project?.id!==id)return;await loadDocs();await openDoc(path);if(project?.id===id&&doc?.path===path){editDoc();docMessage=commitMessage(created.commit)+(created.commit&&['failed','uncertain'].includes(created.commit.status)?': '+created.commit.message:'');}}
+   catch(e){if(project?.id===id)docsError=(e as Error).message;}
  }
  function createDocPrompt(){const path=prompt('New document path','docs/');if(path&&path.trim())void createDoc(path.trim());}
 </script>
-<svelte:window onkeydown={keys} onclick={outside} onbeforeunload={(e)=>{if(saving||failed||inspectorDirty||docUnsaved()){e.preventDefault();e.returnValue='';}}}/>
+<svelte:window onkeydown={keys} onclick={outside} onbeforeunload={(e)=>{if(saving||docSaving||failed||inspectorDirty||docUnsaved()){e.preventDefault();e.returnValue='';}}}/>
 <div class="shell" bind:this={shell}>
  <ProjectSidebar {projects} selected={project?.id??''} hidden={sidebarHidden} ready={booted} onselect={select} onadd={()=>{if(leave())adding=true;}}/>
  <main class="workspace">
@@ -488,7 +504,9 @@
     <div id="board-commands" hidden={!actionsOpen} class="popover-panel action-list" role="group" aria-label="Board actions">
      <span class="popover-heading">PROJECT & BOARD</span>
      <button onclick={()=>command(()=>connectionOpen=true)}><Icon name="shield"/>Repository & deploy key</button>
-     <button disabled={!snapshot||saving||failed||inspectorDirty} onclick={()=>command(()=>importing=true)}><Icon name="import"/>Import documents</button>
+     <button disabled={!snapshot||saving||failed||inspectorDirty} onclick={()=>command(()=>{syncingPlan=true;importing=true;})}><Icon name="refresh"/>Sync plan</button>
+     <button onclick={()=>command(()=>openWorkspaceDoc(PLAN_PATH))}><Icon name="book"/>Open plan document</button>
+     <button disabled={!snapshot||saving||failed||inspectorDirty} onclick={()=>command(()=>{syncingPlan=false;importing=true;})}><Icon name="import"/>Import documents</button>
      <button disabled={!snapshot||saving||failed||inspectorDirty} onclick={()=>command(()=>settings=true)}><Icon name="settings"/>Areas & milestones</button>
      <button disabled={!snapshot} onclick={()=>command(exported)}><Icon name="export"/>Export board</button>
      <button aria-label="Commands" onclick={()=>command(()=>{paletteOpen=true;})}><Icon name="more"/>Commands… <small style="margin-left:auto;color:var(--muted)">⌘/Ctrl K</small></button>
@@ -507,6 +525,7 @@
     <button class="icon-button" aria-label={inboxCount===null?'Needs me (count incomplete)':inboxCount?'Needs me ('+inboxCount+')':'Needs me'} title={inboxCount===null?'Open questions and missing specifications. The attention count is incomplete because a source is unavailable.':'Open questions and missing specifications'} aria-expanded={inboxOpen} onclick={()=>{inboxOpen=!inboxOpen;actionsOpen=false;filtersOpen=false;if(inboxOpen){attentionFocus=null;void loadDocInbox();void loadDocs();}else{attentionFocus=null;}}}><Icon name="book"/> {#if inboxCount}<span class="inbox-count">{inboxCount}</span>{:else if attentionChecked&&!attentionCountComplete}<span class="inbox-count" aria-hidden="true">?</span>{/if}</button>
     {#if inboxOpen}{#key project.id}<AttentionPanel projectId={project.id} questions={inbox} {unlinked} {alertState} {alertBusy} {alertMessage} refreshKey={inboxRefresh} focusId={attentionFocus} onopen={openQuestion} onopenquestion={(session,questionId)=>{inboxOpen=false;attentionFocus=null;questionFocus=questionId;setView('Agents');sessionId=session??'';if(project)writeSelectedSession(localStorage,project.id,session??'');}} oncount={(loaded)=>{attentionCount=loaded.open;attentionCountComplete=loaded.complete;attentionChecked=true;}} onchanged={()=>{void loadDocInbox();}} onenable={()=>void enablePhoneAlerts()} ondisable={()=>void disablePhoneAlerts()} ontest={()=>void testPhoneAlert()} onclose={()=>{inboxOpen=false;attentionFocus=null;}}/>{/key}{/if}
    </div>
+   <button class="icon-button" aria-label="Files and changes" title="Project files and changes" aria-expanded={workspaceOpen} onclick={()=>{workspaceOpen=!workspaceOpen;if(workspaceOpen&&innerWidth<=1100)sidebarHidden=true;}}><Icon name="sidebar"/></button>
    {/if}
   </div>
  </header>
@@ -539,6 +558,7 @@
     <button class="icon-button" aria-label="Undo" title="Undo board change" disabled={!undoStack.length||saving||failed||inspectorDirty} onclick={undo}><Icon name="undo" size={15}/></button>
     <button class="icon-button" aria-label="Redo" title="Redo board change" disabled={!redoStack.length||saving||failed||inspectorDirty} onclick={redo}><Icon name="redo" size={15}/></button>
    </div>
+   <button class="icon-button" aria-label="Sync plan" title="Sync plan from repository documents" disabled={!snapshot||saving||failed||inspectorDirty} onclick={()=>{syncingPlan=true;importing=true;}}><Icon name="refresh" size={15}/></button>
    <button class="primary compact-button" aria-label="＋ Task" disabled={!snapshot||saving||failed||inspectorDirty} onclick={addTask}><Icon name="plus" size={15}/><span>Task</span></button>
   </div>
   {:else if view==='Wiki'}
@@ -574,6 +594,7 @@
  </div>
  {#if snapshot&&selected&&snapshot.board.tasks.some(t=>t.id===selected)}<TaskInspector board={snapshot.board} id={selected} projectId={project.id} disabled={saving||failed} onclose={()=>choose('')} onoperation={mutate} ondirty={(dirty)=>inspectorDirty=dirty}/>{/if}
  {/if}
+ {#if project&&workspaceOpen}{#key project.id}<WorkspaceSidebar projectId={project.id} onclose={()=>workspaceOpen=false} onopendoc={openWorkspaceDoc}/>{/key}{/if}
  </div>
  {#if view!=='Agents'}
  <footer class="statusbar">
@@ -592,7 +613,7 @@
  </main>
 </div>
 {#if settings&&snapshot}<BoardSettings board={snapshot.board} onclose={()=>settings=false} onoperation={mutate}/>{/if}
-{#if importing&&project}<ImportReview projectId={project.id} onclose={()=>importing=false} onapplied={imported}/>{/if}
+{#if importing&&project}{#key project.id}<ImportReview projectId={project.id} repositoryMode={syncingPlan} onclose={closeImport.bind(null,project.id)} onapplied={imported.bind(null,project.id)}/>{/key}{/if}
 {#if adding}<AddProjectDialog onclose={()=>adding=false} oncreated={created}/>{/if}
 {#if providersOpen}<ProviderSettings onclose={()=>providersOpen=false}/>{/if}
 {#if agentManagerOpen}<AgentManager onclose={()=>agentManagerOpen=false} onchanged={()=>{agentsVersion+=1;const id=project?.id;if(id)void loadInbox();}}/>{/if}

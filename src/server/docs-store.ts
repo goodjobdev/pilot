@@ -2,7 +2,9 @@ import { chmod,mkdir,open,readFile,readdir,stat } from 'node:fs/promises';
 import { dirname,join } from 'node:path';
 import type { Project } from '../shared/model';
 import { assertAssetPath,assertEditableDocPath,assetIsSandboxed,assetType,docKind,headings,isBrowsableDocPath,isMarkdownPath,openQuestions,type DocEntry,type DocSnapshot } from '../shared/docs';
-import { atomicWrite,hash,HttpError } from './board-store';
+import { BoardStore,atomicWrite,hash,HttpError } from './board-store';
+import type { WorkspaceStore } from './workspace';
+import { PLAN_PATH } from '../shared/workspace';
 import { safePath } from './paths';
 
 const limits = { listLimit: 5000, readLimit: 2 * 1024 * 1024, writeLimit: 2 * 1024 * 1024, assetLimit: 8 * 1024 * 1024, searchMatches: 200, searchBytes: 8 * 1024 * 1024, inboxQuestions: 200 };
@@ -23,7 +25,8 @@ const createdFolderMode = 0o755;
 export class DocStore {
   private tails = new Map<string, Promise<unknown>>();
   private readonly bounds: typeof limits;
-  constructor(overrides: Partial<typeof limits> = {}) { this.bounds = { ...limits, ...overrides }; }
+  constructor(overrides: Partial<typeof limits> = {},private integrations?:{boards:BoardStore;workspace:WorkspaceStore}) { this.bounds = { ...limits, ...overrides }; }
+  private save<T extends object>(project:Project,path:string,write:()=>Promise<T>){return this.integrations?this.integrations.workspace.save(project,[path],write):write();}
   private async serial<T>(key: string, fn: () => Promise<T>): Promise<T> {
     const previous = this.tails.get(key) ?? Promise.resolve();
     const current = previous.catch(() => {}).then(fn);
@@ -58,7 +61,7 @@ export class DocStore {
         if (entry.isSymbolicLink()) continue;
         const child = relative === '' ? entry.name : relative + '/' + entry.name;
         if (entry.isDirectory()) { if (!isBrowsableDocPath(child + '/placeholder.md')) continue; await walk(child); }
-        else if (entry.isFile() && isMarkdownPath(child) && isBrowsableDocPath(child)) found.push(child);
+        else if (entry.isFile() && isMarkdownPath(child) && (isBrowsableDocPath(child)||(this.integrations&&child===PLAN_PATH))) found.push(child);
       }
     };
     await walk('');
@@ -70,6 +73,7 @@ export class DocStore {
     return listed;
   }
   async read(project: Project, value: string): Promise<DocSnapshot> {
+    if(value===PLAN_PATH&&this.integrations){const text=await this.integrations.boards.raw(project);if(Buffer.byteLength(text)>this.bounds.readLimit)throw new HttpError(413,'Plan exceeds the document preview limit');return this.snapshot(PLAN_PATH,text);}
     const path = assertEditableDocPath(value);
     return this.snapshot(path, await this.body(project, path));
   }
@@ -78,7 +82,7 @@ export class DocStore {
     if (typeof text !== 'string') throw new HttpError(422, 'Document body must be text');
     if (Buffer.byteLength(text) > this.bounds.writeLimit) throw new HttpError(413, 'Document exceeds the size limit');
     await this.root(project);
-    return this.serial(project.id + ':' + path, async () => {
+    return this.serial(project.id + ':' + path, () => this.save(project,path,async () => {
       const file = await safePath(project.path, path);
       try { await mkdir(dirname(file), { recursive: true, mode: createdFolderMode }); }
       catch { throw new HttpError(422, 'Parent folder cannot be created'); }
@@ -92,14 +96,18 @@ export class DocStore {
       }
       try { await handle.writeFile(text); await handle.sync(); } finally { await handle.close(); }
       return this.snapshot(path, text);
-    });
+    }));
   }
   async write(project: Project, value: string, revision: string, text: string): Promise<DocSnapshot> {
+    if(value===PLAN_PATH&&this.integrations){
+      if(typeof text!=='string'||typeof revision!=='string'||!revision)throw new HttpError(422,'Text and the revision you edited are required');
+      const saved=await this.integrations.boards.writeDocument(project,revision,text);return {...this.snapshot(PLAN_PATH,text),commit:saved.commit};
+    }
     const path = assertEditableDocPath(value);
     if (typeof text !== 'string') throw new HttpError(422, 'Document body must be text');
     if (Buffer.byteLength(text) > this.bounds.writeLimit) throw new HttpError(413, 'Document exceeds the size limit');
     if (typeof revision !== 'string' || revision === '') throw new HttpError(422, 'The revision you edited from is required');
-    return this.serial(project.id + ':' + path, async () => {
+    return this.serial(project.id + ':' + path, () => this.save(project,path,async () => {
       const current = await this.body(project, path);
       if (hash(current) !== revision) throw new HttpError(409, 'Document changed on disk or in another tab. Reload and review; your draft is retained.');
       const file = await safePath(project.path, path);
@@ -110,7 +118,7 @@ export class DocStore {
       await atomicWrite(file, text);
       if (mode !== 0o600) await chmod(file, mode);
       return this.snapshot(path, text);
-    });
+    }));
   }
   /** Content search across browsable documents, bounded by bytes scanned and matches returned. */
   async search(project: Project, query: string): Promise<{ path: string; line: number; text: string }[]> {

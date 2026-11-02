@@ -29,15 +29,28 @@ function legacyData(html:string):unknown {
  if(blocks.length!==1)throw Error('Legacy HTML must contain exactly one uncommented dash-data JSON block');
  return JSON.parse(blocks[0]);
 }
+/** Extract semantic lines, retaining only inline Pilot control comments. Raw snapshots stay unchanged. */
+function withoutExamples(content:string):string {
+ const uncommented=content.replace(/<!--[\s\S]*?(?:-->|$)/g,value=>!/[\r\n]/.test(value)&&/^<!--\s*pilot:(?:task|depends)\b[^\r\n]*-->$/.test(value)?value:value.replace(/[^\n]/g,' '));
+ let fence:string|null=null,length=0;
+ return uncommented.split('\n').map(line=>{
+  const marker=/^\s*(`{3,}|~{3,})(.*)$/.exec(line);
+  if(fence!==null){if(marker&&marker[1][0]===fence&&marker[1].length>=length&&!marker[2].trim())fence=null;return '';}
+  if(marker){fence=marker[1][0];length=marker[1].length;return '';}
+  return line;
+ }).join('\n');
+}
 export function previewImport(board:Board,input:unknown):ImportPreview {
  const docs=documentsSchema.parse(input),candidates:Candidate[]=[],milestones=[...board.milestones],relationships:Relationship[]=[],warnings:string[]=[],seen=new Set<string>();
- const milestoneTasks=new Map<string,string>(),dependencySuggestions:{target:string;milestones:string[]}[]=[];
+ const milestoneTasks=new Map<string,string>(),dependencySuggestions:{target:string;milestones:string[]}[]=[],namedTasks=new Map<string,string>(),namedDependencies:{target:string;ids:string[]}[]=[];
+ const sourceId=(name:string,locator:string)=>digestId(locator.startsWith('task:')?locator:name+':'+locator);
  function candidate(name:string,locator:string,title:string,status:Task['status'],description:string,scope:Task['scope']='active',milestone:string|null=null){
-   const key=name+':'+locator,id=digestId(key),priorSource=board.sources.find(s=>s.id===id);
+   const key=name+':'+locator,id=sourceId(name,locator),priorSource=board.sources.find(s=>s.id===id);
+   if(seen.has(id))throw Error('Duplicate stable task ID in the selected source documents');
    const fingerprint=hash(description+'\n'+title+'\n'+status);
-   const source:Source={id,name,path:'docs/dashboard/sources/'+id+'-'+hash(docs.find(d=>d.name===name)!.content)+'.md',locator,fingerprint,captured:new Date().toISOString()};
+   const source:Source={id,name,path:'docs/dashboard/sources/'+digestId('document:'+name)+'-'+hash(docs.find(d=>d.name===name)!.content)+'.md',locator,fingerprint,captured:new Date().toISOString()};
    const existing=board.tasks.find(t=>t.sources.includes(id)),duplicate=[...board.tasks,...candidates.map(c=>c.task)].find(t=>t.title.toLowerCase()===title.toLowerCase()&&t.id!==existing?.id);
-   const task:Task={...(existing??newTask(randomUUID(),title)),title:title.slice(0,500),description:description.slice(0,20000),status,domain:existing?.domain??area(title),scope:existing?.scope??scope,milestone:existing?.milestone??milestone,sources:[...new Set([...(existing?.sources??[]),id])]};
+   const task:Task={...(existing??newTask(randomUUID(),title)),title:title.slice(0,500),description:description.replace(/\s*<!--\s*pilot:[\s\S]*?-->/g,'').trim().slice(0,20000),status,domain:existing?.domain??area(title),scope:existing?.scope??scope,milestone:existing?.milestone??milestone,sources:[...new Set([...(existing?.sources??[]),id])]};
    const change=existing?(priorSource?.fingerprint===fingerprint?'unchanged':'changed'):duplicate?'duplicate':'new';
    candidates.push({id:key,task,source,change,documentName:name,reason:change==='changed'?'Source changed; applying replaces imported title/status/description. Keep unchecked to preserve your edits.':change==='duplicate'?'Similar title already exists; review before adding.':'Review area, completion and acceptance claims before applying.',previous:existing});
    seen.add(id);return task;
@@ -51,20 +64,21 @@ export function previewImport(board:Board,input:unknown):ImportPreview {
      for(const t of data.tasks)candidate(doc.name,String(t.id??hash(String(t.title))),clean(String(t.title??'Untitled')),t.status,String(t.note??t.title??''),'historical',milestones.some(m=>m.id===t.stream)?t.stream!:null);
      continue;
    }
-   const milestoneMatch=doc.content.match(/^#\s+(M[1-9]\d*)\s+[—–-]\s+(.+)$/m);
+   const semantic=withoutExamples(doc.content);
+   const milestoneMatch=semantic.match(/^#\s+(M[1-9]\d*)\s+[—–-]\s+(.+)$/m);
    if(milestoneMatch){
      const mid=milestoneMatch[1],name=mid+' · '+milestoneMatch[2];if(!milestones.some(m=>m.id===mid))milestones.push({id:mid,name,order:Number(mid.slice(1))});
-     const statusLine=doc.content.match(/^(?:\*\*)?Status:\s*(.+?)(?:\*\*)?$/m)?.[1]??'pending';
+     const statusLine=semantic.match(/^(?:\*\*)?Status:\s*(.+?)(?:\*\*)?$/m)?.[1]??'pending';
      const status:Task['status']=/design-only deliverable complete|^complete\b|^done\b/i.test(statusLine)?'done':/in progress/i.test(statusLine)?'doing':/blocked/i.test(statusLine)?'blocked':'todo';
      const task=candidate(doc.name,'milestone:'+mid,name,status,doc.content,mid==='M6'?'design-only':'active',mid);
      if(mid==='M3'||mid==='M4'||mid==='M5')task.acceptance='Implementation/packaging evidence is not installed or real-device acceptance. See source.';
      if(mid==='M6')task.acceptance='Design deliverable only; sharing implementation remains unauthorized.';
-     const dep=doc.content.match(/Depends:\s*([^\n.]+)/i)?.[1]??statusLine.match(/blocked by\s+(M[1-9]\d*[^.\n]*)/i)?.[1];if(dep)dependencySuggestions.push({target:task.id,milestones:[...dep.matchAll(/\bM[1-9]\d*/g)].map(m=>m[0])});
-     const gateText=doc.content.match(/^External blockers:\s*([\s\S]*?)(?=\n(?:Evidence|Checks|Limitations):|(?![\s\S]))/m)?.[1];
+     const dep=semantic.match(/Depends:\s*([^\n.]+)/i)?.[1]??statusLine.match(/blocked by\s+(M[1-9]\d*[^.\n]*)/i)?.[1];if(dep)dependencySuggestions.push({target:task.id,milestones:[...dep.matchAll(/\bM[1-9]\d*/g)].map(m=>m[0])});
+     const gateText=semantic.match(/^External blockers:\s*([\s\S]*?)(?=\n(?:Evidence|Checks|Limitations):|(?![\s\S]))/m)?.[1];
      if(gateText&&!task.gates.length)task.gates=[{id:randomUUID(),label:gateText.trim().slice(0,500),state:'open',evidence:'Source import; verify prerequisites individually.'}];
      milestoneTasks.set(mid,task.id);
    }
-   let heading='',historical=false;const count=new Map<string,number>(),lines=doc.content.split('\n');
+   let heading='',historical=false;const count=new Map<string,number>(),lines=semantic.split('\n');
    for(let index=0;index<lines.length;index++){
      const text=lines[index];
      if(/Legacy checklist below is historical/i.test(text))historical=true;
@@ -76,17 +90,27 @@ export function previewImport(board:Board,input:unknown):ImportPreview {
        if(!continuation||/^\s*[-*]\s+\[/.test(lines[next]))break;
        body+=' '+continuation[1].trim();
      }
-     const title=clean(body).split(' :: ')[0];if(!title)continue;
+     const stable=/<!--\s*pilot:task\s+([A-Za-z][A-Za-z0-9_.:-]{0,79})\s*-->/.exec(body)?.[1];
+     const title=clean(body.replace(/\s*<!--\s*pilot:[\s\S]*?-->/g,'')).split(' :: ')[0];if(!title)continue;
      const key=heading+':'+title,ordinal=count.get(key)??0;count.set(key,ordinal+1);
      const scope:Task['scope']=historical?'historical':/backlog|later|deferred/i.test(heading)?'deferred':/historical|legacy/i.test(heading)?'historical':'active';
-     candidate(doc.name,'checkbox:'+key+':'+ordinal,title,m[1]===' '?'todo':'done',body,scope,milestoneMatch?.[1]??null);
+     const task=candidate(doc.name,stable?'task:'+stable:'checkbox:'+key+':'+ordinal,title,m[1]===' '?'todo':'done',body,scope,milestoneMatch?.[1]??null);
+     if(stable)namedTasks.set(stable,task.id);
+     const depends=/<!--\s*pilot:depends\s+([A-Za-z0-9_.:, -]+)\s*-->/.exec(body)?.[1];
+     if(depends)namedDependencies.push({target:task.id,ids:depends.split(/[\s,]+/).filter(Boolean)});
    }
  }
  for(const dep of dependencySuggestions)for(const mid of new Set(dep.milestones)){
    const from=milestoneTasks.get(mid)??board.tasks.find(t=>t.milestone===mid)?.id;
    if(from&&from!==dep.target&&!board.relationships.some(e=>e.source===from&&e.target===dep.target&&e.kind==='blocks'))relationships.push({id:randomUUID(),source:from,target:dep.target,kind:'blocks'});
  }
- const removed=board.tasks.filter(t=>t.sources.some(id=>{const s=board.sources.find(s=>s.id===id);return s&&!seen.has(id)&&docs.some(d=>digestId(d.name+':'+s.locator)===id);})).map(t=>t.id);
+ for(const dependency of namedDependencies)for(const id of new Set(dependency.ids)){
+   const source=namedTasks.get(id)??board.tasks.find(task=>task.sources.some(key=>board.sources.find(s=>s.id===key)?.locator==='task:'+id))?.id;
+   if(!source){warnings.push('Dependency '+id+' was not found; no relationship was inferred.');continue;}
+   if(source===dependency.target)throw Error('A task cannot depend on itself');
+   if(![...board.relationships,...relationships].some(edge=>edge.kind==='blocks'&&edge.source===source&&edge.target===dependency.target))relationships.push({id:digestId('blocks:'+source+':'+dependency.target),source,target:dependency.target,kind:'blocks'});
+ }
+ const removed=board.tasks.filter(t=>t.sources.some(id=>{const s=board.sources.find(s=>s.id===id);return s&&!seen.has(id)&&docs.some(d=>sourceId(d.name,s.locator)===id);})).map(t=>t.id);
  return {candidates,milestones,relationships,removed,warnings};
 }
 export function applyImport(board:Board,preview:ImportPreview,selected:string[],edgeIds:string[]):Board {

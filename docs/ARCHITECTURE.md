@@ -21,7 +21,9 @@ Three surfaces over one project's own files, plus derived state that can be rebu
    conflict that preserves the draft. The application never overwrites a newer file.
 3. **Paths are contained.** Every read and write resolves through one containment helper that
    refuses absolute paths, `..`, and symlinks. Generated folders (`node_modules`, `dist`, …)
-   and app-managed paths are never served or edited. Reads and writes are size-capped.
+   and app-managed paths are excluded from ordinary browsing. The canonical plan has an
+   explicit, schema-validated Wiki bridge; source snapshots retain their existing read-only
+   source-reference route. Reads and writes are size-capped.
 4. **The agent harness is the only execution surface.** There is no shell endpoint and no
    general file API. Agent tools resolve their paths through the same containment helper, so a
    registered project root is the boundary for question/note and documentation/planning tools.
@@ -29,7 +31,11 @@ Three surfaces over one project's own files, plus derived state that can be rebu
    [Agent planning tools](PLANNING-TOOLS.md). Repository
    setup is a separate fixed-operation provisioning path (keygen, access check, clone and
    worktree): no arbitrary commands, hooks, installs, commits or pushes. See
-   [Project connections](PROJECT-CONNECTIONS.md).
+   [Project connections](PROJECT-CONNECTIONS.md). Documentation saves separately use fixed,
+   local-only, path-scoped Git commits on the project Pilot branch. They disable hooks,
+   filters, signing, external diff and network protocols and preserve unrelated staging.
+   The owner-only file panel is a bounded allowlisted viewer, not a general file-write API.
+   See [Plan, files and local history](PLAN-SYNC.md).
 5. **Everything is behind the same door.** Every route — documents, agents, alerts, assets —
    passes the same authentication, session CSRF, origin and Host checks. There is no bypass
    mode, no anonymous route, and the process binds loopback by default — the only interface
