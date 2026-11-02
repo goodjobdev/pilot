@@ -509,4 +509,3 @@ test('workers: a conversation created before a failed binding still refuses adop
     }
   } finally { await f.close(); }
 });
-
