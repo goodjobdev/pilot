@@ -7,7 +7,8 @@ Read `README.md` first, then `docs/ARCHITECTURE.md` for the invariants and
 
 - **The agent harness is the only execution surface.** There is no general-purpose shell,
   command or file API. Agent tools run inside a registered project's own workspace and
-  nowhere else. The current tools are question/note operations, not a general coding suite.
+  nowhere else. Tools include questions/notes, contained documentation reads and revision-checked
+  planning board updates, not a general coding suite.
 - Repository connection is a narrow provisioning exception: fixed Git/SSH-keygen operations,
   explicit owner action, one managed worktree, no hooks/install/commit/push. There is still no
   arbitrary command endpoint. See `docs/PROJECT-CONNECTIONS.md` before changing it.

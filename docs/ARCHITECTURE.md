@@ -24,7 +24,9 @@ Three surfaces over one project's own files, plus derived state that can be rebu
    and app-managed paths are never served or edited. Reads and writes are size-capped.
 4. **The agent harness is the only execution surface.** There is no shell endpoint and no
    general file API. Agent tools resolve their paths through the same containment helper, so a
-   registered project root is the boundary for the current question/note tools. Repository
+   registered project root is the boundary for question/note and documentation/planning tools.
+   Planning tools reuse the documentation and revision-checked board stores; see
+   [Agent planning tools](PLANNING-TOOLS.md). Repository
    setup is a separate fixed-operation provisioning path (keygen, access check, clone and
    worktree): no arbitrary commands, hooks, installs, commits or pushes. See
    [Project connections](PROJECT-CONNECTIONS.md).

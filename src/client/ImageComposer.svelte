@@ -147,11 +147,11 @@
 <div class="image-composer" class:dragging role="group" aria-label="Images for this message">
  <div class="image-actions">
   <label class="compact-button image-pick">
-   <Icon name="image" size={14}/><span>Add image</span>
+   <Icon name="image" size={14}/><span class="sr-only">Add image</span>
    <input type="file" accept={ACCEPTED_IMAGE_TYPES.join(',')} capture="environment" multiple aria-label="Add an image"
           onchange={(event)=>{const element=event.currentTarget as HTMLInputElement;const files=[...(element.files??[])];element.value='';void addFiles(files);}} />
   </label>
-  <small class="image-hint">Paste, drop, or use the camera · JPEG, PNG or WebP · up to {human(MAX_IMAGE_BYTES)} each</small>
+  <span class="sr-only">Paste, drop, or use the camera. JPEG, PNG or WebP, up to {human(MAX_IMAGE_BYTES)} each.</span>
  </div>
  {#each items as item (item.key)}
   <div class="image-item" class:refused={item.status==='refused'} class:failed={item.status==='failed'} class:missing={item.status==='missing'} class:checking={item.status==='checking'}>
@@ -170,12 +170,13 @@
  {/each}
 </div>
 <style>
- .image-composer{display:flex;flex-direction:column;gap:6px;margin-bottom:8px}
+ .image-composer{display:flex;flex-direction:column;gap:6px;min-width:0}
+ .sr-only{position:absolute;width:1px;height:1px;margin:-1px;padding:0;overflow:hidden;clip-path:inset(50%);white-space:nowrap}
+ .image-pick:focus-within{outline:2px solid var(--accent);outline-offset:2px}
  .image-composer.dragging{outline:1px dashed var(--accent);outline-offset:2px;border-radius:5px}
  .image-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
- .image-pick{position:relative;cursor:pointer}
+ .image-pick{position:relative;cursor:pointer;display:inline-flex;align-items:center;justify-content:center;margin:0;min-width:36px;min-height:36px}
  .image-pick input{position:absolute;inset:0;width:100%;height:100%;opacity:0;cursor:pointer}
- .image-hint{color:var(--muted)}
  .image-item{display:flex;align-items:center;gap:8px;padding:4px 6px;border:1px solid var(--line);border-radius:5px;background:var(--panel)}
  .image-item.refused,.image-item.failed,.image-item.missing{border-color:var(--danger)}
  .image-item.checking{border-style:dashed}

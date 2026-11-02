@@ -43,6 +43,8 @@ async function addProject(page: import('@playwright/test').Page, name: string): 
   const created = await api(page, '/projects');
   const project = (created.body as { id: string; name: string }[]).find(candidate => candidate.name === name);
   if (!project) throw Error('the project was not registered');
+  await expect(page.getByRole('heading', { name, exact: true })).toBeVisible();
+  await expect(page).toHaveURL(new RegExp('project=' + project.id));
   return project.id;
 }
 

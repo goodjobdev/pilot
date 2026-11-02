@@ -109,7 +109,12 @@
   draft=blank();
   draft={...draft,workspace:{scope:projects[0]?{kind:'projects' as const,projectIds:[projects[0].id]}:{kind:'projects' as const,projectIds:[]},subpath:''},model:registry?.models[0]?{...registry.models[0]}:{provider:'',modelId:''}};
  }
+ function scopeAvailable(scope:string):boolean{
+  const entry=registry?.scopes.find(candidate=>candidate.scope===scope);
+  return !!entry?.installed&&(scope!=='file_edit'||!!registry?.fileEdit.enabled);
+ }
  function toggleScope(scope:string,on:boolean){
+  if(on&&!scopeAvailable(scope))return;
   draft={...draft,scopes:on?[...draft.scopes,scope]:draft.scopes.filter(candidate=>candidate!==scope)};
  }
  function budget(field:'maxRequests'|'maxOutputTokens'|'maxJobsPerHour',value:string){
@@ -174,7 +179,7 @@
   try{ledger=await api.fileEdits(projectId);}catch{ledger=null;}
  }
  $effect(()=>{const projectId=workspaceProject();if(registry?.fileEdit.enabled)void loadLedger(projectId);});
- const summary=(agent:AgentRecord)=>agent.scopes.length?agent.scopes.join(', '):'no scopes';
+ const summary=(agent:AgentRecord)=>agent.scopes.length?agent.scopes.map(scope=>scopeAvailable(scope)?scope:scope+' (unavailable)').join(', '):'no scopes';
 </script>
 <dialog bind:this={dialog} oncancel={onclose} class="agent-manager">
  <header class="modal-head">
@@ -235,11 +240,12 @@
     </div>
     {#if fieldErrors.budgets}<small class="field-error" role="alert">{fieldErrors.budgets}</small>{/if}
     <span class="popover-heading">PRIVILEGE SCOPES</span>
-    <small class="muted">An agent has only what its allowlist names. Everything else is refused at dispatch.</small>
+    <small class="muted">Installed tools require a grant. Unavailable scopes cannot be newly granted. Existing unavailable grants stay saved unless you remove them; they do not make tools available.</small>
     <div class="scopes" aria-label="Privilege scopes">
      {#each registry.scopes as entry (entry.scope)}
-     {@const installed=entry.installed}
-     <label class="scope" class:unavailable={!installed} title={installed?'':'This scope has no tool installed in this build and cannot be used by any agent'}><input type="checkbox" aria-label={'Scope '+entry.scope} checked={draft.scopes.includes(entry.scope)} onchange={e=>toggleScope(entry.scope,e.currentTarget.checked)}><span><strong>{entry.scope}</strong><small>{entry.description}{!installed?' — no tool installed, unavailable':''}</small></span></label>
+     {@const available=scopeAvailable(entry.scope)}
+     {@const granted=draft.scopes.includes(entry.scope)}
+     <label class="scope" class:unavailable={!available}><input type="checkbox" aria-label={'Scope '+entry.scope} aria-describedby={'scope-status-'+entry.scope} checked={granted} disabled={!available&&!granted} onchange={e=>toggleScope(entry.scope,e.currentTarget.checked)}><span><strong>{entry.scope}</strong><small>{entry.description}</small><small id={'scope-status-'+entry.scope}>{available?'Installed and available':entry.scope==='file_edit'&&!registry.fileEdit.enabled?'Unavailable: optional file editing is disabled on this deployment.':'Unavailable: no tool is installed for this scope.'}{!available&&granted?' Existing grant; uncheck to remove.':''}</small></span></label>
      {/each}
     </div>
     {#if fieldErrors.scopes}<small class="field-error" role="alert">{fieldErrors.scopes}</small>{/if}
@@ -257,7 +263,7 @@
  <section class="ledger" aria-label="Recorded file edits">
   <span class="popover-heading">RECORDED FILE EDITS</span>
   {#if !registry?.fileEdit.enabled}
-  <p class="muted">The bounded file-edit capability is disabled on this instance, so no file is proposed or written. Set <code>DASHBOARD_FILE_EDIT=on</code> to enable it.</p>
+  <p class="muted">The bounded file-edit capability is disabled on this instance. It is optional and deployment-gated by <code>DASHBOARD_FILE_EDIT</code>; a scope grant alone cannot enable it.</p>
   {:else}
   <p class="muted">The mode in force comes from the acceptance policy and is <strong>{ledger?.mode??registry.fileEdit.mode??'propose-only'}</strong>. In propose-only the change and its diff are recorded and no file is written, so every change is reviewable before it lands.</p>
   {#if ledger?.edits.length}
@@ -291,6 +297,7 @@
  .scope{display:flex;gap:8px;align-items:flex-start;border:1px solid var(--line);border-radius:4px;padding:6px 8px}
  .scope input{width:auto;flex-shrink:0;margin-top:3px}
  .scope small{display:block;color:var(--muted);line-height:1.5}
+ .scope.unavailable{border-style:dashed}
  .field-error{display:block;color:var(--danger);line-height:1.5;margin:4px 0 2px}
  .ledger{margin-top:14px;border:1px solid var(--line);border-radius:5px;padding:10px 12px}
  .edit{margin-top:8px}

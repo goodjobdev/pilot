@@ -180,7 +180,7 @@ test('a held response for the previous session cannot replace the new transcript
  await addProject(page,'Rapid switch fixture');
  await page.getByRole('button',{name:'Agents',exact:true}).click();
  await expect(page.getByLabel('Message the agent')).toBeVisible();
- await expect(page.getByRole('region',{name:'Session',exact:true})).toContainText('live conversation');
+ await expect(page.locator('.session-current strong')).toHaveText('Project conversation');
  await page.getByRole('button',{name:'New session'}).click();
  await page.getByLabel('New session name').fill('Late A');
  await page.getByRole('button',{name:'Create session'}).click();
@@ -243,7 +243,7 @@ test('a delayed initial snapshot from the previous session cannot change the new
  await addProject(page,'Stale generation fixture');
  await page.getByRole('button',{name:'Agents',exact:true}).click();
  await expect(page.getByLabel('Message the agent')).toBeVisible();
- await expect(page.getByRole('region',{name:'Session',exact:true})).toContainText('live conversation');
+ await expect(page.locator('.session-current strong')).toHaveText('Project conversation');
  await page.getByRole('button',{name:'New session'}).click();
  await page.getByLabel('New session name').fill('Stale A');
  await page.getByRole('button',{name:'Create session'}).click();

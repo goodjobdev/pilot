@@ -290,7 +290,7 @@ test('a short phone viewport keeps the primary controls reachable in normal flow
    attach:rect('.image-pick'),
    attention:rect('[aria-label^="Needs me"]'),
    position:style.position,
-   paddingBottom:parseFloat(style.paddingBottom),
+   bottomInset:parseFloat(style.paddingBottom)+parseFloat(style.marginBottom),
   };
  });
  const inside=(box:{x:number;y:number;w:number;h:number}|null)=>Boolean(box&&box.w>0&&box.h>0&&box.y>=0&&box.x>=0&&box.y+box.h<=geometry.viewport.h&&box.x+box.w<=geometry.viewport.w);
@@ -300,13 +300,28 @@ test('a short phone viewport keeps the primary controls reachable in normal flow
  expect(geometry.position).toBe('static');
  expect(geometry.transcript!.y+geometry.transcript!.h).toBeLessThanOrEqual(geometry.composer!.y+0.5);
  expect(geometry.transcript!.h).toBeGreaterThanOrEqual(160);
- expect(geometry.paddingBottom).toBeGreaterThanOrEqual(24);
- for(const [name,box] of Object.entries({send:geometry.send,steer:geometry.steer,stop:geometry.stop,attach:geometry.attach})){
+ expect(geometry.bottomInset).toBeGreaterThanOrEqual(24);
+ expect(geometry.stop).toBeNull();
+ expect(geometry.steer).toBeNull();
+ for(const [name,box] of Object.entries({send:geometry.send,attach:geometry.attach})){
   expect(inside(box),name+' is reachable inside the short viewport').toBe(true);
  }
  // The attention entry stays in the application bar, visible above the section.
  expect(inside(geometry.attention)).toBe(true);
  await expect(page.getByLabel('Message the agent')).toHaveValue('a draft that stays');
+ // During a run, both controls must remain reachable on the same short screen.
+ await page.getByLabel('Message the agent').fill('[pause] short viewport run');
+ await page.getByRole('button',{name:'Send message'}).click();
+ const stop=page.getByRole('button',{name:'Stop the agent'});
+ const steer=page.getByRole('button',{name:'Steer the run'});
+ await expect(stop).toBeVisible();
+ await expect(steer).toBeVisible();
+ await stop.scrollIntoViewIfNeeded();
+ await expect(stop).toBeInViewport();
+ await steer.scrollIntoViewIfNeeded();
+ await expect(steer).toBeInViewport();
+ await stop.click();
+ await expect(stop).toHaveCount(0);
 });
 
 test('a session’s draft survives Back, Forward and a reload',async({page})=>{

@@ -49,7 +49,7 @@ test('the session view shows a bounded activity timeline with recorded outcomes 
   // list. The timeline says exactly how many older events it withholds.
   await composer.fill('[read-notes]');
   await composer.press('Enter');
-  await expect(transcript).toContainText('read_notes (tool call)', { timeout: 20000 });
+  await expect(transcript.locator('.agent-tools').filter({ hasText: 'read_notes' })).toBeVisible({ timeout: 20000 });
   await expect(activity.getByLabel('Recent tool calls')).toContainText('read_notes', { timeout: 20000 });
   await composer.fill('[ask] add the invoice export');
   await composer.press('Enter');
@@ -65,6 +65,7 @@ test('the session view shows a bounded activity timeline with recorded outcomes 
 
 test('switching to a named session clears the previous timeline and names the new session absence', async ({ page }) => {
   await addProject(page, 'Activity switch fixture');
+  await page.locator('details.activity-more > summary').click();
   const activity = page.getByRole('region', { name: 'Session activity', exact: true });
   const transcript = page.getByLabel('Agent transcript');
 
@@ -91,6 +92,7 @@ test('switching to a named session clears the previous timeline and names the ne
 
 test('a late activity response for the previous session is discarded after a switch', async ({ page }) => {
   await addProject(page, 'Activity late fixture');
+  await page.locator('details.activity-more > summary').click();
   const activity = page.getByRole('region', { name: 'Session activity', exact: true });
   const transcript = page.getByLabel('Agent transcript');
 
@@ -107,7 +109,7 @@ test('a late activity response for the previous session is discarded after a swi
   });
   await page.getByLabel('Message the agent').fill('[read-notes]');
   await page.getByLabel('Message the agent').press('Enter');
-  await expect(transcript).toContainText('read_notes (tool call)', { timeout: 20000 });
+  await expect(transcript.locator('.agent-tools').filter({ hasText: 'read_notes' })).toBeVisible({ timeout: 20000 });
 
   await page.getByRole('button', { name: 'New session' }).click();
   await page.getByLabel('New session name').fill('Late switch session');

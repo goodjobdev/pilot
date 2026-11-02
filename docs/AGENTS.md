@@ -39,8 +39,8 @@ exactly one description, which is the description the interface shows beside its
 | `read_notes` | Read this project's notes file back. |
 | `record_note` | Append one line to this project's notes file. |
 | `ask_question` | Ask the owner one question and end the turn until it is answered. |
-| `read_docs` | Read the project's documentation. |
-| `write_docs` | Write the project's documentation. |
+| `read_docs` | Browse project Markdown documents and read the planning board. |
+| `write_docs` | Create or update planning tasks, dependencies and milestones. |
 | `file_read` | Read a file inside the project's connected repository worktree. |
 | `file_edit` | Propose or apply one bounded edit to a file inside the project's connected repository worktree. |
 | `run_tests` | Submit a bounded coding job from the fixed recipe allowlist. |
@@ -54,8 +54,8 @@ exactly one description, which is the description the interface shows beside its
 | `publish` | Publish an artifact to a channel. |
 
 The scopes that govern a tool this build exposes to a model are declared in `AGENT_TOOL_SCOPES`
-(`ask_question`, `record_note`, `read_notes`, `read_docs`, `write_docs`,
-`file_read`, `file_edit`, `run_tests`). The rest are capabilities the command surface and
+(`ask_question`, `record_note`, `read_notes`, `list_docs`, `read_doc`, `read_board`,
+`write_board`, `file_read`, `file_edit`, `run_tests`). The rest are capabilities the command surface and
 the acceptance record name; nothing in the vocabulary is a label with nothing behind it.
 
 ## Tool installation status
@@ -69,15 +69,15 @@ Only the following scopes correspond to a tool this instance installs:
 | `record_note` | Yes, always | On |
 | `read_notes` | Yes, always | On |
 | `file_edit` | Conditional — see below | Off (behind switch) |
-| `read_docs` | **No** — not installed | N/A |
-| `write_docs` | **No** — not installed | N/A |
+| `read_docs` | `list_docs`, `read_doc`, `read_board` | Available; requires a grant |
+| `write_docs` | `write_board` | Available; requires a grant |
 | `file_read` | **No** — not installed | N/A |
 | `run_tests` | **No** — not installed | N/A |
 
-A scope whose tool is not installed is listed in the vocabulary and can be granted to an agent,
-but the agent cannot call the tool: the tool simply does not exist in the running instance. The
-UI and the agent's prompt section report this explicitly, so an owner is never told a capability
-is in effect when the agent cannot use it.
+A scope whose tool is not installed remains in the vocabulary, but the agent cannot call it.
+Settings disable new unavailable grants and preserve existing ones unless the owner removes them.
+The UI and prompt distinguish a grant from an installed tool. Planning does not require enabling
+`file_edit`; see [Agent planning tools](PLANNING-TOOLS.md) for the bounded document/board workflow.
 
 An agent whose granted scopes include uninstalled-tool scopes is told which ones are usable and
 which ones are unavailable, with the reason.
@@ -222,10 +222,10 @@ Two modes, and **the mode in force is read from the acceptance policy rather tha
 
 ## Honest limits
 
-- **The offered tool list is computed when a project's harness is opened**, and the conversation's stored
-  agent state keeps it for the life of that conversation. The authoritative check is the per-call
-  re-check, so a scope change takes effect at dispatch immediately; the offered list is rebuilt the next
-  time the project's harness is opened.
+- **Conversation selections are durable.** Planning tools are added to existing root and named
+  conversations before recovery and checked before new input. The migration preserves the model,
+  transcript and explicit removal filters, and never widens grants. Other optional tools can retain
+  their previous selection. The live per-call check remains authoritative for every tool.
 - **A session's binding is per session.** The scopes in force for a session are its bound agent's, or
   — for an unmanaged session — the project-level rule described above. When more than one enabled agent
   allows a project, only the scopes **every one of them allows** are in force, the safe direction, never

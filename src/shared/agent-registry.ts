@@ -66,8 +66,8 @@ export const AGENT_SCOPE_DESCRIPTIONS: Readonly<Record<AgentScope, string>> = Ob
   read_notes: 'Read this project\u2019s notes file back.',
   record_note: 'Append one line to this project\u2019s notes file.',
   ask_question: 'Ask the owner one question and end the turn until it is answered.',
-  read_docs: 'Read the project\u2019s documentation.',
-  write_docs: 'Write the project\u2019s documentation.',
+  read_docs: 'Browse project Markdown documents and read the planning board.',
+  write_docs: 'Create or update planning tasks, dependencies and milestones.',
   file_read: 'Read a file inside the project\u2019s connected repository worktree.',
   file_edit: 'Propose or apply one bounded edit to a file inside the project\u2019s connected repository worktree.',
   run_tests: 'Submit a bounded coding job from the fixed recipe allowlist.',
@@ -94,7 +94,11 @@ export const AGENT_SCOPE_DESCRIPTIONS: Readonly<Record<AgentScope, string>> = Ob
  */ export const AGENT_DEFAULT_INSTALLED_TOOLS: Readonly<Record<string, AgentScope>> = Object.freeze({
   ask_question: 'ask_question',
   record_note: 'record_note',
-  read_notes: 'read_notes'
+  read_notes: 'read_notes',
+  list_docs: 'read_docs',
+  read_doc: 'read_docs',
+  read_board: 'read_docs',
+  write_board: 'write_docs'
 });
 /**
  * The scope that governs each tool this build exposes to a model. A tool this map does not name is
@@ -109,20 +113,22 @@ export const AGENT_TOOL_SCOPES: Readonly<Record<string, AgentScope>> = Object.fr
   ask_question: 'ask_question',
   record_note: 'record_note',
   read_notes: 'read_notes',
-  read_docs: 'read_docs',
-  write_docs: 'write_docs',
+  list_docs: 'read_docs',
+  read_doc: 'read_docs',
+  read_board: 'read_docs',
+  write_board: 'write_docs',
   file_read: 'file_read',
   file_edit: 'file_edit',
   run_tests: 'run_tests'
 });
 /** Whether a scope whose tool this build declares is also one it actually installs. */
-export function scopeToolIsInstalled(scope: AgentScope): boolean {
+export function scopeToolIsInstalled(scope: AgentScope, fileEditEnabled = false): boolean {
   const installed = Object.values(AGENT_DEFAULT_INSTALLED_TOOLS) as readonly AgentScope[];
-  return installed.includes(scope);
+  return installed.includes(scope) || (scope === 'file_edit' && fileEditEnabled);
 }
 /** The scopes this build actually installs tools for, in vocabulary order. */
 export function installedAgentScopes(): readonly AgentScope[] {
-  return Object.freeze(AGENT_SCOPES.filter(scopeToolIsInstalled));
+  return Object.freeze(AGENT_SCOPES.filter((scope) => scopeToolIsInstalled(scope)));
 }
 /** The scopes this build declares but does NOT install a tool for, in vocabulary order. */
 export function unavailableAgentScopes(): readonly { readonly scope: AgentScope; readonly description: string; readonly reason: string }[] {
@@ -604,8 +610,8 @@ export function decideScopeChange(input: {
 }
 
 /** The closed vocabulary as the interface reads it: each scope beside the one line that describes it and whether a tool is installed for it. */
-export function agentScopeVocabulary(): readonly { readonly scope: AgentScope; readonly description: string; readonly installed: boolean }[] {
-  return Object.freeze(AGENT_SCOPES.map((scope) => Object.freeze({ scope, description: AGENT_SCOPE_DESCRIPTIONS[scope], installed: scopeToolIsInstalled(scope) })));
+export function agentScopeVocabulary(fileEditEnabled = false): readonly { readonly scope: AgentScope; readonly description: string; readonly installed: boolean }[] {
+  return Object.freeze(AGENT_SCOPES.map((scope) => Object.freeze({ scope, description: AGENT_SCOPE_DESCRIPTIONS[scope], installed: scopeToolIsInstalled(scope, fileEditEnabled) })));
 }
 
 /** One entry of the durable audit trail: what changed, by whom, and when. */

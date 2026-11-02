@@ -56,6 +56,9 @@ test('an agent is created with assigned scopes, and a refusal is shown beside th
 
  // A scope outside the closed vocabulary cannot even be chosen, and the model list is the offered one.
  await expect(page.getByLabel('Scope file_edit')).toBeVisible();
+ await expect(page.getByLabel('Scope file_edit')).toBeDisabled();
+ await expect(page.getByLabel('Scope deploy')).toBeDisabled();
+ await expect(page.getByLabel('Scope read_notes')).toBeEnabled();
  expect(await page.getByLabel('Agent model').locator('option').count()).toBeGreaterThan(0);
 
  // Disabling is a revision-checked change, and the list reports the new state.
@@ -67,6 +70,28 @@ test('an agent is created with assigned scopes, and a refusal is shown beside th
 
  // The recorded file edits are shown honestly: the capability is disabled on this instance.
  await expect(dialog).toContainText('The bounded file-edit capability is disabled on this instance');
+
+ // A legacy unavailable grant remains visible and survives an unrelated save.
+ const updateStatus=await page.evaluate(async()=>{
+  const token=document.querySelector<HTMLMetaElement>('meta[name="dashboard-token"]')!.content;
+  const headers={'X-Dashboard-Token':token,'Content-Type':'application/json'};
+  const registry=await (await fetch('/api/agents',{headers})).json();
+  const agent=registry.agents[0];
+  return (await fetch('/api/agents/'+encodeURIComponent(agent.id)+'/update',{
+   method:'POST',headers,body:JSON.stringify({revision:agent.revision,patch:{scopes:['read_notes','record_note','deploy']},actor:{kind:'owner',identity:'local'}})
+  })).status;
+ });
+ expect(updateStatus).toBe(200);
+ await page.getByRole('button',{name:'Close agent manager'}).click();
+ await page.getByRole('button',{name:'Agents and privileges'}).click();
+ await expect(page.getByLabel('Scope deploy')).toBeChecked();
+ await expect(dialog).toContainText('Existing grant; uncheck to remove.');
+ await page.getByLabel('Agent description').fill('Updated description');
+ await page.getByRole('button',{name:'Save agent'}).click();
+ await expect(dialog.getByRole('status')).toContainText('Saved Nightly reviewer');
+ await expect(page.getByLabel('Scope deploy')).toBeChecked();
+ await page.getByLabel('Scope deploy').uncheck();
+ await expect(page.getByLabel('Scope deploy')).toBeDisabled();
 
  await page.getByRole('button',{name:'Close agent manager'}).click();
  await expect(dialog).toBeHidden();

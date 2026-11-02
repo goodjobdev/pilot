@@ -799,8 +799,8 @@ test('DEFECT2a: the scope vocabulary reports which scopes have an installed tool
   assert.ok(installed.includes('ask_question'), 'ask_question is installed');
   // Scopes with no installed tool
   const uninstalled = vocab.filter(s => !s.installed).map(s => s.scope);
-  assert.ok(uninstalled.includes('read_docs'), 'read_docs is uninstalled');
-  assert.ok(uninstalled.includes('write_docs'), 'write_docs is uninstalled');
+  assert.ok(installed.includes('read_docs'), 'read_docs is installed');
+  assert.ok(installed.includes('write_docs'), 'write_docs is installed');
   assert.ok(uninstalled.includes('file_read'), 'file_read is uninstalled');
   assert.ok(uninstalled.includes('run_tests'), 'run_tests is uninstalled');
   assert.ok(uninstalled.includes('fork'), 'fork is uninstalled');
@@ -857,15 +857,13 @@ test('DEFECT2d: the agent prompt section lists only tools it can actually call',
   // A tool whose scope is installed is permitted when scopes include it
   const readNotesVerdict = authorizeToolUse({ scopes: ['read_notes'], tool: 'read_notes' });
   assert.ok(readNotesVerdict.permitted, 'read_notes tool is permitted when scope is held');
-  // A tool whose scope is NOT installed (e.g. read_docs) is NOT permitted even when the scope is held
-  // because authorizeToolUse checks scope membership, not installation status.
-  // The INSTALLATION check is done by the privilege extension section text.
+  // authorizeToolUse checks scope membership; installation is reported separately.
   // Verify the installedAgentScopes function:
   assert.ok(installed.includes('read_notes'));
   assert.ok(installed.includes('record_note'));
   assert.ok(installed.includes('ask_question'));
-  assert.ok(!installed.includes('read_docs'), 'read_docs is NOT in installedAgentScopes');
-  assert.ok(!installed.includes('write_docs'), 'write_docs is NOT in installedAgentScopes');
+  assert.ok(installed.includes('read_docs'), 'read_docs is installed');
+  assert.ok(installed.includes('write_docs'), 'write_docs is installed');
   assert.ok(!installed.includes('file_read'), 'file_read is NOT in installedAgentScopes');
   assert.ok(!installed.includes('run_tests'), 'run_tests is NOT in installedAgentScopes');
   // file_edit is NOT in the default installed list (switch off)

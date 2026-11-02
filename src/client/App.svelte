@@ -350,8 +350,22 @@
  async function redo(){if(!snapshot||!redoStack.length)return;const before=structuredClone($state.snapshot(snapshot.board)),target=redoStack.at(-1)!;await mutate({op:'restore',board:target},false);if(!failed){redoStack=redoStack.slice(0,-1);undoStack=[...undoStack,before];}}
  function exported(){if(snapshot)download(failed?'unsaved-board.md':'board.md',serializeBoard($state.snapshot(snapshot.board)),'text/markdown');}
  function imported(s:Snapshot){snapshot=s;undoStack=[];redoStack=[];saveState='Saved';selected='';}
+ /** Pick up board changes made by the agent or another client without overwriting local edits. */
+ async function refreshBoard(){
+   if(!project||!snapshot||saving||failed||inspectorDirty)return;
+   const id=project.id,revision=snapshot.revision;
+   try{
+     const fresh=await api.board(id);
+     if(project?.id!==id||saving||failed||inspectorDirty||snapshot?.revision!==revision)return;
+     if(fresh.revision!==revision){
+       snapshot=fresh;undoStack=[];redoStack=[];saveState='Saved';
+       if(selected&&!fresh.board.tasks.some(task=>task.id===selected))selected='';
+     }
+   }catch(e){if(project?.id===id&&!saving&&!failed)error=(e as Error).message;}
+ }
  function setView(mode:View,opts:{fromRoute?:boolean;openTree?:boolean}={}){
    view=mode;
+   if(mode==='Dependencies'||mode==='Timeline'||mode==='List')void refreshBoard();
    sessionListOpen=false;
    if(mode==='Wiki'){
      if(project)void loadDocs();
@@ -463,7 +477,6 @@
   <button class="icon-button sidebar-toggle" aria-label={sidebarHidden?'Show project sidebar':'Hide project sidebar'} aria-expanded={!sidebarHidden} aria-controls="project-sidebar" title="Toggle project sidebar (⌘/Ctrl B)" onclick={toggleSidebar}><Icon name="sidebar"/></button>
   <span class="appbar-divider"></span>
   <div class="workspace-identity"><span class="workspace-prefix">WORKSPACE /</span><h1>{project?.name??'Pilot'}</h1></div>
-  {#if project}<span class="authority-badge" class:adopted={snapshot?.board.adoption==='adopted'} title={snapshot?.board.adoption==='adopted'?'Adopted task planning; original specs/evidence remain authoritative.':'Original documents remain authoritative. This board is a planning mirror.'}>{snapshot?.board.adoption==='adopted'?'Adopted board':'Planning mirror'}</span>{/if}
   <div class="appbar-end">
    <button class="icon-button" aria-label="Agents and privileges" title="Agents &amp; privileges" onclick={()=>agentManagerOpen=true}><Icon name="agent"/></button>
    <button class="icon-button" aria-label="Workers" title="Bounded workers" disabled={!project} onclick={()=>workersOpen=true}><Icon name="graph"/></button>
@@ -531,8 +544,6 @@
   {:else if view==='Wiki'}
   <span class="wiki-hint">Documentation is the source of work: write the intent, then link the work to it.</span>
   <div class="commandbar-end"><button class="compact-button wiki-tree-toggle" aria-label="Show documents" onclick={()=>treeOpen=true}><Icon name="book" size={14}/><span>Documents</span></button></div>
-  {:else}
-  <span class="wiki-hint">Choose a model per session. Real calls require provider credentials and explicit opt-in in settings.</span>
   {/if}
  </div>
  <div class="view-area">
@@ -564,19 +575,18 @@
  {#if snapshot&&selected&&snapshot.board.tasks.some(t=>t.id===selected)}<TaskInspector board={snapshot.board} id={selected} projectId={project.id} disabled={saving||failed} onclose={()=>choose('')} onoperation={mutate} ondirty={(dirty)=>inspectorDirty=dirty}/>{/if}
  {/if}
  </div>
+ {#if view!=='Agents'}
  <footer class="statusbar">
  {#if view==='Wiki'}
   <span class="file-state">{doc?doc.path:'No document selected'} · {docs.length} documents</span>
   <span class="save-indicator" class:dirty={docConflict||docDirty} role="status">{docConflict?'Conflict':docDirty?'Unapplied edits':docMessage||'Saved'}</span>
- {:else if view==='Agents'}
-  <span class="file-state">Agent harness · one durable SQLite session per project</span>
-  <span class="save-indicator" role="status">Durable session</span>
  {:else}
   <span class="file-state">Persistent markdown · {snapshot?.board.tasks.length??0} tasks · {visible.length} matching</span>
   <div class="readiness-summary" title="Task checkpoints, not whole-project acceptance"><span><i class="indicator ready"></i>{ready} ready</span><span><i class="indicator doing"></i>{doing} in progress</span><span><i class="indicator waiting"></i>{waiting} waiting</span><span>{done} complete</span></div>
   <span class="save-indicator" class:dirty={failed||inspectorDirty} role="status">{inspectorDirty?'Unapplied edits':saveState}</span>
  {/if}
  </footer>
+ {/if}
  {:else if !booted}<div class="empty" role="status"><p>Opening Pilot…</p></div>
  {:else}<div class="empty"><div class="empty-mark"><Icon name="graph" size={36}/></div><span class="eyebrow">PROJECT CONTROL</span><h2>A workspace for the work.</h2><p>Dependencies, milestones and persistent Markdown. Add a project to start.</p><button class="primary" disabled={!booted} onclick={()=>adding=true}>＋ Add project</button>{#if error}<p role="alert" class="error">{error}</p>{/if}</div>{/if}
  </main>

@@ -39,7 +39,7 @@ async function addProject(page:import('@playwright/test').Page,name:string){
  await page.getByLabel('Project name').fill(name);
  await page.getByRole('button',{name:'Confirm & add project'}).click();
  await page.getByRole('button',{name:'Agents',exact:true}).click();
- await expect(page.locator('.agent-state')).toHaveText('Idle');
+ await expect(page.locator('details.activity-more > summary')).toContainText('Idle');
 }
 async function newSession(page:import('@playwright/test').Page,name:string){
  await page.getByRole('button',{name:'New session'}).click();
@@ -244,6 +244,7 @@ test('a reload recovers a stored image reference, and a reference the server los
  await expect(page.getByRole('button',{name:'Send message'})).toBeEnabled();
 
  // Replace the stored reference with one the server does not have. Recovery must name it.
+ await page.locator('details.draft-more:not([open]) > summary').click();
  await expect(page.locator('.draft-saved')).toBeVisible();
  await page.evaluate(()=>{
   for(const key of Object.keys(localStorage)){
@@ -322,6 +323,7 @@ test('the model capability comes with the view, blocks a send, and refreshes aft
  await composer.fill('needs a vision model');
  await page.locator('input[type=file]').setInputFiles(image);
  await expect(page.locator('.image-item .image-facts')).toContainText('8×6');
+ await page.locator('details.draft-more:not([open]) > summary').click();
  await expect(page.locator('.draft-saved')).toBeVisible();
 
  // The capability travels with the agent view, which is the same request the screen already
@@ -368,6 +370,7 @@ test('a corrupt stored draft is named and left in place, and typing works again'
  await addProject(page,'Draft corrupt fixture');
  const composer=page.getByLabel('Message the agent');
  await composer.fill('will not survive');
+ await page.locator('details.draft-more:not([open]) > summary').click();
  await expect(page.locator('.draft-saved')).toBeVisible();
  await page.evaluate(()=>{
   for(const key of Object.keys(localStorage)){
@@ -389,6 +392,7 @@ test('a failed image lookup keeps the reference and can be retried, while only 4
  await composer.fill('image under a failing lookup');
  await page.locator('input[type=file]').setInputFiles(await imageFile('lookup.png'));
  await expect(page.locator('.image-item .image-facts')).toContainText('8×6');
+ await page.locator('details.draft-more:not([open]) > summary').click();
  await expect(page.locator('.draft-saved')).toBeVisible();
 
  // A sign-in refusal says nothing about the stored object, so it must not become `missing`.
@@ -499,6 +503,7 @@ test('a refused local save keeps the latest text in this tab, warns after reload
 
  // An explicit clear removes drafts and failure markers; nothing on the server changes.
  page.on('dialog',dialog=>void dialog.accept());
+ await page.locator('details.draft-more:not([open]) > summary').click();
  await page.getByRole('button',{name:'Clear local drafts'}).click();
  await expect(composer).toHaveValue('');
  const remaining=await page.evaluate(()=>Object.keys(localStorage).filter(key=>key.startsWith('pilot.draft.')));

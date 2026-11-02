@@ -160,6 +160,27 @@ test('a paused reader keeps a visible anchor when a 500-row window evicts 20 row
  expect(await scroller.evaluate(element=>(element as HTMLElement).scrollTop)).toBeGreaterThan(0);
 });
 
+test('only unresolved questions remain actionable when resolved questions share the view',async({page})=>{
+ const snapshot={conversationId:'mixed-question-session',working:false,attempt:null,entries:[],partial:'',inbox:[],usage:{input:0,output:0,cost:0},model:null,questions:[
+  {id:'open',text:'Still open?',askedAt:null,answer:null},
+  {id:'answered',text:'Already answered?',askedAt:null,answer:{text:'Yes'}},
+  {id:'dismissed',text:'Already dismissed?',askedAt:null,answer:null}
+ ],dismissals:{dismissed:{reason:'Not needed',dismissedAt:null,dismissedBy:'owner'}},updatedAt:new Date().toISOString()};
+ await page.route('**/api/projects/*/agents/stream',route=>route.fulfill({status:200,contentType:'text/event-stream',body:'data: '+JSON.stringify(snapshot)+'\n\n'}));
+ await addProject(page,'Mixed questions fixture');
+ const active=page.getByRole('region',{name:'Questions for me'});
+ await expect(active).toContainText('Still open?');
+ await expect(active).not.toContainText('Already answered?');
+ await expect(active).not.toContainText('Already dismissed?');
+ await expect(active.getByLabel(/^Answer to:/)).toHaveCount(1);
+ const history=page.locator('details.question-history');
+ await history.locator('summary').click();
+ await expect(history).toContainText('Already answered?');
+ await expect(history).toContainText('Yes');
+ await expect(history).toContainText('Already dismissed?');
+ await expect(history).toContainText('Not needed');
+});
+
 test('more than 500 pending questions warn on omission and keep an omitted inbox item answerable by exact id',async({page})=>{
  const questions=Array.from({length:505},(_,i)=>({id:'synthetic-question-'+i,text:'Synthetic pending question '+i+'?',askedAt:null,answer:null}));
  const snapshot={conversationId:'synthetic-question-session',working:false,attempt:null,entries:[],partial:'',inbox:[],usage:{input:5,output:6,cost:0},model:null,questions,updatedAt:new Date().toISOString()};
@@ -230,12 +251,8 @@ test('a phone keeps a usable transcript, and every condensed control is reachabl
  await expect(page.getByRole('region',{name:'Session details'})).toContainText('Scopes in effect');
  await page.getByRole('button',{name:'Hide session details'}).click();
 
- // The model identity and the model state are one expansion away.
- const model=page.locator('details.head-more');
- await expect(model.locator('summary')).toBeVisible();
- await model.locator('summary').click();
- await expect(model).toContainText('no model called');
- await model.locator('summary').click();
+ // The session model remains reachable in the compact composer.
+ await expect(page.getByLabel('Session model')).toBeVisible();
 
  // The activity timeline is bounded by disclosure: open it after several turns and the transcript
  // still keeps its floor, without the composer covering it.
@@ -431,7 +448,8 @@ test('a keyboard-short screen scrolls the section in normal flow and never cover
  await addProject(page,'Follow short fixture');
  await seed(page,5);
 
- await page.setViewportSize({width:390,height:500});
+ // Compact chrome now fits a 500px viewport; use a smaller keyboard viewport to exercise overflow.
+ await page.setViewportSize({width:390,height:380});
  await expect.poll(async()=>(await geometry(page)).scroller.clientHeight,{timeout:5000}).toBeGreaterThanOrEqual(160);
  const short=await geometry(page);
  console.log('SHORT_GEOMETRY '+JSON.stringify(short));
@@ -445,7 +463,7 @@ test('a keyboard-short screen scrolls the section in normal flow and never cover
  await expect(page.getByRole('button',{name:'Send message'})).toBeVisible();
  const composerBox=await page.locator('.agent-composer').boundingBox();
  expect(composerBox).not.toBeNull();
- expect(composerBox!.y+composerBox!.height).toBeLessThanOrEqual(501);
+ expect(composerBox!.y+composerBox!.height).toBeLessThanOrEqual(381);
  const reached=await geometry(page);
  expect(reached.section.scrollTop).toBeGreaterThan(0);
  expect(reached.scroller.clientHeight).toBeGreaterThanOrEqual(160);
@@ -506,7 +524,8 @@ async function switchProject(page:Page,name:string){
 test('a project switch between equal-length conversations resets the follow state and the content',async({page})=>{
  await addProject(page,'Project Alpha');
  const transcript=transcriptOf(page),indicator=indicatorOf(page);
- await seed(page,1);
+ // The compact transcript fits a single exchange; use enough equal-length history to scroll.
+ await seed(page,4);
  await scrollUp(page);
  await expect(indicator).toBeVisible();
  await expect(transcript).toContainText('[note seed message 1]');
@@ -521,7 +540,7 @@ test('a project switch between equal-length conversations resets the follow stat
  await page.getByRole('button',{name:'Agents',exact:true}).click();
  await expect(transcript).toContainText('No messages yet',{timeout:20000});
  await expect(indicator).toHaveCount(0);
- await seed(page,1);
+ await seed(page,4);
 
  // Paused in Beta, then back to Alpha: no count of Beta may appear, and Alpha opens at its newest.
  await scrollUp(page);

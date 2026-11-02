@@ -107,21 +107,12 @@
  <span class="session-scopes" role="status">Scopes in effect: {scopeText}{binding?.authority.emptyReason&&!binding.authority.scopes?.length?' — '+binding.authority.emptyReason:''}</span>
  {/snippet}
  <div class="session-current">
-  <span class="eyebrow">SESSION</span>
-  <strong>{selected?.name??('conversation '+selectedId)}</strong>
-  <span class="pill" class:live={selectedId===sessionId}>{selectedId===sessionId?'live conversation':'not the live conversation'}</span>
-  <span class="session-life">{selected?lifecycleOf(selected):'no lifecycle record'}</span>
+  <strong>{selected?.name??'Project conversation'}</strong>
  </div>
- {#if compact}
- <!-- Progressive disclosure, not removal: the same picker and the same scope line, one tap away.
-      "Session details" below shows the full scopes list at every width. -->
  <details class="session-more">
-  <summary>Agent &amp; scopes</summary>
+  <summary>Agent controls</summary>
   {@render bindingControls()}
  </details>
- {:else}
- {@render bindingControls()}
- {/if}
  <div class="session-actions">
   <button class="compact-button" aria-label="Sessions" aria-expanded={listOpen} onclick={()=>{onlistchange(!listOpen);creating=false;}}><Icon name="list" size={14}/><span>Sessions</span></button>
   <button class="compact-button" aria-label="New session" onclick={()=>{creating=!creating;onlistchange(false);nameError='';}}><Icon name="plus" size={14}/><span>New session</span></button>
@@ -152,15 +143,17 @@
 <style>
  .session-bar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:8px 12px;border-bottom:1px solid var(--line);background:var(--bg)}
  .session-current{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
- .session-current .eyebrow{padding:0}
- .session-life{font:9px var(--mono);color:var(--muted)}
+ .session-current{min-width:0;flex:1 1 0;font-size:13px}
+ .session-current strong{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:100%}
  .agent-picker{min-width:200px;font-size:10px}
  .session-scopes{font-size:11px;color:var(--muted);flex:1 1 240px;min-width:0;overflow-wrap:anywhere}
- .session-more{flex:1 1 220px;min-width:0;font-size:12px}
+ .session-more{min-width:0;font-size:12px}
+ .session-more[open]{flex:1 1 100%;order:3}
  .session-more summary{cursor:pointer;color:var(--muted);font:11px var(--mono)}
  .session-more[open]{display:flex;flex-direction:column;gap:6px;width:100%}
  .session-more .agent-picker{min-width:0}
  .session-actions{display:flex;gap:6px;margin-left:auto}
+ @media(max-width:650px){.session-actions :global(button){min-width:36px;min-height:36px}.session-actions :global(button span){display:none}.session-more summary{font-size:10px}}
  .session-message{color:var(--muted);font-size:11px;margin:4px 12px}
  .session-problem{margin:6px 12px}
  .session-create{display:flex;align-items:flex-end;gap:8px;flex-wrap:wrap;padding:8px 12px;border-bottom:1px solid var(--line)}
@@ -170,6 +163,5 @@
  .session-row.active{border-color:var(--accent);background:color-mix(in srgb,var(--accent) 8%,transparent)}
  .session-name{font-size:12px;font-weight:600;overflow-wrap:anywhere}
  .session-meta{font:10px var(--mono);color:var(--muted);overflow-wrap:anywhere}
- .pill.live{color:var(--accent);border-color:color-mix(in srgb,var(--accent) 40%,var(--line))}
  .field-error{display:block;color:var(--danger);line-height:1.5}
 </style>

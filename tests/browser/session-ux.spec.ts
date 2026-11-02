@@ -53,7 +53,7 @@ test('the composer sends on Enter, keeps Shift+Enter as a newline, and the slash
 test('a session is created with per-field validation, listed with its work, and its details name the agent and scopes in force',async({page})=>{
  await addProject(page,'Session UX fixture');
  const bar=page.getByRole('region',{name:'Session',exact:true});
- await expect(bar).toContainText('live conversation');
+ await expect(bar.locator('.session-current strong')).toHaveText('Project conversation');
 
  // Create a named session.
  await page.getByRole('button',{name:'New session'}).click();
@@ -140,7 +140,7 @@ test('creating a session navigates to it and the phone session list scrolls with
 test('the session bar binds an agent to the live session and shows the scopes in effect, including the empty case',async({page})=>{
  await addProject(page,'Binding fixture');
  const bar=page.getByRole('region',{name:'Session',exact:true});
- await expect(bar).toContainText('live conversation');
+ await expect(bar.locator('.session-current strong')).toHaveText('Project conversation');
 
  // Create an agent scoped to this project, with the record_note scope.
  await page.getByRole('button',{name:'Agents and privileges'}).click();
@@ -153,7 +153,8 @@ test('the session bar binds an agent to the live session and shows the scopes in
  await expect(dialog.getByRole('status')).toContainText('Created Session UX agent');
  await page.getByRole('button',{name:'Close agent manager'}).click();
 
- // Bind it to the live session from the bar; the scopes in effect are now the agent's own.
+ // Bind it to the live session from the collapsed controls.
+ await bar.locator('details.session-more > summary').click();
  await page.getByLabel('Agent for this session').selectOption({label:'Session UX agent'});
  await expect(bar).toContainText('record_note');
  // Choosing "No agent" is explicit: every tool is refused until one is bound.
@@ -172,14 +173,20 @@ test('a question is dismissed with a reason, does not reappear, and cannot be an
  await page.getByRole('button',{name:/Dismiss question:/}).click();
  await page.getByLabel(/^Dismissal reason for:/).fill('Not this cycle');
  await page.getByRole('button',{name:'Confirm dismissal'}).click();
- await expect(questions).toContainText('dismissed');
- await expect(questions).toContainText('Not this cycle');
+ await expect(questions).toHaveCount(0);
+ const history=page.locator('details.question-history');
+ await history.locator('summary').click();
+ await expect(history).toContainText('dismissed');
+ await expect(history).toContainText('Not this cycle');
  // A dismissed question is not answerable: no answer field remains for it.
  await expect(page.getByLabel(/^Answer to:/)).toHaveCount(0);
 
  // It stays dismissed after a reload.
  await page.reload();
  await page.getByRole('button',{name:'Agents',exact:true}).click();
- await expect(page.getByRole('region',{name:'Questions for me'})).toContainText('Not this cycle');
+ await expect(page.getByRole('region',{name:'Questions for me'})).toHaveCount(0);
+ const restoredHistory=page.locator('details.question-history');
+ await restoredHistory.locator('summary').click();
+ await expect(restoredHistory).toContainText('Not this cycle');
  await expect(page.getByLabel(/^Answer to:/)).toHaveCount(0);
 });

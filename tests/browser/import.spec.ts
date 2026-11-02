@@ -5,5 +5,6 @@ test('review selected documents without adopting or running embedded HTML',async
  await page.getByLabel('Markdown or legacy dashboard files').setInputFiles({name:'tasks.md',mimeType:'text/markdown',buffer:Buffer.from('# Now\n- [ ] Persist safely\n- [x] UI fixture')});
  await page.getByRole('button',{name:'Preview import'}).click();await expect(page.getByText('2 candidates · 0 milestones')).toBeVisible();
  await page.getByRole('button',{name:'Apply 2 reviewed tasks'}).click();await expect(page.getByText('Persistent markdown · 2 tasks')).toBeVisible();
- await expect(page.getByText(/Planning mirror/)).toBeVisible();
+ await expect(page.getByText('Persist safely', {exact:true})).toBeVisible();
+ await expect(page.locator('.authority-badge')).toHaveCount(0);
 });

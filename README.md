@@ -132,7 +132,8 @@ exactly once.
 - **The default provider is a scripted local stand-in.** Real provider adapters are available
   through [Providers & models](docs/PROVIDER-SIGNIN.md); credentials and live sign-in are the
   owner's responsibility. Tests use synthetic providers, not billed acceptance calls. Agent
-  tools are still question/note operations, not a complete coding toolchain.
+  tools include bounded documentation reads and revision-checked planning board updates, not a
+  complete coding toolchain. See [Agent planning tools](docs/PLANNING-TOOLS.md).
 - **Uncommitted code is not a GitHub backup.** Repository worktrees and deployment keys are
   described in [Project connections](docs/PROJECT-CONNECTIONS.md). Review and back up before
   a real migration. Pilot supersedes the earlier dashboard, without automatically importing

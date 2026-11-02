@@ -513,7 +513,7 @@ export async function createApp(options:AppOptions){
   const workerHolder:{store?:WorkerStore}={};
   // The agent harness is the only execution surface. It is off unless the instance enables it explicitly.
   const agents=new HarnessHost({
-    dataRoot:options.dataRoot,providers,delivery,lifecycle:lifecycleHooks,
+    dataRoot:options.dataRoot,providers,delivery,lifecycle:lifecycleHooks, docs, boards,
     recovery:lifecycle?{read:(projectId,sessionId)=>{const record=lifecycle.read(projectId,sessionId);return {state:record.state,uncertain:record.uncertain,requestId:record.requestId};}}:undefined,
     enabled:(options.agents??(process.env.DASHBOARD_AGENTS==='on'?'on':'off'))==='on',
     pauseMs:options.agentPauseMs??Number(process.env.DASHBOARD_AGENT_PAUSE_MS??2500),
@@ -1510,7 +1510,7 @@ export async function createApp(options:AppOptions){
           if(!agentStore)throw new HttpError(503,'The agent registry is unavailable: no durable control store is open on this instance');
           try{
             if(path==='/api/agents'){
-              if(req.method==='GET'){json({agents:agentStore.list(),scopes:agentScopeVocabulary(),models:agentStore.offeredModels(),fileEdit:{enabled:fileEdit!==undefined&&fileEdit.enabled,mode:fileEdit===undefined||!fileEdit.enabled?null:await fileEdit.mode()}});return;}
+              if(req.method==='GET'){json({agents:agentStore.list(),scopes:agentScopeVocabulary(fileEdit!==undefined&&fileEdit.enabled),models:agentStore.offeredModels(),fileEdit:{enabled:fileEdit!==undefined&&fileEdit.enabled,mode:fileEdit===undefined||!fileEdit.enabled?null:await fileEdit.mode()}});return;}
               if(req.method==='POST'){
                 const body=parseBody(z.strictObject({draft:z.unknown(),actor:z.unknown()}),payload,'The agent request');
                 json({agent:agentStore.create({draft:body.draft,actor:body.actor})},201);return;

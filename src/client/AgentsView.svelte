@@ -1,4 +1,12 @@
 <script lang="ts">
+ import DOMPurify from 'dompurify';
+ import { marked } from 'marked';
+ function renderMessage(text:string):string {
+  return DOMPurify.sanitize(marked.parse(text,{gfm:true,async:false}) as string,{
+   ALLOWED_TAGS:['p','br','strong','em','del','s','blockquote','pre','code','ul','ol','li','h1','h2','h3','h4','h5','h6','hr','a','table','thead','tbody','tr','th','td'],
+   ALLOWED_ATTR:['href','title','start'],ALLOW_DATA_ATTR:false
+  });
+ }
  import {tick} from 'svelte';
  import { api,ApiError,download,reportSessionExpired } from './api';
  import { openAgentStream,type ConnectionStatus } from './stream';
@@ -33,7 +41,7 @@
    const id=focusQuestion,project=projectId,session=selectedSessionId,loaded=view;
    if(!id){focusedQuestionRequest='';return;}
    if(loaded?.questions.some(question=>question.id===id)){
-     document.getElementById('question-'+id)?.scrollIntoView({block:'center'});
+     void tick().then(()=>{const element=document.getElementById('question-'+id);const disclosure=element?.closest('details');if(disclosure)disclosure.open=true;element?.scrollIntoView({block:'center'});});
      return;
    }
    const key=project+'\u0000'+session+'\u0000'+id;
@@ -754,52 +762,23 @@
  {#if view?.transcriptWindow?.questionsOmitted}
   <p class="agent-gap" role="alert">{view.transcriptWindow.questionsOmitted} questions are outside this client's 500-question action window. The full durable question state is unchanged; do not treat this view as showing no other questions.</p>
  {/if}
- {#snippet modelIdentity()}
- <div class="model-identity">
-  <span class="eyebrow">{!view?.model||view.model.provider==='faux'?'SCRIPTED TEST PROVIDER':'MODEL PROVIDER'}</span>
-  <h2>{view?.model?view.model.provider+' / '+view.model.modelId:'Agent'}</h2>
-  <span class="pill" title="No model is called and nothing is spent: replies come from a deterministic local provider.">no model called</span>
- </div>
- {/snippet}
  {#if enabled}
- <!-- The activity timeline is a native disclosure at every width: open on a roomy screen, closed
-      on a phone so it cannot grow and squeeze the conversation. Its content is never removed. -->
- <details class="activity-more" open={!chromeCompact}>
-  <summary>Activity</summary>
+ <details class="activity-more">
+  <summary>Activity <span class="agent-state" class:busy={working} role="status">{working?'Working…':'Idle'}</span></summary>
   <SessionActivity {projectId} sessionId={selectedSessionId} {view}/>
  </details>
  {/if}
- <header class="agents-head">
-  {#if chromeCompact}
-  <details class="head-more"><summary>Model &amp; provider</summary>{@render modelIdentity()}</details>
-  {:else}
-  {@render modelIdentity()}
-  {/if}
-  <label class="model-picker">Session model<select aria-label="Session model" bind:value={selectedModel} disabled={working||modelBusy} onfocus={()=>void loadModels()} onchange={()=>void chooseModel()}>
-   <option value="">Scripted test provider (free)</option>
-   {#each modelSettings?.models.filter(m=>m.configured)??[] as m (modelKey(m))}<option value={modelKey(m)}>{modelSettings?.preferences.favourites.some(c=>modelKey(c)===modelKey(m))?'★ ':''}{m.provider} / {m.name}</option>{/each}
-  </select></label>
-  <span class="agent-state" class:busy={working} role="status">{working?'Working…':'Idle'}</span>
- </header>
  {#if !enabled}
  <div class="empty"><div class="empty-mark"><Icon name="agent" size={32}/></div><h2>Agents are off here.</h2><p>This instance does not enable the agent harness, so nothing can run. Set <code>DASHBOARD_AGENTS=on</code> to enable it.</p></div>
  {:else}
  {#if problem}<p class="error agents-problem" role="alert">{problem}</p>{/if}
- {#if view?.questions.length}
+ {#if view?.questions.some(question=>!question.answer&&!dismissals[question.id])}
  <section class="agent-questions" aria-label="Questions for me">
   <span class="popover-heading">QUESTIONS FOR ME</span>
   {#each view.questions as question (question.id)}
-  {#if dismissals[question.id]}
-  <article class="agent-question dismissed" id={'question-'+question.id}>
+  {#if !question.answer&&!dismissals[question.id]}
+  <article class="agent-question" id={'question-'+question.id}>
    <p>{question.text}</p>
-   <p class="agent-answer"><span class="pill">dismissed</span>{dismissals[question.id].reason}<small> — {dismissals[question.id].dismissedBy}</small></p>
-  </article>
-  {:else}
-  <article class="agent-question" class:answered={Boolean(question.answer)} id={'question-'+question.id}>
-   <p>{question.text}</p>
-   {#if question.answer}
-   <p class="agent-answer"><span class="pill">answered</span>{question.answer.text}</p>
-   {:else}
    <div class="row">
     <input aria-label={'Answer to: '+question.text} value={answers[question.id]??''} placeholder="Your answer" oninput={(event)=>answers={...answers,[question.id]:(event.currentTarget as HTMLInputElement).value}}>
     <button class="primary compact-button" aria-label="Send answer" disabled={answering===question.id||(answers[question.id]??'').trim()===''} onclick={()=>void answer(question.id)}>Answer once</button>
@@ -810,7 +789,6 @@
     <input aria-label={'Dismissal reason for: '+question.text} value={dismissReason} placeholder="Why are you dismissing this?" oninput={(event)=>dismissReason=(event.currentTarget as HTMLInputElement).value}>
     <button class="danger-command compact-button" aria-label="Confirm dismissal" disabled={dismissing===question.id||dismissReason.trim()===''} onclick={()=>void dismiss(question.id)}>Record dismissal</button>
    </div>
-   {/if}
    {/if}
   </article>
   {/if}
@@ -829,17 +807,28 @@
   {#if view?.transcriptWindow?.omitted}
    <p class="agent-gap" role="note">Showing the newest {view.transcriptWindow.limit} transcript rows. {view.transcriptWindow.omitted} older rows are not shown in this client view. The durable transcript and its history are unchanged.</p>
   {/if}
-  {#if !view?.entries.length}<p class="agent-empty">No messages yet. The scripted provider is free. A real model uses the connected provider account; existing tools are question and note operations only.</p>{/if}
+  {#if view?.questions.some(question=>question.answer||dismissals[question.id])}
+  <details class="question-history"><summary>Resolved questions</summary>
+   {#each view.questions.filter(question=>question.answer||dismissals[question.id]) as question (question.id)}
+   <article class="agent-question" id={'question-'+question.id}><p>{question.text}</p><p class="agent-answer">{#if question.answer}<span class="pill">answered</span>{question.answer.text}{:else}<span class="pill">dismissed</span>{dismissals[question.id].reason} — {dismissals[question.id].dismissedBy}{/if}</p></article>
+   {/each}
+  </details>
+  {/if}
+  {#if !view?.entries.length}<p class="agent-empty">No messages yet. Ask the agent to read this project’s documents and turn them into tasks, dependencies, and milestones. Its available tools depend on the permissions you grant.</p>{/if}
   {#each view?.entries??[] as entry (entry.id)}
+  {#if entry.text||entry.thinking||entry.tools.length||entry.images?.length||entry.error}
   <article class="agent-entry {entry.kind}" data-entry-id={entry.id}>
    <span class="agent-role">{entry.kind==='user'?'You':entry.kind==='assistant'?'Agent':entry.kind==='tool'?'Tool':entry.kind}</span>
    {#if entry.thinking}<details class="agent-thinking"><summary>Reasoning</summary><pre>{entry.thinking}</pre></details>{/if}
    {#if entry.tools.length}<div class="agent-tools">{#each entry.tools as tool}<span class="pill">{tool.name}</span>{/each}</div>{/if}
-   <pre class="agent-text">{entry.text || (entry.tools.length?'(tool call)':(entry.images?.length?'':'(no text)'))}</pre>
+   {#if entry.kind==='assistant'}<div class="agent-text markdown">{@html renderMessage(entry.text)}</div>
+   {:else if entry.kind==='tool'}<details class="agent-tool-result"><summary>{entry.toolResult?.name??'Tool result'}{entry.toolResult?.isError?' · failed':''}</summary><pre class="agent-text">{entry.text}</pre></details>
+   {:else}<pre class="agent-text">{entry.text}</pre>{/if}
    {#each entry.images??[] as image, imageIndex (`${image.id}-${imageIndex}`)}<TranscriptImage id={image.id}/>{/each}
-   {#if entry.stopReason&&entry.stopReason!=='stop'}<small class="agent-note">stopped: {entry.stopReason}</small>{/if}
+   {#if entry.stopReason&&entry.stopReason!=='stop'&&entry.stopReason!=='toolUse'}<small class="agent-note">stopped: {entry.stopReason}</small>{/if}
    {#if entry.error}<small class="agent-note error-inline">{entry.error}</small>{/if}
   </article>
+  {/if}
   {/each}
   </div>
   </div>
@@ -862,7 +851,6 @@
  <!-- svelte-ignore a11y_no_static_element_interactions -->
  <div class="agent-composer" bind:this={composerElement} onpaste={(event)=>composerEvent(event)} ondrop={(event)=>composerEvent(event)}
       ondragover={(event)=>{event.preventDefault();composerDragging=true;}} ondragleave={()=>composerDragging=false}>
-  <ImageComposer projectId={projectId} sessionId={selectedSessionId||undefined} identity={identityKey} bind:items={media} dragging={composerDragging} handle={(composer)=>{composerApi=composer;}} onchange={()=>persistDraft(true)}/>
   {#if slashPicks}
   <div class="slash-list" aria-label="Slash commands">
    <span class="popover-heading">SLASH COMMANDS — from the action registry</span>
@@ -874,7 +862,8 @@
   {/if}
   {#if restoredNotice}<p class="agent-status draft-notice" role="status">{restoredNotice}</p>{/if}
   {#if storageNotice}<p class="error draft-notice" role="alert">{storageNotice}</p>{/if}
-  <label>Message the agent<textarea aria-label="Message the agent" value={draft} onfocus={()=>composerElement?.scrollIntoView({block:'nearest'})} oninput={(event)=>{draft=(event.currentTarget as HTMLTextAreaElement).value;persistDraft();}} onkeydown={(event)=>composerKey(event)} placeholder="Ask for something, type / for commands, or include [pause]. Enter sends; Shift+Enter adds a newline."></textarea></label>
+  <span class="sr-only" id="composer-help">Enter sends. Shift+Enter adds a newline. Type slash for commands.</span>
+  <textarea aria-label="Message the agent" aria-describedby="composer-help" value={draft} onfocus={()=>composerElement?.scrollIntoView({block:'nearest'})} oninput={(event)=>{draft=(event.currentTarget as HTMLTextAreaElement).value;persistDraft();}} onkeydown={(event)=>composerKey(event)} placeholder="Message the agent…"></textarea>
   {#if media.length>0&&capability.state==='known'&&capability.acceptsImages===false}
   <p class="image-capability" role="alert">The model {capability.provider} / {capability.modelId} does not accept images. Remove the images or choose a model that accepts images before sending.</p>
   {:else if media.length>0&&capability.state==='unknown'}
@@ -886,22 +875,27 @@
    <button class="compact-button" aria-label="Copy the unsaved draft" onclick={()=>void copyDraft()}>Copy draft</button>
    <button class="compact-button" aria-label="Download the unsaved draft" onclick={downloadDraft}>Download draft</button>
   </div>
-  {:else if draftSavedAt}<small class="draft-saved">Draft saved for {currentSessionLabel} at {new Date(draftSavedAt).toLocaleTimeString()} · kept in this browser only</small>{/if}
-  {#if chromeCompact}
-  <details class="draft-more"><summary>Draft tools</summary>
-   <div class="draft-local-actions"><button class="compact-button" aria-label="Clear local drafts" onclick={clearLocalDrafts}>Clear local drafts</button></div>
-  </details>
-  {:else}
-  <div class="draft-local-actions"><button class="compact-button" aria-label="Clear local drafts" onclick={clearLocalDrafts}>Clear local drafts</button></div>
   {/if}
   {#if slashRefusal}<p class="error" role="alert">{slashRefusal}</p>{/if}
   {#if slashResult}<p class="agent-status" role="status">{slashResult}</p>{/if}
-  <div class="row">
+  <div class="composer-toolbar">
+  <ImageComposer projectId={projectId} sessionId={selectedSessionId||undefined} identity={identityKey} bind:items={media} dragging={composerDragging} handle={(composer)=>{composerApi=composer;}} onchange={()=>persistDraft(true)}/>
+   <label class="model-picker"><span class="sr-only">Session model</span><select aria-label="Session model" bind:value={selectedModel} disabled={working||modelBusy} onfocus={()=>void loadModels()} onchange={()=>void chooseModel()}>
+    <option value="">Scripted test provider (free)</option>
+    {#each modelSettings?.models.filter(m=>m.configured)??[] as m (modelKey(m))}<option value={modelKey(m)}>{modelSettings?.preferences.favourites.some(c=>modelKey(c)===modelKey(m))?'★ ':''}{m.provider} / {m.name}</option>{/each}
+   </select></label>
+   <details class="draft-more"><summary>Draft tools</summary>
+    {#if draftSavedAt}<small class="draft-saved">Draft saved for {currentSessionLabel} at {new Date(draftSavedAt).toLocaleTimeString()} · kept in this browser only</small>{/if}
+    <div class="draft-local-actions"><button class="compact-button" aria-label="Clear local drafts" onclick={clearLocalDrafts}>Clear local drafts</button></div>
+   </details>
+   <span class="toolbar-spacer"></span>
    <!-- Stop belongs with the other primary controls, so a short screen finds it beside Send and
         Steer instead of only in the header above the transcript. -->
-   <button class="compact-button" aria-label="Stop the agent" disabled={!working} onclick={()=>void stop()}><Icon name="close" size={14}/><span>Stop</span></button>
+   {#if working}<button class="compact-button" aria-label="Stop the agent" disabled={!working} onclick={()=>void stop()}><Icon name="close" size={14}/><span>Stop</span></button>{/if}
    <button class="primary compact-button" aria-label="Send message" disabled={sending||unsettledImages||imageCapabilityBlocked||(draft.trim()===''&&readyImages.length===0)} title={sendHoldReason||undefined} onclick={()=>void send('followUp')}><Icon name="arrow" size={14}/><span>{working?'Queue follow-up':'Send'}</span></button>
-   <button class="compact-button" aria-label="Steer the run" disabled={sending||unsettledImages||imageCapabilityBlocked||!working||(draft.trim()===''&&readyImages.length===0)} title={sendHoldReason||undefined} onclick={()=>void send('steer')}>Steer current run</button>
+   {#if working}<button class="compact-button" aria-label="Steer the run" disabled={sending||unsettledImages||imageCapabilityBlocked||!working||(draft.trim()===''&&readyImages.length===0)} title={sendHoldReason||undefined} onclick={()=>void send('steer')}>Steer</button>{/if}
+  </div>
+  <div class="composer-status">
    {#if unsettledImages}<small class="agent-upload-state" role="status">{uploadingImages?'Uploading an image — the message is held until it is stored':'Checking a stored image — the message is held until it is ready'}</small>{/if}
    <small class="agent-status connection" data-connection={connection.state} title={connection.lastFrameAt===null?'No frame received on this attempt':('Last transport frame '+new Date(connection.lastFrameAt).toLocaleTimeString())}>
     <span class="connection-dot {connection.state}" aria-hidden="true"></span>
@@ -924,7 +918,6 @@
  .agents{flex:1;min-height:0;display:flex;flex-direction:column;overflow-y:auto;scroll-padding-bottom:calc(8px + var(--safe-bottom,0px))}
  .agents-head{display:flex;align-items:center;gap:10px;padding:8px 12px;border-bottom:1px solid var(--line);background:var(--panel);flex-wrap:wrap}
  .model-picker{min-width:180px;max-width:100%;font-size:10px}.model-picker select{max-width:100%}
- .agents-head h2{margin:3px 0 0;font-size:13px}
  .agent-state{font:9px var(--mono);color:var(--muted)}.agent-state.busy{color:var(--accent)}
  .agents-problem{margin:10px 12px 0}
  .agent-questions{margin:10px 12px 0;padding:10px 12px;border:1px solid color-mix(in srgb,#d6b879 32%,var(--line));background:color-mix(in srgb,#d6b879 5%,transparent);border-radius:5px}
@@ -935,16 +928,17 @@
  .agent-question.answered{opacity:.75}
  .agent-transcript-wrap{flex:1 1 0;min-height:160px;display:flex;flex-direction:column;min-width:0}
  .agent-transcript{flex:1 1 auto;min-height:0;overflow:auto;padding:14px 16px 20px}
- .agent-transcript-body{display:flex;flex-direction:column;gap:12px}
+ .agent-transcript-body{display:flex;flex-direction:column;gap:18px;width:100%;max-width:960px;margin:0 auto}
  .new-activity-row{flex:0 0 auto;display:flex;justify-content:center;padding:6px 12px;background:var(--bg);border-top:1px solid var(--line)}
  .sr-only{position:absolute;width:1px;height:1px;margin:-1px;padding:0;overflow:hidden;clip-path:inset(50%);white-space:nowrap}
  .new-activity{min-height:44px;min-width:44px;border:1px solid color-mix(in srgb,var(--accent) 45%,var(--line));border-radius:999px;background:var(--raised);color:var(--ink);font:12px var(--mono);padding:10px 18px}
  .agent-empty{color:var(--muted);font-size:12px;line-height:1.7}
  .agent-gap{margin:0;padding:10px 12px;border:1px solid var(--border);border-radius:10px;color:var(--muted);font-size:12px;line-height:1.6;background:var(--surface)}
- .agent-entry{border:1px solid var(--line);border-left:2px solid var(--muted);border-radius:5px;background:var(--panel);padding:10px 12px}
- .agent-entry.user{border-left-color:var(--accent)}
- .agent-entry.assistant{border-left-color:#7aafff}
- .agent-entry.tool{border-left-color:#d6b879}
+ .agent-entry{min-width:0;border:0;border-radius:12px;padding:10px 14px}
+ .agent-entry.user{align-self:flex-end;max-width:90%;background:var(--raised);border:1px solid var(--line)}
+ .agent-entry.assistant{background:transparent}
+ .agent-entry.tool{border-left:2px solid var(--line);border-radius:0;color:var(--muted);padding:6px 12px}
+ .agent-entry.system,.agent-entry.other{font-size:11px;color:var(--muted)}
  .agent-role{font:9px var(--mono);letter-spacing:1px;color:var(--muted);text-transform:uppercase}
  .agent-text{margin:7px 0 0;white-space:pre-wrap;overflow-wrap:anywhere;font:12px/1.6 var(--mono)}
  .agent-thinking{margin-top:7px}.agent-thinking pre{white-space:pre-wrap;font-size:11px;color:var(--muted)}
@@ -981,9 +975,9 @@
  .agents.compact :global(.session-bar .session-current .eyebrow){display:none}
  .agents.compact :global(.session-bar .session-actions){margin-left:0}
  .agents.compact .agents-head{padding:4px 8px;gap:6px}
- .agents.compact .model-picker{min-width:110px;flex:1 1 120px;font-size:9px}
+ .agents.compact .model-picker{min-width:0;max-width:45%;font-size:10px}
  .agents.compact .agent-composer{padding:6px 8px calc(6px + var(--safe-bottom,0px))}
- .agents.compact .agent-composer .row .compact-button{min-height:36px}
+ .agents.compact .composer-toolbar .compact-button{min-height:36px}
  .agents.compact .agent-composer textarea{min-height:44px}
  .agents.compact .agent-composer .row{gap:6px}
  /* Secondary content is disclosed, never deleted: each summary is a native, focusable control. */
@@ -993,4 +987,29 @@
  .activity-more{margin:6px 12px 0;min-width:0}
  .draft-more{margin-top:2px}
  .draft-more summary{margin-bottom:4px}
+ .agent-composer{align-self:center;width:calc(100% - 24px);max-width:1000px;margin:8px 12px calc(8px + var(--safe-bottom,0px));padding:8px 12px;border:1px solid var(--line);border-radius:16px;background:var(--panel);box-shadow:0 2px 8px #00000008}
+ .agent-composer:focus-within{border-color:color-mix(in srgb,var(--accent) 45%,var(--line))}
+ .agents.compact .agent-composer{width:calc(100% - 16px);padding:8px;margin:6px 8px calc(6px + var(--safe-bottom,0px))}
+ .agent-composer textarea,.agents.compact .agent-composer textarea{height:52px;min-height:48px;max-height:200px;width:100%;border:0;background:transparent;resize:vertical;font-family:inherit;font-size:14px;line-height:1.5;box-shadow:none}
+ .composer-toolbar{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+ .toolbar-spacer{flex:1;min-width:0}
+ .model-picker{display:flex;align-items:center;margin:0;min-width:0;max-width:45%;font-size:11px}
+ .model-picker select{width:100%;border-radius:999px}
+ .composer-status{display:flex;justify-content:center;align-items:center;gap:8px;flex-wrap:wrap;font-size:10px;padding-top:4px}
+ .draft-more{max-width:100%;margin:0}
+ .draft-more summary{margin:0;font:11px inherit;text-transform:none;letter-spacing:0;padding:6px}
+ .draft-more[open]{flex-basis:100%;order:5;padding:4px 0}
+ .agents.compact .draft-more:not([open]) summary{font-size:0;min-width:26px;text-align:center}
+ .agents.compact .draft-more:not([open]) summary::after{content:'⋯';font:18px var(--mono)}
+ .question-history{color:var(--muted);font-size:12px}
+ .question-history summary{cursor:pointer}
+ .agent-text.markdown{font-family:inherit;font-size:14px;line-height:1.65;white-space:normal}
+ .agent-text.markdown :global(p){margin:0 0 .7em}
+ .agent-text.markdown :global(pre){overflow:auto;white-space:pre;padding:10px;background:var(--bg);border-radius:6px}
+ .agent-text.markdown :global(code){font-family:var(--mono)}
+ .agent-text.markdown :global(table){display:block;max-width:100%;overflow:auto;border-collapse:collapse;margin:12px 0}
+ .agent-text.markdown :global(th),.agent-text.markdown :global(td){border:1px solid var(--line);padding:6px 10px;text-align:left}
+ .agent-text.markdown :global(h1),.agent-text.markdown :global(h2),.agent-text.markdown :global(h3){font-size:1.15em;margin:1em 0 .5em}
+ .agent-tool-result summary{font-size:12px;cursor:pointer;color:var(--muted)}
+ .activity-more{margin:4px 12px}
 </style>
