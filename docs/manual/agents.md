@@ -53,10 +53,26 @@ remote backup.
 Each message carries its local time. Two or more consecutive tool results fold into one closed
 group — *N tool calls* — which you open to read them; a single tool result stays visible on its own.
 
-One message may hold up to 8,000 characters. The composer counts as you type, warns near the limit
-and refuses past it with the limit named, keeping your text. An operator can raise how many model
-requests one dispatch may make in a row (`DASHBOARD_MAX_MODEL_TURNS`, default 8); when it is
-reached the run stops and says so, and sending another message continues from the transcript.
+### Messages, attachments and long text
+
+One message may hold up to 200,000 characters. Past 8,000 the composer offers **Save as document**:
+the text is written into the worktree as `docs/uploads/pasted-….md` and the message names the path,
+so an agent reads it from there — the same for any file you attach with **Attach file**. Attachments
+land as **uncommitted changes** in the worktree; review them in Workspace → Changes and commit
+deliberately. A project with no connected repository has no worktree, so attachments are refused
+with that reason rather than stored somewhere unexpected.
+
+### Thinking level
+
+**Thinking** beside the model picker sets how much reasoning the model is asked for for that session
+(`off` … `max`, or the host default). It is stored per session and takes effect on the next request;
+it cannot be changed while a run is in flight.
+
+### One dispatch, many turns
+
+One message may make up to `DASHBOARD_MAX_MODEL_TURNS` model requests in a row (default 40). It is a
+runaway guard, not a conversation limit: when it is reached the run stops, the refusal names the
+bound, and sending another message continues from the transcript. An operator can raise it.
 
 **Draft tools**, under the composer, is about the *local* draft only: when it was last saved into
 this browser, **Copy draft** and **Download draft** while the latest text could not be saved, and

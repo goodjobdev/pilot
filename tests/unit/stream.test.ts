@@ -15,6 +15,7 @@ function view(label: string): AgentView {
     inbox: [],
     usage: { input: 0, output: 0, cost: 0 },
     model: null,
+    thinkingLevel: null,
     questions: [],
     updatedAt: '2026-01-01T00:00:00.000Z'
   };

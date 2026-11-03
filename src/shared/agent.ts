@@ -42,6 +42,18 @@ export interface AgentQuestion {
   answer: { text: string; answeredAt: number | null } | null;
 }
 export interface AgentInboxItem { id: string; mode: string; text: string }
+/** The thinking levels a session may choose, in Pi's own vocabulary, weakest first. */
+export const THINKING_LEVELS = ['off','minimal','low','medium','high','xhigh','max'] as const;
+export type ThinkingLevel = (typeof THINKING_LEVELS)[number];
+/**
+ * The largest single message the server accepts. It is deliberately generous: a long paste is a
+ * normal thing to send. The interface offers to save anything past its own smaller threshold as a
+ * file in the worktree, which is a convenience rather than a limit.
+ */
+export const MESSAGE_MAX_CHARS = 200000;
+/** Past this, the interface offers to keep the text as a document instead of inline. */
+export const MESSAGE_DOCUMENT_THRESHOLD = 8000;
+
 export interface AgentView {
   /** Client transcript-window metadata. It describes only retained rows, not transcript retention. */
   transcriptWindow?: { omitted: number; limit: number; questionsOmitted?: number };
@@ -53,6 +65,8 @@ export interface AgentView {
   inbox: AgentInboxItem[];
   usage: { input: number; output: number; cost: number };
   model: { provider: string; modelId: string } | null;
+  /** The session's thinking level, or null when the host's default is in force. */
+  thinkingLevel: ThinkingLevel | null;
   questions: AgentQuestion[];
   updatedAt: string;
 }
@@ -182,7 +196,7 @@ export function agentUsageView(usage: unknown): { input: number; output: number;
 }
 
 export function emptyAgentView(conversationId = '', model: AgentView['model'] = null): AgentView {
-  return { conversationId, working: false, attempt: null, entries: [], partial: '', inbox: [], usage: { input: 0, output: 0, cost: 0 }, model, questions: [], updatedAt: new Date(0).toISOString() };
+  return { conversationId, working: false, attempt: null, entries: [], partial: '', inbox: [], usage: { input: 0, output: 0, cost: 0 }, model, thinkingLevel: null, questions: [], updatedAt: new Date(0).toISOString() };
 }
 
 /** Maps a Durable conversation view (entries plus built-in documents) to the client shape. */
@@ -191,7 +205,8 @@ export function agentViewFrom(value: unknown, updatedAt = new Date().toISOString
   const entries = (state.entries ?? []).map(entry => agentEntryView(entry, imageResolver)).filter((entry): entry is AgentEntry => entry !== null);
   const live = (state.docs?.['pi.live'] ?? {}) as { run?: unknown; generation?: { attempt?: number } };
   const inboxDoc = (state.docs?.['pi.inbox'] ?? {}) as { items?: { id?: unknown; mode?: unknown; content?: unknown }[] };
-  const agentDoc = (state.docs?.['pi.agent'] ?? {}) as { model?: { provider?: string; modelId?: string } };
+  const agentDoc = (state.docs?.['pi.agent'] ?? {}) as { model?: { provider?: string; modelId?: string }; thinkingLevel?: unknown };
+  const thinkingLevel = THINKING_LEVELS.includes(agentDoc.thinkingLevel as ThinkingLevel) ? agentDoc.thinkingLevel as ThinkingLevel : null;
   const inbox = (inboxDoc.items ?? []).map(item => ({ id: String(item.id ?? ''), mode: String(item.mode ?? 'queued'), text: typeof item.content === 'string' ? item.content : '' }));
   const lastAssistant = entries.filter(entry => entry.kind === 'assistant').at(-1);
   return {
@@ -205,6 +220,7 @@ export function agentViewFrom(value: unknown, updatedAt = new Date().toISOString
     inbox,
     usage: agentUsageView(state.docs?.['pi.usage']),
     model: agentDoc.model?.provider && agentDoc.model?.modelId ? { provider: agentDoc.model.provider, modelId: agentDoc.model.modelId } : null,
+    thinkingLevel,
     questions: agentQuestionViews(entries),
     updatedAt
   };

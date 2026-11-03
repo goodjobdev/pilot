@@ -229,7 +229,7 @@ async function fixture(): Promise<Fixture> {
 }
 
 function view(overrides: Partial<AgentView> = {}): AgentView {
-  return { conversationId: '1', working: false, attempt: null, entries: [], partial: '', inbox: [], usage: { input: 0, output: 0, cost: 0 }, model: null, questions: [], updatedAt: new Date(0).toISOString(), ...overrides };
+  return { conversationId: '1', working: false, attempt: null, entries: [], partial: '', inbox: [], usage: { input: 0, output: 0, cost: 0 }, model: null, thinkingLevel: null, questions: [], updatedAt: new Date(0).toISOString(), ...overrides };
 }
 function entry(overrides: Partial<AgentEntry> & { rawKind: string }): AgentEntry {
   return { id: randomUUID(), kind: 'other', at: null, text: '', thinking: '', tools: [], stopReason: null, error: null, data: null, toolResult: null, ...overrides };

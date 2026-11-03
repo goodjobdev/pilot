@@ -39,7 +39,7 @@ test('the composer uploads a picked image, refuses a bad one per image, and clea
   await withAgents(page,'Image composer fixture');
 
   // The picker is a real file input, and it offers the camera on a phone.
-  const picker=page.locator('input[type=file]');
+  const picker=page.getByLabel('Add an image');
   await expect(picker).toHaveAttribute('capture','environment');
   await expect(picker).toHaveAttribute('accept','image/jpeg,image/png,image/webp');
 
@@ -96,7 +96,7 @@ test('an image with no caption is sendable, and a second one past the limit is r
   // A message needs text or an image: with a ready image, and no text, Send is enabled.
   await page.getByLabel('Message the agent').fill('');
   await expect(page.getByRole('button',{name:'Send message'})).toBeDisabled();
-  await page.locator('input[type=file]').setInputFiles(good);
+  await page.getByLabel('Add an image').setInputFiles(good);
   await expect(page.locator('.image-item')).toHaveCount(1);
   await expect(page.getByRole('button',{name:'Send message'})).toBeEnabled();
   await page.getByRole('button',{name:'Send message'}).click();
@@ -104,7 +104,7 @@ test('an image with no caption is sendable, and a second one past the limit is r
   await expect(page.locator('.image-item')).toHaveCount(0);
 
   // Past the documented maximum, the extra image is refused on itself rather than silently dropped.
-  await page.locator('input[type=file]').setInputFiles([good,good,good,good,good,good,good]);
+  await page.getByLabel('Add an image').setInputFiles([good,good,good,good,good,good,good]);
   await expect(page.locator('.image-item')).toHaveCount(7);
   await expect(page.locator('.image-item.refused .image-refusal')).toContainText('one message');
 });
@@ -159,7 +159,7 @@ test('a send is held until an image that is still uploading has been stored',asy
   const held=new Promise<void>(resolve=>{release=resolve;});
   await page.route('**/agents/media',async route=>{await held;await route.continue();});
   await page.getByLabel('Message the agent').fill('this caption must not go without the image');
-  await page.locator('input[type=file]').setInputFiles(good);
+  await page.getByLabel('Add an image').setInputFiles(good);
   await expect(page.locator('.image-item')).toHaveCount(1);
   await expect(page.locator('.image-item .image-facts')).toContainText('Checking');
   // Nothing is stored yet, so the message is held: Send is disabled, the state says why, and no
@@ -198,7 +198,7 @@ test('an attachment-only draft sends once and renders from authenticated stored 
     try{apiBodies.push(await response.text());}catch{/* A stream can close during a reload. */}
   });
   await expect(composer).toHaveValue('');
-  await page.locator('input[type=file]').setInputFiles(imagePath);
+  await page.getByLabel('Add an image').setInputFiles(imagePath);
   await expect(page.locator('.image-item .image-facts')).toContainText('8×6');
   await page.reload();
   await expect(composer).toHaveValue('');
@@ -240,7 +240,7 @@ test('a media redirect to another origin is not followed or rendered as a transc
   await withAgents(page,'Media redirect fixture');
   const mediaResponse=page.waitForResponse(response=>response.request().method()==='GET'&&new URL(response.url()).pathname.startsWith('/api/media/'));
   const composer=page.getByLabel('Message the agent');
-  await page.locator('input[type=file]').setInputFiles(imagePath);
+  await page.getByLabel('Add an image').setInputFiles(imagePath);
   await expect(page.locator('.image-item .image-facts')).toContainText('8×6');
   await composer.fill('image whose media lookup redirects');
   await page.getByRole('button',{name:'Send message'}).click();
@@ -275,7 +275,7 @@ test('a preview that cannot be fetched is its own condition and never removes th
   page.on('request',request=>{if(request.method()==='POST'&&request.url().includes('/agents/input'))sent.push(JSON.parse(request.postData()??'{}'));});
   // The upload itself succeeds; only the owner-only fetch of the stored bytes fails.
   await page.route('**/api/media/**',route=>route.fulfill({status:403,contentType:'application/json',body:JSON.stringify({error:'not available'})}));
-  await page.locator('input[type=file]').setInputFiles(good);
+  await page.getByLabel('Add an image').setInputFiles(good);
   const item=page.locator('.image-item');
   await expect(item).toHaveCount(1);
   // The server accepted the bytes, so the image is ready: its stored facts are shown, nothing is

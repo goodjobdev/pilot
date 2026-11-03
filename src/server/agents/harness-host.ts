@@ -28,6 +28,7 @@ import { applyOperation } from '../../shared/schema';
 import type { ProviderStore } from '../providers';
 import type { SessionLifecycleDispatchOutcome } from '../state/session-lifecycle';
 import type { ModelChoice } from '../../shared/settings';
+import type { ThinkingLevel } from '../../shared/agent';
 
 export type AgentInputMode = 'followUp' | 'steer' | 'reject';
 /** One stored image attached to an input, as base64 and its sniffed type. */
@@ -1064,7 +1065,7 @@ export class HarnessHost {
               // assistant messages since the last input, so sending another message continues.
               let turns=0;
               for(const message of [...context.messages].reverse()){if(message.role==='user')break;if(message.role==='assistant')turns++;}
-              if(turns>=(this.options.maxModelTurns ?? 8))throw new HttpError(409,'Pilot stopped after '+(this.options.maxModelTurns ?? 8)+' model turns in a row for one message. Nothing is lost: the work so far is in the transcript, and sending another message continues from here. An operator can raise the bound with DASHBOARD_MAX_MODEL_TURNS.');
+              if(turns>=(this.options.maxModelTurns ?? 40))throw new HttpError(409,'Pilot stopped after '+(this.options.maxModelTurns ?? 40)+' model turns in a row for one message. Nothing is lost: the work so far is in the transcript, and sending another message continues from here. An operator can raise the bound with DASHBOARD_MAX_MODEL_TURNS.');
             }
             const maxTokens=Math.min(options?.maxTokens??4096,4096);
             // The worker boundary. The role marker is in the worker system prompt; the guard is the
@@ -1953,6 +1954,20 @@ export class HarnessHost {
         if(!m)throw new HttpError(422,'Unknown model');
       }
       await hosted.conversation.configure({model:choice??{provider:hosted.provider.provider.id,modelId:hosted.provider.getModel().id}},BACKGROUND_CONTEXT);
+      return this.controlView(project, sessionId);
+    });
+  }
+  /**
+   * Set one session's thinking level. `null` clears the stored choice, so the host's default is in
+   * force again. Like the model choice, this is stored on the conversation and applies to the next
+   * request; a run in flight is never changed under itself.
+   */
+  async setThinking(project:Project,level:ThinkingLevel|null,sessionId?:string):Promise<AgentView>{
+    this.assertEnabled();
+    return this.serial('agent:'+project.id,async()=>{
+      const hosted=await this.selected(project, sessionId);
+      if((await this.controlView(project, sessionId)).working)throw new HttpError(409,'Stop the current run before changing the thinking level');
+      await hosted.conversation.configure({thinkingLevel:level},BACKGROUND_CONTEXT);
       return this.controlView(project, sessionId);
     });
   }

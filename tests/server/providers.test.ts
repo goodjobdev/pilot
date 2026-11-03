@@ -123,10 +123,12 @@ test('real-model selection drives the harness with explicit opt-in, persists, an
  }finally{await host.close();await store.close();}
 });
 
-test('model policy stops a tool loop at eight requests',async()=>{
+test('model policy stops a tool loop at the configured request bound',async()=>{
  const directory=await root(),fake=fauxProvider({provider:'test-real',models:[{id:'loop'}]});
  fake.setResponses(Array.from({length:12},()=>()=>fauxAssistantMessage([fauxToolCall('read_notes',{})],{stopReason:'toolUse'})));
- const store=new ProviderStore(directory,[fake.provider]),host=new HarnessHost({dataRoot:directory,enabled:true,providers:store});
+ // The instance's own bound, stated to the harness: the loop is stopped at it rather than at a
+ // number baked into the harness, and the refusal names it.
+ const store=new ProviderStore(directory,[fake.provider]),host=new HarnessHost({dataRoot:directory,enabled:true,providers:store,maxModelTurns:8});
  const project:Project={id:randomUUID(),name:'Loop',managed:true,path:directory,repository:'',created:new Date().toISOString()};
  try{
   await store.savePreferences({defaultModel:{provider:'test-real',modelId:'loop'},favourites:[],allowRealModels:true});

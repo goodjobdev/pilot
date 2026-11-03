@@ -21,6 +21,7 @@ import { AlertStore,type AlertPayload,type AlertTransport } from './alerts';
 import { Catalog } from './catalog';
 import { ProviderStore } from './providers';
 import { RepositoryStore,type RepositoryCommand } from './repositories';
+import { ATTACHMENT_MAX_BYTES,AttachmentStore,type StoredAttachment } from './attachments';
 import { RemoteStore } from './remote';
 import { browse,within } from './paths';
 import { authorize,headers,establishSession,type SecurityConfig } from './security';
@@ -49,6 +50,7 @@ import { harnessWorkerPort } from './workers/harness-port';
 import { WorkerError, WORKER_LIMITS, WORKER_SCOPES } from '../shared/workers';
 import { FileEditTool, FileEditError, type FileEditMode } from './state/file-edit-tool';
 import { AgentError, agentScopeVocabulary } from '../shared/agent-registry';
+import { MESSAGE_MAX_CHARS, THINKING_LEVELS } from '../shared/agent';
 import { WorkerModelPolicyError, type WorkerModelOption, type WorkerModelPolicyView } from '../shared/model-policy';
 import { WORKER_MODEL_POLICY_READBACK_UNCERTAIN } from '../shared/model-policy-codes';
 import { modelKey } from '../shared/settings';
@@ -480,6 +482,8 @@ export async function createApp(options:AppOptions){
   // stored bytes. It validates and processes (decode, orient, resize, re-encode) with the documented
   // ImageProcessor the pinned packages ship; see docs/MEDIA.md for the rules and the honest limits.
   const media=new MediaStore(options.dataRoot);
+  // Attachments are written into the project's connected worktree and nothing else.
+  const attachments=new AttachmentStore(projectId=>{const found=catalog.projects.find(candidate=>candidate.id===projectId);return found===undefined?undefined:repositories.worktreePath(found);});
   const providers=new ProviderStore(catalog.root),repositories=new RepositoryStore(catalog.root,options.repositoryCommand);
   const repositoryOperation:{remote?:RemoteStore}={};
   const assertProjectAvailable=(id:string)=>{if(repositoryOperation.remote?.isBusy(id)||repositories.isConnecting(id))throw new HttpError(409,'Repository operation in progress. Retry after it finishes.');};
@@ -513,7 +517,7 @@ export async function createApp(options:AppOptions){
   // How many model requests one dispatch may make in a row. Bounded, refused if out of range rather
   // than clamped: a bound that silently became another number would be worse than a failed start.
   const maxModelTurns=(()=>{
-    const raw=options.maxModelTurns??Number(process.env.DASHBOARD_MAX_MODEL_TURNS??8);
+    const raw=options.maxModelTurns??Number(process.env.DASHBOARD_MAX_MODEL_TURNS??40);
     if(!Number.isSafeInteger(raw)||raw<1||raw>100)throw new Error('DASHBOARD_MAX_MODEL_TURNS must be a whole number from 1 to 100');
     return raw;
   })();
@@ -1659,7 +1663,7 @@ export async function createApp(options:AppOptions){
           const page=pageAttentionItems(built.items,{cursor,limit,openCount:count.open});
           json({projectId:p.id,items:page.items,page:page.page,count,limits:ATTENTION_LIMITS,sources:built.sources});return;
         }
-        const agentsRoute=path.match(/^\/api\/projects\/([a-f0-9-]{36})\/agents(?:\/(stream|input|abort|answer|dismiss|model|media))?$/);
+        const agentsRoute=path.match(/^\/api\/projects\/([a-f0-9-]{36})\/agents(?:\/(stream|input|abort|answer|dismiss|model|media|attachments|thinking))?$/);
         if(agentsRoute){
           const p=catalog.get(agentsRoute[1]);
           if(!agents.enabled){
@@ -1705,6 +1709,18 @@ export async function createApp(options:AppOptions){
             const {ok:stored,...view}=accepted;void stored;
             json({media:view},201);return;
           }
+          if(agentsRoute[2]==='attachments'&&req.method==='POST'){
+            // A file the owner attaches, or a long paste the interface chose to save as a document.
+            // The bytes are written into the connected worktree and the message names the path, so an
+            // agent reads it through its ordinary contained read rather than trusting an upload.
+            const data=z.strictObject({name:z.string().max(200).optional(),data:z.string().min(1).max(Math.ceil(ATTACHMENT_MAX_BYTES*4/3)+1024)}).parse(payload);
+            const bytes=Buffer.from(data.data,'base64');
+            json({attachment:await attachments.store(p,data.name,bytes)},201);return;
+          }
+          if(agentsRoute[2]==='thinking'&&req.method==='POST'){
+            const data=z.strictObject({sessionId:z.string().min(1).max(200).optional(),thinkingLevel:z.enum(THINKING_LEVELS).nullable()}).parse(payload);
+            json(await agents.setThinking(p,data.thinkingLevel,data.sessionId));return;
+          }
           if(agentsRoute[2]==='input'&&req.method==='POST'){
             // A message carries text, images, or both. An attached image is resolved to its stored
             // bytes here; the dispatch-time vision check inside the harness re-checks the model that
@@ -1712,15 +1728,15 @@ export async function createApp(options:AppOptions){
             // The length rule is stated first, in words a person can act on: a message over the
             // limit is refused here with the limit named, not reported as a malformed field.
             const rawText=(payload as {text?:unknown})?.text;
-            if(typeof rawText==='string'&&rawText.length>8000)throw new HttpError(413,'This message is '+rawText.length+' characters. The limit for one message is 8000, so it was not sent; the text is unchanged and can be shortened or sent in parts.');
+            if(typeof rawText==='string'&&rawText.length>MESSAGE_MAX_CHARS)throw new HttpError(413,'This message is '+rawText.length+' characters. The limit for one message is '+MESSAGE_MAX_CHARS+', so it was not sent; the text is unchanged. Save it as a document, or send it in parts.');
             const data=z.strictObject({
-              text:z.string().max(8000).optional(),
+              text:z.string().max(MESSAGE_MAX_CHARS).optional(),
               mode:z.enum(['followUp','steer','reject']).default('followUp'),
               requestId:z.string().min(1).max(200).optional(),
               sessionId:z.string().min(1).max(200).optional(),
               images:z.array(z.string().regex(MEDIA_ID_PATTERN)).optional()
             }).superRefine((value,context)=>{
-              if((value.text??'').trim()===''&&!(value.images??[]).length)context.addIssue({code:'custom',message:'a message needs text or an image'});
+              if((value.text??'').trim()===''&&!(value.images??[]).length)context.addIssue({code:'custom',message:'a message needs text, an image or an attached file'});
             }).parse(payload);
             // The per-message count is a domain refusal with its own reason and code, like every other
             // media refusal: it is refused before any id is resolved, so nothing is looked up for it.

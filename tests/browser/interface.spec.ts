@@ -28,15 +28,21 @@ test('the workspace file list is a folder tree that opens, closes and still sear
  await expect(folders(),'a search shows matching files, not folders').toHaveCount(0);
  await pane.getByLabel('Find project files').fill('');await expect(folder('src')).toBeVisible();
 });
-test('an over-long message is refused in the composer with the limit named, and nothing is sent',async({page})=>{
+test('a long paste is offered as a document, and only an absurd one is refused',async({page})=>{
  await fixture(page,'Limit fixture');await page.getByRole('button',{name:'Agents',exact:true}).click();
  const requests:string[]=[];page.on('request',request=>{if(request.url().includes('/agents/input'))requests.push(request.url());});
- const box=page.getByLabel('Message the agent');await box.fill('x'.repeat(8100));
- await expect(page.locator('[data-message-limit="over"]')).toContainText('8,100 of 8,000 characters');
+ const box=page.getByLabel('Message the agent');
+ // 8,100 characters is a long paste, not an error: it is offered as a document and can be sent.
+ await box.fill('x'.repeat(8100));
+ await expect(page.getByRole('button',{name:'Save the message text as a document in the worktree'})).toBeVisible();
+ await expect(page.locator('[data-message-limit="over"]')).toHaveCount(0);
+ // Past the server's own maximum, the composer refuses before the request and keeps the text.
+ await box.fill('y'.repeat(200001));
+ await expect(page.locator('[data-message-limit="over"]')).toContainText('200,001 of 200,000 characters');
  await page.getByRole('button',{name:'Send message',exact:true}).click();
- await expect(page.getByRole('alert').filter({hasText:/The limit for one message is 8,000/})).toBeVisible();
- expect(requests.length,'no send leaves the page for an over-long message').toBe(0);
- await expect(box).toHaveValue('x'.repeat(8100));
+ await expect(page.getByRole('alert').filter({hasText:/limit for one message is 200,?000/})).toBeVisible();
+ expect(requests.length,'no send leaves the page for a message past the maximum').toBe(0);
+ await expect(box).toHaveValue('y'.repeat(200001));
  await box.fill('short enough');await expect(page.locator('[data-message-limit="over"]')).toHaveCount(0);
 });
 test('every transcript message carries its time, and the composer holds the draft',async({page})=>{
@@ -69,4 +75,33 @@ test('the agent manager keeps its title and close control in view and grants eve
  expect(await scopes.count(),'an unavailable scope is never granted by select all').toBeGreaterThan(checked);
  await dialog.getByRole('button',{name:'Remove every scope from this draft'}).click();
  expect(await scopes.evaluateAll(boxes=>(boxes as HTMLInputElement[]).filter(box=>box.checked).length),'clear all leaves none granted').toBe(0);
+});
+
+test('a file can be chosen, and a project with no worktree says why it cannot store it',async({page})=>{
+ await fixture(page,'Attachment fixture');await page.getByRole('button',{name:'Agents',exact:true}).click();
+ await page.getByLabel('Attach a file').setInputFiles({name:'brief.md',mimeType:'text/markdown',buffer:Buffer.from('# Brief\nRead me.\n')});
+ // This fixture has no connected repository, so there is no worktree to store into. The composer
+ // names that reason instead of pretending the file was attached, and nothing is sent by accident.
+ await expect(page.getByRole('alert').filter({hasText:/Attachments need a connected repository worktree/})).toBeVisible();
+ await expect(page.getByRole('group',{name:'Attachments'}).getByText('brief.md')).toHaveCount(0);
+ // The storage path itself — the worktree, the generated name, the bounded size — is covered
+ // against a real worktree in tests/server/attachments.test.ts, which a browser fixture cannot have.
+});
+test('a long paste is offered as a document rather than refused',async({page})=>{
+ await fixture(page,'Document fixture');await page.getByRole('button',{name:'Agents',exact:true}).click();
+ const box=page.getByLabel('Message the agent');await box.fill('y'.repeat(9000));
+ const offer=page.getByRole('button',{name:'Save the message text as a document in the worktree'});
+ await expect(offer).toBeVisible();
+ await offer.click();
+ await expect(page.getByRole('alert').filter({hasText:/Attachments need a connected repository worktree/})).toBeVisible();
+ await expect(box,'a refused document keeps every character in the box').toHaveValue('y'.repeat(9000));
+});
+test('the thinking level is chosen per session and reported back by the server',async({page})=>{
+ await fixture(page,'Thinking fixture');await page.getByRole('button',{name:'Agents',exact:true}).click();
+ const picker=page.getByLabel('Thinking level');await expect(picker).toHaveValue('');
+ await picker.selectOption('high');
+ await expect(picker).toHaveValue('high');
+ // The server is the authority: a fresh read of the view reports the same level.
+ await expect.poll(async()=>await page.evaluate(async()=>{const token=document.querySelector('meta[name="dashboard-token"]')?.getAttribute('content')??'';const project=new URL(location.href).searchParams.get('project')??'';const view=await (await fetch('/api/projects/'+project+'/agents',{headers:{'x-dashboard-token':token}})).json();return view.view.thinkingLevel;})).toBe('high');
+ await picker.selectOption('');await expect(picker).toHaveValue('');
 });

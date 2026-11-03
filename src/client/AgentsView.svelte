@@ -10,7 +10,7 @@
  import {tick} from 'svelte';
  import { api,ApiError,download,reportSessionExpired } from './api';
  import { openAgentStream,type ConnectionStatus } from './stream';
- import type { AgentView } from '../shared/agent';
+ import { MESSAGE_DOCUMENT_THRESHOLD,MESSAGE_MAX_CHARS,THINKING_LEVELS,type AgentView,type ThinkingLevel } from '../shared/agent';
  import { transcriptRows as transcriptRowsOf } from '../shared/transcript';
  import { uniqueImageFiles,type ImageCapability,type ImageDraft } from '../shared/images';
  import ImageComposer from './ImageComposer.svelte';
@@ -35,9 +35,10 @@
    focusQuestion?:string;
  }=$props();
  let view=$state<AgentView|null>(null),enabled=$state(true),draft=$state(''),sending=$state(false),problem=$state('');
- /** The server's own limit for one message, stated once. The composer refuses past it with a
-  * sentence instead of letting the request fail with a schema error. */
- const MESSAGE_LIMIT=8000;
+ /** The server's own limits, stated once here: the hard maximum for one message, and the smaller
+  * size past which the interface offers to keep the text as a document instead. */
+ const MESSAGE_LIMIT=MESSAGE_MAX_CHARS;
+ const DOCUMENT_THRESHOLD=MESSAGE_DOCUMENT_THRESHOLD;
  // A deep link names one exact question. If the bounded projection omitted it, read the
  // authoritative session view and retain that identity within the same 500-question cap.
  let focusedQuestionRequest='',focusedQuestionGeneration=0;
@@ -54,7 +55,7 @@
    const generation=++focusedQuestionGeneration;
    void api.agents(project,session||undefined).then(snapshot=>{
      if(generation!==focusedQuestionGeneration||projectId!==project||selectedSessionId!==session||focusQuestion!==id||!snapshot.view)return;
-     view=retainedAgentView(snapshot.view,id);
+     view=retainedAgentView(snapshot.view,id);thinking=snapshot.view.thinkingLevel??'';
    }).catch(()=>{});
  });
  // The stream's own state. `lastViewAt` is when a full snapshot was accepted, which is
@@ -172,7 +173,7 @@
    const project=projectId;
    const session=sessionKeyOf(selectedSessionId);
    const generation=++draftGeneration;
-   draft='';media=[];sending=false;problem='';restoredNotice='';storageNotice='';draftSavedAt=null;latestUnsaved=false;markerAt=null;pendingAttempt=null;
+   draft='';media=[];attachments=[];attachmentProblem='';thinking='';sending=false;problem='';restoredNotice='';storageNotice='';draftSavedAt=null;latestUnsaved=false;markerAt=null;pendingAttempt=null;
    capability={state:'unknown',reason:'Image support has not been checked for this session yet.'};
    capabilityModel='';capabilityRequested='';capabilityRevision+=1;
    const cached=draftCache.get(identityKey);
@@ -470,6 +471,49 @@
    return ()=>observer.disconnect();
  });
  let modelSettings=$state<ProviderSettings|null>(null),selectedModel=$state(''),modelBusy=$state(false);
+ /** The session's thinking level, as the view reports it: '' means the host default is in force. */
+ let thinking=$state(''),thinkingBusy=$state(false);
+ /** Files attached to the next message, already stored in the project's worktree. */
+ let attachments=$state<{path:string;name:string;bytes:number}[]>([]),attachmentBusy=$state(false),attachmentProblem=$state('');
+ async function chooseThinking(){
+   if(thinkingBusy)return;thinkingBusy=true;problem='';
+   try{
+     const next=await request<AgentView>('/projects/'+projectId+'/agents/thinking','POST',{sessionId:selectedSessionId||undefined,thinkingLevel:(thinking===''?null:thinking) as ThinkingLevel|null});
+     view=retainedAgentView(next);thinking=next.thinkingLevel??'';thinking=next.thinkingLevel??'';
+   }catch(e){problem=(e as Error).message;}
+   finally{thinkingBusy=false;}
+ }
+ /** Store one file in the worktree, so the message can name it. The bytes are the owner's own and
+  * are never interpreted here: the agent reads the file through its ordinary contained read. */
+ async function attachFiles(list:FileList|File[]){
+   const files=[...list];if(!files.length)return;
+   attachmentBusy=true;attachmentProblem='';
+   try{
+     for(const file of files){
+       const data=await new Promise<string>((resolve,reject)=>{const reader=new FileReader();reader.onerror=()=>reject(new Error('The file could not be read in this browser.'));reader.onload=()=>{const result=String(reader.result??'');resolve(result.slice(result.indexOf(',')+1));};reader.readAsDataURL(file);});
+       const stored=await api.uploadAttachment(projectId,{data,name:file.name});
+       attachments=[...attachments,stored.attachment];
+     }
+   }catch(e){attachmentProblem=(e as Error).message;}
+   finally{attachmentBusy=false;}
+ }
+ /** Keep the current text as a document in the worktree, and leave the message a pointer to it. */
+ async function saveDraftAsDocument(){
+   const text=draft;
+   if(text.trim()===''||attachmentBusy)return;
+   attachmentBusy=true;attachmentProblem='';
+   try{
+     const name='pasted-'+new Date().toISOString().replace(/[:.]/g,'-')+'.md';
+     const data=btoa(String.fromCharCode(...new TextEncoder().encode(text)));
+     const stored=await api.uploadAttachment(projectId,{data,name});
+     attachments=[...attachments,stored.attachment];
+     draft='';
+     restoredNotice='Saved as '+stored.attachment.path+'. The message will name it.';
+     persistDraft(true);
+   }catch(e){attachmentProblem=(e as Error).message;}
+   finally{attachmentBusy=false;}
+ }
+ const attachmentLine=$derived(attachments.length===0?'':'Attached files, saved into this project\u2019s repository worktree (read them from there): '+attachments.map(item=>item.path).join(', '));
  async function loadModels(){try{modelSettings=await request('/settings/providers');}catch(e){problem=(e as Error).message;}}
  async function chooseModel(){
   if(modelBusy)return;modelBusy=true;problem='';
@@ -505,7 +549,7 @@
        const snapshot=await api.agents(id,sessionId||undefined);
        if(!current())return;
        enabled=snapshot.enabled;
-       if(snapshot.view){view=retainedAgentView(snapshot.view);}
+       if(snapshot.view){view=retainedAgentView(snapshot.view);thinking=snapshot.view.thinkingLevel??'';}
        applyCapability(snapshot.vision??null);
        selectedModel=view?.model?.provider==='faux'?'':view?.model?modelKey(view.model):'';
        await loadModels();
@@ -626,10 +670,12 @@
    onquestions?.();
  });
  async function send(mode:'followUp'|'steer'){
-   const text=draft.trim(),images=readyImages;
+   // A message that only carries files still needs text to send, so the paths become its text.
+   const text=[draft.trim(),attachmentLine].filter(Boolean).join('\n\n'),images=readyImages;
    // A message needs text or an image; a refused, failed or missing image is never sent, and stays
    // visible until it is removed or recovered.
-   if((text===''&&images.length===0)||sending)return;
+   if((text===''&&images.length===0&&attachments.length===0)||sending)return;
+   if(attachmentBusy){problem='A file is still being stored. Wait for it to finish, then send — sending now would leave it out of the message.';return;}
    // An upload in flight or a reference being checked is not a stored image. Sending here would
    // send the text without it and then leave it behind, so the message is held with its own reason.
    // The Send and Steer buttons are disabled on this very condition, with the state named next to
@@ -642,7 +688,7 @@
    const followIdentityAtSend=followKey,followGenerationAtSend=followGeneration;
    const readerIntentAtSend=readerIntentRevision;
    const sendScrollTop=transcript?.scrollTop??null;
-   const sentText=text,sentKeys=media.filter(item=>item.status==='ready'&&item.id).map(item=>item.key),sentImages=[...images];
+   const sentText=text,sentAttachments=[...attachments],sentKeys=media.filter(item=>item.status==='ready'&&item.id).map(item=>item.key),sentImages=[...images];
    // The same message retries under the same request identity, so an ambiguous network failure
    // cannot become two admissions. An edited message is a new message and a new identity.
    const attempt=attemptFor(pendingAttempt,sentText,sentImages)??{requestId:crypto.randomUUID(),text:sentText,images:sentImages};
@@ -676,6 +722,10 @@
      // stays, and a failed, refused or missing one is never silently dropped.
      const sent=new Set(sentKeys);
      media=media.filter(item=>!sent.has(item.key));
+     // The files that were named in the message leave the strip; one attached while the send awaited
+     // stays, because it is not part of what was admitted.
+     const sentPaths=new Set(sentAttachments.map(item=>item.path));
+     attachments=attachments.filter(item=>!sentPaths.has(item.path));
      pendingAttempt=null;
      persistDraft(true);
    }catch(e){
@@ -896,27 +946,50 @@
   </div>
   {/if}
   {#if draft.length>MESSAGE_LIMIT}
-  <p class="message-limit" role="alert" data-message-limit="over">{draft.length.toLocaleString()} of {MESSAGE_LIMIT.toLocaleString()} characters. Send is refused until this is shorter; nothing has been lost.</p>
-  {:else if draft.length>MESSAGE_LIMIT-500}
+  <p class="message-limit" role="alert" data-message-limit="over">{draft.length.toLocaleString()} of {MESSAGE_LIMIT.toLocaleString()} characters. Send is refused until this is shorter; nothing has been lost. Save it as a document to send all of it.</p>
+  {:else if draft.length>MESSAGE_LIMIT-2000}
   <p class="message-limit" role="status" data-message-limit="near">{draft.length.toLocaleString()} of {MESSAGE_LIMIT.toLocaleString()} characters.</p>
   {/if}
+  {#if attachments.length||attachmentBusy||attachmentProblem||draft.length>DOCUMENT_THRESHOLD}
+  <div class="attachment-strip" role="group" aria-label="Attachments">
+   {#each attachments as item (item.path)}
+   <span class="attachment-chip"><code title={item.path}>{item.name}</code><small>{Math.ceil(item.bytes/1024)} KB</small><button aria-label={'Remove attachment '+item.name} onclick={()=>attachments=attachments.filter(candidate=>candidate.path!==item.path)}>×</button></span>
+   {/each}
+   {#if attachmentBusy}<small role="status">Storing the file into the project worktree…</small>{/if}
+   {#if draft.length>DOCUMENT_THRESHOLD}
+   <span class="attachment-offer">
+    <small role="status">{draft.length.toLocaleString()} characters is long for a message. Keep it as a document instead: it is written into the worktree and the message names the path, so an agent reads it from there.</small>
+    <button class="compact-button" aria-label="Save the message text as a document in the worktree" disabled={attachmentBusy} onclick={()=>void saveDraftAsDocument()}>Save as document</button>
+   </span>
+   {/if}
+  </div>
+  {/if}
+  {#if attachmentProblem}<p class="error" role="alert">{attachmentProblem}</p>{/if}
   {#if slashRefusal}<p class="error" role="alert">{slashRefusal}</p>{/if}
   {#if slashResult}<p class="agent-status" role="status">{slashResult}</p>{/if}
   <div class="composer-toolbar">
+  <label class="attach-picker"><span class="sr-only">Attach a file</span><input type="file" multiple aria-label="Attach a file" disabled={attachmentBusy||sending} onchange={(event)=>{void attachFiles(event.currentTarget.files??[]);event.currentTarget.value='';}}><span>{attachmentBusy?'Attaching…':'Attach file'}</span></label>
   <ImageComposer projectId={projectId} sessionId={selectedSessionId||undefined} identity={identityKey} bind:items={media} dragging={composerDragging} handle={(composer)=>{composerApi=composer;}} onchange={()=>persistDraft(true)}/>
    <label class="model-picker"><span class="sr-only">Session model</span><select aria-label="Session model" bind:value={selectedModel} disabled={working||modelBusy} onfocus={()=>void loadModels()} onchange={()=>void chooseModel()}>
     <option value="">Scripted test provider (free)</option>
     {#each modelSettings?.models.filter(m=>m.configured)??[] as m (modelKey(m))}<option value={modelKey(m)}>{modelSettings?.preferences.favourites.some(c=>modelKey(c)===modelKey(m))?'★ ':''}{m.provider} / {m.name}</option>{/each}
    </select></label>
-   <details class="draft-more"><summary>Draft tools</summary>
+   <label class="model-picker thinking-picker"><span class="sr-only">Thinking level</span><select aria-label="Thinking level" bind:value={thinking} disabled={thinkingBusy||working} title="How much reasoning the model is asked for. Stored per session." onchange={()=>void chooseThinking()}>
+    <option value="">Thinking: host default</option>
+    {#each THINKING_LEVELS as level}<option value={level}>Thinking: {level}</option>{/each}
+   </select></label>
+   {#if draftSavedAt||latestUnsaved}
+   <!-- The draft footer is only in the way when there is something to say about the local draft. -->
+   <details class="draft-more"><summary>Draft saved locally</summary>
     {#if draftSavedAt}<small class="draft-saved">Draft saved for {currentSessionLabel} at {new Date(draftSavedAt).toLocaleTimeString()} · kept in this browser only</small>{/if}
     <div class="draft-local-actions"><button class="compact-button" aria-label="Clear local drafts" onclick={clearLocalDrafts}>Clear local drafts</button></div>
    </details>
+   {/if}
    <span class="toolbar-spacer"></span>
    <!-- Stop belongs with the other primary controls, so a short screen finds it beside Send and
         Steer instead of only in the header above the transcript. -->
    {#if working}<button class="compact-button" aria-label="Stop the agent" disabled={!working} onclick={()=>void stop()}><Icon name="close" size={14}/><span>Stop</span></button>{/if}
-   <button class="primary compact-button" aria-label="Send message" disabled={sending||unsettledImages||imageCapabilityBlocked||(draft.trim()===''&&readyImages.length===0)} title={sendHoldReason||undefined} onclick={()=>void send('followUp')}><Icon name="arrow" size={14}/><span>{working?'Queue follow-up':'Send'}</span></button>
+   <button class="primary compact-button" aria-label="Send message" disabled={sending||unsettledImages||imageCapabilityBlocked||attachmentBusy||(draft.trim()===''&&readyImages.length===0&&attachments.length===0)} title={sendHoldReason||undefined} onclick={()=>void send('followUp')}><Icon name="arrow" size={14}/><span>{working?'Queue follow-up':'Send'}</span></button>
    {#if working}<button class="compact-button" aria-label="Steer the run" disabled={sending||unsettledImages||imageCapabilityBlocked||!working||(draft.trim()===''&&readyImages.length===0)} title={sendHoldReason||undefined} onclick={()=>void send('steer')}>Steer</button>{/if}
   </div>
   <div class="composer-status">
@@ -969,6 +1042,16 @@
  .agent-tool-run{margin:8px 0;border-left:2px solid var(--line);padding-left:8px}
  .agent-tool-run>summary{cursor:pointer;font-size:11px;color:var(--muted)}
  .agent-tool-run .agent-entry{margin:6px 0}
+ .attachment-strip{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:6px 0}
+ .attachment-chip{display:inline-flex;align-items:center;gap:6px;border:1px solid var(--line);border-radius:999px;padding:2px 8px;font-size:11px;max-width:100%}
+ .attachment-chip code{font:10px var(--mono);overflow-wrap:anywhere}
+ .attachment-chip small{color:var(--muted)}
+ .attachment-chip button{border:0;background:transparent;font-size:13px;line-height:1;padding:0 2px}
+ .attachment-offer{display:flex;flex-wrap:wrap;gap:6px;align-items:center}
+ .attachment-offer small{color:var(--muted);font-size:11px;max-width:44ch}
+ .attach-picker{display:inline-flex;align-items:center}
+ .attach-picker input{max-width:150px;font-size:10px}
+ .thinking-picker select{font-size:11px}
  .message-limit{margin:4px 0;font-size:11px}
  .message-limit[data-message-limit=over]{color:var(--danger)}
  .agent-thinking{margin-top:7px}.agent-thinking pre{white-space:pre-wrap;font-size:11px;color:var(--muted)}

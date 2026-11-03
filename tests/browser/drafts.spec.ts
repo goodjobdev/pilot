@@ -169,7 +169,7 @@ test('text typed while a send awaits is kept, and only the submitted images leav
  await addProject(page,'Draft concurrent fixture');
  const composer=page.getByLabel('Message the agent');
  const image=await imageFile('while-sending.png');
- await page.locator('input[type=file]').setInputFiles(image);
+ await page.getByLabel('Add an image').setInputFiles(image);
  await expect(page.locator('.image-item .image-facts')).toContainText('8×6');
 
  let release=()=>{};
@@ -206,7 +206,7 @@ test('an upload that finishes after a session switch never appears in the other 
   await new Promise(resolve=>setTimeout(resolve,1200));
   await route.continue();
  });
- await page.locator('input[type=file]').setInputFiles(image);
+ await page.getByLabel('Add an image').setInputFiles(image);
  await expect(page.locator('.image-item')).toHaveCount(1);
  // Switch before the upload is answered.
  await openSession(page,'Beta');
@@ -228,7 +228,7 @@ test('a reload recovers a stored image reference, and a reference the server los
  const composer=page.getByLabel('Message the agent');
  const image=await imageFile('recovered.png');
  await composer.fill('with an image');
- await page.locator('input[type=file]').setInputFiles(image);
+ await page.getByLabel('Add an image').setInputFiles(image);
  await expect(page.locator('.image-item .image-facts')).toContainText('8×6');
 
  // Recovery after a reload is read-only: no input and no upload leaves the page.
@@ -280,7 +280,7 @@ test('a refused or failed upload stays visible after a send and can be removed',
   if(route.request().method()==='POST'){await route.abort('failed');return;}
   await route.continue();
  });
- await page.locator('input[type=file]').setInputFiles(await imageFile('network.png'));
+ await page.getByLabel('Add an image').setInputFiles(await imageFile('network.png'));
  await expect(page.locator('.image-item.failed')).toContainText('could not be reached');
 
  await composer.fill('text without an image');
@@ -299,7 +299,7 @@ test('a stored image is checked before it can be sent, and the check holds the m
  await addProject(page,'Draft checking fixture');
  const composer=page.getByLabel('Message the agent');
  await composer.fill('wait for the check');
- await page.locator('input[type=file]').setInputFiles(await imageFile('checking.png'));
+ await page.getByLabel('Add an image').setInputFiles(await imageFile('checking.png'));
  await expect(page.locator('.image-item .image-facts')).toContainText('8×6');
 
  // A read of the stored object that is slow must hold the send, not send without the image.
@@ -321,7 +321,7 @@ test('the model capability comes with the view, blocks a send, and refreshes aft
  const composer=page.getByLabel('Message the agent');
  const image=await imageFile('capability.png');
  await composer.fill('needs a vision model');
- await page.locator('input[type=file]').setInputFiles(image);
+ await page.getByLabel('Add an image').setInputFiles(image);
  await expect(page.locator('.image-item .image-facts')).toContainText('8×6');
  await page.locator('details.draft-more:not([open]) > summary').click();
  await expect(page.locator('.draft-saved')).toBeVisible();
@@ -390,7 +390,7 @@ test('a failed image lookup keeps the reference and can be retried, while only 4
  await addProject(page,'Draft lookup failure fixture');
  const composer=page.getByLabel('Message the agent');
  await composer.fill('image under a failing lookup');
- await page.locator('input[type=file]').setInputFiles(await imageFile('lookup.png'));
+ await page.getByLabel('Add an image').setInputFiles(await imageFile('lookup.png'));
  await expect(page.locator('.image-item .image-facts')).toContainText('8×6');
  await page.locator('details.draft-more:not([open]) > summary').click();
  await expect(page.locator('.draft-saved')).toBeVisible();
@@ -437,7 +437,7 @@ test('a reconnect keeps a draft and a stored image without a second upload or a 
  const composer=page.getByLabel('Message the agent');
  await expect(composer).toBeVisible();
  await composer.fill('draft across a reconnect');
- await page.locator('input[type=file]').setInputFiles(await imageFile('reconnect.png'));
+ await page.getByLabel('Add an image').setInputFiles(await imageFile('reconnect.png'));
  await expect(page.locator('.image-item .image-facts')).toContainText('8×6');
 
  // The first stream was aborted; the client reconnects on its own. Recovery is read-only.

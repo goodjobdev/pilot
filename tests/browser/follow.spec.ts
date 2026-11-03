@@ -269,7 +269,9 @@ test('a phone keeps a usable transcript, and every condensed control is reachabl
  await expectTranscriptUncovered(page,expanded);
  await activity.locator('summary').click();
 
- // The draft tools are one expansion away, and the action itself is unchanged.
+ // The draft footer stays out of the way until there is something to say about the local draft.
+ await expect(page.locator('details.draft-more'),'nothing to report means nothing in the composer').toHaveCount(0);
+ await page.getByLabel('Message the agent').fill('a draft that is stored locally');
  const draftTools=page.locator('details.draft-more');
  await expect(draftTools.locator('summary')).toBeVisible();
  await draftTools.locator('summary').click();

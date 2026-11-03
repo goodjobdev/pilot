@@ -153,6 +153,15 @@ export const api={
   uploadImage:(id:string,body:{data:string;name?:string;declaredType?:string;sessionId?:string})=>request<{media:MediaView}>('/projects/'+id+'/agents/media','POST',body),
 
   /**
+   * One attached file, or a long paste the interface decided to keep as a document, stored in the
+   * project's connected worktree. The message then names the path, so an agent reads it with its own
+   * contained read rather than the model being handed bytes it cannot take.
+   */
+  uploadAttachment:(id:string,body:{data:string;name:string})=>request<{attachment:{path:string;name:string;bytes:number}}>('/projects/'+id+'/agents/attachments','POST',body),
+  /** One session's thinking level; null returns it to the host default. */
+  agentThinking:(id:string,body:{thinkingLevel:string|null;sessionId?:string})=>request<unknown>('/projects/'+id+'/agents/thinking','POST',body),
+
+  /**
    * The command registry, its live read-only projection and one action's execution. The registry is
    * the only source of what the palette may offer: nothing in the client hardcodes a capability.
    */
