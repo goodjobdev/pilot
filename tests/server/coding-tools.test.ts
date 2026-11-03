@@ -120,3 +120,83 @@ test('the instance switches decide what the interface reports as installed, per 
  const shell=body.scopes.find(entry=>entry.scope==='shell');
  assert.match(String((shell as {description?:string}).description),/not contained/);
 });
+
+/**
+ * The end-to-end evidence: a scripted model, through the real harness, calling the real tools.
+ *
+ * The faux provider answers with tool calls exactly as a model would; everything below the call —
+ * the harness, the environment, the containment and the worktree — is the production code path.
+ */
+async function codingHarness(t: { after: (fn: () => Promise<void>) => void }, scopes?: readonly never[]) {
+  const { mkdtemp:mk, writeFile:wr }=await import('node:fs/promises');
+  const { fauxProvider }=await import('@earendil-works/pi-ai/providers/faux');
+  const { HarnessHost }=await import('../../src/server/agents/harness-host');
+  const { ProviderStore }=await import('../../src/server/providers');
+  const { BoardStore }=await import('../../src/server/board-store');
+  const { randomUUID }=await import('node:crypto');
+  const root=await mk(join(tmpdir(),'pilot-coding-flow-'));
+  const worktree=join(root,'repositories',randomUUID(),'agent');
+  await mkdir(join(worktree,'docs'),{recursive:true});
+  await wr(join(worktree,'docs/inside.md'),'# Inside\n');
+  await mkdir(join(root,'outside'),{recursive:true});
+  await wr(join(root,'outside','secret.md'),'# Secret\n');
+  const project={id:randomUUID(),name:'Coding fixture',path:worktree,managed:true,repository:'',created:''};
+  const fake=fauxProvider({provider:'coding-faux',models:[{id:'fixture'}]});
+  const providers=new ProviderStore(root,[fake.provider]);
+  await providers.savePreferences({defaultModel:{provider:'coding-faux',modelId:'fixture'},favourites:[],allowRealModels:true});
+  const host=new HarnessHost({dataRoot:root,enabled:true,providers,boards:new BoardStore(root),
+    coding:{enabled:true,shell:true,root:()=>worktree},
+    ...(scopes===undefined?{}:{privileges:{scopes}} as never)});
+  t.after(async()=>{await host.close();await rm(root,{recursive:true,force:true});});
+  return {root,worktree,project,fake,host};
+}
+async function until(check:()=>Promise<boolean>){
+  const deadline=Date.now()+15000;
+  while(!await check()){if(Date.now()>deadline)throw Error('the scripted run did not settle');await new Promise(r=>setTimeout(r,20));}
+}
+test('a scripted model reads, writes and runs a command inside the connected worktree',async t=>{
+ const { fauxAssistantMessage,fauxToolCall }=await import('@earendil-works/pi-ai/providers/faux');
+ const { worktree,project,fake,host }=await codingHarness(t);
+ fake.setResponses([
+  () => fauxAssistantMessage([fauxToolCall('read',{path:'docs/inside.md'})],{stopReason:'toolUse'}),
+  () => fauxAssistantMessage([fauxToolCall('write',{path:'docs/written.md',content:'# Written\n'})],{stopReason:'toolUse'}),
+  () => fauxAssistantMessage([fauxToolCall('bash',{command:'printf ran > marker.txt; echo command-ok'})],{stopReason:'toolUse'}),
+  () => fauxAssistantMessage('Coding done.')
+ ]);
+ await host.submit(project,{text:'Work in the worktree',mode:'followUp'});
+ await until(async()=>(await host.view(project)).entries.some(entry=>entry.text.includes('Coding done.')));
+ const view=await host.view(project),transcript=JSON.stringify(view.entries);
+ assert.match(transcript,/# Inside/,'the read tool returned the file inside the worktree');
+ assert.equal(await readFile(join(worktree,'docs/written.md'),'utf8'),'# Written\n');
+ assert.equal(await readFile(join(worktree,'marker.txt'),'utf8'),'ran','the command ran with the worktree as its working directory');
+ assert.match(transcript,/command-ok/,'the command output reached the transcript');
+});
+test('a path outside the worktree is refused at dispatch and changes nothing',async t=>{
+ const { fauxAssistantMessage,fauxToolCall }=await import('@earendil-works/pi-ai/providers/faux');
+ const { root,worktree,project,fake,host }=await codingHarness(t);
+ fake.setResponses([
+  () => fauxAssistantMessage([fauxToolCall('read',{path:'../outside/secret.md'})],{stopReason:'toolUse'}),
+  () => fauxAssistantMessage([fauxToolCall('write',{path:join(root,'outside','secret.md'),content:'overwritten\n'})],{stopReason:'toolUse'}),
+  () => fauxAssistantMessage([fauxToolCall('bash',{command:'echo still-permitted > inside-marker.txt'})],{stopReason:'toolUse'}),
+  () => fauxAssistantMessage('Refusals observed.')
+ ]);
+ await host.submit(project,{text:'Try to leave the worktree',mode:'followUp'});
+ await until(async()=>(await host.view(project)).entries.some(entry=>entry.text.includes('Refusals observed.')));
+ const transcript=JSON.stringify((await host.view(project)).entries);
+ assert.match(transcript,/connected repository worktree/,'both refusals are reported to the model in those words');
+ assert.equal(await readFile(join(root,'outside','secret.md'),'utf8'),'# Secret\n','the file outside the worktree is unchanged');
+ assert.equal(await readFile(join(worktree,'inside-marker.txt'),'utf8'),'still-permitted\n','the shell itself still works inside the worktree');
+});
+
+test('the coding tools are governed by name: read, write and bash each have a scope',async()=>{
+ const { AGENT_TOOL_SCOPES,authorizeToolUse }=await import('../../src/shared/agent-registry');
+ // The tool names a model calls, mapped to the scope that governs them. Without these three
+ // entries the dispatch path refuses every coding tool for every caller, which is exactly the
+ // defect the scripted end-to-end run above catches.
+ assert.equal(AGENT_TOOL_SCOPES['read'],'file_read');
+ assert.equal(AGENT_TOOL_SCOPES['write'],'file_write');
+ assert.equal(AGENT_TOOL_SCOPES['bash'],'shell');
+ assert.equal(authorizeToolUse({scopes:['file_read'],tool:'read'}).permitted,true);
+ assert.equal(authorizeToolUse({scopes:[],tool:'read'}).permitted,false);
+ assert.equal(authorizeToolUse({scopes:['file_read'],tool:'bash'}).permitted,false,'the shell is not granted by reading a file');
+});

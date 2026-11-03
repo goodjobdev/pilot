@@ -121,10 +121,13 @@ export const AGENT_TOOL_SCOPES: Readonly<Record<string, AgentScope>> = Object.fr
   read_doc: 'read_docs',
   read_board: 'read_docs',
   write_board: 'write_docs',
+  // The tool a model actually calls, by name: the coding tools keep Pi's own names, so the scope
+  // that governs them is stated here under `read`, `write` and `bash`.
+  read: 'file_read',
+  write: 'file_write',
+  bash: 'shell',
   file_read: 'file_read',
-  file_write: 'file_write',
   file_edit: 'file_edit',
-  shell: 'shell',
   run_tests: 'run_tests'
 });
 /**
