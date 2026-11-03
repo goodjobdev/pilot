@@ -20,7 +20,8 @@ import { MEDIA_CONTAINER_CODE, MediaContainerError, MediaStore } from './media-s
 import { AlertStore,type AlertPayload,type AlertTransport } from './alerts';
 import { Catalog } from './catalog';
 import { ProviderStore } from './providers';
-import { RepositoryStore } from './repositories';
+import { RepositoryStore,type RepositoryCommand } from './repositories';
+import { RemoteStore } from './remote';
 import { browse,within } from './paths';
 import { authorize,headers,establishSession,type SecurityConfig } from './security';
 import { effectiveConfig } from './effective-config';
@@ -81,7 +82,7 @@ export type ReleasePromotionObservation =
   | {readonly state:'unreadable';readonly reason:string};
 /** What the running service reports about itself, and the one read-only seam that answers for promotion. */
 export interface ReleaseReportOptions {readonly version:string;readonly source:'manifest'|'unreleased-local';readonly buildId?:string;readonly sourceDigest?:string;readonly observe:()=>ReleasePromotionObservation}
-export interface AppOptions {dataRoot:string;browseRoots:string[];security:SecurityConfig;allowedHosts?:readonly string[];clientRoot?:string;registry?:string;agents?:'on'|'off';agentPauseMs?:number;recordNoteDelayMs?:number;recordNoteAfterWriteMs?:number;recordNoteStarted?:()=>void;readNotesSeam?:{delayMs?:number;onExecute?:()=>void};alertTransport?:AlertTransport;alertSubject?:string;alertCooldownMs?:number;readiness?:ReadinessOptions;control?:ControlStore;runner?:{readonly enabled?:boolean;readonly port?:RunnerPort};fileEdit?:{readonly enabled?:boolean};release?:ReleaseReportOptions;workerOpenDelayMs?:number;acceptanceFauxWorkerDelayMs?:number;onModelRequest?:(input:{provider:string;modelId:string;maxTokens:number})=>void;workerProbe?:{tool:string;args:Record<string,unknown>};workerProbeDelayMs?:number;workerGuard?:(input:{projectId:string;runId:string;tool:string})=>string|null;workerRequestGuard?:(input:{projectId:string;runId:string})=>string|null;onWorkerGuard?:(input:{tool:string;refusal:string|null})=>void}
+export interface AppOptions {repositoryCommand?:RepositoryCommand;dataRoot:string;browseRoots:string[];security:SecurityConfig;allowedHosts?:readonly string[];clientRoot?:string;registry?:string;agents?:'on'|'off';agentPauseMs?:number;recordNoteDelayMs?:number;recordNoteAfterWriteMs?:number;recordNoteStarted?:()=>void;readNotesSeam?:{delayMs?:number;onExecute?:()=>void};alertTransport?:AlertTransport;alertSubject?:string;alertCooldownMs?:number;readiness?:ReadinessOptions;control?:ControlStore;runner?:{readonly enabled?:boolean;readonly port?:RunnerPort};fileEdit?:{readonly enabled?:boolean};release?:ReleaseReportOptions;workerOpenDelayMs?:number;acceptanceFauxWorkerDelayMs?:number;onModelRequest?:(input:{provider:string;modelId:string;maxTokens:number})=>void;workerProbe?:{tool:string;args:Record<string,unknown>};workerProbeDelayMs?:number;workerGuard?:(input:{projectId:string;runId:string;tool:string})=>string|null;workerRequestGuard?:(input:{projectId:string;runId:string})=>string|null;onWorkerGuard?:(input:{tool:string;refusal:string|null})=>void}
 /**
  * Approvals answer with a status that says what happened: an invalid request is 422, an approval
  * outside the caller's scope is 403, a missing one is 404, a storage fault is 500, and every
@@ -479,7 +480,9 @@ export async function createApp(options:AppOptions){
   // stored bytes. It validates and processes (decode, orient, resize, re-encode) with the documented
   // ImageProcessor the pinned packages ship; see docs/MEDIA.md for the rules and the honest limits.
   const media=new MediaStore(options.dataRoot);
-  const providers=new ProviderStore(catalog.root),repositories=new RepositoryStore(catalog.root);
+  const providers=new ProviderStore(catalog.root),repositories=new RepositoryStore(catalog.root,options.repositoryCommand);
+  const repositoryOperation:{remote?:RemoteStore}={};
+  const assertProjectAvailable=(id:string)=>{if(repositoryOperation.remote?.isBusy(id)||repositories.isConnecting(id))throw new HttpError(409,'Repository operation in progress. Retry after it finishes.');};
   const alerts=new AlertStore(options.dataRoot,{subject:options.alertSubject??(process.env.DASHBOARD_OWNER?'mailto:'+process.env.DASHBOARD_OWNER:undefined),transport:options.alertTransport,cooldownMs:options.alertCooldownMs});
   await alerts.init();
   // The delivery ledger is the durable half of the question and answer flow, and it exists exactly
@@ -518,7 +521,7 @@ export async function createApp(options:AppOptions){
   const workerHolder:{store?:WorkerStore}={};
   // The agent harness is the only execution surface. It is off unless the instance enables it explicitly.
   const agents=new HarnessHost({
-    dataRoot:options.dataRoot,providers,delivery,lifecycle:lifecycleHooks, docs, boards, workspace,
+    dataRoot:options.dataRoot,providers,delivery,lifecycle:lifecycleHooks, docs, boards, workspace,projectGate:assertProjectAvailable,
     recovery:lifecycle?{read:(projectId,sessionId)=>{const record=lifecycle.read(projectId,sessionId);return {state:record.state,uncertain:record.uncertain,requestId:record.requestId};}}:undefined,
     enabled:(options.agents??(process.env.DASHBOARD_AGENTS==='on'?'on':'off'))==='on',
     pauseMs:options.agentPauseMs??Number(process.env.DASHBOARD_AGENT_PAUSE_MS??2500),
@@ -624,7 +627,7 @@ export async function createApp(options:AppOptions){
     // Asked before a dispatching action writes anything, so an instance that cannot dispatch refuses
     // without claiming a revision. It performs no model work and opens no harness: opening one would
     // resume unfinished work, which is itself a model request.
-    authoriseDispatch:({projectId})=>{if(!agents.enabled)throw new HttpError(503,'Agents are disabled on this instance');catalog.get(projectId);},
+    authoriseDispatch:({projectId})=>{if(!agents.enabled)throw new HttpError(503,'Agents are disabled on this instance');assertProjectAvailable(projectId);catalog.get(projectId);},
     resume:async({projectId,sessionId,requestId})=>{if(!agents.enabled)throw new HttpError(503,'Agents are disabled on this instance');return agents.dispatchLifecycle(catalog.get(projectId),requestId,sessionId);},
     retry:async({projectId,sessionId,requestId})=>{if(!agents.enabled)throw new HttpError(503,'Agents are disabled on this instance');return agents.dispatchLifecycle(catalog.get(projectId),requestId,sessionId);},
     // A cancel on an instance with no harness has nothing to stop, so it is a harmless no-op; a
@@ -705,7 +708,7 @@ export async function createApp(options:AppOptions){
     return Object.freeze(refs);
   }};
   const queueStore=options.control?new QueueStore(options.control,{
-    authorise:({projectId})=>{if(!agents.enabled)throw new HttpError(503,'Agents are disabled on this instance');catalog.get(projectId);},
+    authorise:({projectId})=>{if(!agents.enabled)throw new HttpError(503,'Agents are disabled on this instance');assertProjectAvailable(projectId);catalog.get(projectId);},
     submit:async({projectId,requestId,entryId,text,images})=>{
       if(!agents.enabled)throw new HttpError(503,'Agents are disabled on this instance');
       const attached:AgentImage[]=[];
@@ -714,6 +717,7 @@ export async function createApp(options:AppOptions){
         if(!stored)throw new HttpError(422,'An attached image is not in the media store. Remove it and send again.','unknown-media');
         attached.push({mimeType:stored.mimeType,data:Buffer.from(stored.bytes).toString('base64')});
       }
+      assertProjectAvailable(projectId);
       const submission=await agents.submit(catalog.get(projectId),{text,mode:'followUp',requestId,images:attached});
       return {requestId,entryId,submissionId:submission.submissionId,acceptedAt:new Date().toISOString()};
     }
@@ -757,6 +761,7 @@ export async function createApp(options:AppOptions){
     dispatch:async({projectId,childSessionId,requestId,text})=>{
       const project=catalog.projects.find(candidate=>candidate.id===projectId);
       if(project===undefined)throw new HttpError(404,'Unknown project');
+      assertProjectAvailable(projectId);
       await agents.dispatchToSession(project,childSessionId,{requestId,text});
     }
   };
@@ -957,6 +962,19 @@ export async function createApp(options:AppOptions){
   let closing=false;
   const streams=new Set<{end:()=>void;done:Promise<void>}>();
   const streamFailures:unknown[]=[];
+  const projectRequests=new Map<string,number>();
+  // Read durable runner state even when execution is disabled; never probe a runtime here.
+  const runnerGuard=runner??(options.control?new RunnerBroker(options.control,dockerRunnerPort({}),{workspace:createProjectWorkspaceResolver({projectRoot:id=>catalog.projects.find(p=>p.id===id)?.path}),projectKnown:id=>catalog.projects.some(p=>p.id===id)}):undefined);
+  const remote=new RemoteStore(repositories,workspace,async p=>{
+    if(!lifecycle)throw new HttpError(503,'Repository review needs durable session state on this instance. No Git operation was started.');
+    if(projectRequests.get(p.id))throw new HttpError(409,'Another project action is still finishing. Wait and check again.');
+    if(workerStore?.view(p.id).activeRunId)throw new HttpError(409,'Stop the worker and wait for its report before reviewing repository changes');
+    if(lifecycle?.running().some(record=>record.projectId===p.id)||lifecycle?.attention(p.id).some(record=>record.uncertain))throw new HttpError(409,'Stop active sessions and review uncertain work before updating the repository');
+    const jobs=runnerGuard?.read(p.id);
+    if(jobs?.truncated||jobs?.jobs.some(job=>job.state==='running'||job.state==='claimed'||job.attention?.reason==='job-interrupted'))throw new HttpError(409,'Active, uncertain or incomplete runner history requires operator review before updating the repository');
+    await agents.detach(p);
+  });
+  repositoryOperation.remote=remote;
   const server=createServer(async(req,res)=>{
     // A response can become idle after server.close() checked existing keep-alives.
     // Reap only idle connections on completion, including ordinary draining writers.
@@ -966,6 +984,7 @@ export async function createApp(options:AppOptions){
     // Operational visibility without secrets: method, path and status only.
     const logged=(req.url??'/').split('?')[0];
     res.on('finish',()=>console.log(req.method+' '+logged+' -> '+res.statusCode));
+    const leasedProjects:string[]=[];
     try {
       const url=new URL(req.url??'/',options.security.origin),path=url.pathname;
       if(!allowedHosts().includes(req.headers.host??''))throw new HttpError(403,'Untrusted Host');
@@ -987,6 +1006,10 @@ export async function createApp(options:AppOptions){
           try{payload=JSON.parse(body);}catch{throw new HttpError(400,'Invalid JSON');}
         }
         const scopedProject=path.match(/^\/api\/projects\/([a-f0-9-]{36})(?:\/|$)/)?.[1];
+        const remoteRoute=/^\/api\/projects\/[a-f0-9-]{36}\/workspace\/remote\/(check|diff|apply)$/.test(path);
+        const requestProjects=[scopedProject,payload?.projectId,payload?.scope?.projectId,url.searchParams.get('projectId')];
+        if(!remoteRoute&&requestProjects.some(id=>typeof id==='string'&&remote.isBusy(id)))throw new HttpError(409,'Repository review or update in progress. Retry after it finishes.');
+        if(!remoteRoute&&!['GET','HEAD'].includes(req.method??''))for(const id of new Set(requestProjects))if(typeof id==='string'){leasedProjects.push(id);projectRequests.set(id,(projectRequests.get(id)??0)+1);}
         if(scopedProject&&repositories.isConnecting(scopedProject)&&!/^\/api\/projects\/[a-f0-9-]{36}\/repository(?:\/|$)/.test(path))throw new HttpError(409,'Repository connection in progress. Retry after it finishes.');
         // The release identity this process runs as, the storage schema it expects and which
         // candidate the durable store says is promoted. Read-only, authenticated, path-free.
@@ -1794,10 +1817,18 @@ export async function createApp(options:AppOptions){
             return;
           }
         }
+        const remoteAction=path.match(/^\/api\/projects\/([a-f0-9-]{36})\/workspace\/remote\/(check|diff|apply)$/);
+        if(remoteAction){
+          const p=catalog.get(remoteAction[1]),action=remoteAction[2];
+          if(action==='check'&&req.method==='POST'){parseBody(z.strictObject({}),payload,'The remote check');json(await remote.check(p));return;}
+          if(action==='diff'&&req.method==='GET'){const token=z.string().uuid().parse(url.searchParams.get('token'));const comparison=z.enum(['incoming','result']).parse(url.searchParams.get('comparison')??'incoming');json(await remote.diff(p,token,url.searchParams.get('path')??'',comparison));return;}
+          if(action==='apply'&&req.method==='POST'){const data=parseBody(z.strictObject({token:z.string().uuid(),confirm:z.literal(true)}),payload,'The remote update');json(await remote.apply(p,data.token));return;}
+          throw new HttpError(405,'Method not allowed');
+        }
         const workspaceRoute=path.match(/^\/api\/projects\/([a-f0-9-]{36})\/workspace(?:\/(file|diff|commit-files|commit))?$/);
         if(workspaceRoute){
           const p=catalog.get(workspaceRoute[1]),action=workspaceRoute[2],target=url.searchParams.get('path')??'';
-          if(!action&&req.method==='GET'){json(await workspace.state(p));return;}
+          if(!action&&req.method==='GET'){json({...await workspace.state(p),remoteAvailable:repositories.isConnected(p)});return;}
           if(action==='file'&&req.method==='GET'){json(await workspace.read(p,target));return;}
           if(action==='diff'&&req.method==='GET'){json(await workspace.diff(p,target,url.searchParams.get('commit')??undefined));return;}
           if(action==='commit-files'&&req.method==='GET'){json(await workspace.commitPaths(p,url.searchParams.get('commit')??''));return;}
@@ -1897,7 +1928,7 @@ export async function createApp(options:AppOptions){
       const err=e as Error;const code=e instanceof HttpError?e.status:(e as NodeJS.ErrnoException).code==='ENOENT'?404:400;
       console.error(req.method+' '+logged+' -> '+code+' '+err.message);
       res.statusCode=code;res.setHeader('Content-Type','application/json');res.end(JSON.stringify({error:err.message,...(e instanceof HttpError&&e.code?{code:e.code}:{})}));
-    }
+    }finally{for(const id of leasedProjects){const count=(projectRequests.get(id)??1)-1;if(count)projectRequests.set(id,count);else projectRequests.delete(id);}}
   });
   server.requestTimeout=30000;server.headersTimeout=10000;
   return {server,catalog,boards,docs,agents,alerts,providers,repositories,sessions,lifecycle,actions,media,queue:queueStore,runner,acceptance,forks,agentStore,fileEdit,workerModelPolicy,workerStore,workerService,close:async()=>{

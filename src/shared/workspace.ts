@@ -3,7 +3,7 @@ export interface SaveCommit { status: 'committed' | 'unchanged' | 'unavailable' 
 export interface WorkspaceFile { path: string; bytes: number }
 export interface WorkspaceChange { path: string; status: string }
 export interface WorkspaceCommit { hash: string; subject: string }
-export interface WorkspaceState { files: WorkspaceFile[]; changes: WorkspaceChange[]; commits: WorkspaceCommit[]; git: boolean; branch: string | null; message: string; truncated: boolean }
+export interface WorkspaceState { remoteAvailable?: boolean; files: WorkspaceFile[]; changes: WorkspaceChange[]; commits: WorkspaceCommit[]; git: boolean; branch: string | null; message: string; truncated: boolean }
 export interface WorkspaceDocument { path: string; text: string; revision: string }
 const excluded = new Set(['node_modules','dist','build','out','target','coverage','vendor','venv','test-results','playwright-report','tmp','credentials','secrets']);
 const extensions = new Set(['md','mdx','txt','ts','tsx','js','jsx','mjs','cjs','json','yaml','yml','toml','css','scss','html','htm','svg','xml','sql','sh','py','rs','go','swift','kt','kts','java','c','h','cpp','gradle','svelte','astro','vue','lock','png','jpg','jpeg','gif','webp','avif']);

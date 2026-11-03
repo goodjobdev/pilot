@@ -3,6 +3,20 @@
 Read `README.md` first, then `docs/ARCHITECTURE.md` for the invariants and
 `docs/DEPLOYMENT.md` for running it. Run `pnpm` commands here, never at a parent root.
 
+## Documentation-driven delivery
+
+Read `docs/manual/vision.md` before product-shaped work and `docs/DOCUMENTATION.md`
+before adding/changing a feature. Update its user instructions and behaviour/design
+contract in the same change. Use `docs/templates/feature.md` and `docs/templates/design.md`.
+Do not label planned or locally implemented behaviour as released. The runtime board has
+its own schema: never add editorial Starlight fields to it.
+
+The Starlight app in `docs-site/` has a separate lockfile and dependency tree. Run
+`pnpm --dir docs-site check`, `pnpm --dir docs-site test`, and `pnpm --dir docs-site build`
+alongside the application checks when documentation changes. Only `docs-site/pages.json`
+entries publish; generated output is disposable. Never publish project/runtime/private
+content by globbing the documentation tree.
+
 ## Execution surface
 
 - **The agent harness is the only execution surface.** There is no general-purpose shell,
@@ -15,6 +29,11 @@ Read `README.md` first, then `docs/ARCHITECTURE.md` for the invariants and
 - Documentation saves have a separate, narrow local-history exception: fixed, path-scoped
   commits on the project Pilot branch, with hooks/filters/network disabled. Never push, merge,
   switch branches or sweep unrelated staged files. See `docs/PLAN-SYNC.md`.
+- Owner-reviewed remote updates are a separate narrow exception: fixed fetch, pinned
+  incoming/result previews, and explicitly confirmed fast-forward or two-parent merge.
+  Reviews expire and are lost on restart, never replayed. Preserve dirty/staged/ignored
+  data, refuse active/uncertain work and invalid plans, and never push, stash, reset,
+  rebase, install, or grant an agent a Git tool. Read `docs/specs/repository-updates.md`.
 - Provider and deploy-key secrets live outside project roots under `<data>/credentials/`;
   do not return them in views or logs. Same-UID shell execution would be able to read them:
   do not claim this is per-agent isolation or enable coding tools by accident.

@@ -143,6 +143,37 @@ and a bounded subscription list, throttle repeats of the same kind of event per 
 drop endpoints the push service reports as gone. Payloads carry a title, one line of context
 and a link — never document text.
 
+## Owner-reviewed workspace updates
+
+The unreleased remote-update slice is a separate fixed-operation owner capability, not
+an agent tool or arbitrary Git endpoint. It shares `WorkspaceStore` project serialization
+with saves, refuses already-admitted project mutations and active/uncertain sessions/workers,
+and reads durable runner state even when execution is disabled. New scoped mutations,
+queue/palette dispatch and lifecycle dispatch refuse while the operation owns the project.
+Idle root and named conversations are checked before detaching; work is not canceled to
+make an update fit.
+
+A fetch updates only Git objects and a dedicated tracking ref. A clean merge preview writes
+unreferenced Git objects only. A bounded 10-minute transient review pins project/repository,
+key fingerprint, old head, fetched head and exact result. The incoming and resulting deltas
+are distinct. Apply consumes the review, rechecks state, validates the resulting canonical
+plan, prepares a two-parent commit when needed, and uses native `merge --ff-only` for the
+real index/worktree transaction. Configured filters/hooks/signing and custom merge drivers
+cannot execute. Dirty/staged data, unsafe transitions and ignored collisions are refused.
+
+This owner review is not a general durable approval-ledger record. Restart invalidates it,
+so a crash cannot replay it; Git history is evidence of a completed effect. An unconfirmed
+effect needs operator review, not automatic retry or rollback. This exception grants no
+push, reset, stash, rebase, branch selection, install or new agent scope.
+See [Repository update contract](specs/repository-updates.md).
+
+## Published documentation
+
+`docs-site/` is an isolated Astro Starlight static app over explicitly allowlisted canonical
+Markdown. Editorial metadata and built-link validation are independent of the runtime
+board schema. The app build does not bundle the site, expose runtime content, or configure
+public hosting. See [Documentation contract](DOCUMENTATION.md).
+
 ## The approval and delivery model
 
 An approval is one control-store operation: its immutable definition is the operation input and its

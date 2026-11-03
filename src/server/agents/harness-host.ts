@@ -573,6 +573,13 @@ export interface SessionLifecycleHooks {
 }
 
 export interface HarnessHostOptions {
+  /**
+   * A project-level gate asked before any model request is dispatched. The application uses it so a
+   * consequential workspace-exclusive operation (an owner-reviewed repository update) cannot race a
+   * running generation, including one started by a queued input or a checkpoint resume. It must be
+   * cheap, synchronous and side-effect free: it checks availability and throws a refusal.
+   */
+  projectGate?: (projectId: string) => void;
   docs?: DocStore;
   boards?: BoardStore;
   workspace?: WorkspaceStore;
@@ -1017,6 +1024,11 @@ export class HarnessHost {
             const signal=options?.signal;
             signal?.throwIfAborted();
             const conversationId = signal ? conversationBySignal.get(signal) : undefined;
+            // The project-level gate, asked before any provider request. An owner-reviewed repository
+            // update owns the project exclusively, so a generation that would start for it — including
+            // one resumed from a checkpoint by opening the harness — is refused here instead of racing
+            // a merge in the worktree. A refusal never reaches the provider.
+            this.options.projectGate?.(project.id);
             if (this.options.recovery) {
               if (conversationId === undefined) throw new HttpError(409, 'The model request session cannot be verified; no provider request was sent.');
               const refusal = recoveryGuard.refusalFor(conversationId);
@@ -1427,6 +1439,7 @@ export class HarnessHost {
    */
   async dispatchToSession(project: Project, sessionId: string, input: { requestId: string; text: string }): Promise<{ submissionId: string }> {
     this.assertEnabled();
+    this.options.projectGate?.(project.id);
     const text = input.text.trim();
     if (text === '') throw new HttpError(422, 'Enter a message');
     if (text.length > 8000) throw new HttpError(413, 'Message is too long');
@@ -1533,6 +1546,7 @@ export class HarnessHost {
   }
   async submit(project: Project, input: { text: string; mode: AgentInputMode; requestId?: string; images?: readonly AgentImage[]; sessionId?: string }): Promise<{ submissionId: string; queued: boolean }> {
     this.assertEnabled();
+    this.options.projectGate?.(project.id);
     const text = input.text.trim();
     const images = input.images ?? [];
     if (text === '' && images.length === 0) throw new HttpError(422, 'Enter a message');
@@ -1822,6 +1836,7 @@ export class HarnessHost {
    */
   async dispatchLifecycle(project: Project, requestId: string, sessionId?: string): Promise<SessionLifecycleDispatchOutcome> {
     this.assertEnabled();
+    this.options.projectGate?.(project.id);
     return this.serial('agent:' + project.id, async () => {
       const hosted = await this.selected(project, sessionId);
       this.assertNotUncertain(project.id, this.sessionIdentity(project, hosted.conversation.id));
@@ -2090,7 +2105,8 @@ export class HarnessHost {
     await this.serial('agent:'+project.id,async()=>{
       const pending=this.hosted.get(project.id);if(!pending)return;
       const hosted=await pending;
-      if((await this.view(project)).working)throw new HttpError(409,'Stop the agent before connecting a repository');
+      const ids=new Set([hosted.conversation.id,...[...this.sessionConversations].filter(([key])=>key.startsWith(project.id+':')).map(([,id])=>id)]);
+      for(const id of ids){const conversation=await hosted.harness.conversation(id,BACKGROUND_CONTEXT);if(!conversation)continue;const state=await conversation.viewState(BACKGROUND_CONTEXT);try{const view=agentViewFrom(state.value);if(view.working||view.inbox.length)throw new HttpError(409,'Stop all project sessions and queued inputs before changing the repository');}finally{state.dispose();}}
       await hosted.close();this.hosted.delete(project.id);
     });
   }

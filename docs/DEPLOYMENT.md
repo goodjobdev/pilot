@@ -430,8 +430,18 @@ Provider credentials and model preferences are configured through **Providers & 
 Project deploy keys and review worktrees are configured through **Board actions → Repository
 & deploy key**. See [Provider sign-in](PROVIDER-SIGNIN.md) and
 [Project connections](PROJECT-CONNECTIONS.md) for storage, revocation and backup limitations.
-The container includes Git and OpenSSH for fixed provisioning only; it still has no general
-coding tools. These features do not change the Access application or tunnel policy.
+The container includes Git and OpenSSH for fixed provisioning and, in the unreleased update,
+explicit owner-reviewed repository updates; it still has no general coding tools. Git 2.39+
+is required for the safe merge preview. These features do not change the Access application,
+tunnel policy, credential layout or storage schema. No dependency install or push occurs in
+a project update. Transient reviews disappear on restart and cannot be replayed; an
+unconfirmed update requires checking local history/files before a fresh review.
+
+The Astro Starlight app in `docs-site/` is separate static output, built with its own pinned
+lockfile. It is not added to the application runtime image or automatically deployed.
+Run its check/test/build commands, inspect `pages.json` and the output for private material,
+and choose the public URL/access policy separately before publishing. See
+[Documentation contract](DOCUMENTATION.md).
 
 
 - **A restart rotates the CSRF secret.** The client renews its same-origin session and retries

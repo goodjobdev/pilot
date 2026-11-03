@@ -22,6 +22,7 @@ assumes, and what it does not protect, so you can decide whether that fits.
 | Resource abuse | Read and write size caps, a document-count cap, a bounded subscription list, and bounded search/inbox scans |
 | Untrusted rendering | Markdown is sanitised; assets are limited to images and static HTML/SVG; mockups render in a sandboxed frame with no scripts and no same-origin access; a strict Content-Security-Policy covers the application |
 | Agent execution | No general shell/file API exists. Agent tools include bounded documentation/planning operations. Fixed Git/SSH-keygen provisioning installs or pushes nothing. Documentation saves separately attempt path-scoped local commits only on the project Pilot branch, with hooks, filters, signing and network disabled; no branch switch, push or merge |
+| Owner-reviewed remote updates (unreleased) | Explicit deploy-key fetch and exact incoming/result review, followed by a one-use confirmed update of the managed Pilot branch. Refuses active/uncertain work, dirty/staged paths, ignored collisions, unsafe transitions and invalid plans. No agent Git scope, push, rebase, stash, reset or install; restart invalidates transient reviews |
 | Credentials | Provider credentials and project deploy keys live outside project roots in 0600 files/0700 folders, excluded from ordinary backups; settings reads return status/public keys only. Login and Git failures do not echo raw credential response bodies or command output |
 | Host escape | The container drops all capabilities, runs non-root with a read-only root filesystem, has no Docker socket and no host mounts |
 
@@ -54,6 +55,15 @@ assumes, and what it does not protect, so you can decide whether that fits.
   traffic it forwards. Self-host the relay or keep it on a network you control.
 - **A stolen unlocked device** with an active session, and any credential you paste into a
   chat, log or image.
+
+## Static documentation boundary
+
+The separate Starlight build publishes only the reviewed Markdown paths in
+`docs-site/pages.json`. Never include runtime plans, registered projects, operations,
+credentials or private design artifacts by glob. Draft/sidebar flags do not protect data.
+The static site has no application session, server API or deployment configured here.
+Publishing it is a separate reviewed operation. Existing engineering/operations documents
+remain in Git but are not copied wholesale into the public site.
 
 ## Reporting
 

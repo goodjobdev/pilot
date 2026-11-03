@@ -1,18 +1,23 @@
 <script lang="ts">
+ import { untrack } from 'svelte';
  import { request,assetBlobUrl } from './api';
  import type { WorkspaceState,WorkspaceDocument,SaveCommit } from '../shared/workspace';
  import { commitMessage,isWorkspaceImagePath } from '../shared/workspace';
  import { isBrowsableDocPath } from '../shared/docs';
  import { PLAN_PATH } from '../shared/workspace';
  import Icon from './Icon.svelte';
- let {projectId,onclose,onopendoc}:{projectId:string;onclose:()=>void;onopendoc:(path:string)=>void}=$props();
+ import RemoteChanges from './RemoteChanges.svelte';
+ let {projectId,onclose,onopendoc,pendingEdits=false,onbusy=()=>{},onupdated=async()=>{}}:{projectId:string;onclose:()=>void;onopendoc:(path:string)=>void;pendingEdits?:boolean;onbusy?:(busy:boolean)=>void;onupdated?:()=>Promise<void>}=$props();
+ let remoteBusy=$state(false);
+ function remoteStatus(value:boolean){remoteBusy=value;onbusy(value);}
+ async function remoteUpdated(){back();commit='';commitPaths=[];await load();await onupdated();}
  let workspace=$state<WorkspaceState|null>(null),tab=$state<'Files'|'Changes'>('Files'),query=$state(''),error=$state(''),busy=$state(false);
  let selected=$state(''),document=$state<WorkspaceDocument|null>(null),diff=$state<string|null>(null),commit=$state(''),commitPaths=$state<string[]>([]),message=$state('');
  let generation=0,selection=0,leasedImage='';
  let imageUrl=$state('');
  function dropImage(){if(leasedImage)URL.revokeObjectURL(leasedImage);leasedImage='';imageUrl='';}
- async function load(){const mine=++generation,id=projectId;try{const fresh=await request<WorkspaceState>('/projects/'+id+'/workspace');if(mine===generation){workspace=fresh;error='';}}catch(e){if(mine===generation)error=(e as Error).message;}}
- $effect(()=>{void projectId;dropImage();workspace=null;selected='';document=null;diff=null;commit='';commitPaths=[];query='';selection++;generation++;void load();const timer=setInterval(()=>void load(),8000);return()=>{clearInterval(timer);generation++;selection++;dropImage();};});
+ async function load(){if(remoteBusy)return;const mine=++generation,id=projectId;try{const fresh=await request<WorkspaceState>('/projects/'+id+'/workspace');if(mine===generation){workspace=fresh;error='';}}catch(e){if(mine===generation)error=(e as Error).message;}}
+ $effect(()=>{void projectId;dropImage();workspace=null;selected='';document=null;diff=null;commit='';commitPaths=[];query='';selection++;generation++;untrack(()=>void load());const timer=setInterval(()=>void load(),8000);return()=>{clearInterval(timer);generation++;selection++;dropImage();};});
  async function open(path:string,changes=false){const mine=++selection,id=projectId;selected=path;document=null;diff=null;dropImage();error='';message='';busy=true;try{
   if(changes){const result=await request<{diff:string}>('/projects/'+id+'/workspace/diff?path='+encodeURIComponent(path)+(commit?'&commit='+encodeURIComponent(commit):''));if(mine===selection)diff=result.diff;}
   else if(isWorkspaceImagePath(path)){const url=await assetBlobUrl(id,path);if(mine!==selection){URL.revokeObjectURL(url);return;}leasedImage=url;imageUrl=url;}
@@ -46,6 +51,7 @@
  <div class="file-list">
  {#if commit}<div class="history-head"><button onclick={()=>{commit='';commitPaths=[];}}>← Working changes</button><code>{commit.slice(0,8)}</code></div>{#each commitPaths as path}<button onclick={()=>void open(path,true)}>{path}</button>{/each}{#if !busy&&!commitPaths.length}<p>No previewable files in this commit.</p>{/if}
  {:else}
+ <RemoteChanges {projectId} available={workspace?.remoteAvailable??false} localHead={workspace?.commits[0]?.hash??''} onchecked={load} {pendingEdits} onbusy={remoteStatus} onupdated={remoteUpdated}/>
  <h3>Uncommitted changes</h3>{#each workspace?.changes??[] as change}<button onclick={()=>void open(change.path,true)}><code>{change.status}</code>{change.path}</button>{/each}{#if workspace?.git&&!workspace.changes.length}<p>No previewable changes.</p>{/if}
  <h3>Recent commits</h3>{#each workspace?.commits??[] as entry}<button class="commit-row" onclick={()=>void history(entry.hash)}><code>{entry.hash.slice(0,8)}</code><span>{entry.subject}</span></button>{/each}
  {/if}

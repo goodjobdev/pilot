@@ -1,0 +1,15 @@
+---
+import PageTitle from '@astrojs/starlight/components/PageTitle.astro';
+const p=Astro.locals.starlightRoute.entry.data.pilot;
+const availability:Record<string,string>={planned:'Planned — not available',partial:'Partially available',implemented:'Implemented — unreleased',available:'Available',deprecated:'Deprecated'};
+---
+<PageTitle {...Astro.props} />
+{p && <aside class="doc-status" aria-label="Documentation status">
+ <strong>{availability[p.feature_status]}</strong>
+ <span>Document: {p.doc_status} · {p.kind}</span>
+ {p.verified_release && <span>Verified release: <code>{p.verified_release}</code></span>}
+</aside>}
+<style>
+ .doc-status{display:flex;flex-wrap:wrap;gap:.4rem 1rem;margin-top:1rem;padding:.75rem 1rem;border:1px solid var(--sl-color-gray-4);border-radius:.5rem;font-size:.85rem;overflow-wrap:anywhere}
+ .doc-status strong{color:var(--sl-color-text-accent)}
+</style>

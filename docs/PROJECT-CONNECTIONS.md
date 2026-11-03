@@ -11,6 +11,9 @@ open that panel from **Board actions**.
    is not tested by pushing.
 4. Tick the worktree confirmation and choose **Connect repository worktree**.
 
+Private GitHub repositories use this same deploy-key flow. Read-only is sufficient for
+clone and fetch; no account-wide OAuth login or personal access token is required.
+
 Pilot never clones merely because a URL was entered. Connection is an explicit,
 authenticated, CSRF-protected action. It does not install dependencies, commit,
 push or deploy the website.
@@ -61,6 +64,30 @@ Keys are not encrypted at rest. A shell-capable agent in the same container
 could read them. Current default tools include bounded documentation reads and planning
 updates, not a general coding suite. Adding general coding tools needs an execution-boundary
 review and is not done by connecting a repository.
+
+## Owner-reviewed remote updates (unreleased)
+
+**Workspace → Changes → Check remote changes** explicitly fetches the current GitHub
+default branch into `refs/pilot/remotes/<projectId>/default`. Refresh and Sync plan are
+not fetch/pull. The existing project deploy key and pinned GitHub host key authenticate
+this operation; agents receive no Git tool or new scope.
+
+A review pins local HEAD, fetched head, repository, key fingerprint and the result tree.
+Incoming diffs compare the remote head with the common ancestor. Proposed-result diffs
+compare the exact candidate tree with the pinned local HEAD, including rename resolutions.
+An owner separately confirms a fast-forward or clean two-parent merge; local documentation
+commits remain in history. Conflicts never enter the real index/worktree.
+
+Reviews last 10 minutes, are one-use for apply, and disappear on restart. They are transient
+workspace reviews, not durable records in the general approval ledger. A lost or uncertain
+response requires history/file inspection and a fresh review, never an automatic replay.
+No push, rebase, stash, reset, branch switch, submodule update or install is provided.
+Dirty/staged data, ignored collisions, unsafe transitions, pending Git operations,
+active/uncertain work and malformed/deleted canonical plans block updates. Durable session
+state is required; incomplete/uncertain runner history requires operator review. Concurrent
+external Git writers are unsupported. Git 2.39+ is required.
+
+See the [user guide](manual/remote-updates.md) and [acceptance contract](specs/repository-updates.md).
 
 ## Backup and rollback
 

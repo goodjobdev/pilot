@@ -26,6 +26,7 @@ export class RepositoryStore {
  private connecting=new Set<string>();
  constructor(private root:string,private command:RepositoryCommand=async(file,args,options)=>exec(file,args,options)){}
  isConnecting(id:string){return this.connecting.has(id);}
+ isConnected(p:Project){return p.path===join(this.root,'repositories',p.id,'agent');}
  private id(id:string){return z.string().uuid().parse(id);}
  private async serial<T>(id:string,work:()=>Promise<T>){
   this.id(id);const before=this.tails.get(id)??Promise.resolve(),next=before.catch(()=>{}).then(work);this.tails.set(id,next);
@@ -45,7 +46,7 @@ export class RepositoryStore {
  }
  async view(p:Project):Promise<RepositoryConnection>{
   const branch='work/pilot-'+p.id.slice(0,8);
-  return {repository:p.repository,...await this.keyView(p.id),connected:p.path===join(this.root,'repositories',p.id,'agent'),branch:p.path===join(this.root,'repositories',p.id,'agent')?branch:null};
+  return {repository:p.repository,...await this.keyView(p.id),connected:this.isConnected(p),branch:this.isConnected(p)?branch:null};
  }
  async generate(p:Project){
   githubRepository(p.repository);
@@ -70,11 +71,11 @@ export class RepositoryStore {
   // No shell input comes from the repository URL. Quoting is for the absolute,
   // app-owned key and hosts paths in the fixed GIT_SSH_COMMAND only.
   const quote=(s:string)=>"'"+s.replace(/'/g,"'\\''")+"'";
-  return {PATH:process.env.PATH,HOME:'/nonexistent',LANG:'C.UTF-8',GIT_TERMINAL_PROMPT:'0',GIT_CONFIG_NOSYSTEM:'1',GIT_CONFIG_GLOBAL:'/dev/null',
+  return {PATH:process.env.PATH,HOME:'/nonexistent',LANG:'C.UTF-8',GIT_TERMINAL_PROMPT:'0',GIT_CONFIG_NOSYSTEM:'1',GIT_CONFIG_GLOBAL:'/dev/null',GIT_NO_LAZY_FETCH:'1',
    GIT_SSH_COMMAND:'ssh -F /dev/null -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o HostKeyAlgorithms=ssh-ed25519 -o ConnectTimeout=15 -o IdentityAgent=none -o UserKnownHostsFile='+quote(hosts)+' -i '+quote(key)};
  }
  private async git(id:string,args:string[],cwd?:string){
-  try{return (await this.command('git',['-c','core.hooksPath=/dev/null','-c','protocol.file.allow=never','-c','protocol.ext.allow=never',...args],{env:await this.environment(id),cwd,timeout:120000,maxBuffer:1024*1024})).stdout.trim();}
+  try{return (await this.command('git',['-c','core.hooksPath=/dev/null','-c','core.fsmonitor=false','-c','maintenance.auto=false','-c','gc.auto=0','-c','submodule.recurse=false','-c','protocol.allow=never','-c','protocol.ssh.allow=always','-c','protocol.file.allow=never','-c','protocol.ext.allow=never',...args],{env:await this.environment(id),cwd,timeout:120000,maxBuffer:1024*1024})).stdout.trim();}
   catch(e){if(e instanceof HttpError)throw e;throw new HttpError(422,'Git operation failed. Check the repository URL and deploy key permissions. No credential or command output is shown.');}
  }
  async test(p:Project){const repo=githubRepository(p.repository);await this.git(p.id,['ls-remote','--exit-code',repo.ssh,'HEAD']);return {ok:true,message:'Read access confirmed. Write access is not tested: Pilot does not push automatically.'};}
@@ -112,6 +113,19 @@ export class RepositoryStore {
     throw new HttpError(409,'Connection stopped without overwriting planning files. The old workspace is unchanged; review the staged checkout before retrying.');
    }finally{this.connecting.delete(p.id);}
   });
+ }
+ /** Fetch only the validated GitHub default branch into a dedicated ref; never touch HEAD/index/files. */
+ async fetchDefault(p:Project){
+  if(!(await this.view(p)).connected)throw new HttpError(409,'Connect a managed GitHub repository before checking remote changes');
+  const repo=githubRepository(p.repository),listing=await this.git(p.id,['ls-remote','--symref','--',repo.ssh,'HEAD'],p.path);
+  const branch=/^ref: refs\/heads\/([A-Za-z0-9][A-Za-z0-9._\/-]{0,199})\tHEAD$/m.exec(listing)?.[1];
+  if(!branch)throw new HttpError(409,'The remote default branch is missing or unsupported');
+  await this.git(p.id,['check-ref-format','refs/heads/'+branch],p.path);
+  const ref='refs/pilot/remotes/'+p.id+'/default';
+  await this.git(p.id,['fetch','--no-tags','--no-write-fetch-head','--no-recurse-submodules','--no-auto-maintenance','--',repo.ssh,'+refs/heads/'+branch+':'+ref],p.path);
+  const target=await this.git(p.id,['rev-parse','--verify',ref+'^{commit}'],p.path);
+  if(!/^[a-f0-9]{40,64}$/.test(target))throw new HttpError(422,'The fetched commit identity is invalid');
+  return {branch,target,ref};
  }
  async close(){await Promise.allSettled([...this.tails.values()]);}
 }

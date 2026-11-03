@@ -30,7 +30,7 @@
  <ol>
   <li>{#if settingsUrl}<a href={settingsUrl} target="_blank" rel="noreferrer">Open GitHub deploy keys ↗</a>{:else}Open the repository's GitHub Settings → Deploy keys.{/if}</li>
   <li>Add the public key. Tick <strong>Allow write access</strong> only if you want this project to be push-capable.</li>
-  <li>Check access, then explicitly connect the worktree. Pilot does not install dependencies, commit or push automatically.</li>
+  <li>Check access, then explicitly connect the worktree. Connection does not install, commit or push. Later documentation saves attempt local commits; nothing pushes automatically. Check remote updates in Workspace → Changes.</li>
  </ol>
  <p class="callout">Write access lets a shell-capable agent use that key to push. It is scoped to this repository, not to a branch. Prefer repository rules or pull-request review for main. Removing the key in GitHub revokes access.</p>
  <div class="row"><button onclick={()=>void check()} disabled={busy||!connection?.publicKey}>Check repository access</button></div>

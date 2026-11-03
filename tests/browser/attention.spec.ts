@@ -40,8 +40,15 @@ async function addProject(page: import('@playwright/test').Page, name: string): 
   await page.getByRole('button', { name: '＋ Add project', exact: true }).first().click();
   await page.getByLabel('Project name').fill(name);
   await page.getByRole('button', { name: 'Confirm & add project' }).click();
-  const created = await api(page, '/projects');
-  const project = (created.body as { id: string; name: string }[]).find(candidate => candidate.name === name);
+  // The click resolves when the event was dispatched, not when the registration request has
+  // committed, so the listing is polled instead of read once: a single read raced the in-flight
+  // request under load and reported a project that was never missing. The assertion is unchanged.
+  let project: { id: string; name: string } | undefined;
+  await expect.poll(async () => {
+    const created = await api(page, '/projects');
+    project = (created.body as { id: string; name: string }[]).find(candidate => candidate.name === name);
+    return project?.id ?? '';
+  }, { timeout: 15000 }).not.toBe('');
   if (!project) throw Error('the project was not registered');
   await expect(page.getByRole('heading', { name, exact: true })).toBeVisible();
   await expect(page).toHaveURL(new RegExp('project=' + project.id));

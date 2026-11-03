@@ -1,0 +1,54 @@
+[
+  {
+    "source": "docs/manual/index.md",
+    "slug": "index"
+  },
+  {
+    "source": "docs/manual/vision.md",
+    "slug": "start/vision"
+  },
+  {
+    "source": "docs/manual/first-project.md",
+    "slug": "start/first-project"
+  },
+  {
+    "source": "docs/manual/settings.md",
+    "slug": "guides/settings"
+  },
+  {
+    "source": "docs/manual/planning.md",
+    "slug": "guides/planning"
+  },
+  {
+    "source": "docs/manual/files-history.md",
+    "slug": "guides/files-history"
+  },
+  {
+    "source": "docs/manual/remote-updates.md",
+    "slug": "guides/remote-updates"
+  },
+  {
+    "source": "docs/manual/agents.md",
+    "slug": "guides/agents"
+  },
+  {
+    "source": "docs/manual/design.md",
+    "slug": "guides/design"
+  },
+  {
+    "source": "docs/DOCUMENTATION.md",
+    "slug": "handbook/documentation"
+  },
+  {
+    "source": "docs/templates/feature.md",
+    "slug": "handbook/feature-template"
+  },
+  {
+    "source": "docs/templates/design.md",
+    "slug": "handbook/design-template"
+  },
+  {
+    "source": "docs/specs/repository-updates.md",
+    "slug": "specs/repository-updates"
+  }
+]

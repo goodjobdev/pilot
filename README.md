@@ -1,7 +1,12 @@
 # Pilot
 
-A self-hosted workspace where **the documentation is the source of work** and durable Pi
-agents work from it.
+A self-hosted remote harness for **Documentation Driven Development**, extending to
+**Design Documentation Driven Development (DDDD)**: documentation is the source of work,
+and durable Pi agents work from it.
+
+Start with the [user manual](docs/manual/index.md), [DDDD vision](docs/manual/vision.md),
+[project and board settings](docs/manual/settings.md), and
+[documentation contract](docs/DOCUMENTATION.md). Planned design tooling is not yet available.
 
 Write the intent first — behaviour, decisions, open questions, diagrams — then let an agent
 implement against that page. Pilot keeps the plan, the conversation and the result in one
@@ -33,7 +38,11 @@ work for the current milestone, *Dependable from a phone*, is in [docs/PLAN.md](
   [Sessions](docs/SESSIONS.md) and [Migrating the legacy conversation](docs/MIGRATION.md).
 - **Repository connections.** Generate a project deploy key in the UI and explicitly connect
   an isolated review worktree; provisioning performs no installs, commits or pushes.
+  Read-only deploy keys work for private repositories without an account-wide GitHub login.
   Subsequent documentation saves attempt narrow local commits, never automatic pushes.
+  The unreleased update adds **Workspace → Changes → Check remote changes** with incoming
+  and proposed-result diffs, explicitly confirmed fast-forwards/merges, and preservation guards.
+  See [Remote updates](docs/manual/remote-updates.md); nothing pulls or pushes automatically.
 - **Providers and models.** Add API keys or sign in from settings, pick a default for new
   sessions, and star favourites so they appear first. The scripted provider remains the free
   initial default; real calls require explicit opt-in.
@@ -89,6 +98,26 @@ Browser tests need Playwright's Chromium once:
 pnpm exec playwright install chromium
 pnpm test:browser
 ```
+
+## Living documentation (Astro Starlight)
+
+Canonical user documentation lives under `docs/manual/`, contracts under `docs/specs/`,
+and reusable feature/design templates under `docs/templates/`. The Starlight app publishes
+only its explicit allowlist, with status badges and a static search index. It does not
+publish registered projects, runtime plans or operational evidence.
+
+```sh
+pnpm --dir docs-site install --frozen-lockfile
+pnpm --dir docs-site check
+pnpm --dir docs-site test
+pnpm --dir docs-site build
+pnpm --dir docs-site dev
+```
+
+This is a separate static app with its own lockfile; it does not add Astro to Pilot's
+production dependencies or replace Svelte. No public docs URL or deployment is configured.
+See [Writing documentation](docs/DOCUMENTATION.md) for metadata, link validation and the
+release definition of done.
 
 ## Layout
 

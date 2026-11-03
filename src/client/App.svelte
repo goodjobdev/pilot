@@ -46,6 +46,7 @@
  let theme=$state<'dark'|'light'>(localStorage.getItem('dashboard.theme')==='light'?'light':'dark');
  let sidebarHidden=$state(localStorage.getItem('dashboard.sidebar.hidden')==='true'||(localStorage.getItem('dashboard.sidebar.hidden')===null&&window.innerWidth<900));
  let actionsMenu=$state<HTMLDivElement>(),filtersMenu=$state<HTMLDivElement>();
+ let workspaceUpdating=$state(false);
  let docs=$state<DocEntry[]>([]),doc=$state<DocSnapshot|null>(null),docDraft=$state(''),docEditing=$state(false),docDirty=$state(false),docConflict=$state(false),docSaving=$state(false),docMessage=$state(''),docsError=$state(''),treeOpen=$state(false);
  // The document the route names while its read is still pending. The address and the history
  // entry use this path from the first frame, so a direct document link writes one entry, not two.
@@ -356,8 +357,13 @@
  function exported(){if(snapshot)download(failed?'unsaved-board.md':'board.md',serializeBoard($state.snapshot(snapshot.board)),'text/markdown');}
  function closeImport(id:string){if(project?.id===id){importing=false;syncingPlan=false;}}
  function imported(id:string,s:Snapshot){if(project?.id!==id)return;snapshot=s;undoStack=[];redoStack=[];saveState=commitMessage(s.commit);error=s.commit&&['failed','uncertain'].includes(s.commit.status)?s.commit.message:'';selected='';void loadDocs();}
- onMount(()=>{const timer=setInterval(()=>{if(document.visibilityState!=='visible'||!project)return;if(view==='Dependencies'||view==='Timeline'||view==='List')void refreshBoard();else if(view==='Wiki'&&!docEditing&&!docUnsaved()&&!docSaving&&doc)void refreshDocument();},2500);return()=>clearInterval(timer);});
+ onMount(()=>{const timer=setInterval(()=>{if(document.visibilityState!=='visible'||!project||workspaceUpdating)return;if(view==='Dependencies'||view==='Timeline'||view==='List')void refreshBoard();else if(view==='Wiki'&&!docEditing&&!docUnsaved()&&!docSaving&&doc)void refreshDocument();},2500);return()=>clearInterval(timer);});
  async function refreshDocument(){if(!project||!doc)return;const id=project.id,path=doc.path,revision=doc.revision;try{const fresh=await api.doc(id,path);if(project?.id===id&&doc?.path===path&&doc.revision===revision&&!docEditing&&!docUnsaved()&&!docSaving&&fresh.revision!==revision){doc=fresh;docDraft=fresh.text;docMessage='Updated from disk';}}catch(e){if(project?.id===id&&doc?.path===path)docsError=(e as Error).message;}}
+ async function workspaceUpdated(){
+   const id=project?.id;if(!id)return;
+   await refreshBoard();if(project?.id!==id)return;await loadDocs();
+   if(doc&&!docUnsaved()&&!docSaving){const path=doc.path;try{const fresh=await api.doc(id,path);if(project?.id===id&&doc?.path===path&&!docUnsaved()){doc=fresh;docDraft=fresh.text;docEditing=false;docMessage='Updated from reviewed repository changes';}}catch(e){if(project?.id===id&&!docUnsaved()){clearDoc();docsError=(e as Error).message;}}}
+ }
  function openWorkspaceDoc(path:string){if(!leave())return;inspectorDirty=false;selected='';workspaceOpen=false;setView('Wiki',{openTree:false});void openDoc(path,{force:true});}
  /** Pick up board changes made by the agent or another client without overwriting local edits. */
  async function refreshBoard(){
@@ -502,20 +508,22 @@
    <div class="popover actions-popover" bind:this={actionsMenu}>
     <button class="icon-button" aria-label="Board actions" title="Board actions" aria-expanded={actionsOpen} aria-controls="board-commands" onclick={()=>{actionsOpen=!actionsOpen;filtersOpen=false;}}><Icon name="more"/></button>
     <div id="board-commands" hidden={!actionsOpen} class="popover-panel action-list" role="group" aria-label="Board actions">
-     <span class="popover-heading">PROJECT & BOARD</span>
+     <span class="popover-heading">PROJECT</span>
      <button onclick={()=>command(()=>connectionOpen=true)}><Icon name="shield"/>Repository & deploy key</button>
+     <span class="popover-heading">PLANNING</span>
      <button disabled={!snapshot||saving||failed||inspectorDirty} onclick={()=>command(()=>{syncingPlan=true;importing=true;})}><Icon name="refresh"/>Sync plan</button>
      <button onclick={()=>command(()=>openWorkspaceDoc(PLAN_PATH))}><Icon name="book"/>Open plan document</button>
      <button disabled={!snapshot||saving||failed||inspectorDirty} onclick={()=>command(()=>{syncingPlan=false;importing=true;})}><Icon name="import"/>Import documents</button>
      <button disabled={!snapshot||saving||failed||inspectorDirty} onclick={()=>command(()=>settings=true)}><Icon name="settings"/>Areas & milestones</button>
      <button disabled={!snapshot} onclick={()=>command(exported)}><Icon name="export"/>Export board</button>
-     <button aria-label="Commands" onclick={()=>command(()=>{paletteOpen=true;})}><Icon name="more"/>Commands… <small style="margin-left:auto;color:var(--muted)">⌘/Ctrl K</small></button>
-     <button disabled={saving} onclick={()=>command(()=>{void select(project!);})}><Icon name="refresh"/>Reload</button>
      {#if snapshot?.board.adoption==='mirror'}
-     <div class="menu-separator"></div>
      <button disabled={saving||failed||inspectorDirty} onclick={()=>command(()=>{if(confirm('Adopt this board as the task-planning source? Original evidence/specs remain authoritative.'))void mutate({op:'adopt'});})}><Icon name="shield"/>Adopt board…</button>
      {/if}
+     <span class="popover-heading">WORKSPACE</span>
+     <button aria-label="Commands" onclick={()=>command(()=>{paletteOpen=true;})}><Icon name="more"/>Commands… <small style="margin-left:auto;color:var(--muted)">⌘/Ctrl K</small></button>
+     <button disabled={saving} onclick={()=>command(()=>{void select(project!);})}><Icon name="refresh"/>Reload</button>
      <div class="menu-separator"></div>
+     <span class="popover-heading">PROJECT REGISTRY</span>
      <button class="danger-command" aria-label="Unregister project" onclick={()=>command(()=>{void remove();})}><Icon name="close"/>Unregister project…</button>
     </div>
    </div>
@@ -594,7 +602,7 @@
  </div>
  {#if snapshot&&selected&&snapshot.board.tasks.some(t=>t.id===selected)}<TaskInspector board={snapshot.board} id={selected} projectId={project.id} disabled={saving||failed} onclose={()=>choose('')} onoperation={mutate} ondirty={(dirty)=>inspectorDirty=dirty}/>{/if}
  {/if}
- {#if project&&workspaceOpen}{#key project.id}<WorkspaceSidebar projectId={project.id} onclose={()=>workspaceOpen=false} onopendoc={openWorkspaceDoc}/>{/key}{/if}
+ {#if project&&workspaceOpen}{#key project.id}<WorkspaceSidebar projectId={project.id} pendingEdits={docUnsaved()||inspectorDirty||failed||saving||docSaving} onbusy={(value)=>workspaceUpdating=value} onupdated={workspaceUpdated} onclose={()=>workspaceOpen=false} onopendoc={openWorkspaceDoc}/>{/key}{/if}
  </div>
  {#if view!=='Agents'}
  <footer class="statusbar">
