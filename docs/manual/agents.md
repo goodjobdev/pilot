@@ -48,6 +48,20 @@ Coding tools change files in the working tree. Nothing commits or pushes unless 
 so review **Workspace → Changes**, commit deliberately, and remember that a local commit is not a
 remote backup.
 
+## The transcript and the composer
+
+Each message carries its local time. Two or more consecutive tool results fold into one closed
+group — *N tool calls* — which you open to read them; a single tool result stays visible on its own.
+
+One message may hold up to 8,000 characters. The composer counts as you type, warns near the limit
+and refuses past it with the limit named, keeping your text. An operator can raise how many model
+requests one dispatch may make in a row (`DASHBOARD_MAX_MODEL_TURNS`, default 8); when it is
+reached the run stops and says so, and sending another message continues from the transcript.
+
+**Draft tools**, under the composer, is about the *local* draft only: when it was last saved into
+this browser, **Copy draft** and **Download draft** while the latest text could not be saved, and
+**Clear local drafts** to remove every draft this browser holds. Nothing there touches the server.
+
 ## Review work, not just messages
 
 Link tasks to real specification paths. Ask for acceptance evidence. Inspect the saved files and local history. An assistant saying “done” is not proof of a commit, remote push, passing check or deployment.

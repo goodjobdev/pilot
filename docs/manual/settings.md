@@ -37,6 +37,7 @@ The unreleased update groups actions under **Project**, **Planning**, **Workspac
 | Commands | Open the command palette; shortcut is Command/Ctrl K. |
 | Reload | Reread the server’s project state, with draft/conflict guards. Does not fetch Git. |
 | Adopt board | Available for mirrored boards. Accept it as the task-planning source; source specifications remain authoritative. |
+| Agents & privileges (Agents & privileges in the header) | One allowlist per agent, with **Select all available** and **Clear all**; an unavailable scope is never newly granted. The title, close control and Done button stay in view while the form scrolls. |
 | Unregister project | Remove the registry entry. Files are not deleted. Existing identities/history are not a new project’s identities. |
 
 ## Separate controls

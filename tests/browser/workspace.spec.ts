@@ -18,8 +18,8 @@ test('wiki folders fold together and the right sidebar opens safe source files a
  const {p}=await fixture(page,'Files and changes fixture');await page.getByRole('button',{name:'Wiki',exact:true}).click();
  await page.getByRole('button',{name:'Collapse all folders'}).click();await expect(page.locator('.doc-folder[aria-expanded="true"]')).toHaveCount(0);await page.getByRole('button',{name:'Expand all folders'}).click();await expect(page.locator('.doc-item').filter({hasText:'specs/work.md'})).toBeVisible();
  await page.getByRole('button',{name:'Files and changes',exact:true}).click();const pane=page.getByRole('complementary',{name:'Project files and changes'});
- await pane.getByRole('button',{name:'src/icon.png'}).click();await expect(pane.getByRole('img',{name:'src/icon.png'})).toBeVisible();await expect.poll(()=>pane.getByRole('img',{name:'src/icon.png'}).evaluate(el=>(el as HTMLImageElement).naturalWidth)).toBe(1);await pane.getByRole('button',{name:'Back to files and changes'}).click();
- await pane.getByRole('button',{name:'src/app.ts'}).click();await expect(pane.getByRole('region',{name:'File contents'})).toContainText('export const answer = 1;');
+ await pane.locator('.file-leaf[title="src/icon.png"]').click();await expect(pane.getByRole('img',{name:'src/icon.png'})).toBeVisible();await expect.poll(()=>pane.getByRole('img',{name:'src/icon.png'}).evaluate(el=>(el as HTMLImageElement).naturalWidth)).toBe(1);await pane.getByRole('button',{name:'Back to files and changes'}).click();
+ await pane.locator('.file-leaf[title="src/app.ts"]').click();await expect(pane.getByRole('region',{name:'File contents'})).toContainText('export const answer = 1;');
  await writeFile(join(p.path,'src/app.ts'),'export const answer = 2;\n');await pane.getByRole('button',{name:'Show changes',exact:true}).click();await expect(pane.getByRole('region',{name:'File diff'})).toContainText('-export const answer = 1;');await expect(pane.getByRole('region',{name:'File diff'})).toContainText('+export const answer = 2;');
  await pane.getByRole('tab',{name:'Changes'}).click();await pane.getByRole('button',{name:'fixture: initial project'}).click();await pane.getByRole('button',{name:'src/app.ts',exact:true}).click();await expect(pane.getByRole('region',{name:'File diff'})).toContainText('+export const answer = 1;');
 });
@@ -36,6 +36,6 @@ test('sync creates one committed canonical plan and board/source edits update ea
 });
 test('phone file preview preserves the chat draft and does not overflow the screen',async({page})=>{
  await page.setViewportSize({width:390,height:844});await fixture(page,'Phone workspace fixture');await page.getByRole('button',{name:'Agents',exact:true}).click();await page.getByLabel('Message the agent').fill('Keep this unsent draft');
- await page.getByRole('button',{name:'Files and changes',exact:true}).click();const pane=page.getByRole('complementary',{name:'Project files and changes'});await pane.getByRole('button',{name:'src/app.ts'}).click();await expect(pane.getByRole('region',{name:'File contents'})).toBeVisible();
+ await page.getByRole('button',{name:'Files and changes',exact:true}).click();const pane=page.getByRole('complementary',{name:'Project files and changes'});await pane.locator('.file-leaf[title="src/app.ts"]').click();await expect(pane.getByRole('region',{name:'File contents'})).toBeVisible();
  expect(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth)).toBe(true);await pane.getByRole('button',{name:'Close files and changes'}).click();await expect(page.getByLabel('Message the agent')).toHaveValue('Keep this unsent draft');
 });

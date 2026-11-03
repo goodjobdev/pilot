@@ -82,7 +82,7 @@ export type ReleasePromotionObservation =
   | {readonly state:'unreadable';readonly reason:string};
 /** What the running service reports about itself, and the one read-only seam that answers for promotion. */
 export interface ReleaseReportOptions {readonly version:string;readonly source:'manifest'|'unreleased-local';readonly buildId?:string;readonly sourceDigest?:string;readonly observe:()=>ReleasePromotionObservation}
-export interface AppOptions {repositoryCommand?:RepositoryCommand;coding?:{readonly enabled?:boolean;readonly shell?:boolean};dataRoot:string;browseRoots:string[];security:SecurityConfig;allowedHosts?:readonly string[];clientRoot?:string;registry?:string;agents?:'on'|'off';agentPauseMs?:number;recordNoteDelayMs?:number;recordNoteAfterWriteMs?:number;recordNoteStarted?:()=>void;readNotesSeam?:{delayMs?:number;onExecute?:()=>void};alertTransport?:AlertTransport;alertSubject?:string;alertCooldownMs?:number;readiness?:ReadinessOptions;control?:ControlStore;runner?:{readonly enabled?:boolean;readonly port?:RunnerPort};fileEdit?:{readonly enabled?:boolean};release?:ReleaseReportOptions;workerOpenDelayMs?:number;acceptanceFauxWorkerDelayMs?:number;onModelRequest?:(input:{provider:string;modelId:string;maxTokens:number})=>void;workerProbe?:{tool:string;args:Record<string,unknown>};workerProbeDelayMs?:number;workerGuard?:(input:{projectId:string;runId:string;tool:string})=>string|null;workerRequestGuard?:(input:{projectId:string;runId:string})=>string|null;onWorkerGuard?:(input:{tool:string;refusal:string|null})=>void}
+export interface AppOptions {repositoryCommand?:RepositoryCommand;maxModelTurns?:number;coding?:{readonly enabled?:boolean;readonly shell?:boolean};dataRoot:string;browseRoots:string[];security:SecurityConfig;allowedHosts?:readonly string[];clientRoot?:string;registry?:string;agents?:'on'|'off';agentPauseMs?:number;recordNoteDelayMs?:number;recordNoteAfterWriteMs?:number;recordNoteStarted?:()=>void;readNotesSeam?:{delayMs?:number;onExecute?:()=>void};alertTransport?:AlertTransport;alertSubject?:string;alertCooldownMs?:number;readiness?:ReadinessOptions;control?:ControlStore;runner?:{readonly enabled?:boolean;readonly port?:RunnerPort};fileEdit?:{readonly enabled?:boolean};release?:ReleaseReportOptions;workerOpenDelayMs?:number;acceptanceFauxWorkerDelayMs?:number;onModelRequest?:(input:{provider:string;modelId:string;maxTokens:number})=>void;workerProbe?:{tool:string;args:Record<string,unknown>};workerProbeDelayMs?:number;workerGuard?:(input:{projectId:string;runId:string;tool:string})=>string|null;workerRequestGuard?:(input:{projectId:string;runId:string})=>string|null;onWorkerGuard?:(input:{tool:string;refusal:string|null})=>void}
 /**
  * Approvals answer with a status that says what happened: an invalid request is 422, an approval
  * outside the caller's scope is 403, a missing one is 404, a storage fault is 500, and every
@@ -510,6 +510,13 @@ export async function createApp(options:AppOptions){
   // The coding tools are opt-in per instance, and the shell has its own switch: a build that offers
   // `read` and `write` does not thereby offer arbitrary commands. `DASHBOARD_SHELL=on` without
   // coding tools enables nothing, because a shell with no worktree root is refused instead of run.
+  // How many model requests one dispatch may make in a row. Bounded, refused if out of range rather
+  // than clamped: a bound that silently became another number would be worse than a failed start.
+  const maxModelTurns=(()=>{
+    const raw=options.maxModelTurns??Number(process.env.DASHBOARD_MAX_MODEL_TURNS??8);
+    if(!Number.isSafeInteger(raw)||raw<1||raw>100)throw new Error('DASHBOARD_MAX_MODEL_TURNS must be a whole number from 1 to 100');
+    return raw;
+  })();
   const codingToolsEnabled=options.coding?.enabled??process.env.DASHBOARD_CODING_TOOLS==='on';
   const shellEnabled=codingToolsEnabled&&(options.coding?.shell??process.env.DASHBOARD_SHELL==='on');
   const fileEdit=options.control&&fileEditEnabled?new FileEditTool(options.control,{
@@ -526,7 +533,7 @@ export async function createApp(options:AppOptions){
   const workerHolder:{store?:WorkerStore}={};
   // The agent harness is the only execution surface. It is off unless the instance enables it explicitly.
   const agents=new HarnessHost({
-    dataRoot:options.dataRoot,providers,delivery,lifecycle:lifecycleHooks, docs, boards, workspace,projectGate:assertProjectAvailable,
+    dataRoot:options.dataRoot,providers,delivery,lifecycle:lifecycleHooks, docs, boards, workspace,projectGate:assertProjectAvailable,maxModelTurns,
     // The coding tools, with the two switches that decide whether they exist at all. `root` answers
     // only for a project whose repository is connected: without a worktree there is nothing to bind
     // a path to, so no coding tool is installed for that project.
@@ -1702,6 +1709,10 @@ export async function createApp(options:AppOptions){
             // A message carries text, images, or both. An attached image is resolved to its stored
             // bytes here; the dispatch-time vision check inside the harness re-checks the model that
             // will actually run, and refuses the whole submission rather than dropping the image.
+            // The length rule is stated first, in words a person can act on: a message over the
+            // limit is refused here with the limit named, not reported as a malformed field.
+            const rawText=(payload as {text?:unknown})?.text;
+            if(typeof rawText==='string'&&rawText.length>8000)throw new HttpError(413,'This message is '+rawText.length+' characters. The limit for one message is 8000, so it was not sent; the text is unchanged and can be shortened or sent in parts.');
             const data=z.strictObject({
               text:z.string().max(8000).optional(),
               mode:z.enum(['followUp','steer','reject']).default('followUp'),

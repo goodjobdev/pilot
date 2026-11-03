@@ -156,9 +156,11 @@ test('a durable agent answers, steers, aborts, de-duplicates and survives a rest
     // Authentication and validation still apply to the agent routes.
     assert.equal((await fetch(app.base)).status,401);
     assert.equal((await send({text:''})).status,400);
-    // Request validation rejects an oversized message as a bad request; the host's own
-    // 413 bound also guards direct callers.
-    assert.equal((await send({text:'x'.repeat(9000)})).status,400);
+    // An oversized message is refused with the limit named, in words a person can act on, rather
+    // than reported as a malformed field; the host's own 413 bound also guards direct callers.
+    const oversized=await send({text:'x'.repeat(9000)});
+    assert.equal(oversized.status,413);
+    assert.match(JSON.stringify(await oversized.json()),/The limit for one message is 8000/);
   }finally{await app.created.close();}
 
   // The transcript is in SQLite, so a new process opens the same conversation.

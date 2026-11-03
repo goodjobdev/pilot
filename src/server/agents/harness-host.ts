@@ -597,6 +597,11 @@ export interface HarnessHostOptions {
    */
   coding?: { readonly enabled: boolean; readonly shell: boolean; readonly root: (projectId: string) => string | undefined };
   /**
+   * How many model requests one dispatch may make in a row before it stops for review. Resolved at
+   * startup and stated in the refusal, so the bound a person meets is the bound the instance runs.
+   */
+  maxModelTurns?: number;
+  /**
    * Test-only windows around `record_note`'s append. They are reachable only through the harness
    * options (and the test environment), never through a model's tool arguments. Leave unset in
    * production wiring: `0` or absent means no wait.
@@ -1053,9 +1058,13 @@ export class HarnessHost {
             if(model.provider!==provider.provider.id){
               if(!this.options.providers)throw new HttpError(409,'Real providers are not configured');
               await this.options.providers.assertUsable({provider:model.provider,modelId:model.id});
+              // One dispatch may make only so many model requests in a row before a person looks at
+              // it: a runaway loop of tool calls is stopped rather than billed. The bound is the
+              // instance's (`DASHBOARD_MAX_MODEL_TURNS`), stated in the refusal, and it counts the
+              // assistant messages since the last input, so sending another message continues.
               let turns=0;
               for(const message of [...context.messages].reverse()){if(message.role==='user')break;if(message.role==='assistant')turns++;}
-              if(turns>=8)throw new HttpError(409,'Pilot stopped at eight model turns. Review before sending another message.');
+              if(turns>=(this.options.maxModelTurns ?? 8))throw new HttpError(409,'Pilot stopped after '+(this.options.maxModelTurns ?? 8)+' model turns in a row for one message. Nothing is lost: the work so far is in the transcript, and sending another message continues from here. An operator can raise the bound with DASHBOARD_MAX_MODEL_TURNS.');
             }
             const maxTokens=Math.min(options?.maxTokens??4096,4096);
             // The worker boundary. The role marker is in the worker system prompt; the guard is the
@@ -1473,7 +1482,7 @@ export class HarnessHost {
     this.options.projectGate?.(project.id);
     const text = input.text.trim();
     if (text === '') throw new HttpError(422, 'Enter a message');
-    if (text.length > 8000) throw new HttpError(413, 'Message is too long');
+    if (text.length > 8000) throw new HttpError(413, 'This message is '+text.length+' characters. The limit for one message is 8000.');
     return this.serial('agent:' + project.id, async () => {
       const hosted = await this.open(project);
       const id = conversationIdOf(sessionId);
@@ -1581,7 +1590,7 @@ export class HarnessHost {
     const text = input.text.trim();
     const images = input.images ?? [];
     if (text === '' && images.length === 0) throw new HttpError(422, 'Enter a message');
-    if (text.length > 8000) throw new HttpError(413, 'Message is too long');
+    if (text.length > 8000) throw new HttpError(413, 'This message is '+text.length+' characters. The limit for one message is 8000.');
     // An empty request identity means "none was supplied", so it becomes one generated identity.
     // A non-empty identity must satisfy the same rule the durable lifecycle records, and a bad one
     // is refused here, before any harness opens or any submission is admitted.

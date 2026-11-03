@@ -113,6 +113,13 @@
   const entry=registry?.scopes.find(candidate=>candidate.scope===scope);
   return !!entry?.installed&&(scope!=='file_edit'||!!registry?.fileEdit.enabled);
  }
+ /** Grant or remove every scope the interface may change, in one step on this draft.
+  * An unavailable scope is never newly granted: it has no installed tool, and granting it would
+  * record a capability the instance cannot honour. An existing unavailable grant is kept. */
+ function grantAll(on:boolean):void{
+   const grantable=(registry?.scopes??[]).filter(entry=>scopeAvailable(entry.scope)).map(entry=>entry.scope);
+   draft={...draft,scopes:on?[...new Set([...draft.scopes,...grantable])]:draft.scopes.filter(scope=>!grantable.includes(scope))};
+ }
  function toggleScope(scope:string,on:boolean){
   if(on&&!scopeAvailable(scope))return;
   draft={...draft,scopes:on?[...draft.scopes,scope]:draft.scopes.filter(candidate=>candidate!==scope)};
@@ -186,6 +193,7 @@
   <div><span class="eyebrow">PILOT SETTINGS</span><h2>Agents &amp; privileges</h2></div>
   <button aria-label="Close agent manager" onclick={onclose}>×</button>
  </header>
+ <div class="manager-scroll">
  <p class="muted">Each agent holds an explicit allowlist of privilege scopes. The server enforces it at dispatch, on every tool call, and the interface is never the enforcement point.</p>
  {#if problem}<p class="error" role="alert">{problem}</p>{/if}
  {#if message}<p role="status">{message}</p>{/if}
@@ -239,7 +247,11 @@
      <label>Max jobs per hour<input aria-label="Agent max jobs per hour" value={draft.budgets.maxJobsPerHour??''} inputmode="numeric" oninput={e=>budget('maxJobsPerHour',e.currentTarget.value)}></label>
     </div>
     {#if fieldErrors.budgets}<small class="field-error" role="alert">{fieldErrors.budgets}</small>{/if}
-    <span class="popover-heading">PRIVILEGE SCOPES</span>
+    <div class="scopes-head"><span class="popover-heading">PRIVILEGE SCOPES</span>
+     <div class="scopes-all">
+      <button class="compact-button" aria-label="Grant every available scope" disabled={!registry.scopes.some(entry=>scopeAvailable(entry.scope)&&!draft.scopes.includes(entry.scope))} onclick={()=>grantAll(true)}>Select all available</button>
+      <button class="compact-button" aria-label="Remove every scope from this draft" disabled={draft.scopes.length===0} onclick={()=>grantAll(false)}>Clear all</button>
+     </div></div>
     <small class="muted">Installed tools require a grant. Unavailable scopes cannot be newly granted. Existing unavailable grants stay saved unless you remove them; they do not make tools available.</small>
     <div class="scopes" aria-label="Privilege scopes">
      {#each registry.scopes as entry (entry.scope)}
@@ -276,10 +288,18 @@
   {:else}<p class="muted">No file edit has been recorded for this project yet.</p>{/if}
   {/if}
  </section>
- <footer class="row"><button onclick={onclose}>Done</button></footer>
+ </div>
+ <footer class="row manager-footer"><button onclick={onclose}>Done</button></footer>
 </dialog>
 <style>
- .agent-manager{width:min(1080px,calc(100vw - 24px));max-height:92dvh;overflow:auto}
+ /* A frame with a fixed header and footer: the middle scrolls, so the title, the close control and
+  * the Done button are always reachable no matter how long the form is. */
+ .agent-manager{width:min(1080px,calc(100vw - 24px));max-height:92dvh;overflow:hidden;display:flex;flex-direction:column}
+ .agent-manager .modal-head{flex-shrink:0;border-bottom:1px solid var(--line)}
+ .manager-scroll{flex:1;min-height:0;overflow:auto}
+ .manager-footer{flex-shrink:0;border-top:1px solid var(--line);padding-top:8px}
+ .scopes-head{display:flex;align-items:baseline;justify-content:space-between;gap:8px;flex-wrap:wrap}
+ .scopes-all{display:flex;gap:6px;flex-wrap:wrap}
  .manager{display:grid;grid-template-columns:minmax(200px,280px) 1fr;gap:14px;align-items:start}
  @media (max-width:820px){.manager{grid-template-columns:1fr}}
  .agent-list{border:1px solid var(--line);border-radius:5px;padding:8px;min-width:0}

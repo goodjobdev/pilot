@@ -11,6 +11,7 @@
  import { api,ApiError,download,reportSessionExpired } from './api';
  import { openAgentStream,type ConnectionStatus } from './stream';
  import type { AgentView } from '../shared/agent';
+ import { transcriptRows as transcriptRowsOf } from '../shared/transcript';
  import { uniqueImageFiles,type ImageCapability,type ImageDraft } from '../shared/images';
  import ImageComposer from './ImageComposer.svelte';
  import TranscriptImage from './TranscriptImage.svelte';
@@ -34,6 +35,9 @@
    focusQuestion?:string;
  }=$props();
  let view=$state<AgentView|null>(null),enabled=$state(true),draft=$state(''),sending=$state(false),problem=$state('');
+ /** The server's own limit for one message, stated once. The composer refuses past it with a
+  * sentence instead of letting the request fail with a schema error. */
+ const MESSAGE_LIMIT=8000;
  // A deep link names one exact question. If the bounded projection omitted it, read the
  // authoritative session view and retain that identity within the same 500-question cap.
  let focusedQuestionRequest='',focusedQuestionGeneration=0;
@@ -632,6 +636,7 @@
    // them, so a person never reaches this branch without being told why.
    if(uploadingImages){problem='An image is still uploading. Wait for it to finish, then send — sending now would leave it out of the message.';return;}
    if(checkingImages){problem='A stored image is still being checked with the server. Wait for it to finish, then send.';return;}
+   if(text.length>MESSAGE_LIMIT){problem='This message is '+text.length.toLocaleString()+' characters. The limit for one message is '+MESSAGE_LIMIT.toLocaleString()+', so it was not sent — nothing was lost, and your text is still in the box. Split it into shorter messages, or save long content into a file in the worktree (the agent can read it) and send the path.';return;}
    if(images.length>0&&capability.state==='known'&&capability.acceptsImages===false){problem='The model '+capability.provider+' / '+capability.modelId+' does not accept images, so this message is not sent with them. Remove the images or choose a model that accepts images.';return;}
    const generation=draftGeneration,identityAtSend=identityKey;
    const followIdentityAtSend=followKey,followGenerationAtSend=followGeneration;
@@ -703,6 +708,9 @@
    catch(e){problem=(e as Error).message;}
  }
  const working=$derived(view?.working??false);
+ /** The transcript as readable rows, with runs of tool results folded. The rule itself is pure and
+  * tested on its own in `src/shared/transcript.ts`. */
+ const transcriptRows=$derived(transcriptRowsOf(view?.entries??[]));
 
  /**
   * The slash command surface: the same typed action registry the palette uses.
@@ -815,18 +823,29 @@
   </details>
   {/if}
   {#if !view?.entries.length}<p class="agent-empty">No messages yet. Ask the agent to read this project’s documents and turn them into tasks, dependencies, and milestones. Its available tools depend on the permissions you grant.</p>{/if}
-  {#each view?.entries??[] as entry (entry.id)}
-  {#if entry.text||entry.thinking||entry.tools.length||entry.images?.length||entry.error}
-  <article class="agent-entry {entry.kind}" data-entry-id={entry.id}>
-   <span class="agent-role">{entry.kind==='user'?'You':entry.kind==='assistant'?'Agent':entry.kind==='tool'?'Tool':entry.kind}</span>
-   {#if entry.thinking}<details class="agent-thinking"><summary>Reasoning</summary><pre>{entry.thinking}</pre></details>{/if}
-   {#if entry.tools.length}<div class="agent-tools">{#each entry.tools as tool}<span class="pill">{tool.name}</span>{/each}</div>{/if}
-   {#if entry.kind==='assistant'}<div class="agent-text markdown">{@html renderMessage(entry.text)}</div>
-   {:else if entry.kind==='tool'}<details class="agent-tool-result"><summary>{entry.toolResult?.name??'Tool result'}{entry.toolResult?.isError?' · failed':''}</summary><pre class="agent-text">{entry.text}</pre></details>
-   {:else}<pre class="agent-text">{entry.text}</pre>{/if}
-   {#each entry.images??[] as image, imageIndex (`${image.id}-${imageIndex}`)}<TranscriptImage id={image.id}/>{/each}
-   {#if entry.stopReason&&entry.stopReason!=='stop'&&entry.stopReason!=='toolUse'}<small class="agent-note">stopped: {entry.stopReason}</small>{/if}
-   {#if entry.error}<small class="agent-note error-inline">{entry.error}</small>{/if}
+  {#each transcriptRows as row (row.kind==='tools'?row.id:row.entry.id)}
+  {#if row.kind==='tools'}
+  <details class="agent-tool-run">
+   <summary>{row.entries.length} tool calls</summary>
+   {#each row.entries as entry (entry.id)}
+   <article class="agent-entry tool" data-entry-id={entry.id}>
+    <span class="agent-role">Tool</span>{#if entry.at}<time class="agent-time" datetime={new Date(entry.at).toISOString()}>{new Date(entry.at).toLocaleTimeString()}</time>{/if}
+    {#if entry.tools.length}<div class="agent-tools">{#each entry.tools as tool}<span class="pill">{tool.name}</span>{/each}</div>{/if}
+    <details class="agent-tool-result"><summary>{entry.toolResult?.name??'Tool result'}{entry.toolResult?.isError?' · failed':''}</summary><pre class="agent-text">{entry.text}</pre></details>
+   </article>
+   {/each}
+  </details>
+  {:else}
+  <article class="agent-entry {row.entry.kind}" data-entry-id={row.entry.id}>
+   <span class="agent-role">{row.entry.kind==='user'?'You':row.entry.kind==='assistant'?'Agent':row.entry.kind==='tool'?'Tool':row.entry.kind}</span>{#if row.entry.at}<time class="agent-time" datetime={new Date(row.entry.at).toISOString()}>{new Date(row.entry.at).toLocaleTimeString()}</time>{/if}
+   {#if row.entry.thinking}<details class="agent-thinking"><summary>Reasoning</summary><pre>{row.entry.thinking}</pre></details>{/if}
+   {#if row.entry.tools.length}<div class="agent-tools">{#each row.entry.tools as tool}<span class="pill">{tool.name}</span>{/each}</div>{/if}
+   {#if row.entry.kind==='assistant'}<div class="agent-text markdown">{@html renderMessage(row.entry.text)}</div>
+   {:else if row.entry.kind==='tool'}<details class="agent-tool-result"><summary>{row.entry.toolResult?.name??'Tool result'}{row.entry.toolResult?.isError?' · failed':''}</summary><pre class="agent-text">{row.entry.text}</pre></details>
+   {:else}<pre class="agent-text">{row.entry.text}</pre>{/if}
+   {#each row.entry.images??[] as image, imageIndex (`${image.id}-${imageIndex}`)}<TranscriptImage id={image.id}/>{/each}
+   {#if row.entry.stopReason&&row.entry.stopReason!=='stop'&&row.entry.stopReason!=='toolUse'}<small class="agent-note">stopped: {row.entry.stopReason}</small>{/if}
+   {#if row.entry.error}<small class="agent-note error-inline">{row.entry.error}</small>{/if}
   </article>
   {/if}
   {/each}
@@ -863,7 +882,7 @@
   {#if restoredNotice}<p class="agent-status draft-notice" role="status">{restoredNotice}</p>{/if}
   {#if storageNotice}<p class="error draft-notice" role="alert">{storageNotice}</p>{/if}
   <span class="sr-only" id="composer-help">Enter sends. Shift+Enter adds a newline. Type slash for commands.</span>
-  <textarea aria-label="Message the agent" aria-describedby="composer-help" value={draft} onfocus={()=>composerElement?.scrollIntoView({block:'nearest'})} oninput={(event)=>{draft=(event.currentTarget as HTMLTextAreaElement).value;persistDraft();}} onkeydown={(event)=>composerKey(event)} placeholder="Message the agent…"></textarea>
+  <textarea aria-label="Message the agent" aria-describedby="composer-help" data-over-limit={draft.length>MESSAGE_LIMIT?'true':'false'} value={draft} onfocus={()=>composerElement?.scrollIntoView({block:'nearest'})} oninput={(event)=>{draft=(event.currentTarget as HTMLTextAreaElement).value;persistDraft();}} onkeydown={(event)=>composerKey(event)} placeholder="Message the agent…"></textarea>
   {#if media.length>0&&capability.state==='known'&&capability.acceptsImages===false}
   <p class="image-capability" role="alert">The model {capability.provider} / {capability.modelId} does not accept images. Remove the images or choose a model that accepts images before sending.</p>
   {:else if media.length>0&&capability.state==='unknown'}
@@ -875,6 +894,11 @@
    <button class="compact-button" aria-label="Copy the unsaved draft" onclick={()=>void copyDraft()}>Copy draft</button>
    <button class="compact-button" aria-label="Download the unsaved draft" onclick={downloadDraft}>Download draft</button>
   </div>
+  {/if}
+  {#if draft.length>MESSAGE_LIMIT}
+  <p class="message-limit" role="alert" data-message-limit="over">{draft.length.toLocaleString()} of {MESSAGE_LIMIT.toLocaleString()} characters. Send is refused until this is shorter; nothing has been lost.</p>
+  {:else if draft.length>MESSAGE_LIMIT-500}
+  <p class="message-limit" role="status" data-message-limit="near">{draft.length.toLocaleString()} of {MESSAGE_LIMIT.toLocaleString()} characters.</p>
   {/if}
   {#if slashRefusal}<p class="error" role="alert">{slashRefusal}</p>{/if}
   {#if slashResult}<p class="agent-status" role="status">{slashResult}</p>{/if}
@@ -941,6 +965,12 @@
  .agent-entry.system,.agent-entry.other{font-size:11px;color:var(--muted)}
  .agent-role{font:9px var(--mono);letter-spacing:1px;color:var(--muted);text-transform:uppercase}
  .agent-text{margin:7px 0 0;white-space:pre-wrap;overflow-wrap:anywhere;font:12px/1.6 var(--mono)}
+ .agent-time{margin-left:8px;font-size:10px;color:var(--muted);font-variant-numeric:tabular-nums}
+ .agent-tool-run{margin:8px 0;border-left:2px solid var(--line);padding-left:8px}
+ .agent-tool-run>summary{cursor:pointer;font-size:11px;color:var(--muted)}
+ .agent-tool-run .agent-entry{margin:6px 0}
+ .message-limit{margin:4px 0;font-size:11px}
+ .message-limit[data-message-limit=over]{color:var(--danger)}
  .agent-thinking{margin-top:7px}.agent-thinking pre{white-space:pre-wrap;font-size:11px;color:var(--muted)}
  .agent-tools{display:flex;gap:6px;flex-wrap:wrap;margin-top:7px}
  .agent-note{display:block;margin-top:6px;color:var(--muted);font-size:10px}.error-inline{color:var(--danger)}

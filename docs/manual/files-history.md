@@ -10,6 +10,11 @@ pilot:
   verified_release: fd3fa6f
 ---
 
+The **Files** tab is a folder tree: folders sort before files, a folder shows how many files and
+how much it holds, and clicking it opens or collapses it. Searching replaces the tree with one flat
+list of matches, because a match inside a closed folder would otherwise be invisible. A file still
+opens by its full path, and its preview is unchanged.
+
 Use the header’s **Files and changes** button. It is a right sidebar on wide screens and an overlay on phones. Closing it preserves the chat draft. Wiki **Collapse all / Expand all** controls folder groups.
 
 ## Files and changes

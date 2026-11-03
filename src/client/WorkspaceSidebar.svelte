@@ -27,6 +27,47 @@
  async function retry(){if(!document||!confirm('Commit the current saved version of '+document.path+' locally? This does not push or merge.'))return;const mine=selection,id=projectId,file=document;busy=true;try{const result=await request<{commit:SaveCommit}>('/projects/'+id+'/workspace/commit','POST',{path:file.path,revision:file.revision});if(mine===selection){message=commitMessage(result.commit)+(['failed','uncertain'].includes(result.commit.status)?': '+result.commit.message:'');await load();}}catch(e){if(mine===selection)error=(e as Error).message;}finally{if(mine===selection)busy=false;}}
  function back(){selection++;selected='';document=null;diff=null;dropImage();error='';message='';busy=false;}
  const files=$derived(workspace?.files.filter(file=>file.path.toLowerCase().includes(query.toLowerCase()))??[]);
+ /**
+  * The listing as a folder tree. A path is split into its folders and its name; folders sort before
+  * files at every level, and the closed/open state is per folder path, so reopening the panel keeps
+  * nothing hidden that a person had opened. Searching keeps the flat, matching list: a match inside
+  * a closed folder would otherwise be invisible.
+  */
+ type TreeFile={readonly kind:'file';readonly path:string;readonly name:string;readonly bytes:number};
+ type TreeFolder={readonly kind:'folder';readonly path:string;readonly name:string;readonly children:TreeRow[];readonly files:number;readonly bytes:number};
+ type TreeRow=TreeFile|TreeFolder;
+ const collapsed=$state<Record<string,boolean>>({});
+ const tree=$derived.by(():TreeRow[]=>{
+   const roots:TreeFolder={kind:'folder',path:'',name:'',children:[],files:0,bytes:0};
+   const folders=new Map<string,TreeFolder>([['',roots]]);
+   for(const file of workspace?.files??[]){
+     const parts=file.path.split('/'),name=parts.pop() as string;
+     let parent=roots,at='';
+     for(const part of parts){
+       at=at===''?part:at+'/'+part;
+       let folder=folders.get(at);
+       if(folder===undefined){folder={kind:'folder',path:at,name:part,children:[],files:0,bytes:0};folders.set(at,folder);parent.children.push(folder);}
+       parent=folder;
+     }
+     parent.children.push({kind:'file',path:file.path,name,bytes:file.bytes});
+   }
+   const order=(rows:TreeRow[])=>[...rows].sort((left,right)=>left.kind===right.kind?left.name.localeCompare(right.name):left.kind==='folder'?-1:1);
+   const total=(folder:TreeFolder):{files:number;bytes:number}=>{
+     let count=0,size=0;
+     for(const child of folder.children){
+       if(child.kind==='file'){count+=1;size+=child.bytes;}
+       else{const inner=total(child);count+=inner.files;size+=inner.bytes;}
+     }
+     (folder as {files:number;bytes:number}).files=count;
+     (folder as {files:number;bytes:number}).bytes=size;
+     return {files:count,bytes:size};
+   };
+   const walk=(folder:TreeFolder)=>{(folder as {children:TreeRow[]}).children=order(folder.children);for(const child of folder.children)if(child.kind==='folder')walk(child);};
+   walk(roots);total(roots);
+   return roots.children;
+ });
+ function toggle(path:string){collapsed[path]=!collapsed[path];}
+ const size=(bytes:number)=>Math.ceil(bytes/1024)+' KB';
 </script>
 <aside class="workspace-sidebar" class:preview={selected!==''} aria-label="Project files and changes">
  <header><strong>Workspace</strong><button class="icon-button" aria-label="Close files and changes" onclick={onclose}><Icon name="close"/></button></header>
@@ -46,7 +87,26 @@
  </div>
  {:else if tab==='Files'}
  <input class="file-search" aria-label="Find project files" placeholder="Find a file…" bind:value={query}>
- <div class="file-list">{#each files as file}<button title={file.path} onclick={()=>void open(file.path)}>{file.path}<small>{Math.ceil(file.bytes/1024)} KB</small></button>{/each}{#if workspace&&!files.length}<p>No matching previewable files.</p>{/if}</div>
+ <div class="file-list">
+  {#if query!==''}
+  {#each files as file}<button title={file.path} onclick={()=>void open(file.path)}>{file.path}<small>{size(file.bytes)}</small></button>{/each}{#if workspace&&!files.length}<p>No matching previewable files.</p>{/if}
+  {:else}
+  {#snippet rows(list:TreeRow[],depth:number)}
+   {#each list as row (row.kind==='folder'?row.path:row.path)}
+   {#if row.kind==='folder'}
+   <button class="file-folder" style="--depth:{depth}" aria-expanded={!collapsed[row.path]} title={row.path} onclick={()=>toggle(row.path)}>
+    <span class="folder-mark" aria-hidden="true">{collapsed[row.path]?'▸':'▾'}</span><span class="folder-name">{row.name}</span><small>{row.files} · {size(row.bytes)}</small>
+   </button>
+   {#if !collapsed[row.path]}{@render rows(row.children,depth+1)}{/if}
+   {:else}
+   <button class="file-leaf" style="--depth:{depth}" title={row.path} onclick={()=>void open(row.path)}><span class="file-name">{row.name}</span><small>{size(row.bytes)}</small></button>
+   {/if}
+   {/each}
+  {/snippet}
+  {@render rows(tree,0)}
+  {#if workspace&&!tree.length}<p>No previewable files.</p>{/if}
+  {/if}
+ </div>
  {:else}
  <div class="file-list">
  {#if commit}<div class="history-head"><button onclick={()=>{commit='';commitPaths=[];}}>← Working changes</button><code>{commit.slice(0,8)}</code></div>{#each commitPaths as path}<button onclick={()=>void open(path,true)}>{path}</button>{/each}{#if !busy&&!commitPaths.length}<p>No previewable files in this commit.</p>{/if}
@@ -63,6 +123,9 @@
  .file-image{display:block;max-width:100%;max-height:70dvh;object-fit:contain;margin:auto}
  .workspace-sidebar{width:330px;min-width:0;flex-shrink:0;display:flex;flex-direction:column;background:var(--panel);border-left:1px solid var(--line);overflow:hidden;z-index:25}
  .workspace-sidebar.preview{width:min(650px,60vw)}header,.tabs,.preview-toolbar,.preview-actions,.history-head{display:flex;align-items:center;gap:8px;padding:8px 12px;border-bottom:1px solid var(--line)}header{justify-content:space-between}header strong{font-size:12px}.tabs button{font-size:12px}.tabs button[aria-selected=true]{background:var(--accent-soft);color:var(--accent)}.tabs small{margin-left:6px}.tabs .icon-button{margin-left:auto}
- .file-search{margin:10px;width:calc(100% - 20px)}.file-list,.preview-content{overflow:auto;flex:1;min-height:0}.file-list{padding:6px 10px}.file-list>button{display:flex;width:100%;gap:8px;text-align:left;overflow-wrap:anywhere;font:11px var(--mono);margin-bottom:4px;padding:9px}.file-list small{color:var(--muted);margin-left:auto;white-space:nowrap}.file-list h3{font-size:11px;margin:14px 0 8px}.file-list p,.preview-content p{color:var(--muted);font-size:12px;padding:8px}.commit-row span{font-family:var(--sans);min-width:0}.preview-toolbar strong{font:11px var(--mono);overflow-wrap:anywhere;min-width:0}.preview-toolbar button{flex-shrink:0}.preview-actions{flex-wrap:wrap}.preview-actions button{font-size:11px}.preview-content pre{margin:0;padding:12px;font:12px/1.6 var(--mono);white-space:pre;tab-size:2;min-width:max-content}.diff span{display:block;min-width:100%}.diff .added{background:color-mix(in srgb,var(--accent) 12%,transparent)}.diff .removed{background:color-mix(in srgb,var(--danger) 12%,transparent)}footer{border-top:1px solid var(--line);padding:10px;font:10px/1.5 var(--mono);color:var(--muted)}.error,.sidebar-message{padding:8px 12px;font-size:12px;overflow-wrap:anywhere}
+ .file-search{margin:10px;width:calc(100% - 20px)}
+ .file-list .file-folder,.file-list .file-leaf{display:flex;width:100%;gap:8px;align-items:baseline;text-align:left;overflow-wrap:anywhere;font:11px var(--mono);margin-bottom:2px;padding:7px 9px;padding-left:calc(9px + var(--depth,0) * 12px)}
+ .file-list .file-folder{background:transparent;border:0;color:var(--muted)}.file-list .file-folder .folder-name{color:var(--ink);font-weight:600}
+ .file-list .file-leaf .file-name{min-width:0}.file-list,.preview-content{overflow:auto;flex:1;min-height:0}.file-list{padding:6px 10px}.file-list>button{display:flex;width:100%;gap:8px;text-align:left;overflow-wrap:anywhere;font:11px var(--mono);margin-bottom:4px;padding:9px}.file-list small{color:var(--muted);margin-left:auto;white-space:nowrap}.file-list h3{font-size:11px;margin:14px 0 8px}.file-list p,.preview-content p{color:var(--muted);font-size:12px;padding:8px}.commit-row span{font-family:var(--sans);min-width:0}.preview-toolbar strong{font:11px var(--mono);overflow-wrap:anywhere;min-width:0}.preview-toolbar button{flex-shrink:0}.preview-actions{flex-wrap:wrap}.preview-actions button{font-size:11px}.preview-content pre{margin:0;padding:12px;font:12px/1.6 var(--mono);white-space:pre;tab-size:2;min-width:max-content}.diff span{display:block;min-width:100%}.diff .added{background:color-mix(in srgb,var(--accent) 12%,transparent)}.diff .removed{background:color-mix(in srgb,var(--danger) 12%,transparent)}footer{border-top:1px solid var(--line);padding:10px;font:10px/1.5 var(--mono);color:var(--muted)}.error,.sidebar-message{padding:8px 12px;font-size:12px;overflow-wrap:anywhere}
  @media(max-width:1100px){.workspace-sidebar,.workspace-sidebar.preview{position:absolute;right:0;top:0;bottom:0;width:min(650px,100%);box-shadow:var(--shadow)}}
 </style>
