@@ -7,7 +7,7 @@ import { randomUUID } from 'node:crypto';
 import { ControlStore } from '../../src/server/state/control-store';
 import { AgentStore } from '../../src/server/state/agent-store';
 import {
-  AGENT_BUDGET_BOUNDS, AGENT_SCOPES, AGENT_SCOPE_DESCRIPTIONS, AGENT_TOOL_SCOPES, AgentError, agentScopeVocabulary,
+  AGENT_BUDGET_BOUNDS, AGENT_MAX_SCOPES, AGENT_SCOPES, AGENT_SCOPE_DESCRIPTIONS, AGENT_TOOL_SCOPES, AgentError, agentScopeVocabulary,
   authorizeToolUse, decideScopeChange, parseAgentBudgets, parseAgentScopes, parseAgentWorkspace, projectScopeAllows, scopesInForceFor,
   type AgentActor, type AgentDraft, type AgentRecord, type AgentScope
 } from '../../src/shared/agent-registry';
@@ -58,7 +58,7 @@ async function refused(work: () => unknown, code: AgentError['code']): Promise<s
 
 test('the scope vocabulary is closed, described, and every scope governs at least one declared tool or is a stated capability', () => {
   // The vocabulary is exactly the documented set, and every scope carries one description.
-  assert.deepEqual([...AGENT_SCOPES], ['read_notes', 'record_note', 'ask_question', 'read_docs', 'write_docs', 'file_read', 'file_edit', 'run_tests', 'fork', 'accept', 'commit', 'push', 'deploy', 'spend', 'provision', 'publish']);
+  assert.deepEqual([...AGENT_SCOPES], ['read_notes', 'record_note', 'ask_question', 'read_docs', 'write_docs', 'file_read', 'file_write', 'file_edit', 'shell', 'run_tests', 'fork', 'accept', 'commit', 'push', 'deploy', 'spend', 'provision', 'publish']);
   for (const scope of AGENT_SCOPES) {
     assert.equal(typeof AGENT_SCOPE_DESCRIPTIONS[scope], 'string');
     assert.ok(AGENT_SCOPE_DESCRIPTIONS[scope].length > 10, scope + ' has a real description');
@@ -71,7 +71,7 @@ test('the scope vocabulary is closed, described, and every scope governs at leas
   // action registry and the acceptance record name (fork, accept, commit, push, deploy, spend,
   // provision, publish) — none is a label with nothing behind it.
   const toolScopes = new Set(Object.values(AGENT_TOOL_SCOPES));
-  for (const scope of ['read_notes', 'record_note', 'ask_question', 'read_docs', 'write_docs', 'file_read', 'file_edit', 'run_tests'] as AgentScope[]) {
+  for (const scope of ['read_notes', 'record_note', 'ask_question', 'read_docs', 'write_docs', 'file_read', 'file_write', 'file_edit', 'shell', 'run_tests'] as AgentScope[]) {
     assert.ok(toolScopes.has(scope), scope + ' governs a declared tool');
   }
 });
@@ -443,7 +443,7 @@ test('the scope list is canonical, bounded and duplicate-free, and an oversize r
     assert.deepEqual([...parseAgentScopes([])], []);
     assert.deepEqual([...parseAgentScopes(['publish', 'commit', 'read_notes'])], ['read_notes', 'commit', 'publish']);
     assert.equal(parseAgentScopes(AGENT_SCOPES.map((scope) => scope)).length, AGENT_SCOPES.length, 'the whole vocabulary is the documented maximum, and it is accepted');
-    assert.throws(() => parseAgentScopes(Array.from({ length: 17 }, () => 'read_notes' as AgentScope)), (error: Error) => error instanceof AgentError);
+    assert.throws(() => parseAgentScopes(Array.from({ length: AGENT_MAX_SCOPES + 1 }, () => 'read_notes' as AgentScope)), (error: Error) => error instanceof AgentError);
     assert.throws(() => parseAgentScopes('read_notes'), (error: Error) => error instanceof AgentError);
     // Every agent is one control-store operation per revision: the record is bounded JSON.
     const record = f.agents.create({ draft: f.draft({ description: 'x'.repeat(400) }), actor: OWNER });

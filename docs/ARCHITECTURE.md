@@ -24,9 +24,14 @@ Three surfaces over one project's own files, plus derived state that can be rebu
    and app-managed paths are excluded from ordinary browsing. The canonical plan has an
    explicit, schema-validated Wiki bridge; source snapshots retain their existing read-only
    source-reference route. Reads and writes are size-capped.
-4. **The agent harness is the only execution surface.** There is no shell endpoint and no
-   general file API. Agent tools resolve their paths through the same containment helper, so a
-   registered project root is the boundary for question/note and documentation/planning tools.
+4. **The agent harness is the execution surface for models.** No HTTP route runs a command and
+   there is no general file API: a model reaches a file only through a tool, and every tool resolves
+   its paths through the same containment helper, so a registered project root is the boundary for
+   question/note, documentation/planning and coding tools alike. The coding tools are installed only
+   when the instance switches them on, are offered to an agent only when its allowlist grants the
+   matching scope, and are documented as what they are: `read` and `write` stay inside the
+   connected worktree, the shell is not contained and reaches everything the application user can
+   reach. See [Coding tools](specs/coding-tools.md).
    Planning tools reuse the documentation and revision-checked board stores; see
    [Agent planning tools](PLANNING-TOOLS.md). Repository
    setup is a separate fixed-operation provisioning path (keygen, access check, clone and

@@ -27,6 +27,8 @@ export class RepositoryStore {
  constructor(private root:string,private command:RepositoryCommand=async(file,args,options)=>exec(file,args,options)){}
  isConnecting(id:string){return this.connecting.has(id);}
  isConnected(p:Project){return p.path===join(this.root,'repositories',p.id,'agent');}
+ /** The connected worktree root, or undefined: the one path a coding tool may be rooted at. */
+ worktreePath(p:Project){return this.isConnected(p)?p.path:undefined;}
  private id(id:string){return z.string().uuid().parse(id);}
  private async serial<T>(id:string,work:()=>Promise<T>){
   this.id(id);const before=this.tails.get(id)??Promise.resolve(),next=before.catch(()=>{}).then(work);this.tails.set(id,next);

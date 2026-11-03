@@ -811,10 +811,18 @@ test('DEFECT2a: the scope vocabulary reports which scopes have an installed tool
   assert.ok(uninstalled.includes('spend'), 'spend is uninstalled');
   assert.ok(uninstalled.includes('provision'), 'provision is uninstalled');
   assert.ok(uninstalled.includes('publish'), 'publish is uninstalled');
-  // Verify the total count: 16 scopes, 3 installed + 1 conditional (file_edit behind switch)
-  assert.equal(vocab.length, 16, 'there are exactly 16 scopes');
-  // file_edit is NOT installed by default (switch is off)
-  assert.ok(uninstalled.includes('file_edit'), 'file_edit is uninstalled by default (switch off)');
+  // Verify the total count: 18 scopes, 3 always installed, and 4 behind the instance switches
+  // (file_edit, and the coding tools read/write plus the shell).
+  assert.equal(vocab.length, 18, 'there are exactly 18 scopes');
+  // Every switched capability has NO installed tool by default.
+  for (const scope of ['file_edit', 'file_read', 'file_write', 'shell'] as const)
+    assert.ok(uninstalled.includes(scope), scope + ' is uninstalled by default (its switch is off)');
+  // With the switches on, exactly those four become installed, and nothing else changes.
+  const withCoding = agentScopeVocabulary({ fileEdit: true, fileRead: true, fileWrite: true, shell: true });
+  const nowInstalled = withCoding.filter(s => s.installed).map(s => s.scope);
+  for (const scope of ['file_edit', 'file_read', 'file_write', 'shell'] as const)
+    assert.ok(nowInstalled.includes(scope), scope + ' is installed when its switch is on');
+  assert.equal(nowInstalled.length, installed.length + 4, 'the switches install exactly four tools and no more');
 });
 
 test('DEFECT2b: an agent whose scope is granted but whose tool is not installed gets a 503 from the agent registry endpoint', async () => {
@@ -865,7 +873,14 @@ test('DEFECT2d: the agent prompt section lists only tools it can actually call',
   assert.ok(installed.includes('read_docs'), 'read_docs is installed');
   assert.ok(installed.includes('write_docs'), 'write_docs is installed');
   assert.ok(!installed.includes('file_read'), 'file_read is NOT in installedAgentScopes');
+  assert.ok(!installed.includes('file_write'), 'file_write is NOT in installedAgentScopes');
+  assert.ok(!installed.includes('shell'), 'shell is NOT in installedAgentScopes');
   assert.ok(!installed.includes('run_tests'), 'run_tests is NOT in installedAgentScopes');
+  // The coding capabilities are per switch, and the shell is separable from read/write.
+  const coding = installedAgentScopes({ fileRead: true, fileWrite: true });
+  assert.ok(coding.includes('file_read') && coding.includes('file_write'));
+  assert.ok(!coding.includes('shell'), 'read and write do not install a shell');
+  assert.ok(installedAgentScopes({ shell: true }).includes('shell'));
   // file_edit is NOT in the default installed list (switch off)
   assert.ok(!installed.includes('file_edit'), 'file_edit is NOT in installedAgentScopes when switch off');
 });

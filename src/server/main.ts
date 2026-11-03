@@ -82,7 +82,7 @@ export type ReleasePromotionObservation =
   | {readonly state:'unreadable';readonly reason:string};
 /** What the running service reports about itself, and the one read-only seam that answers for promotion. */
 export interface ReleaseReportOptions {readonly version:string;readonly source:'manifest'|'unreleased-local';readonly buildId?:string;readonly sourceDigest?:string;readonly observe:()=>ReleasePromotionObservation}
-export interface AppOptions {repositoryCommand?:RepositoryCommand;dataRoot:string;browseRoots:string[];security:SecurityConfig;allowedHosts?:readonly string[];clientRoot?:string;registry?:string;agents?:'on'|'off';agentPauseMs?:number;recordNoteDelayMs?:number;recordNoteAfterWriteMs?:number;recordNoteStarted?:()=>void;readNotesSeam?:{delayMs?:number;onExecute?:()=>void};alertTransport?:AlertTransport;alertSubject?:string;alertCooldownMs?:number;readiness?:ReadinessOptions;control?:ControlStore;runner?:{readonly enabled?:boolean;readonly port?:RunnerPort};fileEdit?:{readonly enabled?:boolean};release?:ReleaseReportOptions;workerOpenDelayMs?:number;acceptanceFauxWorkerDelayMs?:number;onModelRequest?:(input:{provider:string;modelId:string;maxTokens:number})=>void;workerProbe?:{tool:string;args:Record<string,unknown>};workerProbeDelayMs?:number;workerGuard?:(input:{projectId:string;runId:string;tool:string})=>string|null;workerRequestGuard?:(input:{projectId:string;runId:string})=>string|null;onWorkerGuard?:(input:{tool:string;refusal:string|null})=>void}
+export interface AppOptions {repositoryCommand?:RepositoryCommand;coding?:{readonly enabled?:boolean;readonly shell?:boolean};dataRoot:string;browseRoots:string[];security:SecurityConfig;allowedHosts?:readonly string[];clientRoot?:string;registry?:string;agents?:'on'|'off';agentPauseMs?:number;recordNoteDelayMs?:number;recordNoteAfterWriteMs?:number;recordNoteStarted?:()=>void;readNotesSeam?:{delayMs?:number;onExecute?:()=>void};alertTransport?:AlertTransport;alertSubject?:string;alertCooldownMs?:number;readiness?:ReadinessOptions;control?:ControlStore;runner?:{readonly enabled?:boolean;readonly port?:RunnerPort};fileEdit?:{readonly enabled?:boolean};release?:ReleaseReportOptions;workerOpenDelayMs?:number;acceptanceFauxWorkerDelayMs?:number;onModelRequest?:(input:{provider:string;modelId:string;maxTokens:number})=>void;workerProbe?:{tool:string;args:Record<string,unknown>};workerProbeDelayMs?:number;workerGuard?:(input:{projectId:string;runId:string;tool:string})=>string|null;workerRequestGuard?:(input:{projectId:string;runId:string})=>string|null;onWorkerGuard?:(input:{tool:string;refusal:string|null})=>void}
 /**
  * Approvals answer with a status that says what happened: an invalid request is 422, an approval
  * outside the caller's scope is 403, a missing one is 404, a storage fault is 500, and every
@@ -507,6 +507,11 @@ export async function createApp(options:AppOptions){
   const agentHolder:{store?:AgentStore}={};
   const fileEditModeHolder:{mode:()=>FileEditMode}={mode:()=>'propose-only'};
   const fileEditEnabled=options.fileEdit?.enabled??process.env.DASHBOARD_FILE_EDIT==='on';
+  // The coding tools are opt-in per instance, and the shell has its own switch: a build that offers
+  // `read` and `write` does not thereby offer arbitrary commands. `DASHBOARD_SHELL=on` without
+  // coding tools enables nothing, because a shell with no worktree root is refused instead of run.
+  const codingToolsEnabled=options.coding?.enabled??process.env.DASHBOARD_CODING_TOOLS==='on';
+  const shellEnabled=codingToolsEnabled&&(options.coding?.shell??process.env.DASHBOARD_SHELL==='on');
   const fileEdit=options.control&&fileEditEnabled?new FileEditTool(options.control,{
     enabled:true,
     // The connected repository worktree is the registered project's own folder and nothing else.
@@ -522,6 +527,10 @@ export async function createApp(options:AppOptions){
   // The agent harness is the only execution surface. It is off unless the instance enables it explicitly.
   const agents=new HarnessHost({
     dataRoot:options.dataRoot,providers,delivery,lifecycle:lifecycleHooks, docs, boards, workspace,projectGate:assertProjectAvailable,
+    // The coding tools, with the two switches that decide whether they exist at all. `root` answers
+    // only for a project whose repository is connected: without a worktree there is nothing to bind
+    // a path to, so no coding tool is installed for that project.
+    coding:{enabled:codingToolsEnabled,shell:shellEnabled,root:id=>{const found=catalog.projects.find(candidate=>candidate.id===id);return found===undefined?undefined:repositories.worktreePath(found);}},
     recovery:lifecycle?{read:(projectId,sessionId)=>{const record=lifecycle.read(projectId,sessionId);return {state:record.state,uncertain:record.uncertain,requestId:record.requestId};}}:undefined,
     enabled:(options.agents??(process.env.DASHBOARD_AGENTS==='on'?'on':'off'))==='on',
     pauseMs:options.agentPauseMs??Number(process.env.DASHBOARD_AGENT_PAUSE_MS??2500),
@@ -1539,7 +1548,7 @@ export async function createApp(options:AppOptions){
           if(!agentStore)throw new HttpError(503,'The agent registry is unavailable: no durable control store is open on this instance');
           try{
             if(path==='/api/agents'){
-              if(req.method==='GET'){json({agents:agentStore.list(),scopes:agentScopeVocabulary(fileEdit!==undefined&&fileEdit.enabled),models:agentStore.offeredModels(),fileEdit:{enabled:fileEdit!==undefined&&fileEdit.enabled,mode:fileEdit===undefined||!fileEdit.enabled?null:await fileEdit.mode()}});return;}
+              if(req.method==='GET'){json({agents:agentStore.list(),scopes:agentScopeVocabulary({fileEdit:fileEdit!==undefined&&fileEdit.enabled,fileRead:codingToolsEnabled,fileWrite:codingToolsEnabled,shell:shellEnabled}),models:agentStore.offeredModels(),fileEdit:{enabled:fileEdit!==undefined&&fileEdit.enabled,mode:fileEdit===undefined||!fileEdit.enabled?null:await fileEdit.mode()}});return;}
               if(req.method==='POST'){
                 const body=parseBody(z.strictObject({draft:z.unknown(),actor:z.unknown()}),payload,'The agent request');
                 json({agent:agentStore.create({draft:body.draft,actor:body.actor})},201);return;

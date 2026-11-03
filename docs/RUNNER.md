@@ -265,11 +265,10 @@ results and limits. This local check does not verify any remote deployment.
   environment for this work, not as a hardened multi-tenant execution service. The application is still
   single-owner, with no roles and no rate limiting.
 
-### One frozen inconsistency, stated rather than hidden
+### Two execution surfaces, both opt-in
 
-`docs/ARCHITECTURE.md` invariant 4 says "the agent harness is the only execution surface", and
-`docs/SECURITY.md` says there is no general shell or file API. Both predate this step and are now
-**incomplete**: the bounded runner is a second execution surface — bounded by the allowlist, the
-containment and the limits above, and enabled only by explicit operator action. Those two files are
-outside this step's file boundary and were deliberately left unmodified; this page is the current
-statement of what the runner is and is not.
+The runner is one: jobs are bounded by the allowlist, the containment and the limits above, and it
+exists only under explicit operator action. The agent's own coding tools are the other, documented
+in [Coding tools](specs/coding-tools.md): `read`/`write` bounded to the connected worktree, and a
+shell that is deliberately **not** contained. `docs/ARCHITECTURE.md` invariant 4 and
+`docs/SECURITY.md` now state both, so neither file claims a boundary this build does not hold.

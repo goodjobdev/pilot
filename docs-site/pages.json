@@ -50,5 +50,9 @@
   {
     "source": "docs/specs/repository-updates.md",
     "slug": "specs/repository-updates"
+  },
+  {
+    "source": "docs/specs/coding-tools.md",
+    "slug": "specs/coding-tools"
   }
 ]

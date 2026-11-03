@@ -430,8 +430,12 @@ Provider credentials and model preferences are configured through **Providers & 
 Project deploy keys and review worktrees are configured through **Board actions → Repository
 & deploy key**. See [Provider sign-in](PROVIDER-SIGNIN.md) and
 [Project connections](PROJECT-CONNECTIONS.md) for storage, revocation and backup limitations.
-The container includes Git and OpenSSH for fixed provisioning and, in the unreleased update,
-explicit owner-reviewed repository updates; it still has no general coding tools. Git 2.39+
+The container includes Git and OpenSSH for fixed provisioning, for the owner-reviewed repository
+updates, and — only when `DASHBOARD_CODING_TOOLS=on` (and `DASHBOARD_SHELL=on` for commands) —
+for the agent's own coding tools. Those switches are the operator's decision, per instance, and
+the per-agent scopes are the owner's: see [Coding tools](specs/coding-tools.md). Read the
+credential warning there before enabling the shell, because it is the same user as the
+application and is not contained. Git 2.39+
 is required for the safe merge preview. These features do not change the Access application,
 tunnel policy, credential layout or storage schema. No dependency install or push occurs in
 a project update. Transient reviews disappear on restart and cannot be replayed; an

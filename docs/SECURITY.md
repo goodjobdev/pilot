@@ -21,7 +21,7 @@ assumes, and what it does not protect, so you can decide whether that fits.
 | Path escape | One containment helper refuses absolute paths, `..` and symlinks; generated and app-managed paths are excluded from ordinary browsing; the canonical plan uses a validated Wiki bridge and source snapshots use their existing read-only source-reference route |
 | Resource abuse | Read and write size caps, a document-count cap, a bounded subscription list, and bounded search/inbox scans |
 | Untrusted rendering | Markdown is sanitised; assets are limited to images and static HTML/SVG; mockups render in a sandboxed frame with no scripts and no same-origin access; a strict Content-Security-Policy covers the application |
-| Agent execution | No general shell/file API exists. Agent tools include bounded documentation/planning operations. Fixed Git/SSH-keygen provisioning installs or pushes nothing. Documentation saves separately attempt path-scoped local commits only on the project Pilot branch, with hooks, filters, signing and network disabled; no branch switch, push or merge |
+| Agent execution | No HTTP route runs a command. Agent tools are the bounded documentation/planning operations by default. The coding tools are opt-in twice — an instance switch (`DASHBOARD_CODING_TOOLS`, then `DASHBOARD_SHELL`) and the agent's own scope (`file_read`, `file_write`, `shell`) — and `read`/`write` stay inside the connected worktree. The shell is **not** contained and reaches everything the application user can reach. Fixed Git/SSH-keygen provisioning installs or pushes nothing. Documentation saves separately attempt path-scoped local commits only on the project Pilot branch, with hooks, filters, signing and network disabled; no branch switch, push or merge |
 | Owner-reviewed remote updates (unreleased) | Explicit deploy-key fetch and exact incoming/result review, followed by a one-use confirmed update of the managed Pilot branch. Refuses active/uncertain work, dirty/staged paths, ignored collisions, unsafe transitions and invalid plans. No agent Git scope, push, rebase, stash, reset or install; restart invalidates transient reviews |
 | Credentials | Provider credentials and project deploy keys live outside project roots in 0600 files/0700 folders, excluded from ordinary backups; settings reads return status/public keys only. Login and Git failures do not echo raw credential response bodies or command output |
 | Host escape | The container drops all capabilities, runs non-root with a read-only root filesystem, has no Docker socket and no host mounts |
@@ -35,8 +35,13 @@ assumes, and what it does not protect, so you can decide whether that fits.
   run the application in a container rather than on a workstation.
 - **Same-container shell access.** Secrets are not encrypted at rest. Code running as the
   application user can read provider credentials and deploy keys; these are not per-agent
-  sandboxes. Write deploy keys are repository-scoped, not branch-scoped. Use provider budgets,
-  GitHub repository rules and a separate execution boundary before enabling general shell tools.
+  sandboxes. **The agent's shell tool is exactly that code**: with `DASHBOARD_SHELL=on` and the
+  `shell` scope granted, a model can read the credentials directory, every other project's files
+  and the durable control store, and it can run `git push` if the repository's deploy key has write
+  access. Grant it only where you accept that, keep write deploy keys off unless pushing is
+  intended, and use provider budgets and GitHub repository rules. Write deploy keys are
+  repository-scoped, not branch-scoped. The contained alternative is the bounded runner, which is
+  network-free and mount-limited but is not an interactive shell.
 - **Multi-user abuse.** There is one owner, no roles, no quotas and no rate limiting. It is not
   multi-tenant.
 - **Backups.** An archive captures `catalog.json`, the documentation, media, settings, agent

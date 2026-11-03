@@ -19,13 +19,21 @@ content by globbing the documentation tree.
 
 ## Execution surface
 
-- **The agent harness is the only execution surface.** There is no general-purpose shell,
-  command or file API. Agent tools run inside a registered project's own workspace and
-  nowhere else. Tools include questions/notes, contained documentation reads and revision-checked
-  planning board updates, not a general coding suite.
+- **The agent harness is the execution surface for models.** No HTTP endpoint runs a command.
+  Agent tools run inside a registered project's own workspace and nowhere else. The default set is
+  questions/notes, contained documentation reads and revision-checked planning board updates.
+- **The coding tools are opt-in twice.** `read` and `write` are installed only when the instance
+  sets `DASHBOARD_CODING_TOOLS=on`, `bash` only when `DASHBOARD_SHELL=on` as well, and each is
+  offered to an agent only when that agent's allowlist grants `file_read`, `file_write` or `shell`.
+  `read` and `write` resolve every path against the project's **connected repository worktree** and
+  refuse anything outside it; a symlink that leaves the worktree cannot be read through them. The
+  shell is **not contained**: it runs as the application user, so it can reach every project, the
+  durable control store and the unencrypted credentials. Never describe it as sandboxed, and never
+  add a command-pattern list that implies a guarantee this code cannot keep. Read
+  `docs/specs/coding-tools.md` before changing any of it.
 - Repository connection is a narrow provisioning exception: fixed Git/SSH-keygen operations,
-  explicit owner action, one managed worktree, no hooks/install/commit/push. There is still no
-  arbitrary command endpoint. See `docs/PROJECT-CONNECTIONS.md` before changing it.
+  explicit owner action, one managed worktree, no hooks/install/commit/push. See
+  `docs/PROJECT-CONNECTIONS.md` before changing it.
 - Documentation saves have a separate, narrow local-history exception: fixed, path-scoped
   commits on the project Pilot branch, with hooks/filters/network disabled. Never push, merge,
   switch branches or sweep unrelated staged files. See `docs/PLAN-SYNC.md`.
@@ -35,8 +43,8 @@ content by globbing the documentation tree.
   data, refuse active/uncertain work and invalid plans, and never push, stash, reset,
   rebase, install, or grant an agent a Git tool. Read `docs/specs/repository-updates.md`.
 - Provider and deploy-key secrets live outside project roots under `<data>/credentials/`;
-  do not return them in views or logs. Same-UID shell execution would be able to read them:
-  do not claim this is per-agent isolation or enable coding tools by accident.
+  do not return them in views or logs. The coding tools, including the shell, run as that same
+  user: granting the shell grants reach to those files, and no part of this code claims otherwise.
 - Documentation assets are read-only and limited to images and static HTML/SVG mockups,
   served with `nosniff` and, for HTML/SVG, a sandboxing Content-Security-Policy with no
   script source. Never add a route that serves arbitrary file types.

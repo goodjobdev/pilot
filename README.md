@@ -149,7 +149,11 @@ exactly once.
   multi-tenant and there is no rate limiting.
 - **The agent harness is code execution.** Agent tools are bounded to a project's workspace,
   but a project you register is a directory the agent may write to. Run it in a container,
-  not on a workstation.
+  not on a workstation. The optional coding tools are off unless the instance enables them
+  (`DASHBOARD_CODING_TOOLS=on`, and `DASHBOARD_SHELL=on` for commands) and an agent is granted
+  the matching scope. `read` and `write` stay inside the connected worktree; the shell is **not
+  contained** and can reach the whole data volume, including the stored credentials. See
+  [Coding tools](docs/specs/coding-tools.md).
 - **The backup script covers documentation and working state, not credentials.** The archive
   captures `catalog.json`, the agent session databases, the durable control store
   (`control.sqlite`), managed projects' boards and documents, media, and settings. For an

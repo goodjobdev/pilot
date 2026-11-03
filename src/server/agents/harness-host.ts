@@ -16,7 +16,8 @@ import { abortableDelay } from './abortable';
 import { selectWorkerPreSubmitDelay } from '../agent-test-seams';
 import { modelAcceptsImages } from '../../shared/images';
 import { projectStoredImage } from './image-projection';
-import { authorizeToolUse, installedAgentScopes, unavailableAgentScopes, scopeToolIsInstalled, type AgentPrivilegePort, type AgentScope, type DispatchAuthority } from '../../shared/agent-registry';
+import { authorizeToolUse, installedAgentScopes, unavailableAgentScopes, scopeToolIsInstalled, type AgentPrivilegePort, type AgentScope, type DispatchAuthority, type InstalledCapabilities } from '../../shared/agent-registry';
+import { codingTools } from './coding-tools';
 import { FILE_EDIT_MAX_FILE_BYTES, FILE_EDIT_MAX_PATH_LENGTH, type FileEditCapability } from '../state/file-edit-tool';
 import { agentViewFrom, type AgentQuestion, type AgentView } from '../../shared/agent';
 import type { Project } from '../../shared/model';
@@ -588,6 +589,14 @@ export interface HarnessHostOptions {
   /** How long a [pause] message holds the run open, in milliseconds. */
   pauseMs?: number;
   /**
+   * The coding tools: `read` and `write` rooted at the project's connected repository worktree, and
+   * `bash` behind its own switch. Absent, disabled, or given no root for this project, none of them
+   * is installed and this harness behaves exactly as it did before they existed. `root` returns
+   * undefined for a project whose repository is not connected, because there is no worktree to
+   * bound a path to and no honest way to offer `read` without one.
+   */
+  coding?: { readonly enabled: boolean; readonly shell: boolean; readonly root: (projectId: string) => string | undefined };
+  /**
    * Test-only windows around `record_note`'s append. They are reachable only through the harness
    * options (and the test environment), never through a model's tool arguments. Leave unset in
    * production wiring: `0` or absent means no wait.
@@ -697,7 +706,8 @@ function permittedTools(extensions: readonly Extension[], scopes: readonly Agent
  * at all, however the call was crafted. Its section tells the model what its allowlist holds, so a
  * well-behaved model never attempts what would be refused.
  */
-function privilegeExtension(project: Project, authorityOf: (sessionId: string) => Promise<DispatchAuthority>, fileEditEnabled?: boolean) {
+function privilegeExtension(project: Project, authorityOf: (sessionId: string) => Promise<DispatchAuthority>, capabilities: InstalledCapabilities) {
+  const fileEditEnabled = capabilities.fileEdit === true;
   return defineExtension({
     name: 'agent-privileges',
     sections: [section('agent-privileges', async (input) => {
@@ -708,19 +718,25 @@ function privilegeExtension(project: Project, authorityOf: (sessionId: string) =
         return 'No agent is bound to this session, so the owner\u2019s own dispatch is in force: no agent allowlist narrows these tools. Bind an agent to a session to run it under an explicit allowlist.';
       if (authority.scopes.length === 0)
         return 'This dispatch has no privilege scopes in force, so every tool is refused at dispatch. ' + (authority.emptyReason ?? 'No agent is bound.') + ' Do not attempt one.';
-      const baseInstalled = installedAgentScopes();
-      // file_edit is installable but behind a switch: include it only when enabled.
-      const fileEditAvailable = fileEditEnabled === true && authority.scopes.includes('file_edit');
-      const installed = fileEditAvailable ? [...baseInstalled, 'file_edit' as const] : baseInstalled;
-      const available = authority.scopes.filter((s) => (installed as readonly string[]).includes(s));
-      const unavailable = authority.scopes.filter((s) => !(installed as readonly string[]).includes(s));
-      const fileEditNote = authority.scopes.includes('file_edit') && !fileEditAvailable
-        ? ' The file_edit scope is granted but this instance has it disabled. A configuration change and process restart are required to install it. Existing conversations can retain their previous tool selection.' : '';
+      // The capability switches decide which tools exist at all; the allowlist decides which of the
+      // existing ones this dispatch may call. Both are stated, so a model never guesses.
+      const granted = authority.scopes;
+      const installed = installedAgentScopes(capabilities);
+      const available = granted.filter((s) => (installed as readonly string[]).includes(s));
+      const unavailable = granted.filter((s) => !(installed as readonly string[]).includes(s));
+      const switchNote = (scope: AgentScope, on: boolean, what: string) => granted.includes(scope) && !on
+        ? ' The ' + scope + ' scope is granted but this instance has ' + what + ' disabled. A configuration change and process restart are required to install it. Existing conversations can retain their previous tool selection.' : '';
+      const fileEditNote = switchNote('file_edit', fileEditEnabled, 'the bounded file-edit tool')
+        + switchNote('file_read', capabilities.fileRead === true, 'the coding tools')
+        + switchNote('file_write', capabilities.fileWrite === true, 'the coding tools')
+        + switchNote('shell', capabilities.shell === true, 'the shell tool');
+      const codingNote = capabilities.shell === true && granted.includes('shell')
+        ? ' The shell tool runs as the application user and is not contained: it can reach other projects, the durable store and the stored credentials. Keep commands inside the project worktree and commit deliberately.' : '';
       const availLine = available.length > 0 ? ' Its scopes with an installed tool are: ' + available.join(', ') + '.' : ' None of its scopes has an installed tool in this build.';
       const unavailLine = unavailable.length > 0 ? ' The following scopes are granted but have NO installed tool in this build and cannot be used: ' + unavailable.join(', ') + '.' : '';
-      const uninstalledAll = unavailableAgentScopes().filter((s) => s.scope !== 'file_edit');
+      const uninstalledAll = unavailableAgentScopes(capabilities).filter((s) => !['file_edit', 'file_read', 'file_write', 'shell'].includes(s.scope));
       const uninstalledLine = uninstalledAll.length > 0 ? ' Scopes without an installed tool in this build: ' + uninstalledAll.map((s) => s.scope).join(', ') + '. They are declared in the vocabulary but the agent cannot call them.' : '';
-      const scopeLine = 'This dispatch runs as an agent' + (authority.agentId === null ? '' : ' (' + authority.agentId + ')') + '.' + availLine + unavailLine + fileEditNote + uninstalledLine + ' A tool outside the granted scopes is refused at dispatch with no effect, so do not attempt one.';
+      const scopeLine = 'This dispatch runs as an agent' + (authority.agentId === null ? '' : ' (' + authority.agentId + ')') + '.' + availLine + unavailLine + fileEditNote + codingNote + uninstalledLine + ' A tool outside the granted scopes is refused at dispatch with no effect, so do not attempt one.';
       const projectLine = authority.projects === null ? '' : ' Its project scope is the explicit set ' + authority.projects.join(', ') + ', so a call that acts on any other project is refused at dispatch with no effect.';
       return scopeLine + projectLine;
     }, { tag: false })],
@@ -1134,6 +1150,11 @@ export class HarnessHost {
           };
         })
       });
+      // The coding tools, built before the extension list so the privilege section and the registry
+      // describe the same instance: read and write are bounded to the worktree, bash is not contained
+      // and exists only behind its own switch.
+      const codingRoot = this.options.coding?.enabled === true ? this.options.coding.root(project.id) : undefined;
+      const coding = codingRoot === undefined ? null : codingTools({ root: codingRoot, shell: this.options.coding?.shell === true });
       const question = questionExtension();
       const notes = notesExtension(project, { beforeWriteMs: this.options.recordNoteDelayMs, afterWriteMs: this.options.recordNoteAfterWriteMs, onExecute: this.options.recordNoteStarted }, { delayMs: this.options.readNotesDelayMs, onExecute: this.options.readNotesStarted },this.options.workspace);
       // The scopes in force are read once here, so the tools the model is offered are the permitted
@@ -1150,7 +1171,12 @@ export class HarnessHost {
         catch { return { agentId: null, scopes: [], projects: [], emptyReason: 'The conversation authority could not be verified.' }; }
       };
       const fileEditEnabled = this.options.fileEdit?.enabled === true;
-      const privileges = privilegeExtension(project, authorityOf, fileEditEnabled);
+      const privileges = privilegeExtension(project, authorityOf, {
+        fileEdit: fileEditEnabled,
+        fileRead: coding !== null,
+        fileWrite: coding !== null,
+        shell: coding !== null && this.options.coding?.shell === true
+      });
       // Installed once, statically, and selected by every conversation. Its durable marker decides
       // whether it applies, so no unregistered dynamic extension carries the worker role.
       const workerRole = workerRoleExtension(project, this.options);
@@ -1158,13 +1184,18 @@ export class HarnessHost {
       const extensions: Extension[] = [question, notes, planning, privileges, recoveryGuard.extension, recoveryBoundary, workerRole].map(guardTools);
       const registry = createRegistry();
       for (const extension of extensions) registry.install(extension);
+      if (coding !== null) {
+        const tools = guardTools(coding.extension);
+        extensions.push(tools);
+        registry.install(tools);
+      }
       const fileEdit = this.options.fileEdit;
       if (fileEdit !== undefined && fileEdit.enabled) {
         const edits = guardTools(fileEditExtension(project, fileEdit, authorityOf));
         extensions.push(edits);
         registry.install(edits);
       }
-      const harness = await Harness.open(storage, { models, registry,settings:{retry:{enabled:false},stream:{maxRetries:0,timeoutMs:120000},compaction:{enabled:false}} }, BACKGROUND_CONTEXT);
+      const harness = await Harness.open(storage, { models, registry,settings:{retry:{enabled:false},stream:{maxRetries:0,timeoutMs:120000},compaction:{enabled:false}},...(coding === null ? {} : { env: coding.env as never }) }, BACKGROUND_CONTEXT);
       const initial=await this.options.providers?.defaultModel();
       // Only the permitted tools are enabled for an agent, so the model is never offered one its
       // scopes forbid. The owner's own dispatch passes no filter at all and is unchanged.

@@ -61,9 +61,9 @@ branch-scoped**: a write key is not technically limited to the review branch.
 Use repository rules for main protection.
 
 Keys are not encrypted at rest. A shell-capable agent in the same container
-could read them. Current default tools include bounded documentation reads and planning
-updates, not a general coding suite. Adding general coding tools needs an execution-boundary
-review and is not done by connecting a repository.
+could read them. Connecting a repository installs no coding tool by itself: `read`, `write` and
+`bash` exist only when the instance switches them on and the agent holds the matching scope, and
+only the shell reaches the keys. See [Coding tools](specs/coding-tools.md).
 
 ## Owner-reviewed remote updates (unreleased)
 

@@ -35,7 +35,7 @@ export const AGENT_WORKSPACE_SUBPATH_MAX_LENGTH = 400;
 /** One instance cannot grow an unbounded registry. */
 export const AGENT_MAX_AGENTS = 200;
 /** One agent can never name more scopes than the closed vocabulary holds. */
-export const AGENT_MAX_SCOPES = 16;
+export const AGENT_MAX_SCOPES = 18;
 
 /**
  * The closed scope vocabulary. A scope is a capability, not a label: an agent has exactly the scopes
@@ -48,7 +48,9 @@ export const AGENT_SCOPES = [
   'read_docs',
   'write_docs',
   'file_read',
+  'file_write',
   'file_edit',
+  'shell',
   'run_tests',
   'fork',
   'accept',
@@ -69,7 +71,9 @@ export const AGENT_SCOPE_DESCRIPTIONS: Readonly<Record<AgentScope, string>> = Ob
   read_docs: 'Browse project Markdown documents and read the planning board.',
   write_docs: 'Create or update planning tasks, dependencies and milestones.',
   file_read: 'Read a file inside the project\u2019s connected repository worktree.',
+  file_write: 'Create or replace a file inside the project\u2019s connected repository worktree. This writes directly: the acceptance policy in force does not gate it.',
   file_edit: 'Propose or apply one bounded edit to a file inside the project\u2019s connected repository worktree.',
+  shell: 'Run a shell command inside the project\u2019s connected repository worktree. It runs as the application user and is not contained: it can reach every project, the durable control store and the stored credentials.',
   run_tests: 'Submit a bounded coding job from the fixed recipe allowlist.',
   fork: 'Branch a transcript and create a child worktree.',
   accept: 'Accept a completion record under the acceptance policy in force.',
@@ -118,22 +122,46 @@ export const AGENT_TOOL_SCOPES: Readonly<Record<string, AgentScope>> = Object.fr
   read_board: 'read_docs',
   write_board: 'write_docs',
   file_read: 'file_read',
+  file_write: 'file_write',
   file_edit: 'file_edit',
+  shell: 'shell',
   run_tests: 'run_tests'
 });
+/**
+ * The capability set a build may install tools for, as the interface, the harness and the worker
+ * validation all read it: the instance switches decided at startup. A capability that is off has
+ * no installed tool, whatever an agent's allowlist says, and the vocabulary reports that.
+ *
+ * `file_write` writes directly and `shell` runs arbitrary commands, so neither is gated by the
+ * acceptance policy: the policy governs the bounded `file_edit` tool only. Granting them is the
+ * deliberate act that makes the agent as capable as a person at a terminal in the container.
+ */
+export interface InstalledCapabilities {
+  readonly fileEdit?: boolean;
+  readonly fileRead?: boolean;
+  readonly fileWrite?: boolean;
+  readonly shell?: boolean;
+}
 /** Whether a scope whose tool this build declares is also one it actually installs. */
-export function scopeToolIsInstalled(scope: AgentScope, fileEditEnabled = false): boolean {
+export function scopeToolIsInstalled(scope: AgentScope, capabilities: InstalledCapabilities | boolean = {}): boolean {
+  const caps: InstalledCapabilities = typeof capabilities === 'boolean' ? { fileEdit: capabilities } : capabilities;
   const installed = Object.values(AGENT_DEFAULT_INSTALLED_TOOLS) as readonly AgentScope[];
-  return installed.includes(scope) || (scope === 'file_edit' && fileEditEnabled);
+  if (installed.includes(scope)) return true;
+  // The read/write/shell tools come from the coding-tool extension: read and write together, and
+  // shell only behind its own switch, because a shell is not contained by anything this build does.
+  if (scope === 'file_read') return caps.fileRead === true;
+  if (scope === 'file_write') return caps.fileWrite === true;
+  if (scope === 'shell') return caps.shell === true;
+  return scope === 'file_edit' && caps.fileEdit === true;
 }
 /** The scopes this build actually installs tools for, in vocabulary order. */
-export function installedAgentScopes(): readonly AgentScope[] {
-  return Object.freeze(AGENT_SCOPES.filter((scope) => scopeToolIsInstalled(scope)));
+export function installedAgentScopes(capabilities: InstalledCapabilities | boolean = {}): readonly AgentScope[] {
+  return Object.freeze(AGENT_SCOPES.filter((scope) => scopeToolIsInstalled(scope, capabilities)));
 }
 /** The scopes this build declares but does NOT install a tool for, in vocabulary order. */
-export function unavailableAgentScopes(): readonly { readonly scope: AgentScope; readonly description: string; readonly reason: string }[] {
+export function unavailableAgentScopes(capabilities: InstalledCapabilities | boolean = {}): readonly { readonly scope: AgentScope; readonly description: string; readonly reason: string }[] {
   return Object.freeze(AGENT_SCOPES
-    .filter((scope) => !scopeToolIsInstalled(scope))
+    .filter((scope) => !scopeToolIsInstalled(scope, capabilities))
     .map((scope) => Object.freeze({ scope, description: AGENT_SCOPE_DESCRIPTIONS[scope], reason: 'No tool is installed for this scope in this build' })));
 }
 
@@ -610,8 +638,8 @@ export function decideScopeChange(input: {
 }
 
 /** The closed vocabulary as the interface reads it: each scope beside the one line that describes it and whether a tool is installed for it. */
-export function agentScopeVocabulary(fileEditEnabled = false): readonly { readonly scope: AgentScope; readonly description: string; readonly installed: boolean }[] {
-  return Object.freeze(AGENT_SCOPES.map((scope) => Object.freeze({ scope, description: AGENT_SCOPE_DESCRIPTIONS[scope], installed: scopeToolIsInstalled(scope, fileEditEnabled) })));
+export function agentScopeVocabulary(capabilities: InstalledCapabilities | boolean = {}): readonly { readonly scope: AgentScope; readonly description: string; readonly installed: boolean }[] {
+  return Object.freeze(AGENT_SCOPES.map((scope) => Object.freeze({ scope, description: AGENT_SCOPE_DESCRIPTIONS[scope], installed: scopeToolIsInstalled(scope, capabilities) })));
 }
 
 /** One entry of the durable audit trail: what changed, by whom, and when. */
