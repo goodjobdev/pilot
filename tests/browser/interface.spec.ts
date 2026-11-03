@@ -105,3 +105,25 @@ test('the thinking level is chosen per session and reported back by the server',
  await expect.poll(async()=>await page.evaluate(async()=>{const token=document.querySelector('meta[name="dashboard-token"]')?.getAttribute('content')??'';const project=new URL(location.href).searchParams.get('project')??'';const view=await (await fetch('/api/projects/'+project+'/agents',{headers:{'x-dashboard-token':token}})).json();return view.view.thinkingLevel;})).toBe('high');
  await picker.selectOption('');await expect(picker).toHaveValue('');
 });
+
+test('the harness settings are the owner’s, apply without a restart, and cannot turn a tool on that the deployment lacks',async({page})=>{
+ await fixture(page,'Harness settings fixture');
+ await page.getByRole('button',{name:'Harness settings',exact:true}).click();
+ const dialog=page.getByRole('dialog');await expect(dialog.getByRole('heading',{name:'Harness',exact:true})).toBeVisible();
+ const turns=dialog.getByLabel('Most model requests in a row for one message');
+ await expect(turns).toHaveValue('40');
+ await turns.fill('300');
+ await dialog.getByLabel('Thinking level for a new conversation').selectOption('medium');
+ await dialog.getByRole('button',{name:'Save harness settings'}).click();
+ await expect(dialog.getByRole('status')).toContainText('no restart');
+ // The server is the authority: a fresh read reports what was saved.
+ await expect.poll(async()=>await page.evaluate(async()=>{const token=document.querySelector('meta[name="dashboard-token"]')?.getAttribute('content')??'';const view=await (await fetch('/api/settings/harness',{headers:{'x-dashboard-token':token}})).json();return JSON.stringify([view.settings.preferences.maxModelTurns,view.settings.preferences.defaultThinking,view.revision]);})).toBe('[300,"medium",2]');
+ // This browser server runs without the capability switches, so the boxes are disabled and each
+ // says why. The narrowing path — a capability the deployment offers, switched off here — is
+ // exercised against an instance that really offers them in tests/server/harness-settings-http.test.ts.
+ const shell=dialog.getByLabel('Shell (bash)');
+ await expect(shell).toBeDisabled();
+ await expect(dialog.locator('[data-capability-state="shell"]')).toContainText('Not offered by this deployment');
+ const coding=dialog.getByLabel('Coding tools (read, write)');
+ await expect(coding).toBeDisabled();
+});

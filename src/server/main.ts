@@ -22,6 +22,7 @@ import { Catalog } from './catalog';
 import { ProviderStore } from './providers';
 import { RepositoryStore,type RepositoryCommand } from './repositories';
 import { ATTACHMENT_MAX_BYTES,AttachmentStore,type StoredAttachment } from './attachments';
+import { HarnessSettingsStore } from './harness-settings-store';
 import { RemoteStore } from './remote';
 import { browse,within } from './paths';
 import { authorize,headers,establishSession,type SecurityConfig } from './security';
@@ -50,7 +51,7 @@ import { harnessWorkerPort } from './workers/harness-port';
 import { WorkerError, WORKER_LIMITS, WORKER_SCOPES } from '../shared/workers';
 import { FileEditTool, FileEditError, type FileEditMode } from './state/file-edit-tool';
 import { AgentError, agentScopeVocabulary } from '../shared/agent-registry';
-import { MESSAGE_MAX_CHARS, THINKING_LEVELS } from '../shared/agent';
+import { MAX_MODEL_TURNS_CEILING, MAX_MODEL_TURNS_DEFAULT, MESSAGE_MAX_CHARS, THINKING_LEVELS } from '../shared/agent';
 import { WorkerModelPolicyError, type WorkerModelOption, type WorkerModelPolicyView } from '../shared/model-policy';
 import { WORKER_MODEL_POLICY_READBACK_UNCERTAIN } from '../shared/model-policy-codes';
 import { modelKey } from '../shared/settings';
@@ -84,7 +85,7 @@ export type ReleasePromotionObservation =
   | {readonly state:'unreadable';readonly reason:string};
 /** What the running service reports about itself, and the one read-only seam that answers for promotion. */
 export interface ReleaseReportOptions {readonly version:string;readonly source:'manifest'|'unreleased-local';readonly buildId?:string;readonly sourceDigest?:string;readonly observe:()=>ReleasePromotionObservation}
-export interface AppOptions {repositoryCommand?:RepositoryCommand;maxModelTurns?:number;coding?:{readonly enabled?:boolean;readonly shell?:boolean};dataRoot:string;browseRoots:string[];security:SecurityConfig;allowedHosts?:readonly string[];clientRoot?:string;registry?:string;agents?:'on'|'off';agentPauseMs?:number;recordNoteDelayMs?:number;recordNoteAfterWriteMs?:number;recordNoteStarted?:()=>void;readNotesSeam?:{delayMs?:number;onExecute?:()=>void};alertTransport?:AlertTransport;alertSubject?:string;alertCooldownMs?:number;readiness?:ReadinessOptions;control?:ControlStore;runner?:{readonly enabled?:boolean;readonly port?:RunnerPort};fileEdit?:{readonly enabled?:boolean};release?:ReleaseReportOptions;workerOpenDelayMs?:number;acceptanceFauxWorkerDelayMs?:number;onModelRequest?:(input:{provider:string;modelId:string;maxTokens:number})=>void;workerProbe?:{tool:string;args:Record<string,unknown>};workerProbeDelayMs?:number;workerGuard?:(input:{projectId:string;runId:string;tool:string})=>string|null;workerRequestGuard?:(input:{projectId:string;runId:string})=>string|null;onWorkerGuard?:(input:{tool:string;refusal:string|null})=>void}
+export interface AppOptions {repositoryCommand?:RepositoryCommand;maxModelTurns?:number;harnessSettings?:HarnessSettingsStore;coding?:{readonly enabled?:boolean;readonly shell?:boolean};dataRoot:string;browseRoots:string[];security:SecurityConfig;allowedHosts?:readonly string[];clientRoot?:string;registry?:string;agents?:'on'|'off';agentPauseMs?:number;recordNoteDelayMs?:number;recordNoteAfterWriteMs?:number;recordNoteStarted?:()=>void;readNotesSeam?:{delayMs?:number;onExecute?:()=>void};alertTransport?:AlertTransport;alertSubject?:string;alertCooldownMs?:number;readiness?:ReadinessOptions;control?:ControlStore;runner?:{readonly enabled?:boolean;readonly port?:RunnerPort};fileEdit?:{readonly enabled?:boolean};release?:ReleaseReportOptions;workerOpenDelayMs?:number;acceptanceFauxWorkerDelayMs?:number;onModelRequest?:(input:{provider:string;modelId:string;maxTokens:number})=>void;workerProbe?:{tool:string;args:Record<string,unknown>};workerProbeDelayMs?:number;workerGuard?:(input:{projectId:string;runId:string;tool:string})=>string|null;workerRequestGuard?:(input:{projectId:string;runId:string})=>string|null;onWorkerGuard?:(input:{tool:string;refusal:string|null})=>void}
 /**
  * Approvals answer with a status that says what happened: an invalid request is 422, an approval
  * outside the caller's scope is 403, a missing one is 404, a storage fault is 500, and every
@@ -517,12 +518,18 @@ export async function createApp(options:AppOptions){
   // How many model requests one dispatch may make in a row. Bounded, refused if out of range rather
   // than clamped: a bound that silently became another number would be worse than a failed start.
   const maxModelTurns=(()=>{
-    const raw=options.maxModelTurns??Number(process.env.DASHBOARD_MAX_MODEL_TURNS??40);
-    if(!Number.isSafeInteger(raw)||raw<1||raw>100)throw new Error('DASHBOARD_MAX_MODEL_TURNS must be a whole number from 1 to 100');
+    const raw=options.maxModelTurns??Number(process.env.DASHBOARD_MAX_MODEL_TURNS??MAX_MODEL_TURNS_DEFAULT);
+    if(!Number.isSafeInteger(raw)||raw<1||raw>MAX_MODEL_TURNS_CEILING)throw new Error('DASHBOARD_MAX_MODEL_TURNS must be a whole number from 1 to '+MAX_MODEL_TURNS_CEILING);
     return raw;
   })();
   const codingToolsEnabled=options.coding?.enabled??process.env.DASHBOARD_CODING_TOOLS==='on';
   const shellEnabled=codingToolsEnabled&&(options.coding?.shell??process.env.DASHBOARD_SHELL==='on');
+  /**
+   * The owner's harness settings: the turn bound and the default thinking level, and a disable-only
+   * word on each capability. The deployment flags above stay the ceiling; this can only narrow them.
+   */
+  const harnessSettings=options.harnessSettings??new HarnessSettingsStore(catalog.root,
+    {codingTools:codingToolsEnabled,shell:shellEnabled,fileEdit:fileEditEnabled},maxModelTurns);
   const fileEdit=options.control&&fileEditEnabled?new FileEditTool(options.control,{
     enabled:true,
     // The connected repository worktree is the registered project's own folder and nothing else.
@@ -538,6 +545,8 @@ export async function createApp(options:AppOptions){
   // The agent harness is the only execution surface. It is off unless the instance enables it explicitly.
   const agents=new HarnessHost({
     dataRoot:options.dataRoot,providers,delivery,lifecycle:lifecycleHooks, docs, boards, workspace,projectGate:assertProjectAvailable,maxModelTurns,
+    allowedCapabilities:()=>harnessSettings.view().then(view=>({codingTools:view.effective.capabilities.codingTools.enabled,shell:view.effective.capabilities.shell.enabled,fileEdit:view.effective.capabilities.fileEdit.enabled})),
+    defaultThinking:()=>harnessSettings.defaultThinking(),
     // The coding tools, with the two switches that decide whether they exist at all. `root` answers
     // only for a project whose repository is connected: without a worktree there is nothing to bind
     // a path to, so no coding tool is installed for that project.
@@ -1035,6 +1044,15 @@ export async function createApp(options:AppOptions){
         // candidate the durable store says is promoted. Read-only, authenticated, path-free.
         if(path==='/api/release'&&req.method==='GET'){json(releaseView());return;}
         if(path==='/api/settings/providers'&&req.method==='GET'){json(await providers.view());return;}
+        // The harness settings: what an owner changes here rather than in a container's environment.
+        if(path==='/api/settings/harness'){
+          if(req.method==='GET'){json(await harnessSettings.view());return;}
+          if(req.method==='POST'){
+            const body=parseBody(z.strictObject({revision:z.unknown(),settings:z.unknown()}),payload,'The harness settings request');
+            json(await harnessSettings.update({revision:body.revision,settings:body.settings}));return;
+          }
+          throw new HttpError(405,'Method not allowed');
+        }
         if(path==='/api/settings/models'&&req.method==='POST'){json(await providers.savePreferences(payload));return;}
         // The owner-only worker model policy. The route derives the owner from the authenticated
         // session and accepts no actor in the body. Saving it opens no harness and dispatches nothing.
@@ -1559,7 +1577,7 @@ export async function createApp(options:AppOptions){
           if(!agentStore)throw new HttpError(503,'The agent registry is unavailable: no durable control store is open on this instance');
           try{
             if(path==='/api/agents'){
-              if(req.method==='GET'){json({agents:agentStore.list(),scopes:agentScopeVocabulary({fileEdit:fileEdit!==undefined&&fileEdit.enabled,fileRead:codingToolsEnabled,fileWrite:codingToolsEnabled,shell:shellEnabled}),models:agentStore.offeredModels(),fileEdit:{enabled:fileEdit!==undefined&&fileEdit.enabled,mode:fileEdit===undefined||!fileEdit.enabled?null:await fileEdit.mode()}});return;}
+              if(req.method==='GET'){json({agents:agentStore.list(),scopes:agentScopeVocabulary(await harnessSettings.view().then(view=>({fileEdit:view.effective.capabilities.fileEdit.enabled,fileRead:view.effective.capabilities.codingTools.enabled,fileWrite:view.effective.capabilities.codingTools.enabled,shell:view.effective.capabilities.shell.enabled}))),models:agentStore.offeredModels(),fileEdit:{enabled:fileEdit!==undefined&&fileEdit.enabled,mode:fileEdit===undefined||!fileEdit.enabled?null:await fileEdit.mode()}});return;}
               if(req.method==='POST'){
                 const body=parseBody(z.strictObject({draft:z.unknown(),actor:z.unknown()}),payload,'The agent request');
                 json({agent:agentStore.create({draft:body.draft,actor:body.actor})},201);return;
@@ -1593,6 +1611,7 @@ export async function createApp(options:AppOptions){
         const fileEditRoute=path.match(/^\/api\/projects\/([a-f0-9-]{36})\/file-edits$/);
         if(fileEditRoute){
           if(!fileEdit)throw new HttpError(503,'The bounded file-edit capability is disabled on this instance: set DASHBOARD_FILE_EDIT=on before a file is proposed or written');
+          if(!await harnessSettings.capability('fileEdit'))throw new HttpError(409,'The file-edit capability is switched off in this instance\u2019s harness settings. An owner turns it back on in Harness settings; nothing was proposed or written.');
           catalog.get(fileEditRoute[1]);
           try{
             if(req.method==='GET'){json(await fileEdit.view(fileEditRoute[1]));return;}
@@ -1979,7 +1998,7 @@ export async function createApp(options:AppOptions){
     for(const stream of streams)stream.end();
     await Promise.all([httpClosed,...Array.from(streams,stream=>stream.done)]);
     if(streamFailures.length)throw streamFailures[0];
-    await repositories.close();await boards.drain();await docs.drain();await agents.close();await workspace.drain();await providers.close();await catalog.close();}};
+    await harnessSettings.drain();await repositories.close();await boards.drain();await docs.drain();await agents.close();await workspace.drain();await providers.close();await catalog.close();}};
 }
 /** A server that cannot drain must not be able to hold the data root forever. */
 const DEFAULT_SHUTDOWN_DEADLINE_MS=10_000;

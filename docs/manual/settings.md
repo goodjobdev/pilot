@@ -75,6 +75,20 @@ The unreleased update groups actions under **Project**, **Planning**, **Workspac
 
 Dependencies, Timeline and List are views of the same plan. Search, area, status (`todo`/`doing`/`done`/`blocked`) and scope filters change presentation, not the underlying task definitions. **Reset** clears the area/status/scope selections, not the search text. Hidden prerequisites still affect readiness. Layout/trace controls do not create prerequisites. Undo/redo are local board-edit conveniences, not Git reset; adopting a changed external board clears stale undo history. None of these controls fetches remote files or deploys a project.
 
+## Harness settings (owner)
+
+**Harness** in the header holds what an owner changes in Pilot rather than in a container's
+environment:
+
+| Setting | Effect |
+| --- | --- |
+| Most model requests in a row for one message | 1–300. When the bound is reached the run stops, names it, and another message continues. Applies to the next request; no restart. |
+| Thinking level for a new conversation | `off` … `max`, or the host default. A session can still override it in the composer. |
+| Coding tools, Shell, Bounded file edit | Each is shown with **both** sides: what the deployment offers and what you allow. A capability can be switched **off** here and takes effect from the next call; switching one **on** stays a deployment switch, because it decides whether the tool exists in the process at all. |
+
+Writes are revision-checked like every other edit: if the settings changed since you read them, the
+save is refused and nothing is written.
+
 ## Recovery-only controls
 
 When the project folder or board is missing, Pilot can offer **Locate folder** or **Confirm & initialize board**. Initialization creates a new file exclusively; it is not a repair that overwrites an existing board. Export retained drafts before changing location or reloading a conflicting edit.

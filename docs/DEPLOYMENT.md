@@ -433,7 +433,10 @@ Project deploy keys and review worktrees are configured through **Board actions 
 The container includes Git and OpenSSH for fixed provisioning, for the owner-reviewed repository
 updates, and — only when `DASHBOARD_CODING_TOOLS=on` (and `DASHBOARD_SHELL=on` for commands) —
 for the agent's own coding tools. Those switches are the operator's decision, per instance, and
-the per-agent scopes are the owner's: see [Coding tools](specs/coding-tools.md). Read the
+the per-agent scopes are the owner's: see [Coding tools](specs/coding-tools.md). Once a deployment
+offers a capability, an owner can switch it **off** in Pilot's **Harness** settings without a
+restart; switching one on is still this deployment switch. The turn bound and the default thinking
+level also live there, with the environment value as the default for a fresh instance. Read the
 credential warning there before enabling the shell, because it is the same user as the
 application and is not contained. Git 2.39+
 is required for the safe merge preview. These features do not change the Access application,

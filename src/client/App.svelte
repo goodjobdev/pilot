@@ -21,6 +21,7 @@
  import AgentManager from './AgentManager.svelte';
  import WorkersPanel from './WorkersPanel.svelte';
  import WorkspaceSidebar from './WorkspaceSidebar.svelte';
+import HarnessSettings from './HarnessSettings.svelte';
  import { PLAN_PATH,commitMessage } from '../shared/workspace';
  import { api,session,ApiError,download,whenSessionExpires } from './api';
  import { HistoryStack,isHomeScreen,isView,narrowView,parseRoute,sameRoute,urlForRoute,type RouteSnapshot,type View } from './navigation';
@@ -56,7 +57,7 @@
  let inbox=$state<{path:string;line:number;text:string;anchor:string|null;id:string}[]>([]),focusAnchor=$state<string|null>(null),inboxMenu=$state<HTMLDivElement>();
  let attentionCount=$state<number|null>(null),attentionCountComplete=$state(false),attentionChecked=$state(false),inboxRefresh=$state(0),attentionFocus=$state<string|null>(null),questionFocus=$state('');
  let alertState=$state<AlertState>('off'),alertBusy=$state(false),alertMessage=$state('');
- let sessionExpired=$state(false),providersOpen=$state(false),workersOpen=$state(false),connectionOpen=$state(false),agentManagerOpen=$state(false),agentsVersion=$state(0);
+ let sessionExpired=$state(false),providersOpen=$state(false),harnessOpen=$state(false),workersOpen=$state(false),connectionOpen=$state(false),agentManagerOpen=$state(false),agentsVersion=$state(0);
  let docPathSet=$derived(new Set(docs.map(d=>d.path)));
  let shell=$state<HTMLDivElement>();
  let unlinked=$derived(snapshot?snapshot.board.tasks.filter(t=>t.scope==='active'&&!t.archived&&specState(t,docPathSet)==='unlinked').length:0);
@@ -87,7 +88,7 @@
      'dialog:settings':settings,
      'dialog:import':importing,
      'dialog:add':adding,
-     'dialog:providers':providersOpen,
+     'dialog:providers':providersOpen,'dialog:harness':harnessOpen,
      'dialog:agentManager':agentManagerOpen,
      'dialog:workers':workersOpen,
      'dialog:connection':connectionOpen,
@@ -112,6 +113,7 @@
      case 'dialog:import': if(open&&!project)return;importing=open;break;
      case 'dialog:add': adding=open;break;
      case 'dialog:providers': providersOpen=open;break;
+     case 'dialog:harness': harnessOpen=open;break;
      case 'dialog:agentManager': agentManagerOpen=open;break;
      case 'dialog:workers': if(open&&!project)return;workersOpen=open;break;
      case 'dialog:connection': if(open&&!project)return;connectionOpen=open;break;
@@ -503,6 +505,7 @@
    <button class="icon-button" aria-label="Agents and privileges" title="Agents &amp; privileges" onclick={()=>agentManagerOpen=true}><Icon name="agent"/></button>
    <button class="icon-button" aria-label="Workers" title="Bounded workers" disabled={!project} onclick={()=>workersOpen=true}><Icon name="graph"/></button>
    <button class="icon-button" aria-label="Providers & models" title="Providers & models" onclick={()=>providersOpen=true}><Icon name="settings"/></button>
+   <button class="icon-button" aria-label="Harness settings" title="Harness settings" onclick={()=>harnessOpen=true}><Icon name="graph"/></button>
    <button class="icon-button" onclick={()=>theme=theme==='dark'?'light':'dark'} aria-label="Toggle theme" title="Toggle light / dark theme"><Icon name={theme==='dark'?'sun':'moon'}/></button>
    {#if project}
    <div class="popover actions-popover" bind:this={actionsMenu}>
@@ -624,6 +627,7 @@
 {#if importing&&project}{#key project.id}<ImportReview projectId={project.id} repositoryMode={syncingPlan} onclose={closeImport.bind(null,project.id)} onapplied={imported.bind(null,project.id)}/>{/key}{/if}
 {#if adding}<AddProjectDialog onclose={()=>adding=false} oncreated={created}/>{/if}
 {#if providersOpen}<ProviderSettings onclose={()=>providersOpen=false}/>{/if}
+{#if harnessOpen}<HarnessSettings onclose={()=>harnessOpen=false}/>{/if}
 {#if agentManagerOpen}<AgentManager onclose={()=>agentManagerOpen=false} onchanged={()=>{agentsVersion+=1;const id=project?.id;if(id)void loadInbox();}}/>{/if}
 {#if workersOpen&&project}<WorkersPanel projectId={project.id} onclose={()=>workersOpen=false}/>{/if}
 {#if connectionOpen&&project}<ProjectConnection {project} onclose={()=>connectionOpen=false} onconnected={()=>void connected()}/>{/if}

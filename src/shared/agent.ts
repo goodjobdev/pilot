@@ -51,6 +51,13 @@ export type ThinkingLevel = (typeof THINKING_LEVELS)[number];
  * file in the worktree, which is a convenience rather than a limit.
  */
 export const MESSAGE_MAX_CHARS = 200000;
+/**
+ * The inclusive ceiling for how many model requests one dispatch may make in a row. The bound
+ * itself is an operator setting; this is the range any of them must fall inside.
+ */
+export const MAX_MODEL_TURNS_CEILING = 300;
+/** The bound an instance runs with when nothing sets it. */
+export const MAX_MODEL_TURNS_DEFAULT = 40;
 /** Past this, the interface offers to keep the text as a document instead of inline. */
 export const MESSAGE_DOCUMENT_THRESHOLD = 8000;
 

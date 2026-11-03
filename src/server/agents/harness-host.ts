@@ -28,7 +28,7 @@ import { applyOperation } from '../../shared/schema';
 import type { ProviderStore } from '../providers';
 import type { SessionLifecycleDispatchOutcome } from '../state/session-lifecycle';
 import type { ModelChoice } from '../../shared/settings';
-import type { ThinkingLevel } from '../../shared/agent';
+import { MAX_MODEL_TURNS_DEFAULT, type ThinkingLevel } from '../../shared/agent';
 
 export type AgentInputMode = 'followUp' | 'steer' | 'reject';
 /** One stored image attached to an input, as base64 and its sniffed type. */
@@ -598,6 +598,15 @@ export interface HarnessHostOptions {
    */
   coding?: { readonly enabled: boolean; readonly shell: boolean; readonly root: (projectId: string) => string | undefined };
   /**
+   * Whether the owner still allows each capability, read per tool call. A capability the deployment
+   * offers can be switched off in Pilot's harness settings, and that takes effect on the next call
+   * rather than at the next restart. Turning one back on needs the deployment switch: this answers
+   * only what the owner allows, never what the process was built with.
+   */
+  allowedCapabilities?: () => Promise<{ readonly codingTools: boolean; readonly shell: boolean; readonly fileEdit: boolean }>;
+  /** The thinking level a new conversation starts with, or null for the host's default. */
+  defaultThinking?: () => Promise<ThinkingLevel | null>;
+  /**
    * How many model requests one dispatch may make in a row before it stops for review. Resolved at
    * startup and stated in the refusal, so the bound a person meets is the bound the instance runs.
    */
@@ -712,7 +721,9 @@ function permittedTools(extensions: readonly Extension[], scopes: readonly Agent
  * at all, however the call was crafted. Its section tells the model what its allowlist holds, so a
  * well-behaved model never attempts what would be refused.
  */
-function privilegeExtension(project: Project, authorityOf: (sessionId: string) => Promise<DispatchAuthority>, capabilities: InstalledCapabilities) {
+/** Which capability governs which coding tool, for the per-call owner check. */
+const CAPABILITY_TOOLS: Readonly<Record<string, 'codingTools'|'shell'|'fileEdit'>> = Object.freeze({ read:'codingTools', write:'codingTools', bash:'shell', file_edit:'fileEdit' });
+function privilegeExtension(project: Project, authorityOf: (sessionId: string) => Promise<DispatchAuthority>, capabilities: InstalledCapabilities, allowedCapabilities?: () => Promise<{readonly codingTools:boolean;readonly shell:boolean;readonly fileEdit:boolean}>) {
   const fileEditEnabled = capabilities.fileEdit === true;
   return defineExtension({
     name: 'agent-privileges',
@@ -748,6 +759,16 @@ function privilegeExtension(project: Project, authorityOf: (sessionId: string) =
     }, { tag: false })],
     hooks: [hook(ToolTask, {
       beforeTool: async (call, api) => {
+        // The owner's own harness settings, checked per call: a capability switched off in Pilot is
+        // refused from the next call, with the reason naming where the change belongs.
+        const capability=CAPABILITY_TOOLS[call.name];
+        if(capability!==undefined&&allowedCapabilities!==undefined){
+          let allowed=true;
+          try{allowed=(await allowedCapabilities())[capability];}
+          catch{allowed=false;}
+          if(!allowed)return { block: 'The '+capability+' capability is switched off in this instance\u2019s harness settings, so the '+call.name+' tool is refused at dispatch with no effect. An owner turns it back on in Harness settings; a deployment that was built without it cannot be changed there.' };
+        }
+
         // The per-call authority: a binding or scope change takes effect at the next tool call with
         // no restart, because this reads the durable record rather than anything captured earlier.
         const authority = await authorityOf(String(api.conversationId));
@@ -1065,7 +1086,7 @@ export class HarnessHost {
               // assistant messages since the last input, so sending another message continues.
               let turns=0;
               for(const message of [...context.messages].reverse()){if(message.role==='user')break;if(message.role==='assistant')turns++;}
-              if(turns>=(this.options.maxModelTurns ?? 40))throw new HttpError(409,'Pilot stopped after '+(this.options.maxModelTurns ?? 40)+' model turns in a row for one message. Nothing is lost: the work so far is in the transcript, and sending another message continues from here. An operator can raise the bound with DASHBOARD_MAX_MODEL_TURNS.');
+              if(turns>=(this.options.maxModelTurns ?? MAX_MODEL_TURNS_DEFAULT))throw new HttpError(409,'Pilot stopped after '+(this.options.maxModelTurns ?? MAX_MODEL_TURNS_DEFAULT)+' model turns in a row for one message. Nothing is lost: the work so far is in the transcript, and sending another message continues from here. An operator can raise the bound with DASHBOARD_MAX_MODEL_TURNS.');
             }
             const maxTokens=Math.min(options?.maxTokens??4096,4096);
             // The worker boundary. The role marker is in the worker system prompt; the guard is the
@@ -1186,7 +1207,7 @@ export class HarnessHost {
         fileRead: coding !== null,
         fileWrite: coding !== null,
         shell: coding !== null && this.options.coding?.shell === true
-      });
+      }, this.options.allowedCapabilities);
       // Installed once, statically, and selected by every conversation. Its durable marker decides
       // whether it applies, so no unregistered dynamic extension carries the worker role.
       const workerRole = workerRoleExtension(project, this.options);
@@ -1210,8 +1231,10 @@ export class HarnessHost {
       // Only the permitted tools are enabled for an agent, so the model is never offered one its
       // scopes forbid. The owner's own dispatch passes no filter at all and is unchanged.
       const permitted = permittedTools(extensions, authority.scopes);
+      const rootThinking=this.options.defaultThinking===undefined?null:await this.options.defaultThinking().catch(()=>null);
       const conversation = await harness.root(BACKGROUND_CONTEXT, { agent: {
         model: initial??{ provider: provider.provider.id, modelId: provider.getModel().id },
+        ...(rootThinking===null?{}:{thinkingLevel:rootThinking}),
         extensions,
         ...(permitted === undefined ? {} : { tools: permitted })
       } });
@@ -1547,9 +1570,10 @@ export class HarnessHost {
       const rootAgent = await hosted.conversation.agent(BACKGROUND_CONTEXT);
       const authority = await this.dispatchAuthority(project, sessionId);
       const tools = permittedTools(hosted.extensions, authority.scopes);
+      const startThinking=this.options.defaultThinking===undefined?null:await this.options.defaultThinking().catch(()=>null);
       const conversation = await hosted.harness.createConversation({
         ownership: { kind: 'ownerless' },
-        agent: { model: rootAgent.model, extensions: hosted.extensions, ...(tools === undefined ? {} : { tools }) }
+        agent: { model: rootAgent.model, extensions: hosted.extensions, ...(startThinking===null?{}:{thinkingLevel:startThinking}), ...(tools === undefined ? {} : { tools }) }
       }, BACKGROUND_CONTEXT);
       if (resolver) {
         // On a concurrent-writer conflict, refuse: never return a conversation that was not durably bound.
