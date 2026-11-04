@@ -17,10 +17,22 @@ export { MAX_MODEL_TURNS_CEILING };
  *   effective state is the deployment switch **and** this setting, never either alone.
  */
 export const HARNESS_SETTINGS_VERSION = 1 as const;
+/**
+ * The inclusive ceiling for how many tokens one model request may produce, and the bound an instance
+ * runs with when nothing sets it.
+ *
+ * The old build capped every request at 4,096 tokens, which is far below what these models do: a
+ * reasoning level above `off` spends that same budget before the answer starts, so an answer could
+ * be cut off — and so could a long tool call, whose arguments are output too.
+ */
+export const MAX_OUTPUT_TOKENS_CEILING = 128000;
+export const MAX_OUTPUT_TOKENS_DEFAULT = 32000;
 
 export interface HarnessPreferences {
   /** How many model requests one dispatch may make in a row. */
   readonly maxModelTurns: number;
+  /** How many tokens one model request may produce, reasoning included. */
+  readonly maxOutputTokens: number;
   /** The thinking level a new conversation starts with, or null for the host's default. */
   readonly defaultThinking: ThinkingLevel | null;
 }
@@ -35,10 +47,10 @@ export interface HarnessSettings {
   readonly capabilities: HarnessCapabilityIntent;
 }
 
-export function defaultHarnessSettings(maxModelTurns: number): HarnessSettings {
+export function defaultHarnessSettings(maxModelTurns: number, maxOutputTokens = MAX_OUTPUT_TOKENS_DEFAULT): HarnessSettings {
   return Object.freeze({
     version: HARNESS_SETTINGS_VERSION,
-    preferences: Object.freeze({ maxModelTurns, defaultThinking: null }),
+    preferences: Object.freeze({ maxModelTurns, maxOutputTokens, defaultThinking: null }),
     capabilities: Object.freeze({ codingTools: true, shell: true, fileEdit: true })
   });
 }
@@ -47,6 +59,7 @@ const settingsSchema = z.strictObject({
   version: z.literal(HARNESS_SETTINGS_VERSION),
   preferences: z.strictObject({
     maxModelTurns: z.number().int().min(1).max(MAX_MODEL_TURNS_CEILING),
+    maxOutputTokens: z.number().int().min(1).max(MAX_OUTPUT_TOKENS_CEILING),
     defaultThinking: z.enum(THINKING_LEVELS).nullable()
   }),
   capabilities: z.strictObject({
@@ -88,6 +101,7 @@ export interface HarnessSettingsView {
   readonly settings: HarnessSettings;
   readonly effective: {
     readonly maxModelTurns: number;
+    readonly maxOutputTokens: number;
     readonly defaultThinking: ThinkingLevel | null;
     readonly capabilities: HarnessCapabilities;
   };

@@ -9,6 +9,7 @@ import {fauxProvider,fauxAssistantMessage,fauxToolCall} from '@earendil-works/pi
 import type {Provider} from '@earendil-works/pi-ai';
 import type {Project} from '../../src/shared/model';
 import {randomUUID} from 'node:crypto';
+import { MAX_OUTPUT_TOKENS_DEFAULT } from '../../src/shared/harness-settings';
 const root=()=>mkdtemp(join(tmpdir(),'pilot-providers-'));
 async function eventually(check:()=>Promise<boolean>){for(let i=0;i<100;i++){if(await check())return;await new Promise(ok=>setTimeout(ok,25));}throw Error('Timed out');}
 
@@ -102,7 +103,9 @@ test('UI-driven login prompts are one-use, cancellable, and never return stored 
 
 test('real-model selection drives the harness with explicit opt-in, persists, and never falls back to faux',async()=>{
  const directory=await root(),fake=fauxProvider({provider:'test-real',models:[{id:'test-model'}]});
- fake.setResponses([(_context,options)=>{assert.equal(options?.maxTokens,4096);return fauxAssistantMessage('Selected provider reply');}]);
+ // The request carries the instance's own output bound, which is what the person can change in
+ // Harness settings; it is no longer a hard 4,096 for every model.
+ fake.setResponses([(_context,options)=>{assert.equal(options?.maxTokens,MAX_OUTPUT_TOKENS_DEFAULT);return fauxAssistantMessage('Selected provider reply');}]);
  const store=new ProviderStore(directory,[fake.provider]),host=new HarnessHost({dataRoot:directory,enabled:true,providers:store});
  const project:Project={id:randomUUID(),name:'Disposable',managed:true,path:directory,repository:'',created:new Date().toISOString()};
  try{

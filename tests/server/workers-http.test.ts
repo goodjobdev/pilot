@@ -1,4 +1,5 @@
 import { test } from 'node:test';
+import { MAX_OUTPUT_TOKENS_DEFAULT } from '../../src/shared/harness-settings';
 import assert from 'node:assert/strict';
 import { appendFile, mkdtemp, readFile, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -345,7 +346,7 @@ test('workers: the legacy open-window seam cancels before a request, and Faux pr
     const finished = await waitForRun(f, projectRecord.id, second.id);
     assert.equal(finished.state, 'completed');
     assert.ok(requests.length >= 1);
-    assert.ok(requests.every((request) => request.maxTokens === 4096));
+    assert.ok(requests.every((request) => request.maxTokens === MAX_OUTPUT_TOKENS_DEFAULT));
     assert.equal(requests[0].provider, 'faux');
   } finally { await f.close(); }
 });
@@ -383,7 +384,7 @@ test('workers: configured Faux acceptance delay is cancellable after durable bin
     const finished = await waitForRun(f, projectRecord.id, second.id);
     assert.equal(finished.state, 'completed');
     assert.equal(requests.length >= 1, true);
-    assert.ok(requests.every((request) => request.maxTokens === 4096), 'the synthetic provider is bounded to 4096 output tokens');
+    assert.ok(requests.every((request) => request.maxTokens === MAX_OUTPUT_TOKENS_DEFAULT), 'the synthetic provider is bounded to the instance default');
     assert.equal(requests[0].provider, 'faux');
   } finally { await f.close(); }
 });
@@ -443,7 +444,7 @@ test('workers: the ninth model request is refused at the real provider boundary'
     assert.equal(settled.report, null);
     assert.match(settled.reason ?? '', /eight-model-request budget/);
     assert.equal(requests.length, 8, 'exactly eight provider requests were made; the ninth was refused before the call');
-    assert.ok(requests.every((request) => request.maxTokens === 4096));
+    assert.ok(requests.every((request) => request.maxTokens === MAX_OUTPUT_TOKENS_DEFAULT));
   } finally { await f.close(); }
 });
 

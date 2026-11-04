@@ -29,6 +29,7 @@ import type { ProviderStore } from '../providers';
 import type { SessionLifecycleDispatchOutcome } from '../state/session-lifecycle';
 import type { ModelChoice } from '../../shared/settings';
 import { MAX_MODEL_TURNS_DEFAULT, type ThinkingLevel } from '../../shared/agent';
+import { MAX_OUTPUT_TOKENS_DEFAULT } from '../../shared/harness-settings';
 
 export type AgentInputMode = 'followUp' | 'steer' | 'reject';
 /** One stored image attached to an input, as base64 and its sniffed type. */
@@ -617,6 +618,8 @@ export interface HarnessHostOptions {
    * startup and stated in the refusal, so the bound a person meets is the bound the instance runs.
    */
   maxModelTurns?: number;
+  /** How many tokens one model request may produce. Read per request; see the note at its use. */
+  maxOutputTokens?: () => Promise<number>;
   /**
    * Test-only windows around `record_note`'s append. They are reachable only through the harness
    * options (and the test environment), never through a model's tool arguments. Leave unset in
@@ -1094,7 +1097,14 @@ export class HarnessHost {
               for(const message of [...context.messages].reverse()){if(message.role==='user')break;if(message.role==='assistant')turns++;}
               if(turns>=(this.options.maxModelTurns ?? MAX_MODEL_TURNS_DEFAULT))throw new HttpError(409,'Pilot stopped after '+(this.options.maxModelTurns ?? MAX_MODEL_TURNS_DEFAULT)+' model turns in a row for one message. Nothing is lost: the work so far is in the transcript, and sending another message continues from here. An operator can raise the bound with DASHBOARD_MAX_MODEL_TURNS.');
             }
-            const maxTokens=Math.min(options?.maxTokens??4096,4096);
+            // How much output one request may produce. The bound is the instance's, read here so a
+            // change applies at the next request; a caller that states its own smaller bound still
+            // wins. Reasoning is spent from this same budget, which is why the old 4,096 cut answers
+            // off at a higher thinking level and truncated long tool-call arguments mid-JSON.
+            const bound=this.options.maxOutputTokens===undefined
+              ?MAX_OUTPUT_TOKENS_DEFAULT
+              :await this.options.maxOutputTokens().catch(()=>MAX_OUTPUT_TOKENS_DEFAULT);
+            const maxTokens=Math.min(options?.maxTokens??bound,bound);
             // The worker boundary. The role marker is in the worker system prompt; the guard is the
             // durable run/worker/policy/revocation check. A refusal returns a terminal assistant error
             // and never calls the provider. The ninth request is refused here, before the call.

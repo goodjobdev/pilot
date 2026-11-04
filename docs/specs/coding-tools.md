@@ -73,6 +73,8 @@ vocabulary the interface reads reports both facts per scope.
 | AC-6 | A project without a connected worktree installs no coding tool. |
 | AC-7 | The interface reports the capability per scope, and the shell's own description says it is not contained. |
 | AC-8 | A dispatch whose allowlist lacks the scope is refused at dispatch even though the tool is installed. |
+| AC-9 | A connected worktree under the data root is writable; a project rooted in the application's own state is refused, naming the area. |
+| AC-10 | The output bound is stored, bounded 1–128,000, read per request, and named in the transcript when a response stops at it. |
 
 # Documentation and delivery
 

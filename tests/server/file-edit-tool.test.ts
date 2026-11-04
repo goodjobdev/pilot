@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname,join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { ControlStore } from '../../src/server/state/control-store';
 import { FILE_EDIT_MAX_DIFF_BYTES, FILE_EDIT_MAX_FILE_BYTES, FileEditError, FileEditTool, unifiedDiff, type FileEditMode } from '../../src/server/state/file-edit-tool';
@@ -229,4 +229,39 @@ for(const change of ['cancel','external edit'] as const)test('queued Markdown ap
  const refusal=assert.rejects(pending,error=>change==='cancel'?(error as Error).name==='AbortError':error instanceof FileEditError&&error.code==='CONFLICT');
  await entered;if(change==='cancel')controller.abort();else await writeFile(file,'# External\n');release();await refusal;
  assert.equal(await readFile(file,'utf8'),change==='cancel'?'# Original\n':'# External\n');
+});
+
+/**
+ * The application-state guard, now that a project's worktree lives *inside* the data root.
+ *
+ * Before this, the guard compared a path against the data root and refused everything under it —
+ * which is every connected worktree, so the tool refused every legitimate edit with "resolves inside
+ * the application data root". The boundary is now the application's own state, named.
+ */
+test('a worktree inside the data root is writable, while the application’s own state is not',async t=>{
+ const root=await mkdtemp(join(tmpdir(),'pilot-file-edit-state-'));
+ const projectId=randomUUID(),worktree=join(root,'repositories',projectId,'agent');
+ await mkdir(join(worktree,'docs'),{recursive:true});
+ await writeFile(join(worktree,'docs','note.md'),'# Note\n');
+ const store=new ControlStore(root);
+ const make=(projectRoot:string)=>new FileEditTool(store,{enabled:true,projectRoot:()=>projectRoot,dataRoot:root,policy:{mode:()=>'auto-apply'},
+   // The production port performs the write and then commits it; this stub must do the same, or the
+   // test would pass while nothing was written.
+   saveMarkdown:async(_projectId,_path,write)=>{await write();return {status:'committed' as const,message:'saved'};}});
+ t.after(async()=>{store.close();await rm(root,{recursive:true,force:true});});
+ const edit=(tool:FileEditTool,path:string)=>tool.edit({projectId,path,content:'# Changed\n',mode:'auto-apply',actor:OWNER,agentId:null});
+ // A path in the connected worktree is the tool's whole purpose, even though the worktree itself is
+ // under the data root. Before this, the guard refused exactly this and named the data root.
+ const applied=await edit(make(worktree),'docs/note.md');
+ assert.equal(applied.written,true);
+ assert.equal(await readFile(join(worktree,'docs','note.md'),'utf8'),'# Changed\n');
+ // A project rooted in the application's own state is refused, and the refusal names the area.
+ for(const area of ['credentials','agents','settings','snapshots']){
+  const leaked=join(root,area,'project');
+  await mkdir(leaked,{recursive:true});
+  await writeFile(join(leaked,'note.md'),'untouched\n');
+  await assert.rejects(()=>edit(make(leaked),'note.md'),
+   (error:Error)=>error instanceof FileEditError&&new RegExp(area).test(error.message),area);
+  assert.equal(await readFile(join(leaked,'note.md'),'utf8'),'untouched\n',area+' was not written');
+ }
 });

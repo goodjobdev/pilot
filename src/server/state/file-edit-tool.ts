@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { lstat, mkdir, readFile } from 'node:fs/promises';
-import { dirname } from 'node:path';
+import { dirname,relative,sep } from 'node:path';
 import { canonicalJson, type ControlScope } from '../../shared/control-state';
 import { ControlStore, ControlStoreError } from './control-store';
 import { atomicWrite } from '../board-store';
@@ -26,7 +26,7 @@ import type { SaveCommit } from '../../shared/workspace';
  * The tool is disabled by default and absent from the typed registry while it is disabled, exactly as
  * the bounded coding runner is: a capability this instance lacks is absent rather than
  * present-and-failing. Nothing here reads a general browse root, follows a symlink out of the
- * worktree, touches a generated directory or writes anywhere under the data root.
+ * worktree, touches a generated directory, or writes into the application's own state.
  */
 
 export const FILE_EDIT_MODES = ['propose-only', 'auto-apply'] as const;
@@ -116,7 +116,12 @@ export type FileEditToolOptions = {
   readonly enabled: boolean;
   /** The registered project's own folder — the connected repository worktree — or undefined. */
   readonly projectRoot: (projectId: string) => string | undefined;
-  /** The data root, which this tool never writes under even when a path would resolve inside it. */
+  /**
+   * The application's data root. A connected worktree lives **inside** it (`repositories/<id>/agent`),
+   * and a managed planning folder lives inside it too (`workspaces/<id>`), so the root alone cannot be
+   * the boundary: what this tool must never touch is the application's own state — session databases,
+   * the control store and its snapshots, credentials, media, alerts and settings.
+   */
   readonly dataRoot?: string;
   /** The acceptance policy in force: the one owner switch that decides the mode. */
   readonly policy: { readonly mode: () => FileEditMode | Promise<FileEditMode> };
@@ -316,8 +321,9 @@ export class FileEditTool implements FileEditCapability {
     if (root === undefined)
       throw new FileEditError('Project ' + projectId + ' could not be resolved to a connected repository worktree, so nothing was written', 'NOT_FOUND');
     const file = await this.contain(root, rawPath);
-    if (this.options.dataRoot !== undefined && await this.inside(file, this.options.dataRoot))
-      throw new FileEditError('That path resolves inside the application data root, which this tool never writes to; nothing was written', 'OUTSIDE_WORKTREE');
+    const state = await this.applicationStateArea(file);
+    if (state !== null)
+      throw new FileEditError('That path resolves inside the application\u2019s own '+state+', which this tool never writes to; nothing was written', 'OUTSIDE_WORKTREE');
 
     const before = await this.readExisting(file);
     const diff = unifiedDiff(before, content);
@@ -379,6 +385,23 @@ export class FileEditTool implements FileEditCapability {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw new FileEditError('That path could not be inspected, so nothing was written', 'OUTSIDE_WORKTREE');
     }
     return resolved;
+  }
+  /**
+   * The name of the application-state area a path falls in, or null when it is a project's own file.
+   *
+   * A path inside this project's connected worktree (or its managed planning folder) is exactly what
+   * the tool is for, even though both live under the data root. Everything else the application keeps
+   * there — sessions, the control store, snapshots, credentials, media, alerts, settings — is refused
+   * by name, so the refusal says which part of the application it would have written to.
+   */
+  private async applicationStateArea(file: string): Promise<string | null> {
+    if (this.options.dataRoot === undefined) return null;
+    if (!await this.inside(file, this.options.dataRoot)) return null;
+    const parts = relative(this.options.dataRoot, file).split(sep);
+    const area = parts[0] ?? '';
+    if (area === '' ) return null;
+    if (area === 'repositories' || area === 'workspaces') return null;
+    return area;
   }
   private async inside(candidate: string, root: string): Promise<boolean> {
     const target = root.replace(/\/+$/, '') + '/';

@@ -2,23 +2,24 @@
  import { onMount } from 'svelte';
  import { request } from './api';
  import { MAX_MODEL_TURNS_CEILING,THINKING_LEVELS } from '../shared/agent';
+ import { MAX_OUTPUT_TOKENS_CEILING } from '../shared/harness-settings';
  import type { HarnessSettingsView } from '../shared/harness-settings';
  let {onclose}:{onclose:()=>void}=$props();
  let dialog:HTMLDialogElement,view=$state<HarnessSettingsView|null>(null);
- let maxModelTurns=$state(40),defaultThinking=$state(''),capabilities=$state({codingTools:true,shell:true,fileEdit:true});
+ let maxModelTurns=$state(40),maxOutputTokens=$state(32000),defaultThinking=$state(''),capabilities=$state({codingTools:true,shell:true,fileEdit:true});
  let busy=$state(false),problem=$state(''),message=$state('');
  onMount(async()=>{dialog.showModal();await load();});
  async function load(){
    try{
      const next=await request<HarnessSettingsView>('/settings/harness');
-     view=next;maxModelTurns=next.settings.preferences.maxModelTurns;defaultThinking=next.settings.preferences.defaultThinking??'';capabilities={...next.settings.capabilities};
+     view=next;maxModelTurns=next.settings.preferences.maxModelTurns;maxOutputTokens=next.settings.preferences.maxOutputTokens;defaultThinking=next.settings.preferences.defaultThinking??'';capabilities={...next.settings.capabilities};
    }catch(e){problem=(e as Error).message;}
  }
  async function save(){
    if(!view||busy)return;busy=true;problem='';message='';
    try{
-     const next=await request<HarnessSettingsView>('/settings/harness','POST',{revision:view.revision,settings:{preferences:{maxModelTurns:Number(maxModelTurns),defaultThinking:defaultThinking===''?null:defaultThinking},capabilities}});
-     view=next;message='Saved. It applies to the next request; no restart.';maxModelTurns=next.settings.preferences.maxModelTurns;defaultThinking=next.settings.preferences.defaultThinking??'';capabilities={...next.settings.capabilities};
+     const next=await request<HarnessSettingsView>('/settings/harness','POST',{revision:view.revision,settings:{preferences:{maxModelTurns:Number(maxModelTurns),maxOutputTokens:Number(maxOutputTokens),defaultThinking:defaultThinking===''?null:defaultThinking},capabilities}});
+     view=next;message='Saved. It applies to the next request; no restart.';maxModelTurns=next.settings.preferences.maxModelTurns;maxOutputTokens=next.settings.preferences.maxOutputTokens;defaultThinking=next.settings.preferences.defaultThinking??'';capabilities={...next.settings.capabilities};
    }catch(e){problem=(e as Error).message;await load();}
    finally{busy=false;}
  }
@@ -36,6 +37,10 @@
   <label class="field">Most model requests in a row for one message
    <input type="number" min="1" max={MAX_MODEL_TURNS_CEILING} bind:value={maxModelTurns} aria-label="Most model requests in a row for one message">
    <small>1 to {MAX_MODEL_TURNS_CEILING}. When the bound is reached the run stops, says so, and sending another message continues from the transcript.</small>
+  </label>
+  <label class="field">Most tokens one request may produce
+   <input type="number" min="1" max={MAX_OUTPUT_TOKENS_CEILING} bind:value={maxOutputTokens} aria-label="Most tokens one request may produce">
+   <small>1 to {MAX_OUTPUT_TOKENS_CEILING}. Reasoning is spent from this same budget: at a higher thinking level a small bound cuts the answer off, and a tool call whose arguments are long can arrive truncated. The old build capped every request at 4,096.</small>
   </label>
   <label class="field">Thinking level for a new conversation
    <select bind:value={defaultThinking} aria-label="Thinking level for a new conversation">

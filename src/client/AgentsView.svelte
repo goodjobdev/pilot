@@ -931,7 +931,9 @@
    {:else if row.entry.kind==='tool'}<details class="agent-tool-result"><summary>{row.entry.toolResult?.name??'Tool result'}{row.entry.toolResult?.isError?' · failed':''}</summary><pre class="agent-text">{row.entry.text}</pre></details>
    {:else}<pre class="agent-text">{row.entry.text}</pre>{/if}
    {#each row.entry.images??[] as image, imageIndex (`${image.id}-${imageIndex}`)}<TranscriptImage id={image.id}/>{/each}
-   {#if row.entry.stopReason&&row.entry.stopReason!=='stop'&&row.entry.stopReason!=='toolUse'}<small class="agent-note">stopped: {row.entry.stopReason}</small>{/if}
+   {#if row.entry.stopReason&&row.entry.stopReason!=='stop'&&row.entry.stopReason!=='toolUse'}
+   <small class="agent-note">{#if row.entry.stopReason==='length'}stopped: the model hit this instance’s output limit for one request. Raise “Most tokens one request may produce” in Harness settings, or lower the thinking level, which spends the same budget.{:else}stopped: {row.entry.stopReason}{/if}</small>
+   {/if}
    {#if row.entry.error}<small class="agent-note error-inline">{row.entry.error}</small>{/if}
   </article>
   {/if}

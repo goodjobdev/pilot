@@ -2,6 +2,8 @@ import type { Context } from '@earendil-works/chord';
 import { defineExtension, hook, GenerationTask, type Extension, type HookApi } from '@earendil-works/pi-durable';
 import type { Api, Message, Model, Models, ModelsSimpleStreamOptions } from '@earendil-works/pi-ai';
 import { createAssistantMessageEventStream } from '@earendil-works/pi-ai/utils/event-stream';
+// One number for the transport clamp and the harness: an owner sets it, and both read it.
+import { MAX_OUTPUT_TOKENS_CEILING } from '../../shared/harness-settings';
 
 export interface DispatchIdentity {
   readonly conversationId: string;
@@ -23,7 +25,15 @@ export interface GuardedDispatch {
 }
 
 /** Final output-token ceiling for every accepted dispatch. */
-const MAX_OUTPUT_TOKENS = 4096;
+/**
+ * The fallback ceiling for one request's output, used when the host states none.
+ *
+ * It is the **absolute** ceiling — what this build will ever accept for one request — and not the
+ * instance's own bound. The bound is the owner's, set in Harness settings and applied by the harness
+ * before the request is built; this refuses a caller that tries to push past the vocabulary's own
+ * maximum, which no setting can raise.
+ */
+const MAX_OUTPUT_TOKENS = MAX_OUTPUT_TOKENS_CEILING;
 /** Longest accepted opaque provider session identifier. */
 const MAX_SESSION_ID_LENGTH = 200;
 /**

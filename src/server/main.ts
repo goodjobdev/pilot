@@ -52,6 +52,7 @@ import { WorkerError, WORKER_LIMITS, WORKER_SCOPES } from '../shared/workers';
 import { FileEditTool, FileEditError, type FileEditMode } from './state/file-edit-tool';
 import { AgentError, agentScopeVocabulary } from '../shared/agent-registry';
 import { MAX_MODEL_TURNS_CEILING, MAX_MODEL_TURNS_DEFAULT, MESSAGE_MAX_CHARS, THINKING_LEVELS } from '../shared/agent';
+import { MAX_OUTPUT_TOKENS_DEFAULT } from '../shared/harness-settings';
 import { WorkerModelPolicyError, type WorkerModelOption, type WorkerModelPolicyView } from '../shared/model-policy';
 import { WORKER_MODEL_POLICY_READBACK_UNCERTAIN } from '../shared/model-policy-codes';
 import { modelKey } from '../shared/settings';
@@ -529,7 +530,8 @@ export async function createApp(options:AppOptions){
    * word on each capability. The deployment flags above stay the ceiling; this can only narrow them.
    */
   const harnessSettings=options.harnessSettings??new HarnessSettingsStore(catalog.root,
-    {codingTools:codingToolsEnabled,shell:shellEnabled,fileEdit:fileEditEnabled},maxModelTurns);
+    {codingTools:codingToolsEnabled,shell:shellEnabled,fileEdit:fileEditEnabled},maxModelTurns,
+    Number(process.env.DASHBOARD_MAX_OUTPUT_TOKENS??MAX_OUTPUT_TOKENS_DEFAULT));
   const fileEdit=options.control&&fileEditEnabled?new FileEditTool(options.control,{
     enabled:true,
     // The connected repository worktree is the registered project's own folder and nothing else.
@@ -547,6 +549,7 @@ export async function createApp(options:AppOptions){
     dataRoot:options.dataRoot,providers,delivery,lifecycle:lifecycleHooks, docs, boards, workspace,projectGate:assertProjectAvailable,maxModelTurns,
     allowedCapabilities:()=>harnessSettings.view().then(view=>({codingTools:view.effective.capabilities.codingTools.enabled,shell:view.effective.capabilities.shell.enabled,fileEdit:view.effective.capabilities.fileEdit.enabled})),
     defaultThinking:()=>harnessSettings.defaultThinking(),
+    maxOutputTokens:()=>harnessSettings.maxOutputTokens(),
     sessionModel:async(projectId,sessionId)=>{if(!sessions)return null;try{return sessions.read(projectId,sessionId).model ?? null;}catch{return null;}},
     // The coding tools, with the two switches that decide whether they exist at all. `root` answers
     // only for a project whose repository is connected: without a worktree there is nothing to bind

@@ -10,6 +10,22 @@ import { adoptRunningSessions } from '../../src/server/state/session-lifecycle';
 import { initialQueue, nextQueueRevision, queueRequestId } from '../../src/shared/queue';
 
 const wait = (ms:number)=>new Promise(resolve=>setTimeout(resolve,ms));
+
+/** Wait until a session reports not-working twice in a row, so a generation that pauses between two
+ * requests cannot land one after a count baseline was taken. */
+async function settle(app:Awaited<ReturnType<typeof createApp>>,security:ReturnType<typeof localConfig>,projectId:string,sessionId:string):Promise<void>{
+ let quiet=0;
+ for(let i=0;i<200;i++){
+  const response=await fetch(security.origin+'/api/projects/'+projectId+'/agents?sessionId='+encodeURIComponent(sessionId),{headers:{'x-dashboard-token':security.token}});
+  const value=await response.json() as {view:{working:boolean}};
+  if(value.view.working){quiet=0;await wait(25);continue;}
+  quiet+=1;
+  if(quiet>=2)return;
+  await wait(60);
+ }
+ throw Error('the session never settled');
+}
+
 test('ack route is strict, CSRF protected, project scoped, and refuses absent/nonterminal proof without dispatch',async()=>{
  const root=await mkdtemp(join(tmpdir(),'pilot-uncertain-ack-route-'));
  const security=localConfig('http://127.0.0.1:0'),control=new ControlStore(root);let requests=0;
@@ -95,13 +111,11 @@ test('ack route is strict, CSRF protected, project scoped, and refuses absent/no
   await app.queue!.claim({projectId:project.id,sessionId:submitted.id,owner:'route-test-owner'});
   const inFlight=await app.queue!.submit({projectId:project.id,sessionId:submitted.id,entryId:queued.entry!.id,owner:'route-test-owner'});
   assert.equal(inFlight.entry?.state,'submitted');
-  for(let i=0;i<100;i++){
-   const response=await fetch(security.origin+'/api/projects/'+project.id+'/agents?sessionId='+encodeURIComponent(submitted.id),{headers:{'x-dashboard-token':security.token}});
-   const value=await response.json() as {view:{working:boolean}};if(!value.view.working)break;await wait(25);
-  }
+  await settle(app,security,project.id,submitted.id);
   app.lifecycle!.markRunning({projectId:project.id,sessionId:submitted.id,requestId:'submitted-proof-request'});
   adoptRunningSessions(app.lifecycle!,new Date());
   let queueLifecycle=app.lifecycle!.read(project.id,submitted.id);
+  await settle(app,security,project.id,submitted.id);
   const queueAckBaseline=requests;
   const submittedAck=await fetch(security.origin+'/api/sessions/'+encodeURIComponent(submitted.id)+'/lifecycle/acknowledge-uncertainty',{method:'POST',headers,body:JSON.stringify({projectId:project.id,revision:queueLifecycle.revision})});
   assert.equal(submittedAck.status,409,'submitted Pilot entry blocks acknowledgement');

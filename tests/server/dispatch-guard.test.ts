@@ -9,6 +9,7 @@ import { fauxAssistantMessage, fauxProvider, type FauxModelDefinition, type Faux
 import { createRegistry, defineExtension, GenerationTask, Harness, hook } from '@earendil-works/pi-durable';
 import { openNodeSqliteStorage } from '@earendil-works/pi-durable/storage/sqlite/node';
 import { createGuardedDispatch, type DispatchIdentity, type DispatchPolicyRequest, type GuardedDispatch } from '../../src/server/agents/dispatch-guard';
+import { MAX_OUTPUT_TOKENS_CEILING, MAX_OUTPUT_TOKENS_DEFAULT } from '../../src/shared/harness-settings';
 
 const DENIED = 'Model dispatch is not authorized by the current host policy.';
 const ABORTED = 'Model dispatch was cancelled.';
@@ -212,8 +213,8 @@ test('ordinary durable transport requires a host admission bound to the exact co
     assert.equal(String(record?.id), witness.identity.taskId);
     // The transport envelope proves the final ceiling and the canonical frozen model reached the provider.
     const envelope = f.envelopes[0];
-    assert.equal(envelope.maxTokens, 4096);
-    assert.equal(envelope.modelMaxTokens, 4096);
+    assert.equal(envelope.maxTokens, MAX_OUTPUT_TOKENS_CEILING, 'a request that states no bound carries this module\u2019s ceiling; the harness always states the instance bound');
+    assert.equal(envelope.modelMaxTokens, 16384, 'the frozen catalog model keeps its own maximum: 16,384, below the accepted ceiling');
     assert.equal(envelope.frozen, true);
     assert.equal(envelope.sameAsCaller, false);
     assert.equal(envelope.hasDeferred, false);
@@ -293,12 +294,12 @@ test('unsupported option overrides are rejected before transport while the suppo
     const callsAfterControl = f.policyCalls.length;
     const overrides: readonly unknown[] = [
       { deferred: true }, { deferred: { window: '1h' } }, { deferred: undefined },
-      { onPayload: () => ({ max_tokens: 99999 }) }, { onResponse: () => { } }, { onProviderStreamEvent: () => { } },
+      { onPayload: () => ({ max_tokens: MAX_OUTPUT_TOKENS_CEILING + 1 }) }, { onResponse: () => { } }, { onProviderStreamEvent: () => { } },
       { samplingParams: { temperature: 1 } }, { reasoning: 'high' }, { thinkingBudgets: { high: 4096 } },
       { temperature: 1 }, { metadata: { user_id: 'x' } }, { transport: 'websocket' }, { toolChoice: 'auto' },
       { cacheRetention: 'none' }, { maxRetries: 0 }, { unknownOption: true },
       { sessionId: '' }, { sessionId: 42 },
-      { maxTokens: 4097 }, { maxTokens: 0 }, { maxTokens: 4096.5 }, { maxTokens: '4096' },
+      { maxTokens: MAX_OUTPUT_TOKENS_CEILING + 1 }, { maxTokens: 0 }, { maxTokens: 4096.5 }, { maxTokens: '4096' }, { maxTokens: MAX_OUTPUT_TOKENS_CEILING * 2 },
     ];
     for (const override of overrides) {
       const result = await dispatchResult(f, { signal: paused.witness.signal, ...(override as object) });
@@ -328,7 +329,7 @@ test('options are validated by value and the caller bag is never forwarded', asy
     assert.equal((await dispatchResult(f, hidden)).stopReason, 'error');
     assert.equal(f.provider.state.callCount, 0);
     // A proxy that reports only supported keys but a hostile maxTokens value is denied by the value check.
-    const lying = new Proxy({ signal, maxTokens: 99999 } as Record<string, unknown>, { ownKeys: () => ['signal', 'maxTokens'] });
+    const lying = new Proxy({ signal, maxTokens: MAX_OUTPUT_TOKENS_CEILING + 1 } as Record<string, unknown>, { ownKeys: () => ['signal', 'maxTokens'] });
     assert.equal((await dispatchResult(f, lying)).stopReason, 'error');
     assert.equal(f.provider.state.callCount, 0);
     // A proxy that lies about `deferred` cannot smuggle it: the transport options are rebuilt, not forwarded.
@@ -342,7 +343,7 @@ test('options are validated by value and the caller bag is never forwarded', asy
   } finally { await f.close(); }
 });
 
-test('the accepted transport ceiling is proven: canonical catalog model, 4096 cap, caller lies ignored', async () => {
+test('the accepted transport ceiling is proven: canonical catalog model, the vocabulary ceiling, caller lies ignored', async () => {
   const f = await openFixture({
     fauxModels: [{ id: 'faux-plain', maxTokens: 16384 }, { id: 'faux-reasoning', reasoning: true, maxTokens: 16384 }, { id: 'faux-knobs', maxTokens: 16384 }],
     responses: [fauxAssistantMessage('a'), fauxAssistantMessage('b')],
@@ -351,22 +352,23 @@ test('the accepted transport ceiling is proven: canonical catalog model, 4096 ca
     const paused = await pausedGeneration(f);
     f.guard.admit(paused.witness.identity);
     const signal = paused.witness.signal;
-    // Default (no caller budget): the catalog model's 16384 is clamped to 4096 for the real request.
+    // Default (no caller budget): the request takes the accepted ceiling, and the catalog model keeps
+    // its own lower maximum.
     assert.equal((await dispatchResult(f, { signal })).stopReason, 'stop');
-    assert.deepEqual({ cap: f.envelopes[0].maxTokens, modelCap: f.envelopes[0].modelMaxTokens, frozen: f.envelopes[0].frozen }, { cap: 4096, modelCap: 4096, frozen: true });
+    assert.deepEqual({ cap: f.envelopes[0].maxTokens, modelCap: f.envelopes[0].modelMaxTokens, frozen: f.envelopes[0].frozen }, { cap: MAX_OUTPUT_TOKENS_CEILING, modelCap: 16384, frozen: true });
     assert.equal(f.provider.state.callCount, 1);
     // A fingerprint-equal object that lies about its own cap cannot move the ceiling: the catalog copy crosses.
-    const spoofer = { ...f.model, maxTokens: 99999, toJSON: () => f.model };
+    const spoofer = { ...f.model, maxTokens: MAX_OUTPUT_TOKENS_CEILING + 1, toJSON: () => f.model };
     assert.equal((await dispatchResult(f, { signal }, spoofer)).stopReason, 'stop');
-    assert.deepEqual({ cap: f.envelopes[1].maxTokens, modelCap: f.envelopes[1].modelMaxTokens, caller: f.envelopes[1].sameAsCaller }, { cap: 4096, modelCap: 4096, caller: false });
+    assert.deepEqual({ cap: f.envelopes[1].maxTokens, modelCap: f.envelopes[1].modelMaxTokens, caller: f.envelopes[1].sameAsCaller }, { cap: MAX_OUTPUT_TOKENS_CEILING, modelCap: 16384, caller: false });
     assert.equal(f.provider.state.callCount, 2);
     // Caller mutation, redirection and budget expansion are denied without transport.
     const denied: readonly { label: string; model?: unknown; options?: unknown }[] = [
-      { label: 'mutated cap', model: { ...f.model, maxTokens: 99999 } },
+      { label: 'mutated cap', model: { ...f.model, maxTokens: MAX_OUTPUT_TOKENS_CEILING + 1 } },
       { label: 'redirected provider', model: { ...f.model, provider: 'nowhere' } },
       { label: 'unknown model id', model: { ...f.model, id: 'no-such-model' } },
       { label: 'reasoning catalog model', model: f.provider.getModel('faux-reasoning') },
-      { label: 'explicit over-cap option', options: { signal, maxTokens: 4097 } },
+      { label: 'explicit over-cap option', options: { signal, maxTokens: MAX_OUTPUT_TOKENS_CEILING + 1 } },
     ];
     for (const entry of denied) {
       const result = await dispatchResult(f, entry.options ?? { signal }, entry.model ?? f.model);

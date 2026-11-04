@@ -2,6 +2,7 @@ import { PrivateStore } from './private-store';
 import { HttpError } from './board-store';
 import {
   defaultHarnessSettings,effectiveCapabilities,parseHarnessSettings,parseHarnessSettingsInput,
+  MAX_OUTPUT_TOKENS_DEFAULT,
   type HarnessCapabilities,type HarnessCapabilitiesDeployed,type HarnessSettings,type HarnessSettingsInput,type HarnessSettingsView,
   type ThinkingLevel
 } from '../shared/harness-settings';
@@ -15,9 +16,9 @@ import {
  */
 export class HarnessSettingsStore {
   private store: PrivateStore<{ revision: number; settings: HarnessSettings }>;
-  constructor(root: string, private deployed: HarnessCapabilitiesDeployed, private startBound: number) {
+  constructor(root: string, private deployed: HarnessCapabilitiesDeployed, private startBound: number, private startOutputTokens = MAX_OUTPUT_TOKENS_DEFAULT) {
     this.store = new PrivateStore(root, 'settings/harness.json',
-      () => ({ revision: 1, settings: defaultHarnessSettings(this.startBound) }),
+      () => ({ revision: 1, settings: defaultHarnessSettings(this.startBound, this.startOutputTokens) }),
       value => {
         const parsed = value as { revision?: unknown; settings?: unknown };
         if (typeof parsed?.revision !== 'number' || !Number.isSafeInteger(parsed.revision) || parsed.revision < 1)
@@ -34,6 +35,7 @@ export class HarnessSettingsStore {
       settings,
       effective: Object.freeze({
         maxModelTurns: settings.preferences.maxModelTurns,
+        maxOutputTokens: settings.preferences.maxOutputTokens,
         defaultThinking: settings.preferences.defaultThinking,
         capabilities
       })
@@ -41,6 +43,8 @@ export class HarnessSettingsStore {
   }
   /** The bound in force, read per dispatch so a change applies to the next request. */
   async maxModelTurns(): Promise<number> { return (await this.store.read()).settings.preferences.maxModelTurns; }
+  /** How many tokens one request may produce, reasoning included. Also read per dispatch. */
+  async maxOutputTokens(): Promise<number> { return (await this.store.read()).settings.preferences.maxOutputTokens; }
   /** The thinking level a new conversation starts with, or null for the host's default. */
   async defaultThinking(): Promise<ThinkingLevel | null> {
     return (await this.store.read()).settings.preferences.defaultThinking;

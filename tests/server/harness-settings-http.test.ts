@@ -32,23 +32,23 @@ test('the harness settings share the owner-only boundary and are revision-checke
   const f=await fixture(t);
   assert.equal((await fetch(f.security.origin+'/api/settings/harness')).status,401);
   assert.equal((await fetch(f.security.origin+'/api/settings/harness',{method:'POST',headers:{...f.writes,origin:'https://evil.invalid'},body:'{}'})).status,403);
-  const first=await (await f.call('/settings/harness')).json() as {revision:number;settings:{preferences:{maxModelTurns:number};capabilities:{shell:boolean}};effective:{capabilities:{shell:{deployed:boolean;enabled:boolean}}}};
+  const first=await (await f.call('/settings/harness')).json() as {revision:number;settings:{preferences:{maxOutputTokens:32000,maxModelTurns:number};capabilities:{shell:boolean}};effective:{capabilities:{shell:{deployed:boolean;enabled:boolean}}}};
   assert.equal(first.revision,1);assert.equal(first.effective.capabilities.shell.deployed,true,'this instance offers the shell');
   assert.equal(first.effective.capabilities.shell.enabled,true);
   // A stale revision writes nothing and says so.
-  await f.call('/settings/harness',{revision:first.revision,settings:{preferences:{maxModelTurns:50,defaultThinking:'low'},capabilities:{codingTools:true,shell:true,fileEdit:true}}});
-  const stale=await f.call('/settings/harness',{revision:1,settings:{preferences:{maxModelTurns:9,defaultThinking:null},capabilities:{codingTools:true,shell:true,fileEdit:true}}});
+  await f.call('/settings/harness',{revision:first.revision,settings:{preferences:{maxOutputTokens:32000,maxModelTurns:50,defaultThinking:'low'},capabilities:{codingTools:true,shell:true,fileEdit:true}}});
+  const stale=await f.call('/settings/harness',{revision:1,settings:{preferences:{maxOutputTokens:32000,maxModelTurns:9,defaultThinking:null},capabilities:{codingTools:true,shell:true,fileEdit:true}}});
   assert.equal(stale.status,409);assert.match((await stale.json()).error,/changed since you read/);
   // An out-of-range bound is refused by the shared validation, with nothing written.
-  const tooHigh=await f.call('/settings/harness',{revision:2,settings:{preferences:{maxModelTurns:301,defaultThinking:null},capabilities:{codingTools:true,shell:true,fileEdit:true}}});
+  const tooHigh=await f.call('/settings/harness',{revision:2,settings:{preferences:{maxOutputTokens:32000,maxModelTurns:301,defaultThinking:null},capabilities:{codingTools:true,shell:true,fileEdit:true}}});
   assert.equal(tooHigh.status,422);
-  const current=await (await f.call('/settings/harness')).json() as {revision:number;settings:{preferences:{maxModelTurns:number}}};
+  const current=await (await f.call('/settings/harness')).json() as {revision:number;settings:{preferences:{maxOutputTokens:32000,maxModelTurns:number}}};
   assert.equal(current.revision,2);assert.equal(current.settings.preferences.maxModelTurns,50);
 });
 test('switching a capability off refuses the tool from the next call; switching it on is deployment-only',async t=>{
   const f=await fixture(t);
   const view=await (await f.call('/settings/harness')).json() as {revision:number};
-  const off=await (await f.call('/settings/harness',{revision:view.revision,settings:{preferences:{maxModelTurns:40,defaultThinking:null},capabilities:{codingTools:true,shell:false,fileEdit:false}}})).json() as {effective:{capabilities:{shell:{deployed:boolean;allowed:boolean;enabled:boolean};fileEdit:{enabled:boolean}}}};
+  const off=await (await f.call('/settings/harness',{revision:view.revision,settings:{preferences:{maxOutputTokens:32000,maxModelTurns:40,defaultThinking:null},capabilities:{codingTools:true,shell:false,fileEdit:false}}})).json() as {effective:{capabilities:{shell:{deployed:boolean;allowed:boolean;enabled:boolean};fileEdit:{enabled:boolean}}}};
   assert.deepEqual(off.effective.capabilities.shell,{deployed:true,allowed:false,enabled:false});
   assert.equal(off.effective.capabilities.fileEdit.enabled,false);
   // The vocabulary the interface reads reports the same state, so the two cannot disagree.

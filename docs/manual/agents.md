@@ -79,6 +79,14 @@ that agent's model, and choosing a model in the composer overrides it for that s
 image goes to the model as image content, everything else is written into the worktree and named in
 the message for the agent to read.
 
+### Output per request
+
+**Most tokens one request may produce** (Harness settings) is the budget for one answer, reasoning
+included. The old build capped every request at 4,096, which is below what these models do: at a
+higher thinking level the reasoning consumed it and the answer was cut off — shown as
+`stopped: length` — and a long tool call could arrive truncated mid-JSON. The default is now 32,000
+and the ceiling 128,000.
+
 ### One dispatch, many turns
 
 One message may make up to `DASHBOARD_MAX_MODEL_TURNS` model requests in a row (default 40). It is a
