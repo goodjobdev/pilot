@@ -114,7 +114,7 @@ test('attention ranks all four kinds on a phone, is read-only, and resolves only
   // Phone-sized, in the Agents view, with the drawer out of the way. The route change is made
   // inside the app so the entry under the attention layer is one this page wrote.
   await page.setViewportSize({ width: 390, height: 844 });
-  await page.getByRole('button', { name: 'Agents', exact: true }).click();
+  await page.getByRole('button', { name: 'Session', exact: true }).click();
   const hideDrawer = page.getByRole('button', { name: 'Hide project sidebar' });
   if (await hideDrawer.count()) await hideDrawer.click();
   const beforeUrl = page.url();
@@ -251,7 +251,7 @@ test('an alert project switch discards a delayed attention response and its appr
   // same project switch an alert uses.
   await page.locator('#project-sidebar').getByRole('button', { name: /Alert switch alpha/ }).click();
   await expect(page).toHaveURL(new RegExp('project=' + alpha));
-  await page.getByRole('button', { name: 'List', exact: true }).click();
+  await page.getByRole('button', { name: 'Task', exact: true }).click();
   await page.getByRole('button', { name: /Needs me/ }).click();
   await expect.poll(() => requestStarted).toBe(true);
 

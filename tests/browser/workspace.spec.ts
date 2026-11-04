@@ -15,7 +15,7 @@ async function fixture(page:Page,name:string){
  await writeFile(join(p.path,'src/app.ts'),'export const answer = 1;\n');await git('add','docs/dashboard/board.md','docs/specs/work.md','src/app.ts','src/icon.png');await git('commit','-m','fixture: initial project');return {p,git};
 }
 test('wiki folders fold together and the right sidebar opens safe source files and real commit diffs',async({page})=>{
- const {p}=await fixture(page,'Files and changes fixture');await page.getByRole('button',{name:'Wiki',exact:true}).click();
+ const {p}=await fixture(page,'Files and changes fixture');await page.getByRole('button',{name:'Doc',exact:true}).click();
  await page.getByRole('button',{name:'Collapse all folders'}).click();await expect(page.locator('.doc-folder[aria-expanded="true"]')).toHaveCount(0);await page.getByRole('button',{name:'Expand all folders'}).click();await expect(page.locator('.doc-item').filter({hasText:'specs/work.md'})).toBeVisible();
  await page.getByRole('button',{name:'Files and changes',exact:true}).click();const pane=page.getByRole('complementary',{name:'Project files and changes'});
  await pane.locator('.file-leaf[title="src/icon.png"]').click();await expect(pane.getByRole('img',{name:'src/icon.png'})).toBeVisible();await expect.poll(()=>pane.getByRole('img',{name:'src/icon.png'}).evaluate(el=>(el as HTMLImageElement).naturalWidth)).toBe(1);await pane.getByRole('button',{name:'Back to files and changes'}).click();
@@ -27,15 +27,15 @@ test('sync creates one committed canonical plan and board/source edits update ea
  const {p,git}=await fixture(page,'Shared plan fixture');await page.getByRole('button',{name:'Sync plan',exact:true}).click();await expect(page.getByRole('heading',{name:'Sync plan',exact:true})).toBeVisible();
  await page.getByLabel('docs/specs/work.md',{exact:true}).check();await page.getByRole('button',{name:'Preview sync'}).click();await expect(page.getByText('2 candidates', {exact:false})).toBeVisible();await page.getByLabel('Storage first → UI second',{exact:true}).check();
  const before=Number((await git('rev-list','--count','HEAD')).trim());await page.getByRole('button',{name:'Apply 2 reviewed tasks'}).click();await expect(page.getByRole('dialog')).not.toBeVisible();expect(Number((await git('rev-list','--count','HEAD')).trim())).toBe(before+1);
- await page.getByRole('button',{name:'List',exact:true}).click();await page.getByRole('button',{name:'Storage first active'}).click();await page.getByLabel('Task title',{exact:true}).fill('Board edited title');await page.getByRole('button',{name:'Save task',exact:true}).click();await expect(page.locator('.save-indicator')).toContainText('Committed');
+ await page.getByRole('button',{name:'Task',exact:true}).click();await page.getByRole('button',{name:'Storage first active'}).click();await page.getByLabel('Task title',{exact:true}).fill('Board edited title');await page.getByRole('button',{name:'Save task',exact:true}).click();await expect(page.locator('.save-indicator')).toContainText('Committed');
  expect(await git('show','HEAD:docs/dashboard/board.md')).toContain('Board edited title');
  await page.getByRole('button',{name:'Board actions',exact:true}).click();await page.getByRole('button',{name:'Open plan document',exact:true}).click();await expect(page.getByRole('heading',{name:'Board edited title',exact:true})).toBeVisible();
  await page.getByRole('button',{name:'Edit document',exact:true}).click();const body=page.getByRole('textbox',{name:'Document body',exact:true});await body.fill((await body.inputValue()).replace('Board edited title','Document edited title'));await page.getByRole('button',{name:'Save document',exact:true}).click();await expect(page.getByRole('heading',{name:'Document edited title',exact:true})).toBeVisible();
- await page.getByRole('button',{name:'List',exact:true}).click();await expect(page.getByRole('button',{name:'Document edited title active'})).toBeVisible();
+ await page.getByRole('button',{name:'Task',exact:true}).click();await expect(page.getByRole('button',{name:'Document edited title active'})).toBeVisible();
  const path=join(p.path,'docs/dashboard/board.md'),source=await readFile(path,'utf8');await writeFile(path,source.replace('Document edited title','Externally edited title'));await expect(page.getByRole('button',{name:'Externally edited title active'})).toBeVisible({timeout:7000});
 });
 test('phone file preview preserves the chat draft and does not overflow the screen',async({page})=>{
- await page.setViewportSize({width:390,height:844});await fixture(page,'Phone workspace fixture');await page.getByRole('button',{name:'Agents',exact:true}).click();await page.getByLabel('Message the agent').fill('Keep this unsent draft');
+ await page.setViewportSize({width:390,height:844});await fixture(page,'Phone workspace fixture');await page.getByRole('button',{name:'Session',exact:true}).click();await page.getByLabel('Message the agent').fill('Keep this unsent draft');
  await page.getByRole('button',{name:'Files and changes',exact:true}).click();const pane=page.getByRole('complementary',{name:'Project files and changes'});await pane.locator('.file-leaf[title="src/app.ts"]').click();await expect(pane.getByRole('region',{name:'File contents'})).toBeVisible();
  expect(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth)).toBe(true);await pane.getByRole('button',{name:'Close files and changes'}).click();await expect(page.getByLabel('Message the agent')).toHaveValue('Keep this unsent draft');
 });

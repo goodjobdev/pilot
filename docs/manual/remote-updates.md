@@ -39,4 +39,4 @@ No automatic stash, hard reset, branch switch, push or discarded edit. No hooks,
 
 A merge preview may write temporary Git objects but not branch refs or working files. Applying an approved merge creates local history. External concurrent Git writers are unsupported; unexpected interference requires operator review, not forced repair.
 
-After a successful update, clean Wiki/board views reread disk and reset stale undo history. **Sync plan** remains a separate reviewed action for interpreting changed source documents.
+After a successful update, clean Doc/board views reread disk and reset stale undo history. **Sync plan** remains a separate reviewed action for interpreting changed source documents.

@@ -33,7 +33,7 @@ Pilot clones the repository and opens `work/pilot-<project-id-prefix>` as a sepa
 
 ## Inspect and plan
 
-Open **Workspace → Files** to inspect the checkout, or **Wiki** to read Markdown. Choose **Sync plan**, select source documents, preview candidates and explicitly apply tasks and dependency suggestions. Read [planning](./planning.md) for the supported input format.
+Open **Workspace → Files** to inspect the checkout, or **Doc** to read Markdown. Choose **Sync plan**, select source documents, preview candidates and explicitly apply tasks and dependency suggestions. Read [planning](./planning.md) for the supported input format.
 
 Document saves and board changes attempt local commits on the Pilot branch. Files copied during connection can still be untracked: review and save/commit those files before a later repository update. Do not assume connection committed them.
 

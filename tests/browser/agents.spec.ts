@@ -4,7 +4,7 @@ test('the agent runs, streams, steers and stops without calling a model',async({
  await page.getByRole('button',{name:'＋ Add project',exact:true}).first().click();
  await page.getByLabel('Project name').fill('Agents fixture');
  await page.getByRole('button',{name:'Confirm & add project'}).click();
- await page.getByRole('button',{name:'Agents',exact:true}).click();
+ await page.getByRole('button',{name:'Session',exact:true}).click();
  // The instance is explicit that a scripted provider answers, so nobody mistakes it for a model:
  // the model and thinking chip names it, and the panel is where it is changed.
  await expect(page.getByRole('button',{name:'Model and thinking'})).toContainText('Scripted test provider');
@@ -31,7 +31,7 @@ test('the agent runs, streams, steers and stops without calling a model',async({
 
  // The conversation lives in SQLite, so it is still there after a reload.
  await page.reload();
- await page.getByRole('button',{name:'Agents',exact:true}).click();
+ await page.getByRole('button',{name:'Session',exact:true}).click();
  await expect(page.getByLabel('Agent transcript')).toContainText('Scripted test reply');
 });
 
@@ -40,7 +40,7 @@ test('a run survives the browser closing and the reopened view reconnects to it'
  await page.getByRole('button',{name:'＋ Add project',exact:true}).first().click();
  await page.getByLabel('Project name').fill('Reconnect fixture');
  await page.getByRole('button',{name:'Confirm & add project'}).click();
- await page.getByRole('button',{name:'Agents',exact:true}).click();
+ await page.getByRole('button',{name:'Session',exact:true}).click();
  await page.getByLabel('Message the agent').fill('[pause] keep working while I leave');
  await page.getByRole('button',{name:'Send message'}).click();
  await expect(page.locator('details.activity-more > summary')).toContainText('Working…');
@@ -49,7 +49,7 @@ test('a run survives the browser closing and the reopened view reconnects to it'
  await page.close();
  const reopened=await page.context().newPage();
  await reopened.goto('/');
- await reopened.getByRole('button',{name:'Agents',exact:true}).click();
+ await reopened.getByRole('button',{name:'Session',exact:true}).click();
  const transcript=reopened.getByLabel('Agent transcript');
  await expect(transcript).toContainText('keep working while I leave');
  await expect(reopened.locator('details.activity-more > summary')).toContainText('Idle');
@@ -62,7 +62,7 @@ test('an agent question reaches the inbox and is answered once on a phone-sized 
  await page.getByRole('button',{name:'＋ Add project',exact:true}).first().click();
  await page.getByLabel('Project name').fill('Question fixture');
  await page.getByRole('button',{name:'Confirm & add project'}).click();
- await page.getByRole('button',{name:'Agents',exact:true}).click();
+ await page.getByRole('button',{name:'Session',exact:true}).click();
  // From here on it is a phone-sized screen, which is where the question has to be answerable.
  // The desktop preference left the project drawer open, and a drawer covers content by design.
  await page.setViewportSize({width:390,height:844});
@@ -91,7 +91,7 @@ test('an agent question reaches the inbox and is answered once on a phone-sized 
 
  // It stays answered after a reload, with no way to answer it twice.
  await page.reload();
- await page.getByRole('button',{name:'Agents',exact:true}).click();
+ await page.getByRole('button',{name:'Session',exact:true}).click();
  await expect(page.getByRole('region',{name:'Questions for me'})).toHaveCount(0);
  const restoredHistory=page.locator('details.question-history');
  await restoredHistory.locator('summary').click();
@@ -113,7 +113,7 @@ test('assistant Markdown renders and removes executable markup',async({page})=>{
  await page.getByRole('button',{name:'＋ Add project',exact:true}).first().click();
  await page.getByLabel('Project name').fill('Markdown safety fixture');
  await page.getByRole('button',{name:'Confirm & add project'}).click();
- await page.getByRole('button',{name:'Agents',exact:true}).click();
+ await page.getByRole('button',{name:'Session',exact:true}).click();
  const assistant=page.locator('.agent-entry.assistant').filter({hasText:'bold text'});
  await expect(assistant.locator('h2')).toHaveText('Heading');
  await expect(assistant.locator('strong')).toHaveText('bold text');

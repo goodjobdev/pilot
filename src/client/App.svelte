@@ -76,6 +76,11 @@ import HarnessSettings from './HarnessSettings.svelte';
   */
  const LAYER_ORDER=['drawer:projects','drawer:docs','panel:inbox','menu:actions','menu:filters','panel:sessions','panel:workspace','dialog:settings','dialog:import','dialog:add','dialog:providers','dialog:agentManager','dialog:workers','dialog:connection','dialog:palette'] as const;
  const VIEW_MODES:View[]=['Dependencies','Timeline','List','Wiki','Agents'];
+ /**
+  * The words the tabs show, which are not the internal names: the stored view, the route and the
+  * filters keep the original identifiers, so a rename is a label and never a migration.
+  */
+ const VIEW_LABELS:Record<View,string>={Dependencies:'Map',Timeline:'Milestone',List:'Task',Wiki:'Doc',Agents:'Session'};
  function currentLayers():string[]{
    const open:Record<string,boolean>={
      'drawer:projects':!sidebarHidden&&narrowProjects,
@@ -546,11 +551,13 @@ import HarnessSettings from './HarnessSettings.svelte';
  {#if project}
  {#if error}<div class="error workspace-error" role="alert">{error}<div class="row">{#if failed}<button onclick={exported}>Export unsaved draft</button><button onclick={()=>select(project!)}>Reload & review</button>{:else if !snapshot}<button onclick={locate}>Locate folder</button>{#if missingBoard}<button onclick={initialize}>Confirm & initialize board</button>{/if}{/if}</div></div>{/if}
  <div class="commandbar">
-  <div class="view-switch" aria-label="Board views">
+  <div class="view-switch" aria-label="Workspace views">
    {#each VIEW_MODES as mode}
-   <button class:active={view===mode} aria-pressed={view===mode} aria-label={mode} title={mode} onclick={()=>setView(mode)}><Icon name={mode==='Dependencies'?'graph':mode==='Timeline'?'timeline':mode==='List'?'list':mode==='Wiki'?'book':'agent'} size={14}/><span class="view-label">{mode}</span></button>
+   <button class:active={view===mode} aria-pressed={view===mode} aria-label={VIEW_LABELS[mode]} title={VIEW_LABELS[mode]} onclick={()=>setView(mode)}><Icon name={mode==='Dependencies'?'graph':mode==='Timeline'?'timeline':mode==='List'?'list':mode==='Wiki'?'book':'agent'} size={14}/><span class="view-label">{VIEW_LABELS[mode]}</span></button>
    {/each}
   </div>
+  <!-- The one line that says what this workspace is for, where the views are chosen. -->
+  <p class="view-tagline">Documentation is the source of work: write the intent, then link the work to it.</p>
   {#if view!=='Wiki'&&view!=='Agents'}
   <span class="command-divider"></span>
   <label class="search task-search"><Icon name="search" size={14}/><input aria-label="Search tasks" placeholder="Search tasks" bind:value={search}></label>

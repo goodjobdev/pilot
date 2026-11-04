@@ -78,7 +78,7 @@
  <div class="preview-toolbar"><button aria-label="Back to files and changes" onclick={back}>← Back</button><strong>{selected}</strong></div>
  <div class="preview-actions">
  {#if diff!==null}<button disabled={busy} onclick={()=>void open(selected)}>Open current file</button>{:else if (document||imageUrl)&&workspace?.git}<button disabled={busy} onclick={()=>{commit='';void open(selected,true);}}>Show changes</button>{/if}
- {#if document&&(isBrowsableDocPath(selected)||selected===PLAN_PATH)}<button onclick={()=>onopendoc(selected)}>Edit in Wiki</button>{#if workspace?.git}<button disabled={busy} onclick={()=>void retry()}>Commit saved file</button>{/if}{/if}
+ {#if document&&(isBrowsableDocPath(selected)||selected===PLAN_PATH)}<button onclick={()=>onopendoc(selected)}>Edit in Doc</button>{#if workspace?.git}<button disabled={busy} onclick={()=>void retry()}>Commit saved file</button>{/if}{/if}
  </div>
  {#if busy}<p role="status">Loading…</p>{/if}
  <!-- svelte-ignore a11y_no_noninteractive_tabindex (The scrollable code preview must support keyboard scrolling.) -->

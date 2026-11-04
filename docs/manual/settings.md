@@ -30,7 +30,7 @@ The unreleased update groups actions under **Project**, **Planning**, **Workspac
 | --- | --- |
 | Repository & deploy key | Generate/copy/remove a project key, check read access, explicitly connect a checkout. Removing the local key does not revoke it on GitHub. |
 | Sync plan | Preview repository documents and apply selected planning changes. Not Git synchronization. |
-| Open plan document | Open the canonical `docs/dashboard/board.md` in the Wiki. |
+| Open plan document | Open the canonical `docs/dashboard/board.md` in the Doc view. |
 | Import documents | Preview selected uploaded Markdown/MDX or supported legacy HTML planning documents; never execute them. |
 | Areas & milestones | Edit area names/colours and milestone names/order. Referenced entries cannot be removed. Order is not an automatic dependency or a date. |
 | Export board | Download `board.md`, or an unsaved board draft when applicable. Not a complete project backup. |
@@ -73,7 +73,7 @@ The unreleased update groups actions under **Project**, **Planning**, **Workspac
 
 ## Board presentation
 
-Dependencies, Timeline and List are views of the same plan. Search, area, status (`todo`/`doing`/`done`/`blocked`) and scope filters change presentation, not the underlying task definitions. **Reset** clears the area/status/scope selections, not the search text. Hidden prerequisites still affect readiness. Layout/trace controls do not create prerequisites. Undo/redo are local board-edit conveniences, not Git reset; adopting a changed external board clears stale undo history. None of these controls fetches remote files or deploys a project.
+Map, Milestone and Task are views of the same plan. Search, area, status (`todo`/`doing`/`done`/`blocked`) and scope filters change presentation, not the underlying task definitions. **Reset** clears the area/status/scope selections, not the search text. Hidden prerequisites still affect readiness. Layout/trace controls do not create prerequisites. Undo/redo are local board-edit conveniences, not Git reset; adopting a changed external board clears stale undo history. None of these controls fetches remote files or deploys a project.
 
 ## Harness settings (owner)
 

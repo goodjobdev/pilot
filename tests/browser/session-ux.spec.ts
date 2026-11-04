@@ -12,7 +12,7 @@ async function addProject(page:import('@playwright/test').Page,name:string){
  await page.getByRole('button',{name:'＋ Add project',exact:true}).first().click();
  await page.getByLabel('Project name').fill(name);
  await page.getByRole('button',{name:'Confirm & add project'}).click();
- await page.getByRole('button',{name:'Agents',exact:true}).click();
+ await page.getByRole('button',{name:'Session',exact:true}).click();
 }
 
 test('the composer sends on Enter, keeps Shift+Enter as a newline, and the slash list is the registry',async({page})=>{
@@ -183,7 +183,7 @@ test('a question is dismissed with a reason, does not reappear, and cannot be an
 
  // It stays dismissed after a reload.
  await page.reload();
- await page.getByRole('button',{name:'Agents',exact:true}).click();
+ await page.getByRole('button',{name:'Session',exact:true}).click();
  await expect(page.getByRole('region',{name:'Questions for me'})).toHaveCount(0);
  const restoredHistory=page.locator('details.question-history');
  await restoredHistory.locator('summary').click();

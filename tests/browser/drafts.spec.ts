@@ -38,7 +38,7 @@ async function addProject(page:import('@playwright/test').Page,name:string){
  await page.getByRole('button',{name:'＋ Add project',exact:true}).first().click();
  await page.getByLabel('Project name').fill(name);
  await page.getByRole('button',{name:'Confirm & add project'}).click();
- await page.getByRole('button',{name:'Agents',exact:true}).click();
+ await page.getByRole('button',{name:'Session',exact:true}).click();
  await expect(page.locator('details.activity-more > summary')).toContainText('Idle');
 }
 async function newSession(page:import('@playwright/test').Page,name:string){
@@ -430,7 +430,7 @@ test('a reconnect keeps a draft and a stored image without a second upload or a 
   if(path.endsWith('/agents/input'))inputPosts+=1;
  });
  await addProject(page,'Draft reconnect fixture');
- await page.getByRole('button',{name:'Agents',exact:true}).click();
+ await page.getByRole('button',{name:'Session',exact:true}).click();
  const composer=page.getByLabel('Message the agent');
  await expect(composer).toBeVisible();
  await composer.fill('draft across a reconnect');

@@ -39,7 +39,7 @@ test('a dropped agent stream shows offline, reconnects once and returns to live'
  });
  await addProject(page,'Reconnect drop fixture');
  await observeStates(page);
- await page.getByRole('button',{name:'Agents',exact:true}).click();
+ await page.getByRole('button',{name:'Session',exact:true}).click();
  await expect(page.getByLabel('Message the agent')).toBeVisible();
  const status=page.locator('[data-connection]');
  await expect(status).toHaveAttribute('data-connection','live',{timeout:15000});
@@ -57,7 +57,7 @@ test('a sign-in refusal stops the stream loop and names the sign-in state',async
  });
  await addProject(page,'Reconnect auth fixture');
  await observeStates(page);
- await page.getByRole('button',{name:'Agents',exact:true}).click();
+ await page.getByRole('button',{name:'Session',exact:true}).click();
  await expect(page.getByLabel('Message the agent')).toBeVisible();
  const status=page.locator('[data-connection]');
  await expect(status).toHaveAttribute('data-connection','auth-required');
@@ -94,13 +94,13 @@ test('a reload while the network is down shows the failure and recovers with one
  });
  await addProject(page,'Reload offline fixture');
  nonGet.length=0;
- await page.getByRole('button',{name:'Agents',exact:true}).click();
+ await page.getByRole('button',{name:'Session',exact:true}).click();
  const status=page.locator('[data-connection]');
  await expect(status).toHaveAttribute('data-connection','live',{timeout:15000});
 
  offline=true;
  await page.reload();
- await page.getByRole('button',{name:'Agents',exact:true}).click();
+ await page.getByRole('button',{name:'Session',exact:true}).click();
  await expect(status).toHaveAttribute('data-connection','server-error',{timeout:15000});
  // The failure is named on the connection status; nothing is sent while the view is unusable.
  expect(nonGet).toEqual([]);
@@ -128,14 +128,14 @@ test('two tabs keep one subscription each, one send reaches both once, and closi
   });
  };
  watch(page,'first');
- await page.getByRole('button',{name:'Agents',exact:true}).click();
+ await page.getByRole('button',{name:'Session',exact:true}).click();
  const first=page.locator('[data-connection]');
  await expect(first).toHaveAttribute('data-connection','live',{timeout:15000});
  const other=await context.newPage();
  watch(other,'second');
  try{
   await other.goto('/');
-  await other.getByRole('button',{name:'Agents',exact:true}).click();
+  await other.getByRole('button',{name:'Session',exact:true}).click();
   const second=other.locator('[data-connection]');
   await expect(second).toHaveAttribute('data-connection','live',{timeout:15000});
   await expect(page.getByLabel('Agent transcript')).toBeVisible();
@@ -178,7 +178,7 @@ const lateView={
 
 test('a held response for the previous session cannot replace the new transcript',async({page})=>{
  await addProject(page,'Rapid switch fixture');
- await page.getByRole('button',{name:'Agents',exact:true}).click();
+ await page.getByRole('button',{name:'Session',exact:true}).click();
  await expect(page.getByLabel('Message the agent')).toBeVisible();
  await expect(page.locator('.session-current strong')).toHaveText('Project conversation');
  await page.getByRole('button',{name:'New session'}).click();
@@ -230,7 +230,7 @@ test('a slow first snapshot stays connecting instead of claiming stale',async({p
  });
  await addProject(page,'Slow snapshot fixture');
  await observeStates(page);
- await page.getByRole('button',{name:'Agents',exact:true}).click();
+ await page.getByRole('button',{name:'Session',exact:true}).click();
  await expect(page.getByLabel('Message the agent')).toBeVisible();
  await expect(page.locator('[data-connection]')).toHaveAttribute('data-connection','live',{timeout:15000});
  const states=await page.evaluate(()=>(window as unknown as {__connectionStates:string[]}).__connectionStates);
@@ -241,7 +241,7 @@ test('a slow first snapshot stays connecting instead of claiming stale',async({p
 
 test('a delayed initial snapshot from the previous session cannot change the new view',async({page})=>{
  await addProject(page,'Stale generation fixture');
- await page.getByRole('button',{name:'Agents',exact:true}).click();
+ await page.getByRole('button',{name:'Session',exact:true}).click();
  await expect(page.getByLabel('Message the agent')).toBeVisible();
  await expect(page.locator('.session-current strong')).toHaveText('Project conversation');
  await page.getByRole('button',{name:'New session'}).click();

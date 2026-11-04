@@ -12,7 +12,7 @@ pilot:
 
 ## Available building blocks
 
-The Wiki can render Markdown, diagrams, supported images and static HTML/SVG mockups within its existing safety limits. Static mockups do not execute arbitrary scripts. Task specifications can link to these repository artifacts.
+The Doc view can render Markdown, diagrams, supported images and static HTML/SVG mockups within its existing safety limits. Static mockups do not execute arbitrary scripts. Task specifications can link to these repository artifacts.
 
 ## Planned design functionality
 

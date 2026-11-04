@@ -20,7 +20,7 @@ test('wiki browse, render, edit, search and conflict-safe saving',async({page})=
  await mkdir(join(projectPath,'docs','spec'),{recursive:true});
  await writeFile(join(projectPath,'docs','spec','flow.png'),Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==','base64'));
  await writeFile(join(projectPath,'docs','spec','checkout.html'),'<p>Static checkout mockup</p>');
- await page.getByRole('button',{name:'Wiki',exact:true}).click();
+ await page.getByRole('button',{name:'Doc',exact:true}).click();
  await expect(page.getByText('Write the intent first.')).toBeVisible();
  page.once('dialog',dialog=>void dialog.accept('docs/spec/alpha.md'));
  await page.getByRole('button',{name:'New page',exact:true}).click();
@@ -62,7 +62,7 @@ test('wiki browse, render, edit, search and conflict-safe saving',async({page})=
  await page.getByRole('button',{name:'Search contents'}).click();
  await expect(page.getByText('No matches in document contents')).toBeVisible();
  // A work item points at the documentation; the link is advisory, never a gate.
- await page.getByRole('button',{name:'List',exact:true}).click();
+ await page.getByRole('button',{name:'Task',exact:true}).click();
  await page.getByRole('button',{name:'＋ Task',exact:true}).click();
  await page.getByLabel('Task title',{exact:true}).fill('Implement checkout');
  await page.getByRole('button',{name:'Save task',exact:true}).click();
@@ -90,7 +90,7 @@ test('wiki browse, render, edit, search and conflict-safe saving',async({page})=
  // Narrow screen: the tree becomes a drawer that closes after choosing a document.
  await page.setViewportSize({width:390,height:844});
  await page.reload();
- await page.getByRole('button',{name:'Wiki',exact:true}).click();
+ await page.getByRole('button',{name:'Doc',exact:true}).click();
  await expect(page.locator('.wiki-tree')).toHaveClass(/open/);
  await page.getByRole('button',{name:/alpha\.md/}).click();
  await expect(page.locator('.doc-body h1')).toHaveText('Checkout behaviour revised');

@@ -12,7 +12,7 @@ pilot:
 
 ## One canonical plan
 
-Canvas, timeline, task list, agent planning tools and Wiki plan source use the same `docs/dashboard/board.md`. Board operations validate the version-1 schema and revision. Wiki source edits use that same validation; a conflict retains the draft.
+Map, Milestone, Task, Session planning tools and the Doc plan source use the same `docs/dashboard/board.md`. Board operations validate the version-1 schema and revision. Doc source edits use that same validation; a conflict retains the draft.
 
 Use **Open plan document** to inspect the readable task summary or edit YAML source. Preserve IDs and references. The plan’s Markdown body is its summary; it is not a second plan database.
 

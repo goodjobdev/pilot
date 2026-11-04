@@ -15,11 +15,11 @@ how much it holds, and clicking it opens or collapses it. Searching replaces the
 list of matches, because a match inside a closed folder would otherwise be invisible. A file still
 opens by its full path, and its preview is unchanged.
 
-Use the header’s **Files and changes** button. It is a right sidebar on wide screens and an overlay on phones. Closing it preserves the chat draft. Wiki **Collapse all / Expand all** controls folder groups.
+Use the header’s **Files and changes** button. It is a right sidebar on wide screens and an overlay on phones. Closing it preserves the chat draft. Doc **Collapse all / Expand all** controls folder groups.
 
 ## Files and changes
 
-**Files** previews escaped text and supported raster images. Markdown can open in the Wiki. **Changes** shows real local Git patches and recent local commits. Select a commit and a path to inspect its patch; merge patches compare with their first parent.
+**Files** previews escaped text and supported raster images. Markdown can open in the Doc view. **Changes** shows real local Git patches and recent local commits. Select a commit and a path to inspect its patch; merge patches compare with their first parent.
 
 The listing deliberately omits credentials, secret-like names, generated folders, Git metadata and managed evidence snapshots. It is not a complete Git status. A capped list identifies itself as incomplete; search searches that list only. Text previews are limited to 2 MiB and listings to 5,000 entries. Unsupported/binary text is refused. Image assets use their own bounded authenticated route.
 

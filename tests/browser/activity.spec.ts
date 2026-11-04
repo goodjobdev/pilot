@@ -12,7 +12,7 @@ async function addProject(page: import('@playwright/test').Page, name: string): 
   await page.getByRole('button', { name: '＋ Add project', exact: true }).first().click();
   await page.getByLabel('Project name').fill(name);
   await page.getByRole('button', { name: 'Confirm & add project' }).click();
-  await page.getByRole('button', { name: 'Agents', exact: true }).click();
+  await page.getByRole('button', { name: 'Session', exact: true }).click();
 }
 
 test('the session view shows a bounded activity timeline with recorded outcomes and says what it truncates', async ({ page }) => {

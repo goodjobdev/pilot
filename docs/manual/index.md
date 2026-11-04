@@ -16,7 +16,7 @@ Start with [the vision](./vision.md), [your first project](./first-project.md), 
 
 ## What is available
 
-Repository connection, the Wiki, task boards, bounded agent planning tools, session recovery, local documentation commits, and file/change previews are available in the workspace release based on `fd3fa6f`.
+Repository connection the Doc view, task boards, bounded agent planning tools, session recovery, local documentation commits, and file/change previews are available in the workspace release based on `fd3fa6f`.
 
 [Remote updates](./remote-updates.md) are an unreleased addition. A design editor is planned, not available. Existing diagrams, images and static mockups are documentation assets, not an interactive design application.
 

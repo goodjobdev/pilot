@@ -49,9 +49,13 @@ dialog::backdrop{background:#040b15b3;backdrop-filter:blur(3px)}.modal-head{disp
 .icon-button,.compact-button,.small-button{display:inline-flex;align-items:center;justify-content:center;gap:6px;height:28px;min-height:28px;padding:0 8px;border:1px solid var(--line);border-radius:4px;background:transparent;font-size:11px;color:var(--muted);white-space:nowrap}
 .icon-button{width:28px;min-width:28px;padding:0}.icon-button:hover,.compact-button:hover,.small-button:hover{color:var(--ink);background:var(--raised)}
 .appbar .icon-button{border-color:transparent}.appbar .icon-button:hover{border-color:var(--line)}
+.view-tagline{flex:0 1 auto;min-width:0;margin:0 8px 0 auto;font-size:11px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+/* The tagline is decoration: it appears where the row has room for it and yields to the controls
+   everywhere else, so a longer set of view words can never crowd the search field. */
+@media(max-width:1600px){.view-tagline{display:none}}
 .commandbar{display:flex;align-items:center;gap:8px;padding:6px 10px;min-height:42px;border-bottom:1px solid var(--line);background:var(--panel);position:relative;z-index:20;flex-shrink:0}
 .view-switch{display:flex;gap:2px;flex-shrink:0}.view-switch button{display:flex;gap:6px;align-items:center;height:28px;padding:0 8px;font-size:11px;color:var(--muted);background:transparent;border-color:transparent;border-radius:4px}.view-switch button.active{color:var(--accent);background:color-mix(in srgb,var(--accent) 9%,var(--panel));border-color:color-mix(in srgb,var(--accent) 32%,var(--line))}
-.task-search{margin:0;height:28px;flex:1;min-width:100px;max-width:280px}.task-search input{padding:4px 5px;height:26px}.commandbar-end{display:flex;align-items:center;gap:8px;margin-left:auto;flex-shrink:0}.history-controls{display:flex;gap:2px}.history-controls .icon-button{border-color:transparent}
+.task-search{margin:0;height:28px;flex:1 1 auto;min-width:170px;max-width:280px}.task-search input{padding:4px 5px;height:26px}.commandbar-end{display:flex;align-items:center;gap:8px;margin-left:auto;flex-shrink:0}.history-controls{display:flex;gap:2px}.history-controls .icon-button{border-color:transparent}
 .filter-count{display:grid;place-items:center;min-width:16px;height:16px;font:9px var(--mono);color:var(--accent);border:1px solid color-mix(in srgb,var(--accent) 40%,var(--line));border-radius:3px}
 .popover{position:relative;flex-shrink:0}.popover>button{user-select:none}.popover>button[aria-expanded=true]{background:var(--raised);color:var(--accent);border-color:var(--line)}
 .popover-panel{position:absolute;right:0;top:calc(100% + 8px);z-index:60;width:250px;padding:8px;background:var(--panel);border:1px solid var(--line);border-top:2px solid var(--accent);border-radius:6px;box-shadow:var(--shadow);max-height:calc(100dvh - 100px);overflow:auto}

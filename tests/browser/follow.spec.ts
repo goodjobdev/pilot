@@ -23,7 +23,7 @@ async function addProject(page:Page,name:string){
  await page.getByRole('button',{name:'Confirm & add project'}).click();
  const hideSidebar=page.getByRole('button',{name:'Hide project sidebar'});
  if(await hideSidebar.isVisible().catch(()=>false))await hideSidebar.click();
- await page.getByRole('button',{name:'Agents',exact:true}).click();
+ await page.getByRole('button',{name:'Session',exact:true}).click();
  await expect(page.getByLabel('Message the agent')).toBeVisible();
 }
 
@@ -107,7 +107,7 @@ test('client caps a synthetic 507-row stream snapshot, marks the gap, and preser
 
  // Reload opens a fresh snapshot. The same cap and honest gap must remain, with no send or replay.
  await page.reload();
- await page.getByRole('button',{name:'Agents',exact:true}).click();
+ await page.getByRole('button',{name:'Session',exact:true}).click();
  const reconnected=transcriptOf(page);
  await expect(reconnected.locator('.agent-entry')).toHaveCount(500);
  await expect(reconnected).toContainText('7 older rows are not shown');
@@ -519,7 +519,7 @@ async function switchProject(page:Page,name:string){
  const hide=page.getByRole('button',{name:'Hide project sidebar'});
  if(await hide.isVisible().catch(()=>false))await hide.click();
  await expect(page.getByRole('heading',{name})).toBeVisible({timeout:20000});
- await page.getByRole('button',{name:'Agents',exact:true}).click();
+ await page.getByRole('button',{name:'Session',exact:true}).click();
  await expect(page.getByLabel('Message the agent')).toBeVisible({timeout:20000});
 }
 
@@ -539,7 +539,7 @@ test('a project switch between equal-length conversations resets the follow stat
  await page.getByRole('button',{name:'Confirm & add project'}).click();
  const hide=page.getByRole('button',{name:'Hide project sidebar'});
  if(await hide.isVisible().catch(()=>false))await hide.click();
- await page.getByRole('button',{name:'Agents',exact:true}).click();
+ await page.getByRole('button',{name:'Session',exact:true}).click();
  await expect(transcript).toContainText('No messages yet',{timeout:20000});
  await expect(indicator).toHaveCount(0);
  await seed(page,4);
@@ -579,7 +579,7 @@ test('a reconnect snapshot of the selected session shows no phantom count from t
 
  await page.reload();
  await expect(page.getByRole('heading',{name:'Follow reconnect fixture'})).toBeVisible({timeout:20000});
- await page.getByRole('button',{name:'Agents',exact:true}).click();
+ await page.getByRole('button',{name:'Session',exact:true}).click();
  await expect(page.getByLabel('Message the agent')).toBeVisible({timeout:20000});
  await expect(page.getByRole('region',{name:'Session',exact:true})).toContainText('Reconnect session',{timeout:20000});
  await expect(transcript).toContainText('No messages yet',{timeout:20000});

@@ -29,7 +29,7 @@ test('the workspace file list is a folder tree that opens, closes and still sear
  await pane.getByLabel('Find project files').fill('');await expect(folder('src')).toBeVisible();
 });
 test('a long paste is offered as a document, and only an absurd one is refused',async({page})=>{
- await fixture(page,'Limit fixture');await page.getByRole('button',{name:'Agents',exact:true}).click();
+ await fixture(page,'Limit fixture');await page.getByRole('button',{name:'Session',exact:true}).click();
  const requests:string[]=[];page.on('request',request=>{if(request.url().includes('/agents/input'))requests.push(request.url());});
  const box=page.getByLabel('Message the agent');
  // 8,100 characters is a long paste, not an error: it is offered as a document and can be sent.
@@ -46,7 +46,7 @@ test('a long paste is offered as a document, and only an absurd one is refused',
  await box.fill('short enough');await expect(page.locator('[data-message-limit="over"]')).toHaveCount(0);
 });
 test('every transcript message carries its time, and the composer holds the draft',async({page})=>{
- await fixture(page,'Timestamps fixture');await page.getByRole('button',{name:'Agents',exact:true}).click();
+ await fixture(page,'Timestamps fixture');await page.getByRole('button',{name:'Session',exact:true}).click();
  await page.getByLabel('Message the agent').fill('Hello there');await page.getByRole('button',{name:'Send message',exact:true}).click();
  const transcript=page.getByRole('region',{name:'Agent transcript'});
  await expect(transcript.locator('.agent-entry').first()).toBeVisible();
@@ -78,7 +78,7 @@ test('the agent manager keeps its title and close control in view and grants eve
 });
 
 test('a file can be chosen, and a project with no worktree says why it cannot store it',async({page})=>{
- await fixture(page,'Attachment fixture');await page.getByRole('button',{name:'Agents',exact:true}).click();
+ await fixture(page,'Attachment fixture');await page.getByRole('button',{name:'Session',exact:true}).click();
  await page.getByLabel('Attach a file or image').setInputFiles({name:'brief.md',mimeType:'text/markdown',buffer:Buffer.from('# Brief\nRead me.\n')});
  // This fixture has no connected repository, so there is no worktree to store into. The composer
  // names that reason instead of pretending the file was attached, and nothing is sent by accident.
@@ -88,7 +88,7 @@ test('a file can be chosen, and a project with no worktree says why it cannot st
  // against a real worktree in tests/server/attachments.test.ts, which a browser fixture cannot have.
 });
 test('a long paste is offered as a document rather than refused',async({page})=>{
- await fixture(page,'Document fixture');await page.getByRole('button',{name:'Agents',exact:true}).click();
+ await fixture(page,'Document fixture');await page.getByRole('button',{name:'Session',exact:true}).click();
  const box=page.getByLabel('Message the agent');await box.fill('y'.repeat(9000));
  const offer=page.getByRole('button',{name:'Save the message text as a document in the worktree'});
  await expect(offer).toBeVisible();
@@ -97,7 +97,7 @@ test('a long paste is offered as a document rather than refused',async({page})=>
  await expect(box,'a refused document keeps every character in the box').toHaveValue('y'.repeat(9000));
 });
 test('the thinking level is chosen per session and reported back by the server',async({page})=>{
- await fixture(page,'Thinking fixture');await page.getByRole('button',{name:'Agents',exact:true}).click();
+ await fixture(page,'Thinking fixture');await page.getByRole('button',{name:'Session',exact:true}).click();
  await page.getByRole('button',{name:'Model and thinking'}).click();
  const panel=page.getByRole('group',{name:'Model and thinking'});
  await panel.getByRole('button',{name:'high',exact:true}).click();

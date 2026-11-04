@@ -24,7 +24,7 @@ async function addProject(page:Page,name:string){
 }
 
 async function createDoc(page:Page,path:string,title:string){
- await page.getByRole('button',{name:'Wiki',exact:true}).click();
+ await page.getByRole('button',{name:'Doc',exact:true}).click();
  page.once('dialog',dialog=>void dialog.accept(path));
  await page.getByRole('button',{name:'New page',exact:true}).click();
  await page.getByLabel('Document body').fill('# '+title+'\n\nThe intent for this flow.');
@@ -33,7 +33,7 @@ async function createDoc(page:Page,path:string,title:string){
 }
 
 async function openAgents(page:Page){
- await page.getByRole('button',{name:'Agents',exact:true}).click();
+ await page.getByRole('button',{name:'Session',exact:true}).click();
  await expect(page.getByLabel('Message the agent')).toBeVisible();
 }
 
@@ -75,14 +75,14 @@ test('on a phone, Back closes the newest layer one at a time and only then leave
  // is deterministic even when earlier tests registered projects. One Back from the base leaves.
  await page.goto('/healthz');
  await page.goto('/?project='+fixture.project+'&view=List');
- await expect(page.getByRole('button',{name:'List',exact:true})).toHaveClass(/active/);
+ await expect(page.getByRole('button',{name:'Task',exact:true})).toHaveClass(/active/);
 
  // The document tree is its own layer above the Wiki view.
- await page.getByRole('button',{name:'Wiki',exact:true}).click();
+ await page.getByRole('button',{name:'Doc',exact:true}).click();
  await expect(page.locator('.wiki-tree')).toHaveClass(/open/);
  await page.goBack();
  await expect(page.locator('.wiki-tree')).not.toHaveClass(/open/);
- await expect(page.getByRole('button',{name:'Wiki',exact:true})).toHaveClass(/active/);
+ await expect(page.getByRole('button',{name:'Doc',exact:true})).toHaveClass(/active/);
  await page.goForward();
  await expect(page.locator('.wiki-tree')).toHaveClass(/open/);
 
@@ -107,11 +107,11 @@ test('on a phone, Back closes the newest layer one at a time and only then leave
  await page.goBack();
  await expect(page.locator('.doc-body h1')).toHaveCount(0);
  // Opening the document closed the tree, so the entry under it is the Wiki view.
- await expect(page.getByRole('button',{name:'Wiki',exact:true})).toHaveClass(/active/);
+ await expect(page.getByRole('button',{name:'Doc',exact:true})).toHaveClass(/active/);
  expect(await marker(page)).toBe('alive');
 
  await page.goBack();
- await expect(page.getByRole('button',{name:'List',exact:true})).toHaveClass(/active/);
+ await expect(page.getByRole('button',{name:'Task',exact:true})).toHaveClass(/active/);
  expect(await marker(page)).toBe('alive');
  // Traversing the stack sends no write: Back and Forward are reads of committed state only.
  expect(writes).toEqual([]);
@@ -135,18 +135,18 @@ test('Android-style history.back closes the same layers, restores Forward, and n
  // The Android browser Back button is a history traversal, not a click.
  await page.evaluate(()=>history.back());
  await expect(page.locator('.doc-body h1')).toHaveCount(0);
- await expect(page.getByRole('button',{name:'Wiki',exact:true})).toHaveClass(/active/);
+ await expect(page.getByRole('button',{name:'Doc',exact:true})).toHaveClass(/active/);
  expect(await page.evaluate(()=>((window as unknown as {__pops?:number}).__pops))).toBe(1);
  expect(await marker(page)).toBe('alive');
 
  await page.evaluate(()=>history.back());
- await expect(page.getByRole('button',{name:'List',exact:true})).toHaveClass(/active/);
+ await expect(page.getByRole('button',{name:'Task',exact:true})).toHaveClass(/active/);
  expect(await page.evaluate(()=>((window as unknown as {__pops?:number}).__pops))).toBe(2);
  expect(await marker(page)).toBe('alive');
 
  // Forward returns to the same layers, in order, without a reload.
  await page.goForward();
- await expect(page.getByRole('button',{name:'Wiki',exact:true})).toHaveClass(/active/);
+ await expect(page.getByRole('button',{name:'Doc',exact:true})).toHaveClass(/active/);
  await page.goForward();
  await expect(page.locator('.doc-body h1')).toHaveText('Beta');
  // Two Backs and two Forwards are four traversals, one popstate each. A loop would add more.
@@ -164,7 +164,7 @@ test('menus, sessions and documents each take their own history entry',async({pa
  await expect(page.getByRole('group',{name:'Board actions',exact:true})).toBeVisible();
  await page.goBack();
  await expect(page.getByRole('group',{name:'Board actions',exact:true})).toBeHidden();
- await expect(page.getByRole('button',{name:'Agents',exact:true})).toHaveClass(/active/);
+ await expect(page.getByRole('button',{name:'Session',exact:true})).toHaveClass(/active/);
 
  // Sessions: choosing one is a route, and Back returns to the previous session.
  await createSession(page,'Alpha');
@@ -214,7 +214,7 @@ test('a direct session or document link opens its route, and an unknown one fall
  await expect(page.getByLabel('Named sessions')).toBeVisible();
  await expect(page.getByText(/not in this project/)).toBeVisible();
  await expect.poll(()=>new URL(page.url()).searchParams.get('session')).toBeNull();
- await expect(page.getByRole('button',{name:'Agents',exact:true})).toHaveClass(/active/);
+ await expect(page.getByRole('button',{name:'Session',exact:true})).toHaveClass(/active/);
  // A very long untrusted id is not echoed into the interface.
  const longId='x'.repeat(400);
  await page.goto('/?project='+ids.project+'&view=Agents&session='+longId);
@@ -226,7 +226,7 @@ test('a direct session or document link opens its route, and an unknown one fall
  // to the route before this link rather than leaving the page.
  await page.getByRole('button',{name:'Sessions',exact:true}).click();
  await expect(page.getByLabel('Named sessions')).toHaveCount(0);
- await expect(page.getByRole('button',{name:'Agents',exact:true})).toHaveClass(/active/);
+ await expect(page.getByRole('button',{name:'Session',exact:true})).toHaveClass(/active/);
  expect(new URL(page.url()).pathname).toBe('/');
  await page.goBack();
  expect(new URL(page.url()).pathname).toBe('/');
@@ -241,7 +241,7 @@ test('a direct session or document link opens its route, and an unknown one fall
  await expect(page.getByText(/not in this project/)).toBeVisible();
  await page.getByRole('button',{name:'Sessions',exact:true}).click();
  await expect(page.getByLabel('Named sessions')).toHaveCount(0);
- await expect(page.getByRole('button',{name:'Agents',exact:true})).toHaveClass(/active/);
+ await expect(page.getByRole('button',{name:'Session',exact:true})).toHaveClass(/active/);
  await expect.poll(()=>new URL(page.url()).searchParams.get('session')).toBeNull();
 
  // An unknown project shows an explicit error and selects nothing. It never silently opens the
@@ -369,7 +369,7 @@ test('Back asks before it discards unsaved document text, and the text survives 
  page.once('dialog',async dialog=>{asked+=1;await dialog.accept();});
  await page.goBack();
  await expect(page.getByLabel('Document body')).toHaveCount(0);
- await expect(page.getByRole('button',{name:'Wiki',exact:true})).toHaveClass(/active/);
+ await expect(page.getByRole('button',{name:'Doc',exact:true})).toHaveClass(/active/);
  expect(asked).toBe(2);
 
  // Forward reopens the document. The unsubmitted editor text is not restored: only the route is.
@@ -405,7 +405,7 @@ test('a direct document link writes one entry before its read, keeps the address
  const failure=page.locator('.error.doc-message');
  await expect(failure).toHaveAttribute('role','alert');
  await expect(failure).toBeVisible();
- await expect(page.getByRole('button',{name:'Wiki',exact:true})).toHaveClass(/active/);
+ await expect(page.getByRole('button',{name:'Doc',exact:true})).toHaveClass(/active/);
  // One Back leaves this single route entry.
  await page.goBack();
  await page.waitForURL(/\/healthz$/);
@@ -488,7 +488,7 @@ test('a foreign history entry under a layer is re-anchored, and the app stays af
  const fixture=await fixtureIds(page,'Foreign entry fixture');
  await page.goto('/healthz');
  await page.goto('/?project='+fixture.project+'&view=List');
- await expect(page.getByRole('button',{name:'List',exact:true})).toHaveClass(/active/);
+ await expect(page.getByRole('button',{name:'Task',exact:true})).toHaveClass(/active/);
 
  // A script on the page writes an entry this stack did not create, then the person opens a layer.
  await page.evaluate(()=>history.pushState({foreign:true},'',location.pathname+'?foreign=1'));
@@ -518,8 +518,8 @@ test('an entry from an earlier page load stays readable but is not this load’s
  const ids=await fixtureIds(page,'Earlier load fixture');
  await page.goto('/healthz');
  await page.goto('/?project='+ids.project+'&view=List');
- await expect(page.getByRole('button',{name:'List',exact:true})).toHaveClass(/active/);
- await page.getByRole('button',{name:'Wiki',exact:true}).click();
+ await expect(page.getByRole('button',{name:'Task',exact:true})).toHaveClass(/active/);
+ await page.getByRole('button',{name:'Doc',exact:true}).click();
  await expect(page.locator('.wiki-tree')).toHaveClass(/open/);
  // Close the tree so the current entry is the Wiki route itself; the List entry is below it.
  await page.getByRole('button',{name:'Hide documents'}).click();
@@ -527,9 +527,9 @@ test('an entry from an earlier page load stays readable but is not this load’s
 
  // The reload gives this page load a new nonce. The List entry below is from the earlier load.
  await page.reload();
- await expect(page.getByRole('button',{name:'Wiki',exact:true})).toHaveClass(/active/);
+ await expect(page.getByRole('button',{name:'Doc',exact:true})).toHaveClass(/active/);
  await page.goBack();
- await expect(page.getByRole('button',{name:'List',exact:true})).toHaveClass(/active/);
+ await expect(page.getByRole('button',{name:'Task',exact:true})).toHaveClass(/active/);
  expect(new URL(page.url()).searchParams.get('view')).toBe('List');
 
  // A layer opened now and closed in the app does not walk into the earlier entry.
@@ -538,7 +538,7 @@ test('an entry from an earlier page load stays readable but is not this load’s
  await expect(commands).toBeVisible();
  await page.getByRole('button',{name:'Board actions',exact:true}).click();
  await expect(commands).toBeHidden();
- await expect(page.getByRole('button',{name:'List',exact:true})).toHaveClass(/active/);
+ await expect(page.getByRole('button',{name:'Task',exact:true})).toHaveClass(/active/);
  expect(new URL(page.url()).pathname).toBe('/');
 
  // The next Back leaves for the page before the earlier entry.

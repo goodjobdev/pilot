@@ -28,7 +28,7 @@ async function withAgents(page:import('@playwright/test').Page,fixture:string){
   await page.getByRole('button',{name:'＋ Add project',exact:true}).first().click();
   await page.getByLabel('Project name').fill(fixture);
   await page.getByRole('button',{name:'Confirm & add project'}).click();
-  await page.getByRole('button',{name:'Agents',exact:true}).click();
+  await page.getByRole('button',{name:'Session',exact:true}).click();
   await expect(page.locator('details.activity-more > summary')).toContainText('Idle');
 }
 

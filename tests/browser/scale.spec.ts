@@ -43,7 +43,7 @@ test('a five-hundred task board stays legible and usable',async({page})=>{
 
   await page.reload();
   const started=Date.now();
-  await page.getByRole('button',{name:'List',exact:true}).click();
+  await page.getByRole('button',{name:'Task',exact:true}).click();
   await expect(page.locator('.task-table tbody tr')).toHaveCount(500,{timeout:15000});
   const listMs=Date.now()-started;
   await expect(page.getByText('500 matching tasks')).toBeVisible();
@@ -56,16 +56,16 @@ test('a five-hundred task board stays legible and usable',async({page})=>{
   await expect(page.locator('.task-table tbody tr')).toHaveCount(500);
 
   // The canvas groups by area rather than drawing five hundred loose cards at once.
-  await page.getByRole('button',{name:'Dependencies',exact:true}).click();
+  await page.getByRole('button',{name:'Map',exact:true}).click();
   await expect(page.locator('.task-card.group')).toHaveCount(areas.length,{timeout:15000});
-  await page.getByRole('button',{name:'Timeline',exact:true}).click();
+  await page.getByRole('button',{name:'Milestone',exact:true}).click();
   await expect(page.getByText('Sequence, not dates or duration')).toBeVisible();
 
   await mkdir('/tmp/project-dashboard-ui-preview',{recursive:true});
-  await page.getByRole('button',{name:'List',exact:true}).click();
+  await page.getByRole('button',{name:'Task',exact:true}).click();
   await expect(page.locator('.task-table tbody tr')).toHaveCount(500);
   await page.screenshot({path:'/tmp/project-dashboard-ui-preview/scale-list.png',animations:'disabled'});
-  await page.getByRole('button',{name:'Dependencies',exact:true}).click();
+  await page.getByRole('button',{name:'Map',exact:true}).click();
   await expect(page.locator('.task-card.group')).toHaveCount(areas.length);
   await page.screenshot({path:'/tmp/project-dashboard-ui-preview/scale-canvas.png',animations:'disabled'});
 

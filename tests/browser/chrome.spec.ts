@@ -17,7 +17,10 @@ test('compact console, persistent sidebar hiding and keyboard/popover controls p
  });
  const before=await snapshot();
  const originalWidth=(await page.locator('.view-area').boundingBox())!.width;
- expect((await page.locator('.view-area').boundingBox())!.y).toBeLessThanOrEqual(90);
+ // The header is two rows when the toolbar needs them: the view labels are words, not glyphs, and
+ // the search field keeps a usable width instead of being squeezed under the menus. The bound holds
+ // that shape rather than a single-row one.
+ expect((await page.locator('.view-area').boundingBox())!.y).toBeLessThanOrEqual(140);
  await page.getByRole('button',{name:'Hide project sidebar'}).click();
  await expect(page.getByRole('complementary',{name:'Project sidebar'})).toBeHidden();
  expect((await page.locator('.view-area').boundingBox())!.width).toBeGreaterThan(originalWidth+180);
@@ -48,7 +51,7 @@ test('compact console, persistent sidebar hiding and keyboard/popover controls p
  await expect(page.locator('.svelte-flow')).toHaveClass(/light/);await page.screenshot({path:'/tmp/project-dashboard-ui-preview/console-light.png',animations:'disabled'});
  expect(await snapshot()).toEqual(before);expect(before.board.adoption).toBe('mirror');
  await page.setViewportSize({width:390,height:844});await page.reload();
- await expect(page.getByRole('button',{name:'List',exact:true})).toHaveClass(/active/);
+ await expect(page.getByRole('button',{name:'Task',exact:true})).toHaveClass(/active/);
  expect(await page.evaluate(()=>document.documentElement.scrollWidth)).toBeLessThanOrEqual(390);
  expect((await page.locator('.view-area').boundingBox())!.y).toBeLessThanOrEqual(125);
  await page.getByRole('button',{name:'Filters',exact:true}).click();await expect(page.getByLabel('Filter status')).toBeVisible();
