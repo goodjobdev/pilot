@@ -273,6 +273,29 @@ export class SessionRegistry {
     return this.write(this.rebuild(current, { name }, revision));
   }
 
+  /**
+   * Records the model the owner chose for one session, or clears it with null.
+   *
+   * This is the per-session choice, and the reason it exists as a record of its own: a session bound
+   * to an agent takes the agent's declared model unless the owner has chosen differently **for that
+   * session**, and this is where that choice lives. Setting the same value again is a no-op, and a
+   * stale revision is a conflict that changes nothing.
+   */
+  setModel(input: unknown): SessionRecord {
+    const data = parseStrict(
+      z.strictObject({ projectId: z.unknown(), sessionId: z.unknown(), model: z.unknown(), revision: z.unknown() }),
+      input,
+      'model request (requires projectId, sessionId, model and revision)'
+    );
+    const projectId = parseSessionIdentifier(data.projectId, 'projectId'), sessionId = parseSessionIdentifier(data.sessionId, 'sessionId');
+    const revision = parseRevision(data.revision);
+    const model = parseSessionModel(data.model);
+    const current = this.require(projectId, sessionId);
+    if ((current.model?.provider ?? null) === (model?.provider ?? null) && (current.model?.modelId ?? null) === (model?.modelId ?? null)) return current;
+    this.assertRevision(current, revision, 'model');
+    return this.write(this.rebuild(current, { model }, revision));
+  }
+
   /** Links one work item, validated by the resource port. Linking a link the session already has is a no-op. */
   async link(input: unknown): Promise<SessionRecord> {
     const data = parseStrict(
@@ -321,11 +344,12 @@ export class SessionRegistry {
       throw new SessionError('Session ' + current.id + ' is at revision ' + current.revision + ', not ' + revision + '; the ' + action + ' wrote nothing and the record is unchanged', 'CONFLICT');
   }
   /** The next revision of a record: the write that carries it is the compare-and-swap. */
-  private rebuild(current: SessionRecord, change: { name?: string; links?: readonly SessionLink[] }, expectedRevision: number): SessionRecord {
+  private rebuild(current: SessionRecord, change: { name?: string; links?: readonly SessionLink[]; model?: SessionModelChoice | null }, expectedRevision: number): SessionRecord {
     return validateSessionRecord({
       ...current,
       name: change.name ?? current.name,
       links: canonicalLinks(change.links ?? current.links),
+      model: change.model === undefined ? current.model : change.model,
       revision: expectedRevision + 1,
       updatedAt: this.now()
     });

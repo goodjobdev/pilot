@@ -62,11 +62,22 @@ land as **uncommitted changes** in the worktree; review them in Workspace → Ch
 deliberately. A project with no connected repository has no worktree, so attachments are refused
 with that reason rather than stored somewhere unexpected.
 
-### Thinking level
+### Model and thinking
 
-**Thinking** beside the model picker sets how much reasoning the model is asked for for that session
-(`off` … `max`, or the host default). It is stored per session and takes effect on the next request;
-it cannot be changed while a run is in flight.
+One control opens both: search the configured models, pick one, and set how hard it should think
+(`off` … `max`, or the default). It is the chip beside **Attach**. **Make default** makes the chosen
+model the default for new sessions. Both choices are stored per session and take effect on the next
+request; neither can be changed while a run is in flight.
+
+Which model governs a session, in order: **the model you chose for that session**, else **the model
+the bound agent declares**, else the conversation's own. So binding an agent to a session applies
+that agent's model, and choosing a model in the composer overrides it for that session only.
+
+### Attaching anything
+
+**Attach** takes images and any other file in one control, and splits them by what they are: an
+image goes to the model as image content, everything else is written into the worktree and named in
+the message for the agent to read.
 
 ### One dispatch, many turns
 

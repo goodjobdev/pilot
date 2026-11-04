@@ -7,6 +7,7 @@ import {
   agentInForce, projectScopeAllows, projectScopeSet,
   type AgentActor, type AgentAuditEntry, type AgentBinding, type ConversationBinding, type AgentDraft, type AgentPatch, type AgentRecord, type AgentScope
 } from '../../shared/agent-registry';
+import type { AgentModelChoice } from '../../shared/agent-registry';
 
 /**
  * The durable agent registry: the record, its revision rule and its governance audit.
@@ -245,17 +246,17 @@ export class AgentStore {
    * - A binding naming a disabled or archived agent refuses the same way, naming that agent.
    * - A binding naming a live agent puts exactly that agent's allowlist in force.
    */
-  authorityForSession(input: { readonly projectId: string; readonly sessionId: string }): { readonly agentId: string | null; readonly scopes: readonly AgentScope[] | null; readonly projects: readonly string[] | null; readonly emptyReason: string | null } {
+  authorityForSession(input: { readonly projectId: string; readonly sessionId: string }): { readonly agentId: string | null; readonly model: AgentModelChoice | null; readonly scopes: readonly AgentScope[] | null; readonly projects: readonly string[] | null; readonly emptyReason: string | null } {
     const projectId = parseAgentIdentifier(input.projectId, 'projectId');
     const sessionId = parseAgentIdentifier(input.sessionId, 'sessionId');
     const binding = this.binding(projectId, sessionId);
-    if (binding === null) { const legacy = this.authority(projectId); return Object.freeze({ agentId: legacy.agentId, scopes: legacy.scopes, projects: this.projectsInForce(projectId), emptyReason: null }); }
+    if (binding === null) { const legacy = this.authority(projectId); const record = legacy.agentId === null ? null : this.require(legacy.agentId); return Object.freeze({ agentId: legacy.agentId, model: record === null || !record.enabled || record.archived ? null : record.model, scopes: legacy.scopes, projects: this.projectsInForce(projectId), emptyReason: null }); }
     if (binding.agentId === null)
-      return Object.freeze({ agentId: null, scopes: Object.freeze([]) as readonly AgentScope[], projects: Object.freeze([]) as readonly string[], emptyReason: 'No agent is bound to this session, so it has an empty privilege allowlist and every tool is refused. Bind an agent to grant tools.' });
+      return Object.freeze({ agentId: null, model: null, scopes: Object.freeze([]) as readonly AgentScope[], projects: Object.freeze([]) as readonly string[], emptyReason: 'No agent is bound to this session, so it has an empty privilege allowlist and every tool is refused. Bind an agent to grant tools.' });
     const record = this.require(binding.agentId);
     if (!agentInForce(record))
-      return Object.freeze({ agentId: record.id, scopes: Object.freeze([]) as readonly AgentScope[], projects: Object.freeze([]) as readonly string[], emptyReason: 'The agent bound to this session (' + record.name + ', ' + record.id + ') is ' + (record.archived ? 'archived' : 'disabled') + ', so it is not in force and every tool is refused. Enable or re-bind an agent.' });
-    return Object.freeze({ agentId: record.id, scopes: record.scopes, projects: projectScopeSet(record.workspace.scope), emptyReason: null });
+      return Object.freeze({ agentId: record.id, model: null, scopes: Object.freeze([]) as readonly AgentScope[], projects: Object.freeze([]) as readonly string[], emptyReason: 'The agent bound to this session (' + record.name + ', ' + record.id + ') is ' + (record.archived ? 'archived' : 'disabled') + ', so it is not in force and every tool is refused. Enable or re-bind an agent.' });
+    return Object.freeze({ agentId: record.id, model: record.model, scopes: record.scopes, projects: projectScopeSet(record.workspace.scope), emptyReason: null });
   }
 
   /**

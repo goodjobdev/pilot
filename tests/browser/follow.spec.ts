@@ -251,8 +251,8 @@ test('a phone keeps a usable transcript, and every condensed control is reachabl
  await expect(page.getByRole('region',{name:'Session details'})).toContainText('Scopes in effect');
  await page.getByRole('button',{name:'Hide session details'}).click();
 
- // The session model remains reachable in the compact composer.
- await expect(page.getByLabel('Session model')).toBeVisible();
+ // The model and thinking control remains reachable in the compact composer.
+ await expect(page.getByRole('button',{name:'Model and thinking'})).toBeVisible();
 
  // The activity timeline is bounded by disclosure: open it after several turns and the transcript
  // still keeps its floor, without the composer covering it.

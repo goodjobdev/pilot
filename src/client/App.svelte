@@ -593,7 +593,7 @@ import HarnessSettings from './HarnessSettings.svelte';
   {/if}
  </section>
  {:else if view==='Agents'}
- <AgentsView projectId={project.id} {agentsVersion} sessionId={sessionId} onsessionchange={sessionChanged} sessionListOpen={sessionListOpen} onsessionlistchange={(open)=>sessionListOpen=open} onmissing={sessionUnavailable} onerror={(message)=>error=message} focusQuestion={questionFocus} onquestions={()=>{void loadInbox();inboxRefresh+=1;}}/>
+ <AgentsView projectId={project.id} {agentsVersion} sessionId={sessionId} onsessionchange={sessionChanged} sessionListOpen={sessionListOpen} onsessionlistchange={(open)=>sessionListOpen=open} onmissing={sessionUnavailable} onerror={(message)=>error=message} focusQuestion={questionFocus} onopenproviders={()=>providersOpen=true} onquestions={()=>{void loadInbox();inboxRefresh+=1;}}/>
  {:else}
  <div class="view-content">
  {#if loading}<div class="empty"><p>Loading board…</p></div>

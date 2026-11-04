@@ -36,7 +36,7 @@ test('named controls, authority revocation, questions, completion and recovery s
     },
     privileges: { authority: async ({ sessionId }: { projectId: string; sessionId?: string }) => {
       authorityReads.push(sessionId!);
-      return { agentId: sessionId === a ? 'agent-a' : null, scopes: sessionId === a ? scopes : null, projects: null, emptyReason: null };
+      return { model: null, agentId: sessionId === a ? 'agent-a' : null, scopes: sessionId === a ? scopes : null, projects: null, emptyReason: null };
     } },
     lifecycle: {
       began: ({ sessionId, requestId }: { sessionId: string; requestId: string }) => {

@@ -326,8 +326,9 @@ test('a session binding is revision-checked and durable, and the same session wi
     assert.equal(bound.revision, 1);
     assert.deepEqual(bound.boundBy, OWNER);
     assert.ok(Number.isFinite(Date.parse(bound.boundAt)), 'the binding records when it was made');
-    // The authority now follows the bound agent: its scopes and its project scope.
-    assert.deepEqual(f.agents.authorityForSession({ projectId: f.projectId, sessionId: '1' }), { agentId: agent.id, scopes: ['read_notes', 'record_note'], projects: [f.projectId], emptyReason: null });
+    // The authority now follows the bound agent: its scopes, its project scope, and the model it
+    // declares — which that agent's sessions take unless the owner chooses one for the session.
+    assert.deepEqual(f.agents.authorityForSession({ projectId: f.projectId, sessionId: '1' }), { agentId: agent.id, model: agent.model, scopes: ['read_notes', 'record_note'], projects: [f.projectId], emptyReason: null });
     // A stale revision writes nothing.
     const stale = await refused(() => f.agents.bindSession({ projectId: f.projectId, sessionId: '1', revision: 0, agentId: null, actor: OWNER }), 'CONFLICT');
     assert.match(stale, /binding revision 1, not 0/);

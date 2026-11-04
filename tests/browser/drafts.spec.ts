@@ -346,12 +346,9 @@ test('the model capability comes with the view, blocks a send, and refreshes aft
 
  // A model change answers with the capability now in force, so the stale reading is replaced.
  await page.unroute(viewRoute);
- await page.evaluate(()=>{
-  const select=document.querySelector<HTMLSelectElement>('select[aria-label="Session model"]');
-  if(!select)throw new Error('model select missing');
-  select.value='';
-  select.dispatchEvent(new Event('change',{bubbles:true}));
- });
+ // The model and thinking choices are one panel: the scripted provider is chosen from its list.
+ await page.getByRole('button',{name:'Model and thinking'}).click();
+ await page.getByRole('group',{name:'Model and thinking'}).getByRole('button',{name:/Scripted test provider/}).click();
  await expect(page.locator('.image-capability')).toHaveCount(0);
  await expect(page.getByRole('button',{name:'Send message'})).toBeEnabled();
 

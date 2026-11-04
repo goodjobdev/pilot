@@ -27,12 +27,14 @@
  import {appendedTranscriptRows,retainedAgentView} from './transcript-window';
  import SessionBar from './SessionBar.svelte';
  import SessionActivity from './SessionActivity.svelte';
- let { projectId,sessionId='',onsessionchange=()=>{},sessionListOpen=false,onsessionlistchange=()=>{},onmissing=()=>{},onerror,onquestions,agentsVersion=0,focusQuestion='' }:{
+ let { projectId,sessionId='',onsessionchange=()=>{},sessionListOpen=false,onsessionlistchange=()=>{},onmissing=()=>{},onerror,onquestions,agentsVersion=0,focusQuestion='',onopenproviders=()=>{} }:{
    projectId:string; sessionId?:string; onsessionchange?:(id:string)=>void;
    sessionListOpen?:boolean; onsessionlistchange?:(open:boolean)=>void; onmissing?:()=>void;
    onerror:(message:string)=>void; onquestions?:()=>void; agentsVersion?:number;
    /** An exact question an attention deep link names; the view scrolls to it once it is rendered. */
    focusQuestion?:string;
+   /** Open the providers screen from the model panel, for a model that is not configured yet. */
+   onopenproviders?:()=>void;
  }=$props();
  let view=$state<AgentView|null>(null),enabled=$state(true),draft=$state(''),sending=$state(false),problem=$state('');
  /** The server's own limits, stated once here: the hard maximum for one message, and the smaller
@@ -473,6 +475,28 @@
  let modelSettings=$state<ProviderSettings|null>(null),selectedModel=$state(''),modelBusy=$state(false);
  /** The session's thinking level, as the view reports it: '' means the host default is in force. */
  let thinking=$state(''),thinkingBusy=$state(false);
+ /** The model and thinking panel: one place for the two choices that shape every request. */
+ let modelOpen=$state(false),modelQuery=$state('');
+ const thinkingChoices=[{value:'',label:'default'},...THINKING_LEVELS.filter(level=>['off','low','medium','high','max'].includes(level)).map(level=>({value:level,label:level}))];
+ const filteredModels=$derived((modelSettings?.models??[]).filter(m=>m.configured&&(modelQuery.trim()===''||(m.name+' '+m.provider+' '+m.modelId).toLowerCase().includes(modelQuery.trim().toLowerCase()))).slice(0,40));
+ const currentModelLabel=$derived.by(()=>{
+   if(selectedModel==='')return 'Scripted test provider';
+   const m=modelSettings?.models.find(candidate=>modelKey(candidate)===selectedModel);
+   return m===undefined?selectedModel.split('/').slice(1).join('/'):m.provider+' / '+m.name;
+ });
+ /** Choose a model for this session: the server records it here and applies it at the next request. */
+ async function pickModel(key:string){if(working||modelBusy)return;selectedModel=key;await chooseModel();}
+ async function pickThinking(level:string){if(working||thinkingBusy)return;thinking=level;await chooseThinking();}
+ /** Make the chosen model this instance's default for new sessions. */
+ async function makeDefault(){
+   if(!modelSettings||selectedModel==='')return;modelBusy=true;problem='';
+   try{
+     const m=modelSettings.models.find(candidate=>modelKey(candidate)===selectedModel);
+     await request('/settings/models','POST',{...$state.snapshot(modelSettings.preferences),defaultModel:m?{provider:m.provider,modelId:m.modelId}:null});
+     await loadModels();restoredNotice='Default for new sessions: '+(m?m.provider+' / '+m.name:'Scripted test provider')+'.';
+   }catch(e){problem=(e as Error).message;}
+   finally{modelBusy=false;}
+ }
  /** Files attached to the next message, already stored in the project's worktree. */
  let attachments=$state<{path:string;name:string;bytes:number}[]>([]),attachmentBusy=$state(false),attachmentProblem=$state('');
  async function chooseThinking(){
@@ -482,6 +506,19 @@
      view=retainedAgentView(next);thinking=next.thinkingLevel??'';thinking=next.thinkingLevel??'';
    }catch(e){problem=(e as Error).message;}
    finally{thinkingBusy=false;}
+ }
+ /**
+  * One attach control, split by what the bytes are: an image goes to the media store, so the model
+  * receives it as an image, and anything else is written into the worktree, so the message names a
+  * path the agent can read. The split is decided by the browser's own type for the file and the
+  * server re-checks an image's bytes; a file the browser calls an image but the server refuses is
+  * reported, not silently sent as something else.
+  */
+ async function attachAny(files:File[]){
+   const images=files.filter(file=>file.type.startsWith('image/'));
+   const others=files.filter(file=>!file.type.startsWith('image/'));
+   if(images.length)composerApi?.add(images);
+   if(others.length)await attachFiles(others);
  }
  /** Store one file in the worktree, so the message can name it. The bytes are the owner's own and
   * are never interpreted here: the agent reads the file through its ordinary contained read. */
@@ -968,16 +1005,43 @@
   {#if slashRefusal}<p class="error" role="alert">{slashRefusal}</p>{/if}
   {#if slashResult}<p class="agent-status" role="status">{slashResult}</p>{/if}
   <div class="composer-toolbar">
-  <label class="attach-picker"><span class="sr-only">Attach a file</span><input type="file" multiple aria-label="Attach a file" disabled={attachmentBusy||sending} onchange={(event)=>{void attachFiles(event.currentTarget.files??[]);event.currentTarget.value='';}}><span>{attachmentBusy?'Attaching…':'Attach file'}</span></label>
+  <label class="attach-picker" title="Attach an image or any other file"><span class="sr-only">Attach a file</span><Icon name="attach" size={14}/>
+   <input type="file" multiple aria-label="Attach a file or image" disabled={attachmentBusy||sending}
+    onchange={(event)=>{const chosen=[...(event.currentTarget.files??[])];event.currentTarget.value='';void attachAny(chosen);}}>
+   <span class="attach-label">{attachmentBusy?'Attaching…':'Attach'}</span>
+  </label>
   <ImageComposer projectId={projectId} sessionId={selectedSessionId||undefined} identity={identityKey} bind:items={media} dragging={composerDragging} handle={(composer)=>{composerApi=composer;}} onchange={()=>persistDraft(true)}/>
-   <label class="model-picker"><span class="sr-only">Session model</span><select aria-label="Session model" bind:value={selectedModel} disabled={working||modelBusy} onfocus={()=>void loadModels()} onchange={()=>void chooseModel()}>
-    <option value="">Scripted test provider (free)</option>
-    {#each modelSettings?.models.filter(m=>m.configured)??[] as m (modelKey(m))}<option value={modelKey(m)}>{modelSettings?.preferences.favourites.some(c=>modelKey(c)===modelKey(m))?'★ ':''}{m.provider} / {m.name}</option>{/each}
-   </select></label>
-   <label class="model-picker thinking-picker"><span class="sr-only">Thinking level</span><select aria-label="Thinking level" bind:value={thinking} disabled={thinkingBusy||working} title="How much reasoning the model is asked for. Stored per session." onchange={()=>void chooseThinking()}>
-    <option value="">Thinking: host default</option>
-    {#each THINKING_LEVELS as level}<option value={level}>Thinking: {level}</option>{/each}
-   </select></label>
+   <!-- One control for the two choices that always belong together: which model, and how hard it
+        should think. The chip names both; the panel searches, lists and sets them. -->
+   <div class="model-menu">
+    <button class="model-chip" aria-label="Model and thinking" aria-expanded={modelOpen} aria-controls="model-panel" onclick={()=>{modelOpen=!modelOpen;if(modelOpen)void loadModels();}}>
+     <span>{currentModelLabel}</span><small>· {thinking===''?'default thinking':thinking}</small>
+    </button>
+    {#if modelOpen}
+    <div class="popover-panel model-panel" id="model-panel" role="group" aria-label="Model and thinking">
+     <div class="panel-head"><span class="popover-heading">MODEL</span><button class="text-button" aria-label="Open Providers and models" onclick={()=>{modelOpen=false;onopenproviders();}}>Providers</button></div>
+     <label class="model-search"><Icon name="search" size={14}/><input aria-label="Search models" placeholder="Search models…" bind:value={modelQuery}></label>
+     <div class="model-list">
+      <button class="model-row" class:current={selectedModel===''} disabled={working||modelBusy} onclick={()=>void pickModel('')}>
+       <span class="model-name">Scripted test provider (free)</span><small>the free stand-in</small>{#if selectedModel===''}<span class="model-check" aria-hidden="true">✓</span>{/if}
+      </button>
+      {#each filteredModels as m (modelKey(m))}
+      <button class="model-row" class:current={selectedModel===modelKey(m)} disabled={working||modelBusy} onclick={()=>void pickModel(modelKey(m))}>
+       <span class="model-name">{m.name}</span><small>{m.provider}{modelSettings?.preferences.favourites.some(c=>modelKey(c)===modelKey(m))?' · ★':''}</small>{#if selectedModel===modelKey(m)}<span class="model-check" aria-hidden="true">✓</span>{/if}
+      </button>
+      {/each}
+      {#if !filteredModels.length}<p class="muted">No configured model matches.</p>{/if}
+     </div>
+     <div class="panel-head"><span class="popover-heading">THINKING</span></div>
+     <div class="thinking-row" role="group" aria-label="Thinking level">
+      {#each thinkingChoices as choice}
+      <button class="compact-button" aria-pressed={thinking===choice.value} disabled={thinkingBusy||working} onclick={()=>void pickThinking(choice.value)}>{choice.label}</button>
+      {/each}
+     </div>
+     <div class="panel-foot"><button class="compact-button" aria-label="Make the selected model the default for new sessions" disabled={modelBusy||!selectedModel} onclick={()=>void makeDefault()}>Make default</button></div>
+    </div>
+    {/if}
+   </div>
    {#if draftSavedAt||latestUnsaved}
    <!-- The draft footer is only in the way when there is something to say about the local draft. -->
    <details class="draft-more"><summary>Draft saved locally</summary>
@@ -1014,7 +1078,6 @@
     docked or overlaid, so the composer can never cover the conversation. */
  .agents{flex:1;min-height:0;display:flex;flex-direction:column;overflow-y:auto;scroll-padding-bottom:calc(8px + var(--safe-bottom,0px))}
  .agents-head{display:flex;align-items:center;gap:10px;padding:8px 12px;border-bottom:1px solid var(--line);background:var(--panel);flex-wrap:wrap}
- .model-picker{min-width:180px;max-width:100%;font-size:10px}.model-picker select{max-width:100%}
  .agent-state{font:9px var(--mono);color:var(--muted)}.agent-state.busy{color:var(--accent)}
  .agents-problem{margin:10px 12px 0}
  .agent-questions{margin:10px 12px 0;padding:10px 12px;border:1px solid color-mix(in srgb,#d6b879 32%,var(--line));background:color-mix(in srgb,#d6b879 5%,transparent);border-radius:5px}
@@ -1050,8 +1113,26 @@
  .attachment-offer{display:flex;flex-wrap:wrap;gap:6px;align-items:center}
  .attachment-offer small{color:var(--muted);font-size:11px;max-width:44ch}
  .attach-picker{display:inline-flex;align-items:center}
- .attach-picker input{max-width:150px;font-size:10px}
- .thinking-picker select{font-size:11px}
+ .model-menu{position:relative}
+ .model-chip{display:inline-flex;align-items:baseline;gap:4px;font-size:11px;border:1px solid var(--line);border-radius:999px;padding:3px 10px;background:transparent;max-width:44vw;overflow:hidden;text-overflow:ellipsis}
+ .model-chip small{color:var(--muted)}
+ .model-panel{width:min(340px,calc(100vw - 24px));right:auto;left:0}
+ .model-panel .panel-head{display:flex;align-items:baseline;justify-content:space-between}
+ .model-search{display:flex;align-items:center;gap:6px;border:1px solid var(--line);border-radius:6px;padding:4px 8px;margin:0 0 8px}
+ .model-search input{border:0;background:transparent;font-size:12px;width:100%}
+ .model-list{max-height:240px;overflow:auto;display:flex;flex-direction:column;gap:2px}
+ .model-row{display:grid;grid-template-columns:1fr auto;gap:2px 8px;text-align:left;border:0;background:transparent;padding:7px 8px;border-radius:6px;font-size:12px}
+ .model-row:hover{background:var(--raised)}
+ .model-row.current{background:var(--accent-soft)}
+ .model-row .model-name{min-width:0;overflow-wrap:anywhere}
+ .model-row small{color:var(--muted);font-size:10px}
+ .model-check{grid-row:1 / span 2;align-self:center;color:var(--accent)}
+ .thinking-row{display:flex;flex-wrap:wrap;gap:4px}
+ .thinking-row button[aria-pressed=true]{background:var(--accent-soft);color:var(--accent)}
+ .panel-foot{margin-top:8px;border-top:1px solid var(--line);padding-top:8px}
+ .attach-picker{gap:4px;cursor:pointer;border:1px solid var(--line);border-radius:6px;padding:2px 8px;font-size:11px}
+ .attach-picker input{position:absolute;width:1px;height:1px;opacity:0;pointer-events:none}
+ .attach-picker .attach-label{font-size:11px}
  .message-limit{margin:4px 0;font-size:11px}
  .message-limit[data-message-limit=over]{color:var(--danger)}
  .agent-thinking{margin-top:7px}.agent-thinking pre{white-space:pre-wrap;font-size:11px;color:var(--muted)}
@@ -1088,7 +1169,6 @@
  .agents.compact :global(.session-bar .session-current .eyebrow){display:none}
  .agents.compact :global(.session-bar .session-actions){margin-left:0}
  .agents.compact .agents-head{padding:4px 8px;gap:6px}
- .agents.compact .model-picker{min-width:0;max-width:45%;font-size:10px}
  .agents.compact .agent-composer{padding:6px 8px calc(6px + var(--safe-bottom,0px))}
  .agents.compact .composer-toolbar .compact-button{min-height:36px}
  .agents.compact .agent-composer textarea{min-height:44px}
@@ -1106,8 +1186,6 @@
  .agent-composer textarea,.agents.compact .agent-composer textarea{height:52px;min-height:48px;max-height:200px;width:100%;border:0;background:transparent;resize:vertical;font-family:inherit;font-size:14px;line-height:1.5;box-shadow:none}
  .composer-toolbar{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
  .toolbar-spacer{flex:1;min-width:0}
- .model-picker{display:flex;align-items:center;margin:0;min-width:0;max-width:45%;font-size:11px}
- .model-picker select{width:100%;border-radius:999px}
  .composer-status{display:flex;justify-content:center;align-items:center;gap:8px;flex-wrap:wrap;font-size:10px;padding-top:4px}
  .draft-more{max-width:100%;margin:0}
  .draft-more summary{margin:0;font:11px inherit;text-transform:none;letter-spacing:0;padding:6px}

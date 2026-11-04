@@ -67,7 +67,7 @@ test('existing root and named selections migrate durably and a live scope revoca
   let scopes: readonly AgentScope[] = ['read_docs', 'write_docs'];
   const options = {
     dataRoot: f.root, enabled: true, providers: f.providers, boards: f.boards,
-    privileges: { authority: async () => ({ agentId: 'fixture-agent', scopes, projects: [f.project.id], emptyReason: null }) },
+    privileges: { authority: async () => ({ model: null, agentId: 'fixture-agent', scopes, projects: [f.project.id], emptyReason: null }) },
     conversationBinding: {
       list: () => [...bindings].map(([sessionId, conversationId]) => ({ sessionId, conversationId })),
       read: (_projectId: string, sessionId: string) => bindings.has(sessionId) ? { conversationId: bindings.get(sessionId)!, revision: 1 } : null,

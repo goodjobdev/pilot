@@ -607,6 +607,12 @@ export interface HarnessHostOptions {
   /** The thinking level a new conversation starts with, or null for the host's default. */
   defaultThinking?: () => Promise<ThinkingLevel | null>;
   /**
+   * The model the owner chose **for one session**, or null when the session declares none. It is the
+   * first word in the precedence: a session's own choice, then the bound agent's declared model, then
+   * whatever the conversation already uses.
+   */
+  sessionModel?: (projectId: string, sessionId: string) => Promise<ModelChoice | null>;
+  /**
    * How many model requests one dispatch may make in a row before it stops for review. Resolved at
    * startup and stated in the refusal, so the bound a person meets is the bound the instance runs.
    */
@@ -989,9 +995,9 @@ export class HarnessHost {
     if (recovery.uncertain) throw new HttpError(409, 'This session has an uncertain interrupted effect. Operator review is required before new work.');
   }
   private async dispatchAuthority(project: Project, sessionId: string): Promise<DispatchAuthority> {
-    if (!this.options.privileges) return Object.freeze({ agentId: null, scopes: null, projects: null, emptyReason: null });
+    if (!this.options.privileges) return Object.freeze({ agentId: null, model: null, scopes: null, projects: null, emptyReason: null });
     const authority = await this.options.privileges.authority({ projectId: project.id, sessionId });
-    return Object.freeze({ agentId: authority.agentId ?? null, scopes: authority.scopes ?? null, projects: authority.projects ?? null, emptyReason: authority.emptyReason ?? null });
+    return Object.freeze({ agentId: authority.agentId ?? null, model: authority.model ?? null, scopes: authority.scopes ?? null, projects: authority.projects ?? null, emptyReason: authority.emptyReason ?? null });
   }
   /** Resolve numeric aliases back to the named authority, including after restart. */
   private sessionIdentity(project: Project, conversationId: ConversationId): string {
@@ -1199,7 +1205,7 @@ export class HarnessHost {
       const authority = await this.dispatchAuthority(project, rootSessionId);
       const authorityOf = async (conversationId: string): Promise<DispatchAuthority> => {
         try { return await this.dispatchAuthority(project, this.sessionIdentity(project, Number(conversationId) as ConversationId)); }
-        catch { return { agentId: null, scopes: [], projects: [], emptyReason: 'The conversation authority could not be verified.' }; }
+        catch { return { agentId: null, model: null, scopes: [], projects: [], emptyReason: 'The conversation authority could not be verified.' }; }
       };
       const fileEditEnabled = this.options.fileEdit?.enabled === true;
       const privileges = privilegeExtension(project, authorityOf, {
@@ -1571,9 +1577,13 @@ export class HarnessHost {
       const authority = await this.dispatchAuthority(project, sessionId);
       const tools = permittedTools(hosted.extensions, authority.scopes);
       const startThinking=this.options.defaultThinking===undefined?null:await this.options.defaultThinking().catch(()=>null);
+      // The precedence for a brand-new session conversation: the owner's choice for this session,
+      // else the bound agent's declared model, else the conversation it is created beside.
+      const declaredModel=this.options.sessionModel===undefined?null:await this.options.sessionModel(project.id,sessionId).catch(()=>null);
+      const startModel=declaredModel??authority.model??rootAgent.model;
       const conversation = await hosted.harness.createConversation({
         ownership: { kind: 'ownerless' },
-        agent: { model: rootAgent.model, extensions: hosted.extensions, ...(startThinking===null?{}:{thinkingLevel:startThinking}), ...(tools === undefined ? {} : { tools }) }
+        agent: { model: startModel, extensions: hosted.extensions, ...(startThinking===null?{}:{thinkingLevel:startThinking}), ...(tools === undefined ? {} : { tools }) }
       }, BACKGROUND_CONTEXT);
       if (resolver) {
         // On a concurrent-writer conflict, refuse: never return a conversation that was not durably bound.
@@ -1979,6 +1989,39 @@ export class HarnessHost {
       }
       await hosted.conversation.configure({model:choice??{provider:hosted.provider.provider.id,modelId:hosted.provider.getModel().id}},BACKGROUND_CONTEXT);
       return this.controlView(project, sessionId);
+    });
+  }
+  /**
+   * The model that governs one session, in the one place the order is decided: the model the owner
+   * chose for this session, else the model the bound agent declares, else the conversation's own.
+   */
+  private async modelForSession(hosted: HostedAgent, project: Project, sessionId: string): Promise<ModelChoice | null> {
+    const authority = await this.dispatchAuthority(project, sessionId);
+    const declared = this.options.sessionModel === undefined ? null : await this.options.sessionModel(project.id, sessionId).catch(() => null);
+    if (declared !== null) return declared;
+    if (authority.model !== null) return authority.model;
+    const current = (await hosted.conversation.agent(BACKGROUND_CONTEXT)).model;
+    return current === undefined ? null : { provider: current.provider, modelId: current.modelId };
+  }
+  /**
+   * Apply the model in force to an existing conversation of a session. Called when a binding changes
+   * and when a session's own choice changes, so the precedence is applied rather than only described.
+   */
+  async applySessionModel(project: Project, sessionId: string): Promise<void> {
+    this.assertEnabled();
+    return this.serial('agent:' + project.id, async () => {
+      const hosted = await this.open(project);
+      const bindingId = this.options.conversationBinding?.read(project.id, sessionId)?.conversationId;
+      const direct = conversationIdOf(sessionId);
+      const conversation = direct !== null
+        ? await hosted.harness.conversation(direct, BACKGROUND_CONTEXT)
+        : bindingId === undefined || bindingId === null
+          ? (sessionId === String(ROOT_CONVERSATION_ID) ? hosted.conversation : undefined)
+          : await hosted.harness.conversation(bindingId as ConversationId, BACKGROUND_CONTEXT);
+      if (conversation === undefined || conversation === null) return;
+      const model = await this.modelForSession(hosted, project, sessionId);
+      if (model === null) return;
+      await conversation.configure({ model }, BACKGROUND_CONTEXT);
     });
   }
   /**

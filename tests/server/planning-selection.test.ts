@@ -22,7 +22,7 @@ test('migration preserves owner removals and a later grant works without changin
   const providers = new ProviderStore(root, [fake.provider]);
   await providers.savePreferences({ defaultModel: { provider: 'selection-faux', modelId: 'fixture' }, favourites: [], allowRealModels: true });
   let scopes: readonly AgentScope[] = [];
-  const options = { dataRoot: root, enabled: true, providers, privileges: { authority: async () => ({ agentId: 'fixture-agent', scopes, projects: [project.id], emptyReason: null }) } };
+  const options = { dataRoot: root, enabled: true, providers, privileges: { authority: async () => ({ model: null, agentId: 'fixture-agent', scopes, projects: [project.id], emptyReason: null }) } };
   let host = new HarnessHost(options);
   try {
     const opened = await (host as any).open(project);

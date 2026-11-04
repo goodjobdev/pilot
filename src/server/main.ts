@@ -547,6 +547,7 @@ export async function createApp(options:AppOptions){
     dataRoot:options.dataRoot,providers,delivery,lifecycle:lifecycleHooks, docs, boards, workspace,projectGate:assertProjectAvailable,maxModelTurns,
     allowedCapabilities:()=>harnessSettings.view().then(view=>({codingTools:view.effective.capabilities.codingTools.enabled,shell:view.effective.capabilities.shell.enabled,fileEdit:view.effective.capabilities.fileEdit.enabled})),
     defaultThinking:()=>harnessSettings.defaultThinking(),
+    sessionModel:async(projectId,sessionId)=>{if(!sessions)return null;try{return sessions.read(projectId,sessionId).model ?? null;}catch{return null;}},
     // The coding tools, with the two switches that decide whether they exist at all. `root` answers
     // only for a project whose repository is connected: without a worktree there is nothing to bind
     // a path to, so no coding tool is installed for that project.
@@ -569,7 +570,7 @@ export async function createApp(options:AppOptions){
     // to, and its durable binding (written through this same store) decides the authority, so a
     // binding or scope change takes effect at the next dispatch with no restart. With no registry
     // open, the owner's own dispatch is in force and nothing is narrowed.
-    privileges:{authority:async({projectId,sessionId})=>agentHolder.store?agentHolder.store.authorityForSession({projectId,sessionId:sessionId??''}):Object.freeze({agentId:null,scopes:null,projects:null,emptyReason:null})},
+    privileges:{authority:async({projectId,sessionId})=>agentHolder.store?agentHolder.store.authorityForSession({projectId,sessionId:sessionId??''}):Object.freeze({agentId:null,model:null,scopes:null,projects:null,emptyReason:null})},
     // The durable conversation binding port. It resolves the control-store holder at call time because
     // the registry is wired later in createApp; with no control store, writes fail closed rather than
     // claiming that an in-memory mapping is durable.
@@ -1268,6 +1269,9 @@ export async function createApp(options:AppOptions){
                 }
                 sessions.read(project.id,identity);
                 const binding=agentStore.bindSession({projectId:project.id,sessionId:identity,revision:bound.revision,agentId:bound.agentId,actor:bound.actor});
+                // A binding is what makes an agent's declared model apply to that session, so it is
+                // applied here rather than described: the session's own choice still wins.
+                await agents.applySessionModel(project,identity).catch(()=>{});
                 json({binding,authority:agentStore.authorityForSession({projectId:project.id,sessionId:identity})});return;
               }
               if(req.method!=='POST')throw new HttpError(405,'Method not allowed');
@@ -1706,6 +1710,9 @@ export async function createApp(options:AppOptions){
           if(agentsRoute[2]==='model'&&req.method==='POST'){
             const c=z.strictObject({sessionId:z.string().min(1).max(200).optional(),model:z.strictObject({provider:z.string().min(1).max(100),modelId:z.string().min(1).max(200)}).nullable()}).parse(payload);
             const changed=await agents.setModel(p,c.model,c.sessionId);
+            // The session's own choice is recorded with the session, which is what makes it win over
+            // the bound agent's declared model for that session and only that session.
+            if(c.sessionId!==undefined&&sessions!==undefined){try{const record=sessions.read(p.id,c.sessionId);sessions.setModel({projectId:p.id,sessionId:c.sessionId,model:c.model,revision:record.revision});}catch{/* a session that is not registered keeps no per-session choice */}}
             // The capability of the model now in force travels with the change, so a client cannot
             // keep showing an older model's image support.
             json({...changed,vision:await agents.vision(p,c.sessionId).catch(()=>null)});return;

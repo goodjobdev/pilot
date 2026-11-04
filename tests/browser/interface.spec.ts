@@ -79,7 +79,7 @@ test('the agent manager keeps its title and close control in view and grants eve
 
 test('a file can be chosen, and a project with no worktree says why it cannot store it',async({page})=>{
  await fixture(page,'Attachment fixture');await page.getByRole('button',{name:'Agents',exact:true}).click();
- await page.getByLabel('Attach a file').setInputFiles({name:'brief.md',mimeType:'text/markdown',buffer:Buffer.from('# Brief\nRead me.\n')});
+ await page.getByLabel('Attach a file or image').setInputFiles({name:'brief.md',mimeType:'text/markdown',buffer:Buffer.from('# Brief\nRead me.\n')});
  // This fixture has no connected repository, so there is no worktree to store into. The composer
  // names that reason instead of pretending the file was attached, and nothing is sent by accident.
  await expect(page.getByRole('alert').filter({hasText:/Attachments need a connected repository worktree/})).toBeVisible();
@@ -98,12 +98,14 @@ test('a long paste is offered as a document rather than refused',async({page})=>
 });
 test('the thinking level is chosen per session and reported back by the server',async({page})=>{
  await fixture(page,'Thinking fixture');await page.getByRole('button',{name:'Agents',exact:true}).click();
- const picker=page.getByLabel('Thinking level');await expect(picker).toHaveValue('');
- await picker.selectOption('high');
- await expect(picker).toHaveValue('high');
+ await page.getByRole('button',{name:'Model and thinking'}).click();
+ const panel=page.getByRole('group',{name:'Model and thinking'});
+ await panel.getByRole('button',{name:'high',exact:true}).click();
+ await expect(panel.getByRole('button',{name:'high',exact:true})).toHaveAttribute('aria-pressed','true');
  // The server is the authority: a fresh read of the view reports the same level.
  await expect.poll(async()=>await page.evaluate(async()=>{const token=document.querySelector('meta[name="dashboard-token"]')?.getAttribute('content')??'';const project=new URL(location.href).searchParams.get('project')??'';const view=await (await fetch('/api/projects/'+project+'/agents',{headers:{'x-dashboard-token':token}})).json();return view.view.thinkingLevel;})).toBe('high');
- await picker.selectOption('');await expect(picker).toHaveValue('');
+ await panel.getByRole('button',{name:'default',exact:true}).click();
+ await expect(panel.getByRole('button',{name:'default',exact:true})).toHaveAttribute('aria-pressed','true');
 });
 
 test('the harness settings are the owner’s, apply without a restart, and cannot turn a tool on that the deployment lacks',async({page})=>{

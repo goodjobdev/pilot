@@ -765,6 +765,12 @@ export function validateConversationBinding(value: unknown, code: AgentErrorCode
 export type DispatchAuthority = {
   /** The agent whose scopes govern this dispatch, or null when the owner's own dispatch is in force. */
   readonly agentId: string | null;
+  /**
+   * The model the bound agent declares, or null when no agent is bound. It is applied to that
+   * agent's sessions **unless the owner chose a model for the session itself**, which is recorded
+   * with the session and wins over this.
+   */
+  readonly model: AgentModelChoice | null;
   /** The scopes in force: null means the owner (unrestricted), an empty list means an agent allowed nothing. */
   readonly scopes: readonly AgentScope[] | null;
   /**

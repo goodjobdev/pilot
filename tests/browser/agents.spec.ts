@@ -5,8 +5,9 @@ test('the agent runs, streams, steers and stops without calling a model',async({
  await page.getByLabel('Project name').fill('Agents fixture');
  await page.getByRole('button',{name:'Confirm & add project'}).click();
  await page.getByRole('button',{name:'Agents',exact:true}).click();
- // The instance is explicit that a scripted provider answers, so nobody mistakes it for a model.
- await expect(page.getByLabel('Session model')).toHaveValue('');
+ // The instance is explicit that a scripted provider answers, so nobody mistakes it for a model:
+ // the model and thinking chip names it, and the panel is where it is changed.
+ await expect(page.getByRole('button',{name:'Model and thinking'})).toContainText('Scripted test provider');
  await expect(page.getByRole('button',{name:'Stop the agent'})).toHaveCount(0);
  await expect(page.locator('details.activity-more > summary')).toContainText('Idle');
 
