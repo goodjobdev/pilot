@@ -71,6 +71,17 @@ The unreleased update groups actions under **Project**, **Planning**, **Workspac
 
 **Areas & milestones** edits are a dialog draft: **Save configuration** applies the batch, **Cancel** leaves the stored configuration unchanged. Area accent is a colour, milestone order is a number from 0 to 10,000. Removing referenced entries is refused instead of silently reassigning tasks.
 
+## The header
+
+Two rows above the work: the views (**Map**, **Milestone**, **Task**, **Doc**, **Session**) with the
+one line about what the workspace is for, then the tools for the view in force — search, filters,
+undo/redo, refresh and **＋ Task** on the board views, the document count on **Doc**. A small screen
+shows the views as icons and keeps each row on one line.
+
+In **Session**, chips beside the conversation name the project's own documents (its instructions and
+readme first) and the canonical plan with the board revision it is at. Each chip opens that document
+in the **Doc** view, so the session and the documentation it works from are one tap apart.
+
 ## Board presentation
 
 Map, Milestone and Task are views of the same plan. Search, area, status (`todo`/`doing`/`done`/`blocked`) and scope filters change presentation, not the underlying task definitions. **Reset** clears the area/status/scope selections, not the search text. Hidden prerequisites still affect readiness. Layout/trace controls do not create prerequisites. Undo/redo are local board-edit conveniences, not Git reset; adopting a changed external board clears stale undo history. None of these controls fetches remote files or deploys a project.

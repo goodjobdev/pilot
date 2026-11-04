@@ -49,11 +49,13 @@ dialog::backdrop{background:#040b15b3;backdrop-filter:blur(3px)}.modal-head{disp
 .icon-button,.compact-button,.small-button{display:inline-flex;align-items:center;justify-content:center;gap:6px;height:28px;min-height:28px;padding:0 8px;border:1px solid var(--line);border-radius:4px;background:transparent;font-size:11px;color:var(--muted);white-space:nowrap}
 .icon-button{width:28px;min-width:28px;padding:0}.icon-button:hover,.compact-button:hover,.small-button:hover{color:var(--ink);background:var(--raised)}
 .appbar .icon-button{border-color:transparent}.appbar .icon-button:hover{border-color:var(--line)}
+.view-row{display:flex;align-items:center;gap:8px;min-width:0}
+.tool-row{display:flex;align-items:center;gap:8px;min-width:0;flex-wrap:wrap}
 .view-tagline{flex:0 1 auto;min-width:0;margin:0 8px 0 auto;font-size:11px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 /* The tagline is decoration: it appears where the row has room for it and yields to the controls
    everywhere else, so a longer set of view words can never crowd the search field. */
-@media(max-width:1600px){.view-tagline{display:none}}
-.commandbar{display:flex;align-items:center;gap:8px;padding:6px 10px;min-height:42px;border-bottom:1px solid var(--line);background:var(--panel);position:relative;z-index:20;flex-shrink:0}
+@media(max-width:1000px){.view-tagline{display:none}}
+.commandbar{display:flex;flex-direction:column;align-items:stretch;gap:6px;padding:6px 10px;min-height:42px;border-bottom:1px solid var(--line);background:var(--panel);position:relative;z-index:20;flex-shrink:0}
 .view-switch{display:flex;gap:2px;flex-shrink:0}.view-switch button{display:flex;gap:6px;align-items:center;height:28px;padding:0 8px;font-size:11px;color:var(--muted);background:transparent;border-color:transparent;border-radius:4px}.view-switch button.active{color:var(--accent);background:color-mix(in srgb,var(--accent) 9%,var(--panel));border-color:color-mix(in srgb,var(--accent) 32%,var(--line))}
 .task-search{margin:0;height:28px;flex:1 1 auto;min-width:170px;max-width:280px}.task-search input{padding:4px 5px;height:26px}.commandbar-end{display:flex;align-items:center;gap:8px;margin-left:auto;flex-shrink:0}.history-controls{display:flex;gap:2px}.history-controls .icon-button{border-color:transparent}
 .filter-count{display:grid;place-items:center;min-width:16px;height:16px;font:9px var(--mono);color:var(--accent);border:1px solid color-mix(in srgb,var(--accent) 40%,var(--line));border-radius:3px}
@@ -73,8 +75,8 @@ dialog::backdrop{background:#040b15b3;backdrop-filter:blur(3px)}.modal-head{disp
 @media(max-width:650px){
  .appbar{gap:7px;padding:0 7px}.workspace-identity{flex:1}.workspace-identity h1{max-width:100%}.appbar-divider{display:none}.authority-badge{font-size:8px;padding:3px 4px}.appbar-end{gap:2px}
  .sidebar{position:fixed;top:42px;left:0;bottom:0;width:212px;z-index:40;box-shadow:12px 0 32px #0004}.brand{height:52px}.sidebar-toggle{position:relative;z-index:50}
- .commandbar{flex-wrap:wrap;gap:6px;padding:6px 8px}.view-switch{flex:1}.view-switch button{flex:1;font-size:10px;gap:4px;padding:0 6px}.command-divider,.history-controls{display:none}.commandbar-end{margin-left:0}
- .task-search{order:3;flex-basis:calc(100% - 40px);max-width:none;min-width:0}.filters-popover{order:4}.filters-popover>button{width:28px;padding:0;position:relative}.filters-popover>button>span:not(.filter-count){display:none}.filter-count{position:absolute;right:-4px;top:-5px;background:var(--panel);min-width:13px;height:13px;font-size:8px}
+ .commandbar{gap:4px;padding:6px 8px}.view-row{gap:6px}.view-switch{flex:1}.view-switch button{flex:1;font-size:10px;gap:4px;padding:0 6px}.command-divider,.history-controls{display:none}.commandbar-end{margin-left:0}
+ .tool-row{flex-wrap:nowrap;gap:6px}.task-search{flex:1 1 auto;max-width:none;min-width:0}.filters-popover>button{width:28px;padding:0;position:relative}.filters-popover>button>span:not(.filter-count){display:none}.filter-count{position:absolute;right:-4px;top:-5px;background:var(--panel);min-width:13px;height:13px;font-size:8px}
  .popover-panel{max-width:calc(100vw - 20px)}.statusbar{gap:8px;font-size:8px}.task-table td,.task-table th{padding:10px}.task-table .optional{display:none}
 }
 @media(prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}

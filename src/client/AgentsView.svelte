@@ -27,7 +27,7 @@
  import {appendedTranscriptRows,retainedAgentView} from './transcript-window';
  import SessionBar from './SessionBar.svelte';
  import SessionActivity from './SessionActivity.svelte';
- let { projectId,sessionId='',onsessionchange=()=>{},sessionListOpen=false,onsessionlistchange=()=>{},onmissing=()=>{},onerror,onquestions,agentsVersion=0,focusQuestion='',onopenproviders=()=>{} }:{
+ let { projectId,sessionId='',onsessionchange=()=>{},sessionListOpen=false,onsessionlistchange=()=>{},onmissing=()=>{},onerror,onquestions,agentsVersion=0,focusQuestion='',onopenproviders=()=>{},chips=[],onopenchip=()=>{} }:{
    projectId:string; sessionId?:string; onsessionchange?:(id:string)=>void;
    sessionListOpen?:boolean; onsessionlistchange?:(open:boolean)=>void; onmissing?:()=>void;
    onerror:(message:string)=>void; onquestions?:()=>void; agentsVersion?:number;
@@ -35,6 +35,9 @@
    focusQuestion?:string;
    /** Open the providers screen from the model panel, for a model that is not configured yet. */
    onopenproviders?:()=>void;
+   /** The documents and board revision of this project, shown as chips beside the session. */
+   chips?:readonly {label:string;path:string}[];
+   onopenchip?:(path:string)=>void;
  }=$props();
  let view=$state<AgentView|null>(null),enabled=$state(true),draft=$state(''),sending=$state(false),problem=$state('');
  /** The server's own limits, stated once here: the hard maximum for one message, and the smaller
@@ -497,6 +500,27 @@
    }catch(e){problem=(e as Error).message;}
    finally{modelBusy=false;}
  }
+ /**
+  * Dictation, where the browser offers it. Speech recognition is a browser capability, not a Pilot
+  * one: the button appears only when the browser really implements it, and the transcript is appended
+  * to the draft as it is heard. Nothing is sent to a provider by dictation itself.
+  */
+ type SpeechRecognitionLike={lang:string;continuous:boolean;interimResults:boolean;start:()=>void;stop:()=>void;
+   onresult:((event:{resultIndex:number;results:{length:number;[index:number]:{isFinal:boolean;[index:number]:{transcript:string}}}})=>void)|null;
+   onend:(()=>void)|null;onerror:(()=>void)|null};
+ const speechSupported=typeof window!=='undefined'&&Boolean((window as unknown as {SpeechRecognition?:unknown;webkitSpeechRecognition?:unknown}).SpeechRecognition??(window as unknown as {webkitSpeechRecognition?:unknown}).webkitSpeechRecognition);
+ let listening=$state(false),recognition=$state<SpeechRecognitionLike|null>(null);
+ function dictate(){
+   if(!speechSupported)return;
+   if(listening){recognition?.stop();return;}
+   const ctor=(window as unknown as {SpeechRecognition?:new()=>SpeechRecognitionLike;webkitSpeechRecognition?:new()=>SpeechRecognitionLike});
+   const engine=new (ctor.SpeechRecognition??ctor.webkitSpeechRecognition!)();
+   engine.lang=navigator.language||'en-US';engine.continuous=true;engine.interimResults=false;
+   engine.onresult=(event)=>{let heard='';for(let i=event.resultIndex;i<event.results.length;i+=1)if(event.results[i].isFinal)heard+=event.results[i][0].transcript;if(heard)draft=(draft?draft+' ':'')+heard.trim();};
+   engine.onend=()=>{listening=false;recognition=null;persistDraft(true);};
+   engine.onerror=()=>{listening=false;recognition=null;};
+   recognition=engine;listening=true;engine.start();
+ }
  /** Files attached to the next message, already stored in the project's worktree. */
  let attachments=$state<{path:string;name:string;bytes:number}[]>([]),attachmentBusy=$state(false),attachmentProblem=$state('');
  async function chooseThinking(){
@@ -852,6 +876,13 @@
  }
 </script>
 <section class="agents" class:compact={chromeCompact} bind:this={shell}>
+ {#if chips.length}
+ <div class="session-chips" role="group" aria-label="Project documents">
+  {#each chips as chip (chip.path+chip.label)}
+  <button class="compact-button session-chip" title={chip.path} onclick={()=>onopenchip(chip.path)}><Icon name="book" size={12}/><span>{chip.label}</span></button>
+  {/each}
+ </div>
+ {/if}
  {#if view?.conversationId||selectedSessionId}<SessionBar {projectId} sessionId={selectedSessionId||view?.conversationId||''} {view} {agentsVersion} compact={chromeCompact} listOpen={sessionListOpen} onlistchange={onsessionlistchange} onerror={(message)=>onerror(message)} onsessionchange={(id)=>selectSession(id)}/>{/if}
  {#if sessionFallback}<p class="error agents-problem" role="alert">{sessionFallback}</p>{/if}
  {#if view?.transcriptWindow?.questionsOmitted}
@@ -1012,6 +1043,9 @@
     onchange={(event)=>{const chosen=[...(event.currentTarget.files??[])];event.currentTarget.value='';void attachAny(chosen);}}>
    <span class="attach-label">{attachmentBusy?'Attaching…':'Attach'}</span>
   </label>
+  {#if speechSupported}
+  <button class="compact-button mic-button" class:listening aria-label={listening?'Stop dictating':'Dictate the message'} aria-pressed={listening} title="Dictate the message with this device’s speech recognition" onclick={dictate}><Icon name={listening?'close':'mic'} size={14}/></button>
+  {/if}
   <ImageComposer projectId={projectId} sessionId={selectedSessionId||undefined} identity={identityKey} bind:items={media} dragging={composerDragging} handle={(composer)=>{composerApi=composer;}} onchange={()=>persistDraft(true)}/>
    <!-- One control for the two choices that always belong together: which model, and how hard it
         should think. The chip names both; the panel searches, lists and sets them. -->
@@ -1103,6 +1137,8 @@
  .agent-entry.system,.agent-entry.other{font-size:11px;color:var(--muted)}
  .agent-role{font:9px var(--mono);letter-spacing:1px;color:var(--muted);text-transform:uppercase}
  .agent-text{margin:7px 0 0;white-space:pre-wrap;overflow-wrap:anywhere;font:12px/1.6 var(--mono)}
+ .session-chips{display:flex;flex-wrap:wrap;gap:6px;padding:6px 12px 0;min-width:0}
+ .session-chip{font:10px var(--mono);max-width:100%;overflow:hidden;text-overflow:ellipsis}
  .agent-time{margin-left:8px;font-size:10px;color:var(--muted);font-variant-numeric:tabular-nums}
  .agent-tool-run{margin:8px 0;border-left:2px solid var(--line);padding-left:8px}
  .agent-tool-run>summary{cursor:pointer;font-size:11px;color:var(--muted)}
@@ -1132,6 +1168,7 @@
  .thinking-row{display:flex;flex-wrap:wrap;gap:4px}
  .thinking-row button[aria-pressed=true]{background:var(--accent-soft);color:var(--accent)}
  .panel-foot{margin-top:8px;border-top:1px solid var(--line);padding-top:8px}
+ .mic-button.listening{color:var(--danger);border-color:color-mix(in srgb,var(--danger) 40%,var(--line))}
  .attach-picker{gap:4px;cursor:pointer;border:1px solid var(--line);border-radius:6px;padding:2px 8px;font-size:11px}
  .attach-picker input{position:absolute;width:1px;height:1px;opacity:0;pointer-events:none}
  .attach-picker .attach-label{font-size:11px}

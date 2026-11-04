@@ -970,7 +970,12 @@ test('P0: a named (UUID) session resolves to the same conversation after a resta
       const thirdConvId = secondView.view.conversationId;
       assert.ok(thirdConvId !== undefined && String(thirdConvId).length > 0);
       assert.notEqual(String(thirdConvId), String(firstConvId), 'a second named session gets a distinct conversation from the first');
-      assert.equal(conversationCount(), 3, 'each named session has one conversation, with no orphan duplicates');
+      // The third conversation is created as the second session opens, so the count is polled to the
+      // expected value rather than read once: a single read raced the creation and reported 2.
+      const thirdCount = await waitFor(async () => conversationCount() === 3 ? 3 : undefined);
+      assert.equal(thirdCount, 3, 'each named session has one conversation, with no orphan duplicates');
+      await new Promise(resolve => setTimeout(resolve, 50));
+      assert.equal(conversationCount(), 3, 'and no orphan duplicate appeared afterwards');
     } finally {
       await reopened.created.close();
     }

@@ -75,7 +75,8 @@ that agent's model, and choosing a model in the composer overrides it for that s
 
 ### Attaching anything
 
-**Attach** takes images and any other file in one control, and splits them by what they are: an
+**Dictate** appears where the browser implements speech recognition: it appends what it hears to the
+message box and sends nothing by itself. **Attach** takes images and any other file in one control, and splits them by what they are: an
 image goes to the model as image content, everything else is written into the worktree and named in
 the message for the agent to read.
 

@@ -371,6 +371,18 @@ import HarnessSettings from './HarnessSettings.svelte';
    await refreshBoard();if(project?.id!==id)return;await loadDocs();
    if(doc&&!docUnsaved()&&!docSaving){const path=doc.path;try{const fresh=await api.doc(id,path);if(project?.id===id&&doc?.path===path&&!docUnsaved()){doc=fresh;docDraft=fresh.text;docEditing=false;docMessage='Updated from reviewed repository changes';}}catch(e){if(project?.id===id&&!docUnsaved()){clearDoc();docsError=(e as Error).message;}}}
  }
+ /**
+  * The chips beside a session: the few documents that matter most in this project — its own
+  * instructions and readme first — and the canonical plan with the revision it is at. Each opens in
+  * the Doc view, so a session and the documentation it works from are one tap apart.
+  */
+ const sessionChips=$derived.by(()=>{
+   const preferred=docs.filter(entry=>/^(AGENTS|PROJECT|STRUCTURE|README)\.md$/.test(entry.path)).slice(0,3);
+   const rest=docs.filter(entry=>!preferred.includes(entry)&&/\.md$/.test(entry.path)&&!entry.path.startsWith('docs/dashboard/')).slice(0,Math.max(0,3-preferred.length));
+   const chips=[...preferred,...rest].map(entry=>({label:entry.path,path:entry.path}));
+   if(snapshot!==null&&project!==null)chips.push({label:'Board state · revision '+snapshot.revision.slice(0,8),path:PLAN_PATH});
+   return chips;
+ });
  function openWorkspaceDoc(path:string){if(!leave())return;inspectorDirty=false;selected='';workspaceOpen=false;setView('Wiki',{openTree:false});void openDoc(path,{force:true});}
  /** Pick up board changes made by the agent or another client without overwriting local edits. */
  async function refreshBoard(){
@@ -551,13 +563,17 @@ import HarnessSettings from './HarnessSettings.svelte';
  {#if project}
  {#if error}<div class="error workspace-error" role="alert">{error}<div class="row">{#if failed}<button onclick={exported}>Export unsaved draft</button><button onclick={()=>select(project!)}>Reload & review</button>{:else if !snapshot}<button onclick={locate}>Locate folder</button>{#if missingBoard}<button onclick={initialize}>Confirm & initialize board</button>{/if}{/if}</div></div>{/if}
  <div class="commandbar">
+  <!-- Row one: which view, and the one line that says what this workspace is for. -->
+  <div class="view-row">
   <div class="view-switch" aria-label="Workspace views">
    {#each VIEW_MODES as mode}
    <button class:active={view===mode} aria-pressed={view===mode} aria-label={VIEW_LABELS[mode]} title={VIEW_LABELS[mode]} onclick={()=>setView(mode)}><Icon name={mode==='Dependencies'?'graph':mode==='Timeline'?'timeline':mode==='List'?'list':mode==='Wiki'?'book':'agent'} size={14}/><span class="view-label">{VIEW_LABELS[mode]}</span></button>
    {/each}
   </div>
-  <!-- The one line that says what this workspace is for, where the views are chosen. -->
   <p class="view-tagline">Documentation is the source of work: write the intent, then link the work to it.</p>
+  </div>
+  <!-- Row two: the tools for the view in force. -->
+  <div class="tool-row">
   {#if view!=='Wiki'&&view!=='Agents'}
   <span class="command-divider"></span>
   <label class="search task-search"><Icon name="search" size={14}/><input aria-label="Search tasks" placeholder="Search tasks" bind:value={search}></label>
@@ -580,9 +596,10 @@ import HarnessSettings from './HarnessSettings.svelte';
    <button class="primary compact-button" aria-label="＋ Task" disabled={!snapshot||saving||failed||inspectorDirty} onclick={addTask}><Icon name="plus" size={15}/><span>Task</span></button>
   </div>
   {:else if view==='Wiki'}
-  <span class="wiki-hint">Documentation is the source of work: write the intent, then link the work to it.</span>
+  <span class="wiki-hint">{doc?doc.path:'No document selected'} · {docs.length} documents</span>
   <div class="commandbar-end"><button class="compact-button wiki-tree-toggle" aria-label="Show documents" onclick={()=>treeOpen=true}><Icon name="book" size={14}/><span>Documents</span></button></div>
   {/if}
+  </div>
  </div>
  <div class="view-area">
  {#if view==='Wiki'}
@@ -600,7 +617,7 @@ import HarnessSettings from './HarnessSettings.svelte';
   {/if}
  </section>
  {:else if view==='Agents'}
- <AgentsView projectId={project.id} {agentsVersion} sessionId={sessionId} onsessionchange={sessionChanged} sessionListOpen={sessionListOpen} onsessionlistchange={(open)=>sessionListOpen=open} onmissing={sessionUnavailable} onerror={(message)=>error=message} focusQuestion={questionFocus} onopenproviders={()=>providersOpen=true} onquestions={()=>{void loadInbox();inboxRefresh+=1;}}/>
+ <AgentsView projectId={project.id} {agentsVersion} sessionId={sessionId} chips={sessionChips} onopenchip={(path)=>openWorkspaceDoc(path)} onsessionchange={sessionChanged} sessionListOpen={sessionListOpen} onsessionlistchange={(open)=>sessionListOpen=open} onmissing={sessionUnavailable} onerror={(message)=>error=message} focusQuestion={questionFocus} onopenproviders={()=>providersOpen=true} onquestions={()=>{void loadInbox();inboxRefresh+=1;}}/>
  {:else}
  <div class="view-content">
  {#if loading}<div class="empty"><p>Loading board…</p></div>
