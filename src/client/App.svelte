@@ -15,6 +15,7 @@
  import DocView from './DocView.svelte';
  import DocEditor from './DocEditor.svelte';
  import AgentsView from './AgentsView.svelte';
+ import Terminal from './Terminal.svelte';
  import ActionPalette from './ActionPalette.svelte';
  import ProviderSettings from './ProviderSettings.svelte';
  import ProjectConnection from './ProjectConnection.svelte';
@@ -113,7 +114,7 @@
      const projectId=params.get('project');
      if(projectId){const found=projects.find(candidate=>candidate.id===projectId);if(found&&found.id!==project?.id)await select(found);}
      const view=params.get('view');
-     if(view&&['Dependencies','Timeline','List','Wiki','Agents'].includes(view))setView(view);
+     if(view&&['Dependencies','Timeline','List','Wiki','Agents','Terminal'].includes(view))setView(view);
    }catch{/* a malformed alert link is ignored */}
  }
  function command(action:()=>void){actionsOpen=false;action();}
@@ -138,7 +139,7 @@
      const id=link.projectId??localStorage.getItem('dashboard.project');
      const p=projects.find(candidate=>candidate.id===id)??projects[0];
      if(p)await select(p);
-     if(link.view&&['Dependencies','Timeline','List','Wiki','Agents'].includes(link.view))setView(link.view);
+     if(link.view&&['Dependencies','Timeline','List','Wiki','Agents','Terminal'].includes(link.view))setView(link.view);
    }catch(e){error=(e as Error).message;}
  }
  async function select(p:Project){
@@ -280,11 +281,11 @@
  {#if error}<div class="error workspace-error" role="alert">{error}<div class="row">{#if failed}<button onclick={exported}>Export unsaved draft</button><button onclick={()=>select(project!)}>Reload & review</button>{:else if !snapshot}<button onclick={locate}>Locate folder</button>{#if missingBoard}<button onclick={initialize}>Confirm & initialize board</button>{/if}{/if}</div></div>{/if}
  <div class="commandbar">
   <div class="view-switch" aria-label="Board views">
-   {#each ['Dependencies','Timeline','List','Wiki','Agents'] as mode}
-   <button class:active={view===mode} aria-pressed={view===mode} aria-label={mode} title={mode} onclick={()=>setView(mode)}><Icon name={mode==='Dependencies'?'graph':mode==='Timeline'?'timeline':mode==='List'?'list':mode==='Wiki'?'book':'agent'} size={14}/><span class="view-label">{mode}</span></button>
+   {#each ['Dependencies','Timeline','List','Wiki','Agents','Terminal'] as mode}
+   <button class:active={view===mode} aria-pressed={view===mode} aria-label={mode} title={mode} onclick={()=>setView(mode)}><Icon name={mode==='Dependencies'?'graph':mode==='Timeline'?'timeline':mode==='List'?'list':mode==='Wiki'?'book':mode==='Terminal'?'terminal':'agent'} size={14}/><span class="view-label">{mode}</span></button>
    {/each}
   </div>
-  {#if view!=='Wiki'&&view!=='Agents'}
+  {#if view!=='Wiki'&&view!=='Agents'&&view!=='Terminal'}
   <span class="command-divider"></span>
   <label class="search task-search"><Icon name="search" size={14}/><input aria-label="Search tasks" placeholder="Search tasks" bind:value={search}></label>
   <div class="popover filters-popover" bind:this={filtersMenu}>
@@ -307,6 +308,8 @@
   {:else if view==='Wiki'}
   <span class="wiki-hint">Documentation is the source of work: write the intent, then link the work to it.</span>
   <div class="commandbar-end"><button class="compact-button wiki-tree-toggle" aria-label="Show documents" onclick={()=>treeOpen=true}><Icon name="book" size={14}/><span>Documents</span></button></div>
+  {:else if view==='Terminal'}
+  <span class="wiki-hint">Interactive shell for the selected project; commands run as Pilot’s service user.</span>
   {:else}
   <span class="wiki-hint">Choose a model per session. Real calls require provider credentials and explicit opt-in in settings.</span>
   {/if}
@@ -328,6 +331,8 @@
  </section>
  {:else if view==='Agents'}
  <AgentsView projectId={project.id} {agentsVersion} onerror={(message)=>error=message} onquestions={()=>void loadInbox()}/>
+ {:else if view==='Terminal'}
+ <Terminal projectId={project.id} onerror={(message)=>error=message}/>
  {:else}
  <div class="view-content">
  {#if loading}<div class="empty"><p>Loading board…</p></div>
@@ -347,6 +352,9 @@
  {:else if view==='Agents'}
   <span class="file-state">Agent harness · one durable SQLite session per project</span>
   <span class="save-indicator" role="status">Durable session</span>
+ {:else if view==='Terminal'}
+  <span class="file-state">Same-user shell · initial directory is the selected project</span>
+  <span class="save-indicator" role="status">Processes stop when Pilot shuts down</span>
  {:else}
   <span class="file-state">Persistent markdown · {snapshot?.board.tasks.length??0} tasks · {visible.length} matching</span>
   <div class="readiness-summary" title="Task checkpoints, not whole-project acceptance"><span><i class="indicator ready"></i>{ready} ready</span><span><i class="indicator doing"></i>{doing} in progress</span><span><i class="indicator waiting"></i>{waiting} waiting</span><span>{done} complete</span></div>

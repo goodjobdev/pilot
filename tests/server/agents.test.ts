@@ -724,6 +724,9 @@ test('DEFECT2a: the scope vocabulary reports which scopes have an installed tool
   assert.ok(installed.includes('read_notes'), 'read_notes is installed');
   assert.ok(installed.includes('record_note'), 'record_note is installed');
   assert.ok(installed.includes('ask_question'), 'ask_question is installed');
+  // The broad shell is absent unless explicitly enabled for this instance.
+  assert.equal(vocab.find(s => s.scope === 'shell')?.installed, false);
+  assert.equal(agentScopeVocabulary(['shell']).find(s => s.scope === 'shell')?.installed, true);
   // Scopes with no installed tool
   const uninstalled = vocab.filter(s => !s.installed).map(s => s.scope);
   assert.ok(uninstalled.includes('read_docs'), 'read_docs is uninstalled');
@@ -738,8 +741,8 @@ test('DEFECT2a: the scope vocabulary reports which scopes have an installed tool
   assert.ok(uninstalled.includes('spend'), 'spend is uninstalled');
   assert.ok(uninstalled.includes('provision'), 'provision is uninstalled');
   assert.ok(uninstalled.includes('publish'), 'publish is uninstalled');
-  // Verify the total count: 16 scopes, 3 installed + 1 conditional (file_edit behind switch)
-  assert.equal(vocab.length, 16, 'there are exactly 16 scopes');
+  // Verify the total count: 17 scopes, including optional file_edit and shell capabilities.
+  assert.equal(vocab.length, 17, 'there are exactly 17 scopes');
   // file_edit is NOT installed by default (switch is off)
   assert.ok(uninstalled.includes('file_edit'), 'file_edit is uninstalled by default (switch off)');
 });
@@ -797,6 +800,8 @@ test('DEFECT2d: the agent prompt section lists only tools it can actually call',
   assert.ok(!installed.includes('run_tests'), 'run_tests is NOT in installedAgentScopes');
   // file_edit is NOT in the default installed list (switch off)
   assert.ok(!installed.includes('file_edit'), 'file_edit is NOT in installedAgentScopes when switch off');
+  assert.ok(!installed.includes('shell'), 'shell is NOT in installedAgentScopes when switch off');
+  assert.ok(installedAgentScopes(['shell']).includes('shell'), 'shell is installed only when explicitly enabled');
 });
 
 test('DEFECT2e: enabling the file_edit switch makes the tool appear', async () => {

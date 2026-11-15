@@ -1,5 +1,7 @@
-import { createServer } from 'node:http';
+import { createServer,type IncomingMessage,type ServerResponse } from 'node:http';
+import { WebSocket,WebSocketServer } from 'ws';
 import { createConnection } from 'node:net';
+import type { Duplex } from 'node:stream';
 import { constants,writeSync } from 'node:fs';
 import { access,lstat,mkdir,readFile,realpath } from 'node:fs/promises';
 import { createHash,randomUUID } from 'node:crypto';
@@ -12,6 +14,7 @@ import { fileURLToPath,pathToFileURL } from 'node:url';
 import { BoardStore,HttpError } from './board-store';
 import { DocStore } from './docs-store';
 import { HarnessHost,type AgentDeliveryPort,type AgentImage,type SessionLifecycleHooks } from './agents/harness-host';
+import { TerminalService } from './agents/terminal-service';
 import { MEDIA_CONTAINER_CODE, MediaContainerError, MediaStore } from './media-store';
 import { AlertStore,type AlertPayload,type AlertTransport } from './alerts';
 import { Catalog } from './catalog';
@@ -47,6 +50,7 @@ import { emptyBoard } from '../shared/model';
 import { serializeBoard } from '../shared/markdown';
 import { MAX_IMAGES_PER_MESSAGE, MEDIA_ID_PATTERN, TOO_MANY_IMAGES_CODE, inspectImage, tooManyImagesReason } from '../shared/images';
 import { QueueError, queueView, type QueueImageRef } from '../shared/queue';
+
 /**
  * Expected-version readiness inputs: the release identity, whether this process holds the lock, and
  * the schema observed from the live store handle. Startup supplies the live observer; a caller that
@@ -66,7 +70,7 @@ export type ReleasePromotionObservation =
   | {readonly state:'unreadable';readonly reason:string};
 /** What the running service reports about itself, and the one read-only seam that answers for promotion. */
 export interface ReleaseReportOptions {readonly version:string;readonly source:'manifest'|'unreleased-local';readonly buildId?:string;readonly sourceDigest?:string;readonly observe:()=>ReleasePromotionObservation}
-export interface AppOptions {dataRoot:string;browseRoots:string[];security:SecurityConfig;allowedHosts?:readonly string[];clientRoot?:string;registry?:string;agents?:'on'|'off';agentPauseMs?:number;alertTransport?:AlertTransport;alertSubject?:string;alertCooldownMs?:number;readiness?:ReadinessOptions;control?:ControlStore;runner?:{readonly enabled?:boolean;readonly port?:RunnerPort};fileEdit?:{readonly enabled?:boolean};release?:ReleaseReportOptions}
+export interface AppOptions {dataRoot:string;browseRoots:string[];security:SecurityConfig;allowedHosts?:readonly string[];clientRoot?:string;registry?:string;agents?:'on'|'off';agentPauseMs?:number;alertTransport?:AlertTransport;alertSubject?:string;alertCooldownMs?:number;readiness?:ReadinessOptions;control?:ControlStore;runner?:{readonly enabled?:boolean;readonly port?:RunnerPort};fileEdit?:{readonly enabled?:boolean};terminal?:{readonly enabled?:boolean;readonly service?:TerminalService};release?:ReleaseReportOptions}
 /**
  * Approvals answer with a status that says what happened: an invalid request is 422, an approval
  * outside the caller's scope is 403, a missing one is 404, a storage fault is 500, and every
@@ -436,6 +440,8 @@ export async function createApp(options:AppOptions){
   const agentHolder:{store?:AgentStore}={};
   const fileEditModeHolder:{mode:()=>FileEditMode}={mode:()=>'propose-only'};
   const fileEditEnabled=options.fileEdit?.enabled??process.env.DASHBOARD_FILE_EDIT==='on';
+  const terminalEnabled=options.terminal?.enabled??process.env.DASHBOARD_TERMINAL==='on';
+  const terminal=terminalEnabled?(options.terminal?.service??new TerminalService()):undefined;
   const fileEdit=options.control&&fileEditEnabled?new FileEditTool(options.control,{
     enabled:true,
     // The connected repository worktree is the registered project's own folder and nothing else.
@@ -458,6 +464,7 @@ export async function createApp(options:AppOptions){
     // open, the owner's own dispatch is in force and nothing is narrowed.
     privileges:{authority:async({projectId,sessionId})=>agentHolder.store?agentHolder.store.authorityForSession({projectId,sessionId:sessionId??''}):Object.freeze({agentId:null,scopes:null,projects:null,emptyReason:null})},
     fileEdit,
+    shell:terminal?{enabled:true}:undefined,
     onEvent:event=>{
       // A question is notified by the ledger's own outbox step, which tags the notification by the
       // question id so a later re-send collapses onto the same one. Without a ledger the plain alert
@@ -812,6 +819,36 @@ export async function createApp(options:AppOptions){
         if(scopedProject&&repositories.isConnecting(scopedProject))throw new HttpError(409,'Repository connection in progress. Retry after it finishes.');
         if(path==='/api/session' && req.method==='GET'){json(establishSession(req,res,options.security,subject));return;}
         if(path==='/api/roots' && req.method==='GET'){json(options.browseRoots);return;}
+        // Same-user terminal sessions are an explicit operator opt-in. These routes remain owner-only
+        // and behind the ordinary Host, session and CSRF checks; they never accept a command string.
+        const projectTerminals=path.match(/^\/api\/projects\/([a-f0-9-]{36})\/terminals$/);
+        if(projectTerminals){
+          if(!terminal)throw new HttpError(503,'The terminal is disabled on this instance; set DASHBOARD_TERMINAL=on and restart to enable same-user command execution');
+          const project=catalog.get(projectTerminals[1]);
+          if(req.method==='GET'){json({terminals:terminal.list(project.id)});return;}
+          if(req.method==='POST'){
+            const data=z.strictObject({cols:z.number().int().min(2).max(240).optional(),rows:z.number().int().min(2).max(100).optional()}).parse(payload);
+            try{json({terminal:terminal.open(project,data)},201);}catch(error){throw new HttpError(409,(error as Error).message);}
+            return;
+          }
+          throw new HttpError(405,'Method not allowed');
+        }
+        const terminalRoute=path.match(/^\/api\/terminals\/([a-f0-9-]{36})(?:\/(ticket))?$/);
+        if(terminalRoute){
+          if(!terminal)throw new HttpError(503,'The terminal is disabled on this instance');
+          const id=terminalRoute[1];
+          if(terminalRoute[2]==='ticket'&&req.method==='POST'){
+            const data=z.strictObject({projectId:z.string().uuid()}).parse(payload);
+            try{terminal.read(id,data.projectId);json({ticket:terminal.issueTicket(id,data.projectId)});}catch(error){throw new HttpError(404,(error as Error).message);}
+            return;
+          }
+          if(!terminalRoute[2]&&req.method==='DELETE'){
+            const data=z.strictObject({projectId:z.string().uuid()}).parse(payload);
+            if(!terminal.closeTerminal(id,data.projectId))throw new HttpError(404,'Terminal not found');
+            json({closed:true});return;
+          }
+          throw new HttpError(405,'Method not allowed');
+        }
         // Media: owner-only like every other route, behind the same Host check. A media id is the hex
         // hash of the stored bytes, so it is never a path; the response carries the type sniffed from
         // the bytes, nosniff, and an immutable cache header. Nothing outside the media directory is
@@ -1193,7 +1230,7 @@ export async function createApp(options:AppOptions){
           if(!agentStore)throw new HttpError(503,'The agent registry is unavailable: no durable control store is open on this instance');
           try{
             if(path==='/api/agents'){
-              if(req.method==='GET'){json({agents:agentStore.list(),scopes:agentScopeVocabulary(),models:agentStore.offeredModels(),fileEdit:{enabled:fileEdit!==undefined&&fileEdit.enabled,mode:fileEdit===undefined||!fileEdit.enabled?null:await fileEdit.mode()}});return;}
+              if(req.method==='GET'){json({agents:agentStore.list(),scopes:agentScopeVocabulary(terminal?['shell']:[]),models:agentStore.offeredModels(),fileEdit:{enabled:fileEdit!==undefined&&fileEdit.enabled,mode:fileEdit===undefined||!fileEdit.enabled?null:await fileEdit.mode()},terminal:{enabled:terminal!==undefined}});return;}
               if(req.method==='POST'){
                 const body=parseBody(z.strictObject({draft:z.unknown(),actor:z.unknown()}),payload,'The agent request');
                 json({agent:agentStore.create({draft:body.draft,actor:body.actor})},201);return;
@@ -1413,12 +1450,40 @@ export async function createApp(options:AppOptions){
       res.statusCode=code;res.setHeader('Content-Type','application/json');res.end(JSON.stringify({error:err.message,...(e instanceof HttpError&&e.code?{code:e.code}:{})}));
     }
   });
+  const terminalWebSockets=new WebSocketServer({noServer:true,maxPayload:8192,handleProtocols:protocols=>protocols.has('pilot-terminal')?'pilot-terminal':false});
+  const upgradedSockets=new Set<Duplex>();
+  server.on('upgrade',(req,socket,head)=>{
+    upgradedSockets.add(socket);socket.once('close',()=>upgradedSockets.delete(socket));
+    void (async()=>{
+      try{
+        const url=new URL(req.url??'/',options.security.origin);
+        if(!terminal||!allowedHosts().includes(req.headers.host??''))throw new Error('unavailable');
+        const terminalRoute=url.pathname.match(/^\/api\/terminals\/([a-f0-9-]{36})\/stream$/);
+        if(terminalRoute){
+          const terminalId=terminalRoute[1];
+          if(new URL(req.headers.origin??'').origin!==new URL(options.security.origin).origin)throw new Error('unavailable');
+          const protocols=(req.headers['sec-websocket-protocol']??'').split(',').map(value=>value.trim()).filter(Boolean);
+          const ticket=protocols[1];
+          if(protocols.length!==2||protocols[0]!=='pilot-terminal'||!ticket||!terminal.consumeTicket(terminalId,ticket))throw new Error('unavailable');
+          terminalWebSockets.handleUpgrade(req,socket,head,websocket=>terminal.attach(terminalId,websocket));
+          return;
+        }
+        throw new Error('unavailable');
+      }catch{
+        if(!socket.destroyed)socket.end('HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');
+      }
+    })();
+  });
   server.requestTimeout=30000;server.headersTimeout=10000;
-  return {server,catalog,boards,docs,agents,alerts,providers,repositories,sessions,lifecycle,actions,media,queue:queueStore,runner,acceptance,forks,agentStore,fileEdit,close:async()=>{
+  return {server,catalog,boards,docs,agents,alerts,providers,repositories,sessions,lifecycle,actions,media,queue:queueStore,runner,acceptance,forks,agentStore,fileEdit,terminal,close:async()=>{
     // A server that never opened reports ERR_SERVER_NOT_RUNNING, which means "already closed", not
     // "close failed". A failed start (for example a port already in use) must still drain and
     // release the lock that this same start created, and must report the original failure instead.
     // Any other close error stays fatal and remains, with the deadline, the only retention cause.
+    await terminal?.close();
+    for(const websocket of terminalWebSockets.clients)websocket.terminate();
+    for(const socket of upgradedSockets)socket.destroy();
+    terminalWebSockets.close(()=>{});
     await new Promise<void>((ok,fail)=>server.close(error=>{
       if(!error||(error as NodeJS.ErrnoException).code==='ERR_SERVER_NOT_RUNNING')ok();else fail(error);
     }));

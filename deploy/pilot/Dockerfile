@@ -16,7 +16,7 @@ ENV NODE_ENV=production \
 # ca-certificates is only recommended by curl, so it must be named explicitly for
 # TLS tools inside the image to trust anything.
 RUN apt-get update \
- && apt-get install --no-install-recommends --yes curl ca-certificates git openssh-client \
+ && apt-get install --no-install-recommends --yes curl ca-certificates git openssh-client build-essential python3 \
  && rm -rf /var/lib/apt/lists/* \
  && npm install --global pnpm@12.14.0 \
  && useradd --uid 10001 --user-group --create-home --shell /usr/sbin/nologin pilot \
@@ -24,9 +24,13 @@ RUN apt-get update \
  && chown -R pilot:pilot /app /data
 
 WORKDIR /app
-COPY package.json pnpm-lock.yaml ./
-RUN pnpm install --prod --frozen-lockfile --ignore-scripts \
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+# node-pty needs its native PTY helper built for the image architecture. Build it from the locked
+# source in this layer, then discard the compiler toolchain so none is present at runtime.
+RUN npm_config_build_from_source=true pnpm install --prod --frozen-lockfile \
  && pnpm store prune \
+ && apt-get purge --auto-remove --yes build-essential python3 \
+ && rm -rf /var/lib/apt/lists/* \
  && chown -R pilot:pilot /app
 
 COPY --chown=pilot:pilot dist ./dist

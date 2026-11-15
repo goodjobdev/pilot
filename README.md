@@ -105,9 +105,12 @@ exactly once.
 
 - **Single owner by design.** One person, one credential, no roles or sharing. It is not
   multi-tenant and there is no rate limiting.
-- **The agent harness is code execution.** Agent tools are bounded to a project's workspace,
-  but a project you register is a directory the agent may write to. Run it in a container,
-  not on a workstation.
+- **The interactive terminal and optional agent shell are code execution.** `DASHBOARD_TERMINAL=on`
+  exposes broad same-service-user command execution with the process environment and filesystem
+  permissions. The selected project is only the initial directory, not confinement. Enable only
+  where you accept that access; do not enable on a workstation with secrets you do not intend to expose.
+  The dev-server preview is intentionally unavailable: safely isolating active content while
+  preserving owner authentication needs a separately configured origin and authenticated proxy.
 - **The backup script covers documentation, not sessions.** Agent transcripts, alert keys and
   credentials are deliberately excluded, so a restore needs a fresh sign-in.
 - **An unclean kill leaves a lock.** SIGKILL, OOM or power loss leaves `service.lock` and
@@ -117,7 +120,7 @@ exactly once.
 - **The default provider is a scripted local stand-in.** Real provider adapters are available
   through [Providers & models](docs/PROVIDER-SIGNIN.md); credentials and live sign-in are the
   owner's responsibility. Tests use synthetic providers, not billed acceptance calls. Agent
-  tools are still question/note operations, not a complete coding toolchain.
+  tools remain independently scoped; the optional shell scope is arbitrary same-user command execution.
 - **Uncommitted code is not a GitHub backup.** Repository worktrees and deployment keys are
   described in [Project connections](docs/PROJECT-CONNECTIONS.md). Review and back up before
   a real migration. Pilot supersedes the earlier dashboard, without automatically importing

@@ -21,7 +21,7 @@ assumes, and what it does not protect, so you can decide whether that fits.
 | Path escape | One containment helper refuses absolute paths, `..` and symlinks; generated folders and app-managed paths are never served or edited |
 | Resource abuse | Read and write size caps, a document-count cap, a bounded subscription list, and bounded search/inbox scans |
 | Untrusted rendering | Markdown is sanitised; assets are limited to images and static HTML/SVG; mockups render in a sandboxed frame with no scripts and no same-origin access; a strict Content-Security-Policy covers the application |
-| Agent execution | No general shell/file API exists. Current agent tools are questions and project notes. Fixed Git/SSH-keygen operations are available only through explicit repository provisioning, with no hooks, installs, commits or pushes |
+| Agent execution | The question/note tools remain scoped. The explicitly opt-in `DASHBOARD_TERMINAL=on` additionally enables an interactive owner terminal and the independently scoped agent `shell` tool; both run as the Pilot service user with its environment and filesystem permissions, and the project is only the initial cwd. No shell confinement is claimed. |
 | Credentials | Provider credentials and project deploy keys live outside project roots in 0600 files/0700 folders, excluded from ordinary backups; settings reads return status/public keys only. Login and Git failures do not echo raw credential response bodies or command output |
 | Host escape | The container drops all capabilities, runs non-root with a read-only root filesystem, has no Docker socket and no host mounts |
 
@@ -34,8 +34,13 @@ assumes, and what it does not protect, so you can decide whether that fits.
   run the application in a container rather than on a workstation.
 - **Same-container shell access.** Secrets are not encrypted at rest. Code running as the
   application user can read provider credentials and deploy keys; these are not per-agent
-  sandboxes. Write deploy keys are repository-scoped, not branch-scoped. Use provider budgets,
-  GitHub repository rules and a separate execution boundary before enabling general shell tools.
+  sandboxes. Write deploy keys are repository-scoped, not branch-scoped. The terminal and agent
+  shell are off unless explicitly enabled with `DASHBOARD_TERMINAL=on`; enabling either is broad
+  same-user execution, not a separate execution boundary. Non-interactive shell calls cap runtime
+  and output and escalate process-group termination from SIGTERM to SIGKILL; shutdown does the same
+  for interactive terminals. A command that deliberately daemonizes or escapes its process group
+  may outlive Pilot, so this is process cleanup, not containment. Use provider budgets, GitHub
+  repository rules and an external execution boundary before opting in.
 - **Multi-user abuse.** There is one owner, no roles, no quotas and no rate limiting. It is not
   multi-tenant.
 - **Backups.** They deliberately exclude credentials, alert keys and agent sessions. Treat a
@@ -44,6 +49,10 @@ assumes, and what it does not protect, so you can decide whether that fits.
   traffic it forwards. Self-host the relay or keep it on a network you control.
 - **A stolen unlocked device** with an active session, and any credential you paste into a
   chat, log or image.
+- **Project dev-server previews are unavailable.** A same-origin proxy would risk bypassing owner
+  authentication and executing SVG or other active content in the application origin. No preview
+  content is served until a separate-origin design with owner-authenticated proxying is implemented
+  and verified.
 
 ## Reporting
 

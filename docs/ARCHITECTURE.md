@@ -22,12 +22,15 @@ Three surfaces over one project's own files, plus derived state that can be rebu
 3. **Paths are contained.** Every read and write resolves through one containment helper that
    refuses absolute paths, `..`, and symlinks. Generated folders (`node_modules`, `dist`, …)
    and app-managed paths are never served or edited. Reads and writes are size-capped.
-4. **The agent harness is the only execution surface.** There is no shell endpoint and no
-   general file API. Agent tools resolve their paths through the same containment helper, so a
-   registered project root is the boundary for the current question/note tools. Repository
-   setup is a separate fixed-operation provisioning path (keygen, access check, clone and
+4. **Execution is normally limited to the agent harness, with one explicit broad opt-in.**
+   The question/note tools use contained project paths. With `DASHBOARD_TERMINAL=on`, an owner
+   terminal and the independently scoped agent `shell` capability run arbitrary commands as the
+   Pilot service user; the project is only their initial working directory, not a boundary. This
+   opt-in can access other files, credentials and services available to the process. Repository
+   setup remains a separate fixed-operation provisioning path (keygen, access check, clone and
    worktree): no arbitrary commands, hooks, installs, commits or pushes. See
-   [Project connections](PROJECT-CONNECTIONS.md).
+   [Project connections](PROJECT-CONNECTIONS.md). Previewing a project dev server is unavailable
+   until an authenticated separate-origin design is implemented.
 5. **Everything is behind the same door.** Every route — documents, agents, alerts, assets —
    passes the same authentication, session CSRF, origin and Host checks. There is no bypass
    mode, no anonymous route, and the process binds loopback by default — the only interface

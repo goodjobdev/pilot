@@ -106,11 +106,18 @@ message naming the problem; nothing is created and nothing listens.
 | `DASHBOARD_ROOT_ID` | Optional logical root id recorded in the lock, bounded the same way. Defaults to the first 16 hex characters of sha256 of the canonical data root path. |
 | `DASHBOARD_SHUTDOWN_DEADLINE_MS` | Optional. How long one drain may take, 1-60000; 10000 by default. Reaching it retains the lock. |
 | `PORT`, `DASHBOARD_DATA`, `DASHBOARD_ROOTS` | Listen port (4317 by default), data root, and approved roots. |
+| `DASHBOARD_TERMINAL` | Optional, default off. `on` enables the interactive owner terminal and optional agent `shell` capability. Both are broad same-service-user command execution; project cwd is not confinement. |
 
 `DASHBOARD_RELEASE`, `DASHBOARD_ROOT_ID` and `DASHBOARD_SHUTDOWN_DEADLINE_MS` are not part of
 the effective configuration, but the entrypoint bounds them with the same fail-closed rule
 before it touches the data root: both lock identity values are durable evidence and are
 therefore restricted to that opaque-token alphabet instead of being recorded verbatim.
+
+`DASHBOARD_TERMINAL=on` is a separate opt-in, not a sandbox. It allows commands to access all
+files, credentials and services available to the service user. Native `node-pty` support must be
+built for the deployment platform (the bundled Dockerfile copies the pnpm build allowlist before
+installing). The dev-server preview is disabled: do not expose active project content through the
+Pilot origin until a separate-origin, owner-authenticated proxy is independently verified.
 
 Local mode rejects the hosted identity variables (`DASHBOARD_ORIGIN`, `CF_ACCESS_TEAM`,
 `CF_ACCESS_AUD`, `DASHBOARD_OWNER`) instead of ignoring them. The process validates the

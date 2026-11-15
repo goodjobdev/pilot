@@ -58,7 +58,7 @@ async function refused(work: () => unknown, code: AgentError['code']): Promise<s
 
 test('the scope vocabulary is closed, described, and every scope governs at least one declared tool or is a stated capability', () => {
   // The vocabulary is exactly the documented set, and every scope carries one description.
-  assert.deepEqual([...AGENT_SCOPES], ['read_notes', 'record_note', 'ask_question', 'read_docs', 'write_docs', 'file_read', 'file_edit', 'run_tests', 'fork', 'accept', 'commit', 'push', 'deploy', 'spend', 'provision', 'publish']);
+  assert.deepEqual([...AGENT_SCOPES], ['read_notes', 'record_note', 'ask_question', 'read_docs', 'write_docs', 'file_read', 'file_edit', 'run_tests', 'shell', 'fork', 'accept', 'commit', 'push', 'deploy', 'spend', 'provision', 'publish']);
   for (const scope of AGENT_SCOPES) {
     assert.equal(typeof AGENT_SCOPE_DESCRIPTIONS[scope], 'string');
     assert.ok(AGENT_SCOPE_DESCRIPTIONS[scope].length > 10, scope + ' has a real description');

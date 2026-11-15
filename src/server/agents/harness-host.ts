@@ -18,6 +18,7 @@ import type { Project } from '../../shared/model';
 import { HttpError } from '../board-store';
 import type { ProviderStore } from '../providers';
 import type { ModelChoice } from '../../shared/settings';
+import { SHELL_MAX_COMMAND_BYTES, runShellCommand } from './terminal-service';
 
 export type AgentInputMode = 'followUp' | 'steer' | 'reject';
 /** One stored image attached to an input, as base64 and its sniffed type. */
@@ -339,6 +340,8 @@ export interface HarnessHostOptions {
    * than existing and failing.
    */
   fileEdit?: FileEditCapability;
+  /** Opt-in broad same-service-user shell. The project directory is the initial cwd, not confinement. */
+  shell?: { readonly enabled: boolean };
 }
 
 /**
@@ -364,7 +367,25 @@ function permittedTools(extensions: readonly Extension[], scopes: readonly Agent
  * at all, however the call was crafted. Its section tells the model what its allowlist holds, so a
  * well-behaved model never attempts what would be refused.
  */
-function privilegeExtension(project: Project, authorityOf: (sessionId: string) => Promise<DispatchAuthority>, fileEditEnabled?: boolean) {
+function shellExtension(project: Project) {
+  return defineExtension({
+    name: 'same-user-shell',
+    sections: [section('shell-capability', () => 'The bash tool runs arbitrary shell commands as the Pilot service user, with the process environment and filesystem access available to that user. The selected project directory is only the initial working directory, not a sandbox; commands may read or change other accessible files, credentials or services. Use it only because the owner explicitly enabled this broad capability. Prefer ordinary foreground commands; long-running interactive processes belong in the owner\'s browser terminal.', { tag: false })],
+    tools: [defineTool({
+      name: 'bash',
+      description: 'Run one arbitrary shell command as the Pilot service user, starting in this project directory. This is broad same-user execution, not project confinement.',
+      parameters: Type.Object({ command: Type.String({ minLength: 1, maxLength: SHELL_MAX_COMMAND_BYTES, description: 'The shell command to execute. Runs as the Pilot service user; the project path is only the initial working directory.' }) }),
+      replay: 'unsafe',
+      execute: async (args, _api, context) => {
+        const result = await runShellCommand({ command: args.command, cwd: project.path, signal: context.abortSignal });
+        const status = result.timedOut ? 'timed out' : 'exited ' + String(result.exitCode);
+        return { output: [{ type: 'text' as const, text: 'Command ' + status + (result.truncated ? ' (output truncated at 64 KiB)' : '') + '.\n' + result.stdout }] };
+      }
+    })]
+  });
+}
+
+function privilegeExtension(project: Project, authorityOf: (sessionId: string) => Promise<DispatchAuthority>, optionalScopes: readonly AgentScope[] = []) {
   return defineExtension({
     name: 'agent-privileges',
     sections: [section('agent-privileges', async (input) => {
@@ -375,19 +396,18 @@ function privilegeExtension(project: Project, authorityOf: (sessionId: string) =
         return 'No agent is bound to this session, so the owner\u2019s own dispatch is in force: no agent allowlist narrows these tools. Bind an agent to a session to run it under an explicit allowlist.';
       if (authority.scopes.length === 0)
         return 'This dispatch has no privilege scopes in force, so every tool is refused at dispatch. ' + (authority.emptyReason ?? 'No agent is bound.') + ' Do not attempt one.';
-      const baseInstalled = installedAgentScopes();
-      // file_edit is installable but behind a switch: include it only when enabled.
-      const fileEditAvailable = fileEditEnabled === true && authority.scopes.includes('file_edit');
-      const installed = fileEditAvailable ? [...baseInstalled, 'file_edit' as const] : baseInstalled;
+      const installed = installedAgentScopes(optionalScopes);
       const available = authority.scopes.filter((s) => (installed as readonly string[]).includes(s));
       const unavailable = authority.scopes.filter((s) => !(installed as readonly string[]).includes(s));
-      const fileEditNote = authority.scopes.includes('file_edit') && !fileEditAvailable
+      const fileEditNote = authority.scopes.includes('file_edit') && !optionalScopes.includes('file_edit')
         ? ' The file_edit scope is granted but the instance has it DISABLED: the operator must set DASHBOARD_FILE_EDIT=on and restart for the tool to appear. Until then, no file-editing tool is callable.' : '';
+      const shellNote = authority.scopes.includes('shell') && !optionalScopes.includes('shell')
+        ? ' The shell scope is granted but the instance has it DISABLED: the operator must set DASHBOARD_TERMINAL=on and restart. Until then, no shell tool is callable.' : '';
       const availLine = available.length > 0 ? ' Its scopes with an installed tool are: ' + available.join(', ') + '.' : ' None of its scopes has an installed tool in this build.';
       const unavailLine = unavailable.length > 0 ? ' The following scopes are granted but have NO installed tool in this build and cannot be used: ' + unavailable.join(', ') + '.' : '';
-      const uninstalledAll = unavailableAgentScopes().filter((s) => s.scope !== 'file_edit');
+      const uninstalledAll = unavailableAgentScopes(optionalScopes).filter((s) => s.scope !== 'file_edit');
       const uninstalledLine = uninstalledAll.length > 0 ? ' Scopes without an installed tool in this build: ' + uninstalledAll.map((s) => s.scope).join(', ') + '. They are declared in the vocabulary but the agent cannot call them.' : '';
-      const scopeLine = 'This dispatch runs as an agent' + (authority.agentId === null ? '' : ' (' + authority.agentId + ')') + '.' + availLine + unavailLine + fileEditNote + uninstalledLine + ' A tool outside the granted scopes is refused at dispatch with no effect, so do not attempt one.';
+      const scopeLine = 'This dispatch runs as an agent' + (authority.agentId === null ? '' : ' (' + authority.agentId + ')') + '.' + availLine + unavailLine + fileEditNote + shellNote + uninstalledLine + ' A tool outside the granted scopes is refused at dispatch with no effect, so do not attempt one.';
       const projectLine = authority.projects === null ? '' : ' Its project scope is the explicit set ' + authority.projects.join(', ') + ', so a call that acts on any other project is refused at dispatch with no effect.';
       return scopeLine + projectLine;
     }, { tag: false })],
@@ -591,8 +611,10 @@ export class HarnessHost {
       const rootSessionId = String(ROOT_CONVERSATION_ID);
       const authority = await this.dispatchAuthority(project, rootSessionId);
       const authorityOf = (sessionId: string) => this.dispatchAuthority(project, sessionId);
-      const fileEditEnabled = this.options.fileEdit?.enabled === true;
-      const privileges = privilegeExtension(project, authorityOf, fileEditEnabled);
+      const optionalScopes: AgentScope[] = [];
+      if (this.options.fileEdit?.enabled === true) optionalScopes.push('file_edit');
+      if (this.options.shell?.enabled === true) optionalScopes.push('shell');
+      const privileges = privilegeExtension(project, authorityOf, optionalScopes);
       const extensions: Extension[] = [question, notes, privileges];
       const registry = createRegistry();
       registry.install(question);
@@ -603,6 +625,11 @@ export class HarnessHost {
         const edits = fileEditExtension(project, fileEdit, authorityOf);
         extensions.push(edits);
         registry.install(edits);
+      }
+      if (this.options.shell?.enabled) {
+        const shell = shellExtension(project);
+        extensions.push(shell);
+        registry.install(shell);
       }
       const harness = await Harness.open(storage, { models, registry,settings:{retry:{enabled:false},stream:{maxRetries:0,timeoutMs:120000},compaction:{enabled:false}} }, BACKGROUND_CONTEXT);
       const initial=await this.options.providers?.defaultModel();

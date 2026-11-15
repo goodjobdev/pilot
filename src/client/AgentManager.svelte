@@ -182,6 +182,7 @@
   <button aria-label="Close agent manager" onclick={onclose}>×</button>
  </header>
  <p class="muted">Each agent holds an explicit allowlist of privilege scopes. The server enforces it at dispatch, on every tool call, and the interface is never the enforcement point.</p>
+ {#if registry?.terminal.enabled}<p class="warning" role="note"><strong>Broad shell access is enabled.</strong> Agents granted the shell scope run as Pilot’s service user. The project path is only their starting directory; they can access other files, credentials and services available to that user.</p>{:else}<p class="muted">Agent shell is disabled on this instance. The owner can opt in with <code>DASHBOARD_TERMINAL=on</code> and restart; the shell scope then grants broad same-user command access.</p>{/if}
  {#if problem}<p class="error" role="alert">{problem}</p>{/if}
  {#if message}<p role="status">{message}</p>{/if}
  <div class="manager">
@@ -238,7 +239,7 @@
     <small class="muted">An agent has only what its allowlist names. Everything else is refused at dispatch.</small>
     <div class="scopes" aria-label="Privilege scopes">
      {#each registry.scopes as entry (entry.scope)}
-     {@const installed=['ask_question','record_note','read_notes'].includes(entry.scope)}
+     {@const installed=entry.installed||(entry.scope==='file_edit'&&registry.fileEdit.enabled)}
      <label class="scope" class:unavailable={!installed} title={installed?'':'This scope has no tool installed in this build and cannot be used by any agent'}><input type="checkbox" aria-label={'Scope '+entry.scope} checked={draft.scopes.includes(entry.scope)} onchange={e=>toggleScope(entry.scope,e.currentTarget.checked)}><span><strong>{entry.scope}</strong><small>{entry.description}{!installed?' — no tool installed, unavailable':''}</small></span></label>
      {/each}
     </div>

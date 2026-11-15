@@ -50,10 +50,11 @@ export type ActionScope={projectId?:string;sessionId?:string};
 export interface ActionListView{readOnly:true;scope:{projectId:string|null;sessionId:string|null};actions:ActionDescriptor[]}
 /** One execution: the id that ran and the handler's own result. */
 export interface ActionExecution{action:string;result:unknown}
+export interface TerminalInfo{id:string;projectId:string;projectName:string;cwd:string;createdAt:string;connected:boolean}
 /** One scope of the closed vocabulary, with the one line that describes what granting it would allow. */
 export interface AgentScopeOption{scope:string;description:string;installed:boolean}
 /** The registry as the server offers it: every agent, the vocabulary, the offered models and the switch. */
-export interface AgentRegistryView{agents:AgentRecord[];scopes:AgentScopeOption[];models:AgentModelChoice[];fileEdit:{enabled:boolean;mode:string|null}}
+export interface AgentRegistryView{agents:AgentRecord[];scopes:AgentScopeOption[];models:AgentModelChoice[];fileEdit:{enabled:boolean;mode:string|null};terminal:{enabled:boolean}}
 export interface AgentDetailView{agent:AgentRecord;history:AgentAuditEntry[]}
 /** The actor a change is made by. The interface always declares the owner: it is the authenticated session. */
 export interface AgentActorBody{kind:'owner'|'agent';identity:string}
@@ -151,6 +152,10 @@ export const api={
   fileEdits:(projectId:string)=>request<FileEditLedgerView>('/projects/'+projectId+'/file-edits'),
   writeFileEdit:(projectId:string,body:{request:{agentId:string|null;path:string;content:string;mode?:'propose-only'|'auto-apply'};actor:AgentActorBody})=>request<{edit:FileEditRecordView;written:boolean}>('/projects/'+projectId+'/file-edits','POST',body),
   runAction:(id:string,body:{params?:Record<string,unknown>;scope?:ActionScope}={})=>request<ActionExecution>('/actions/execute','POST',{id,...body}),
+  terminals:(projectId:string)=>request<{terminals:TerminalInfo[]}>('/projects/'+encodeURIComponent(projectId)+'/terminals'),
+  openTerminal:(projectId:string,body:{cols:number;rows:number})=>request<{terminal:TerminalInfo}>('/projects/'+encodeURIComponent(projectId)+'/terminals','POST',body),
+  terminalTicket:(projectId:string,terminalId:string)=>request<{ticket:string}>('/terminals/'+encodeURIComponent(terminalId)+'/ticket','POST',{projectId}),
+  closeTerminal:(projectId:string,terminalId:string)=>request<{closed:boolean}>('/terminals/'+encodeURIComponent(terminalId),'DELETE',{projectId}),
 };
 export function assetUrl(id:string,path:string){return '/api/projects/'+id+'/docs/asset?path='+encodeURIComponent(path);}
 /**

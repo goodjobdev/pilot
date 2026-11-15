@@ -24,7 +24,8 @@
   agent:'M5 8h14v9H5z M9 11h.01 M15 11h.01 M9 14h6 M12 4v4 M8 20l-1-3 M16 20l1-3',
   edit:'M4 20h4L20 8l-4-4L4 16z M14 6l4 4',
   save:'M5 4h11l3 3v13H5z M8 4v6h7V4 M8 20v-6h8v6',
-  image:'M3 5h18v14H3z M8.5 10a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3 M4 17l5-5 4 4 3-3 4 4'
+  image:'M3 5h18v14H3z M8.5 10a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3 M4 17l5-5 4 4 3-3 4 4',
+  terminal:'M4 5l7 7-7 7 M13 19h7'
  };
  let {name,size=16}:{name:keyof typeof paths;size?:number}=$props();
 </script>
