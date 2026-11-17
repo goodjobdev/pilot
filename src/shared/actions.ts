@@ -433,7 +433,7 @@ const forkForceParameter: ActionParameter = Object.freeze({
   name: 'force',
   type: 'flag' as const,
   required: false,
-  description: 'an explicit force, and the only way a child worktree holding uncommitted or untracked changes is ever removed; an absent or false value refuses that removal and reports the named operator-attention state instead'
+  description: 'reserved for future use; automatic removal of an existing worktree is unavailable even when force is true'
 });
 
 const agentIdParameter: ActionParameter = Object.freeze({
@@ -1111,7 +1111,7 @@ export const ACTION_DESCRIPTORS: readonly ActionDescriptor[] = Object.freeze([
   describe({
     id: 'fork.discard' as const,
     label: 'Discard a fork',
-    description: "Remove one fork's worktree and close the fork, refusing anything it did not create.",
+    description: "Close a non-active fork only after its worktree is already absent; active discard and automatic worktree removal are unavailable.",
     requires: sessionScope,
     parameters: sessionParameters([forkRevisionParameter, forkForceParameter]),
     preconditions: [
@@ -1119,12 +1119,12 @@ export const ACTION_DESCRIPTORS: readonly ActionDescriptor[] = Object.freeze([
       Object.freeze({ code: 'FORK_EXISTS' as const, description: 'the session scope names the child session of a fork this project really holds; an unknown one is refused as not found' }),
       Object.freeze({ code: 'REVISION_MATCHES' as const, description: 'the revision the caller read is the stored fork revision; a stale one is refused as a conflict and nothing is touched' }),
       Object.freeze({ code: 'TARGET_IN_FORK_ROOT' as const, description: 'the worktree path the record itself carries is still inside the designated fork root; a record that says otherwise is refused as an escape and nothing is removed' }),
-      Object.freeze({ code: 'WORKTREE_CLEAN' as const, description: 'the child worktree holds no uncommitted or untracked change, or the caller explicitly forces it. A dirty worktree is never removed implicitly: the fork becomes the named operator-attention state worktree-dirty and the worktree is left exactly where it is' }),
-      Object.freeze({ code: 'TRANSITION_LEGAL' as const, description: 'the fork can become discarded: a paused, active or failed fork can, and a discarded fork is terminal' })
+      Object.freeze({ code: 'WORKTREE_CLEAN' as const, description: 'automatic removal of an existing child worktree is unavailable, including when force is supplied; the worktree must already be absent before the fork can be closed' }),
+      Object.freeze({ code: 'TRANSITION_LEGAL' as const, description: 'only a paused or failed fork may be discarded; active discard is unavailable until concurrent admission can be controlled, and a discarded fork is terminal' })
     ],
     noops: Object.freeze(['discarding a fork whose worktree is already gone completes the discard and removes nothing']),
     writes: true,
-    effect: "reads the child worktree's own status, removes it by one git worktree remove — with an explicit force only where the caller forced it — and writes the discarded state; a worktree git will not remove or cannot report becomes the named operator-attention state worktree-remove-refused or worktree-unreadable instead, and nothing outside the designated fork root is ever touched"
+    effect: 'for a non-active fork whose worktree is already absent, writes the discarded state without removing a file; otherwise refuses because admission or path-based removal cannot be safely controlled'
   }),
   describe({
     id: 'agent.list' as const,

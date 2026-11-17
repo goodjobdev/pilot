@@ -11,6 +11,8 @@ import { DatabaseSync } from 'node:sqlite';
 import { createApp } from '../../src/server/main';
 import { localConfig } from '../../src/server/security';
 import { ControlStore } from '../../src/server/state/control-store';
+import { ForkLifecycleFence } from '../../src/server/state/fork-lifecycle-fence';
+import { ForkCreationFence } from '../../src/server/state/fork-creation-fence';
 import { DeliveryLedger } from '../../src/server/state/delivery';
 import { SessionLifecycleService, SessionLifecycleStore } from '../../src/server/state/session-lifecycle';
 import type { AlertPayload } from '../../src/server/alerts';
@@ -1009,6 +1011,22 @@ test('the live projection reports the durable run state and distinguishes none, 
   assert.deepEqual(unavailable.harness.invocations,[]);
  }finally{await offApp.close();offStore.close();await rm(off,{recursive:true,force:true});}
 });
+test('requesting the built-in Docker runner does not advertise or start an unavailable execution port',async()=>{
+ const root=await mkdtemp(join(tmpdir(),'dashboard-runner-unavailable-'));
+ const data=join(root,'data');await mkdir(data,{recursive:true,mode:0o700});
+ const store=new ControlStore(data),security=localConfig('http://127.0.0.1:0');
+ const app=await createApp({dataRoot:data,browseRoots:[],security,control:store,runner:{enabled:true}});
+ await listen(app,security);
+ try{
+  const url=security.origin,token={'x-dashboard-token':security.token},writes={...token,'content-type':'application/json',origin:url};
+  const project=await (await fetch(url+'/api/projects',{method:'POST',headers:writes,body:JSON.stringify({name:'Runner unavailable',managed:true,confirm:true})})).json();
+  const listed=await (await fetch(url+'/api/actions?projectId='+project.id,{headers:token})).json();
+  assert.deepEqual(listed.actions.filter((action:{id:string})=>RUNNER_ACTION_IDS.includes(action.id)),[]);
+  const response=await fetch(url+'/api/projects/'+project.id+'/runner/jobs',{method:'POST',headers:writes,body:JSON.stringify({recipe:'noop-probe',workspace:'.'})});
+  assert.equal(response.status,503);
+  assert.match((await response.json()).error,/unavailable.*termination/i);
+ }finally{await app.close();store.close();await rm(root,{recursive:true,force:true});}
+});
 test('the coding runner routes are owner-only, are enabled explicitly, and refuse a job this instance cannot contain',async()=>{
  const root=await mkdtemp(join(tmpdir(),'dashboard-runner-api-'));
  const data=join(root,'data');await mkdir(data,{recursive:true,mode:0o700});
@@ -1116,7 +1134,9 @@ test('the acceptance routes are owner-only, refuse an agent acceptance under own
   assert.equal((await post('/api/acceptance/accept',{projectId:project.id,request:{}})).status,422,'an unparseable acceptance is an invalid request');
 
   // The policy before anything is written is the documented default, and it says so.
-  const initial=(await (await read('/api/acceptance/policy')).json()).policy;
+  const initialResponse=await (await read('/api/acceptance/policy')).json();
+  assert.equal(initialResponse.agentEvidenceRecording,false,'agent evidence recording is off without an explicit deployment opt-in');
+  const initial=initialResponse.policy;
   assert.deepEqual([initial.mode,initial.revision,initial.recorded,initial.updatedBy,initial.absenceReason,Object.values(initial.actionClasses)],['owner-only',0,false,null,'no-policy-recorded-yet',['ask','ask','ask','ask','ask','ask']]);
   assert.deepEqual((await (await read('/api/acceptance?projectId='+project.id)).json()).evidence,[],'a project with no completion record reads as an empty list');
 
@@ -1141,26 +1161,28 @@ test('the acceptance routes are owner-only, refuse an agent acceptance under own
   // Under the default owner-only policy an agent acceptance is refused outright, and nothing is written.
   const agentRefused=await post('/api/acceptance/accept',{projectId:project.id,request:{evidenceId:record.id,artifact,actionClass:'commit'},actor:{kind:'agent',identity:'api-worker'}});
   assert.equal(agentRefused.status,403);
-  assert.match((await agentRefused.json()).error,/The acceptance policy is owner-only, so an acceptance by agent api-worker is refused outright/);
+  assert.match((await agentRefused.json()).error,/owner interface cannot act as an agent/);
   assert.equal((await (await read('/api/acceptance?projectId='+project.id)).json()).evidence[0].acceptance,null,'the refusal recorded no acceptance');
 
-  // The owner sets the policy, and then the agent may accept the class set to full-auto.
+  // Opening the policy never lets an owner HTTP request impersonate an agent.
   const updated=await post('/api/acceptance/policy',{revision:0,policy:{mode:'agent-may-accept',actionClasses:{commit:'full-auto',push:'ask',deploy:'ask',spend:'ask',provision:'ask',publish:'ask'}}});
   assert.equal(updated.status,200);
   const updatedPolicy=(await updated.json()).policy;
   assert.deepEqual([updatedPolicy.mode,updatedPolicy.revision,updatedPolicy.updatedBy],['agent-may-accept',1,'local'],'the policy records the authenticated owner as the one who changed it');
-  const accepted=await post('/api/acceptance/accept',{projectId:project.id,request:{evidenceId:record.id,artifact,actionClass:'commit'},actor:{kind:'agent',identity:'api-worker'}});
+  const impersonation=await post('/api/acceptance/accept',{projectId:project.id,request:{evidenceId:record.id,artifact,actionClass:'commit'},actor:{kind:'agent',identity:'api-worker'}});
+  assert.equal(impersonation.status,403);
+  assert.equal((await (await read('/api/acceptance?projectId='+project.id)).json()).evidence[0].acceptance,null);
+  const accepted=await post('/api/acceptance/accept',{projectId:project.id,request:{evidenceId:record.id,artifact,actionClass:'commit'}});
   assert.equal(accepted.status,200);
   const acceptedBody=await accepted.json();
-  assert.deepEqual([acceptedBody.acceptance.acceptedBy.kind,acceptedBody.acceptance.acceptedBy.policyRule,acceptedBody.acceptance.policy.mode,acceptedBody.acceptance.singleUse],['agent','agent-may-accept:commit=full-auto','agent-may-accept',true]);
+  assert.deepEqual([acceptedBody.acceptance.acceptedBy.kind,acceptedBody.acceptance.acceptedBy.policyRule,acceptedBody.acceptance.policy.mode,acceptedBody.acceptance.singleUse],['owner',null,'agent-may-accept',true]);
   const acceptedMarkdown=await readFile(join(project.path,'docs','acceptance',record.id+'.md'),'utf8');
-  assert.ok(acceptedMarkdown.includes('agent-may-accept:commit=full-auto'),'the Markdown record carries the rule that permitted the acceptance');
-  assert.match(acceptedMarkdown,/- Accepted by: agent .api-worker. at \d{4}-/,'and who accepted it');
+  assert.match(acceptedMarkdown,/- Accepted by: owner .local. at \d{4}-/,'the Markdown records the authenticated owner');
   assert.ok(!acceptedMarkdown.includes('No acceptance is recorded for this evidence.'));
   // A second acceptance of the same artifact is single use, whether it is an agent or the owner.
   const second=await post('/api/acceptance/accept',{projectId:project.id,request:{evidenceId:record.id,artifact,actionClass:'commit'}});
   assert.equal(second.status,409,'the second acceptance is refused, even though this one names no actor and so is the owner');
-  assert.match((await second.json()).error,/already accepted at .* by agent .api-worker.; an acceptance is single use/);
+  assert.match((await second.json()).error,/already accepted at .* by owner .local.; an acceptance is single use/);
   // An artifact that has moved since the evidence was produced is refused before any acceptance.
   const moved=await post('/api/acceptance/accept',{projectId:project.id,request:{evidenceId:record.id,artifact:{revision:'b'.repeat(64),commit:null},actionClass:'commit'}});
   assert.equal(moved.status,409);
@@ -1171,7 +1193,7 @@ test('the acceptance routes are owner-only, refuse an agent acceptance under own
   assert.match((await stale.json()).error,/at revision 1, not 0/);
   // The read reports the record with its acceptance and the policy in force, and no path.
   const view=await (await read('/api/acceptance?projectId='+project.id)).json();
-  assert.deepEqual([view.readOnly,view.projectId,view.evidence.length,view.policy.revision,view.evidence[0].acceptance.acceptedBy.identity,view.truncated],[true,project.id,1,1,'api-worker',false]);
+  assert.deepEqual([view.readOnly,view.projectId,view.evidence.length,view.policy.revision,view.evidence[0].acceptance.acceptedBy.identity,view.truncated],[true,project.id,1,1,'local',false]);
   assert.ok(!JSON.stringify(view).includes(data)&&!JSON.stringify(view).includes(root),'the view leaks no filesystem path');
   // The same capability through the command registry keeps its own statuses.
   const viaRegistry=await post('/api/actions/execute',{id:'acceptance.read',params:{},scope:{projectId:project.id}});
@@ -1182,7 +1204,7 @@ test('the acceptance routes are owner-only, refuse an agent acceptance under own
   assert.ok(!JSON.stringify(await registryRefusal.json()).includes(project.path),'a registry refusal is path-free');
  }finally{await app.close();store.close();await rm(root,{recursive:true,force:true});}
 });
-test('the accept route records the declared actor whatever shape declares it, refuses a disagreement, and refuses an agent the policy forbids',async()=>{
+test('owner acceptance routes refuse agent impersonation and conflicting actor declarations',async()=>{
  const root=await mkdtemp(join(tmpdir(),'dashboard-acceptance-actor-'));
  const data=join(root,'data');await mkdir(data,{recursive:true,mode:0o700});
  const store=new ControlStore(data);
@@ -1207,7 +1229,7 @@ test('the accept route records the declared actor whatever shape declares it, re
   // recorded as the owner's permitted acceptance.
   const nestedRefused=await post('/api/acceptance/accept',{projectId:project.id,request:{evidenceId:first.id,artifact:firstArtifact,actionClass:'commit',actor:{kind:'agent',identity:'nested-worker'}}});
   assert.equal(nestedRefused.status,403,'an agent the owner-only policy forbids is refused, however its actor is declared');
-  assert.match((await nestedRefused.json()).error,/The acceptance policy is owner-only, so an acceptance by agent nested-worker is refused outright/);
+  assert.match((await nestedRefused.json()).error,/owner interface cannot act as an agent/);
   assert.equal(await acceptanceOf(first.id),null,'the refusal recorded no acceptance');
 
   // A body that declares two different actors is refused rather than one of them being chosen for it.
@@ -1218,25 +1240,17 @@ test('the accept route records the declared actor whatever shape declares it, re
   assert.ok(!JSON.stringify(disagreeingBody).includes(project.path),'the refusal is path-free');
   assert.equal(await acceptanceOf(first.id),null,'the disagreement recorded no acceptance');
 
-  // The owner opens the class, and then the registry-shaped body is accepted as the agent it declares.
+  // A permissive policy still cannot turn an owner request into an agent action.
   const policy=await post('/api/acceptance/policy',{revision:0,policy:{mode:'agent-may-accept',actionClasses:{commit:'full-auto',push:'ask',deploy:'ask',spend:'ask',provision:'ask',publish:'ask'}}});
   assert.equal(policy.status,200);
-  const nestedAccepted=await post('/api/acceptance/accept',{projectId:project.id,request:{evidenceId:first.id,artifact:firstArtifact,actionClass:'commit',actor:{kind:'agent',identity:'nested-worker'}}});
-  assert.equal(nestedAccepted.status,200);
-  const acceptedBody=await nestedAccepted.json();
-  assert.deepEqual(
-   [acceptedBody.acceptance.acceptedBy.kind,acceptedBody.acceptance.acceptedBy.identity,acceptedBody.acceptance.acceptedBy.policyRule,acceptedBody.acceptance.policy.classDecision],
-   ['agent','nested-worker','agent-may-accept:commit=full-auto','full-auto'],
-   'the agent acceptance records the rule that permitted it, not an owner acceptance'
-  );
-  assert.ok((await readFile(join(project.path,'docs','acceptance',first.id+'.md'),'utf8')).includes('- Accepted by: agent `nested-worker` at '),'the Markdown record carries the agent the body declared');
-
-  // Declaring the same actor in both places is one identity rather than a disagreement, and is accepted.
+  const nested=await post('/api/acceptance/accept',{projectId:project.id,request:{evidenceId:first.id,artifact:firstArtifact,actionClass:'commit',actor:{kind:'agent',identity:'nested-worker'}}});
+  assert.equal(nested.status,403); assert.equal(await acceptanceOf(first.id),null);
   const agreeing=await post('/api/acceptance/accept',{projectId:project.id,request:{evidenceId:second.id,artifact:secondArtifact,actionClass:'commit',actor:{kind:'agent',identity:'nested-worker'}},actor:{kind:'agent',identity:'nested-worker'}});
-  assert.equal(agreeing.status,200);
-  const agreeingBody=await agreeing.json();
-  assert.deepEqual([agreeingBody.acceptance.acceptedBy.kind,agreeingBody.acceptance.acceptedBy.identity],['agent','nested-worker']);
-  assert.equal((await acceptanceOf(second.id) as {acceptedBy:{kind:string}}).acceptedBy.kind,'agent');
+  assert.equal(agreeing.status,403); assert.equal(await acceptanceOf(second.id),null);
+  const registry=await post('/api/actions/execute',{id:'acceptance.accept',params:{request:{evidenceId:first.id,artifact:firstArtifact,actionClass:'commit',actor:{kind:'agent',identity:'nested-worker'}}},scope:{projectId:project.id}});
+  assert.equal(registry.status,403); assert.equal(await acceptanceOf(first.id),null);
+  const owner=await post('/api/acceptance/accept',{projectId:project.id,request:{evidenceId:first.id,artifact:firstArtifact,actionClass:'commit',actor:{kind:'owner',identity:'local'}}});
+  assert.equal(owner.status,200); assert.equal((await owner.json()).acceptance.acceptedBy.identity,'local');
  }finally{await app.close();store.close();await rm(root,{recursive:true,force:true});}
 });
 
@@ -1332,7 +1346,7 @@ test('the fork routes are owner-only, branch a real repository at a cutoff and n
   // The child cannot be dispatched into while it is paused, and this project's queue refuses to
   // misdirect a child's queued input into the root conversation.
   assert.equal((await post('/api/sessions/'+forkBody.childSessionId+'/queue/claim',{projectId:project.id,owner:'fork-dispatcher'})).status,409,'a child input is never dispatched into the project root conversation');
-  const dispatchRefusal=await app.forks!.dispatchChild({projectId:project.id,childSessionId:forkBody.childSessionId,text:'not yet'}).then(()=>null).catch((error:Error)=>error);
+  const dispatchRefusal=await app.forks!.dispatchChild({projectId:project.id,parentSessionId:parent.id,childSessionId:forkBody.childSessionId,text:'not yet',invocationId:'http-paused'}).then(()=>null).catch((error:Error)=>error);
   assert.ok(dispatchRefusal instanceof Error&&/paused/.test(dispatchRefusal.message),'a paused child refuses to dispatch');
 
   // A stale revision is a conflict that touches nothing, and the resume is what lifts the pause.
@@ -1341,30 +1355,80 @@ test('the fork routes are owner-only, branch a real repository at a cutoff and n
   const resumed=await post(forks+'/'+forkBody.childSessionId+'/resume',{revision:forkBody.revision});
   assert.equal(resumed.status,200);
   assert.deepEqual([(await resumed.json()).outcome,(await (await read(forks)).json()).forks[0].state],['resumed','active']);
+  // The production dispatch route is wired to the fenced, durably bound child submission. Its refusal
+  // paths are asserted here without starting a model run: a bad invocation identity, an unknown child,
+  // a missing CSRF token and a foreign origin each refuse before anything is submitted.
+  assert.equal((await post(forks+'/'+forkBody.childSessionId+'/dispatch',{parentSessionId:parent.id,invocationId:'',text:'hello'})).status,422,'an empty invocation identity is refused');
+  assert.equal((await post(forks+'/'+forkBody.childSessionId+'/dispatch',{parentSessionId:parent.id,invocationId:'http-1',text:'hello',extra:true})).status,422,'an unknown dispatch field is refused');
+  assert.equal((await post(forks+'/'+'f'.repeat(32)+'/dispatch',{parentSessionId:parent.id,invocationId:'http-1',text:'hello'})).status,404,'an unknown child session is refused');
+  assert.equal((await fetch(url+forks+'/'+forkBody.childSessionId+'/dispatch',{method:'POST',headers:{...writes,origin:'https://evil.example'},body:JSON.stringify({parentSessionId:parent.id,invocationId:'http-1',text:'hello'})})).status,403,'dispatching to a child needs the canonical origin');
+  assert.equal((await fetch(url+forks+'/'+forkBody.childSessionId+'/dispatch',{method:'POST',headers:{...token,'content-type':'application/json'},body:JSON.stringify({parentSessionId:parent.id,invocationId:'http-1',text:'hello'})})).status,403,'a request without the canonical Origin is refused in local mode');
+  assert.deepEqual((await (await read(forks)).json()).forks[0].revision,2,'no refused dispatch wrote a revision');
   assert.equal((await post(forks+'/'+forkBody.childSessionId+'/discard',{})).status,422,'a discard needs the revision it read');
 
-  // A worktree holding this child's own work is never removed without an explicit force.
+  // Active forks refuse discard regardless of worktree state, because input admission can race it.
+  const cleanRefusal=await post(forks+'/'+forkBody.childSessionId+'/discard',{revision:2});
+  assert.equal(cleanRefusal.status,503); assert.equal(await exists(forkBody.worktreePath),true);
   await writeFile(join(forkBody.worktreePath,'child-only.txt'),'this worktree own work\n');
-  const dirty=await post(forks+'/'+forkBody.childSessionId+'/discard',{revision:2});
-  assert.equal(dirty.status,200);
-  const dirtyBody=await dirty.json();
-  assert.deepEqual([dirtyBody.outcome,dirtyBody.removed,dirtyBody.fork.state,dirtyBody.fork.attention.reason],['attention',false,'failed','worktree-dirty']);
+  const refused=await post(forks+'/'+forkBody.childSessionId+'/discard',{revision:2});
+  assert.equal(refused.status,503); assert.match((await refused.json()).error,/concurrent input admission/);
+  const forced=await post(forks+'/'+forkBody.childSessionId+'/discard',{revision:2,force:true});
+  assert.equal(forced.status,503);
   assert.equal(await exists(join(forkBody.worktreePath,'child-only.txt')),true,'the dirty worktree is untouched');
-  assert.equal((await post(forks+'/'+forkBody.childSessionId+'/resume',{revision:3})).status,409,'a fork that needs an operator cannot be resumed');
-  const forced=await post(forks+'/'+forkBody.childSessionId+'/discard',{revision:3,force:true});
-  assert.equal(forced.status,200);
-  const forcedBody=await forced.json();
-  assert.deepEqual([forcedBody.outcome,forcedBody.removed,forcedBody.fork.state],['discarded',true,'discarded']);
-  assert.equal(await exists(forkBody.worktreePath),false,'the forced discard removed the worktree');
-  assert.deepEqual((await (await read(forks)).json()).forks,[],'a discarded fork is not listed any more');
+  // Disposable fixture cleanup only: even externally removing the worktree does not authorize active discard.
+  await gitIn(repo,['worktree','remove','--force','--',forkBody.worktreePath]);
+  const discarded=await post(forks+'/'+forkBody.childSessionId+'/discard',{revision:2});
+  assert.equal(discarded.status,503);
+  assert.equal((await (await read(forks)).json()).forks[0].state,'active');
   assert.equal(await readFile(sentinel,'utf8'),'parent only\n','the parent working tree is untouched by every step');
-  assert.equal((await post(forks+'/'+forkBody.childSessionId+'/discard',{revision:4})).status,200,'discarding a discarded fork is a legal no-op that touches nothing');
   // The registry offers the fork actions on this instance, and the same capability works through it.
   const offered=await (await read('/api/actions?projectId='+project.id+'&sessionId='+parent.id)).json();
   assert.deepEqual(offered.actions.map((action:any)=>action.id).filter((id:string)=>id.startsWith('fork.')).sort(),['fork.create','fork.discard','fork.list','fork.resume']);
   const viaRegistry=await post('/api/actions/execute',{id:'fork.create',params:{baseCommit,cutoffEntryId:cutoff},scope:{projectId:project.id,sessionId:parent.id}});
   assert.equal(viaRegistry.status,200,'the same capability is reachable through the registry the palette writes with');
   assert.equal((await viaRegistry.json()).action,'fork.create');
+  // The production dispatch route really submits into the active child under its durable identity.
+  const {fauxProvider:forkDispatchFaux,fauxAssistantMessage:forkDispatchMessage}=await import('@earendil-works/pi-ai/providers/faux');
+  const dispatchFake=forkDispatchFaux({provider:'fork-dispatch-faux',models:[{id:'fixture'}]});
+  app.providers.models.setProvider(dispatchFake.provider);
+  await app.providers.savePreferences({defaultModel:{provider:'fork-dispatch-faux',modelId:'fixture'},favourites:[],allowRealModels:true});
+  dispatchFake.setResponses([()=>forkDispatchMessage('child answered')]);
+  const dispatchPath=forks+'/'+forkBody.childSessionId+'/dispatch';
+  const dispatched=await post(dispatchPath,{parentSessionId:parent.id,invocationId:'http-dispatch-1',text:'run the child task'});
+  assert.equal(dispatched.status,200);
+  const dispatchedBody=await dispatched.json();
+  assert.match(dispatchedBody.requestId,/^fork:/,'the route reports the durable request identity');
+  const childAfter=await app.agents.sessionView(app.catalog.get(project.id),forkBody.childSessionId);
+  assert.ok(childAfter?.entries.some((entry:any)=>entry.text.includes('run the child task')),'the child transcript holds the dispatched text');
+  const repeatDispatch=await post(dispatchPath,{parentSessionId:parent.id,invocationId:'http-dispatch-1',text:'run the child task'});
+  assert.equal(repeatDispatch.status,200);
+  assert.equal((await repeatDispatch.json()).requestId,dispatchedBody.requestId,'an exact repeat returns the same durable request');
+  assert.equal((await post(dispatchPath,{parentSessionId:parent.id,invocationId:'http-dispatch-1',text:'different text'})).status,409,'changed text under one identity conflicts');
+  assert.equal((await post(dispatchPath,{parentSessionId:'ffffffff-ffff-4fff-8fff-ffffffffffff',invocationId:'http-other',text:'x'})).status,404,'a caller that is not this fork parent cannot dispatch into it');
+  // Owner recovery for a held lifecycle fence: it needs the exact revision and a quiescent child,
+  // releases only the fence, and never dispatches, replays or removes anything.
+  const lifecycleFence=new ForkLifecycleFence(store);
+  const heldFence=lifecycleFence.acquire(project.id,forkBody.childSessionId);
+  const recoverPath=forks+'/'+forkBody.childSessionId+'/recover';
+  assert.equal((await post(recoverPath,{revision:heldFence.revision+5})).status,409,'a stale fence revision is refused');
+  assert.equal(lifecycleFence.read(project.id,forkBody.childSessionId)?.state,'held','a refused recovery leaves the fence held');
+  const recovered=await post(recoverPath,{revision:heldFence.revision});
+  assert.equal(recovered.status,200);
+  assert.deepEqual(await recovered.json(),{recovered:true,revision:heldFence.revision+1});
+  assert.equal(lifecycleFence.read(project.id,forkBody.childSessionId)?.state,'released','the fence is released');
+  const entriesAfterRecovery=(await app.agents.sessionView(app.catalog.get(project.id),forkBody.childSessionId))?.entries.length;
+  assert.equal((await post(recoverPath,{revision:heldFence.revision+1})).status,404,'a released fence is not held any more');
+  assert.equal((await app.agents.sessionView(app.catalog.get(project.id),forkBody.childSessionId))?.entries.length,entriesAfterRecovery,'recovery replayed nothing');
+
+  // The creation fence has the same owner recovery, and the parent session and revision are checked.
+  const creationFence=new ForkCreationFence(store);
+  const heldCreation=creationFence.acquire(project.id,parent.id);
+  const recoverCreation=forks+'/recover-creation';
+  assert.equal((await post(recoverCreation,{parentSessionId:parent.id,revision:heldCreation.revision+9})).status,409,'a stale creation revision is refused');
+  assert.equal((await post(recoverCreation,{parentSessionId:'ffffffff-ffff-4fff-8fff-ffffffffffff',revision:heldCreation.revision})).status,404,'a different parent cannot release it');
+  const creationRecovered=await post(recoverCreation,{parentSessionId:parent.id,revision:heldCreation.revision});
+  assert.equal(creationRecovered.status,200);
+  assert.equal(creationFence.read(project.id)?.state,'released','the creation fence is released');
   assert.equal((await post(forks,{parentSessionId:parent.id,baseCommit,cutoffEntryId:0})).status,422,'a cutoff of zero is not an entry of any transcript');
  }finally{await app.close();store.close();await rm(root,{recursive:true,force:true});}
 });
@@ -1433,26 +1497,28 @@ test('the agent registry routes are owner-only, strict, governance-checked, and 
   const changed=await post('/api/agents/'+agent.id+'/update',{revision:agent.revision,patch:{name:'Renamed',enabled:false},actor:{kind:'owner',identity:'second'}});
   assert.equal(changed.status,200);
   const renamed=(await changed.json()).agent;
-  assert.deepEqual([renamed.revision,renamed.name,renamed.enabled,renamed.updatedBy.identity],[2,'Renamed',false,'second']);
+  assert.deepEqual([renamed.revision,renamed.name,renamed.enabled,renamed.updatedBy.identity],[2,'Renamed',false,'local']);
   // Governance: an agent may not edit its own record, and the refusal is the rule's own.
   const selfEdit=await post('/api/agents/'+agent.id+'/update',{revision:renamed.revision,patch:{scopes:['read_notes','file_edit']},actor:{kind:'agent',identity:agent.id}});
   assert.equal(selfEdit.status,403);
-  assert.match((await selfEdit.json()).error,/may not edit its own record/);
+  assert.match((await selfEdit.json()).error,/owner interface cannot act as an agent/);
   const wider=await post('/api/agents',{draft:draft({name:'Wider'}),actor:{kind:'agent',identity:agent.id}});
   assert.equal(wider.status,403);
-  assert.match((await wider.json()).error,/may not create another agent/);
+  assert.match((await wider.json()).error,/owner interface cannot act as an agent/);
   // Archiving closes it, and the audit trail is durable and complete.
   const archived=await post('/api/agents/'+agent.id+'/archive',{revision:renamed.revision,actor});
   assert.equal(archived.status,200);
   assert.equal((await archived.json()).agent.archived,true);
   const history=await (await read('/api/agents/'+agent.id)).json();
-  assert.deepEqual(history.history.map((entry:any)=>[entry.revision,entry.action,entry.changedBy.identity]),[[1,'created','local'],[2,'updated','second'],[3,'archived','local']]);
+  assert.deepEqual(history.history.map((entry:any)=>[entry.revision,entry.action,entry.changedBy.identity]),[[1,'created','local'],[2,'updated','local'],[3,'archived','local']]);
   for(const entry of history.history)assert.ok(Number.isFinite(Date.parse(entry.changedAt)),'every audit entry carries an instant');
   // An unknown agent, and an unknown route under the registry prefix, are both refused as not found.
   assert.equal((await read('/api/agents/'+randomUUID())).status,404);
   assert.equal((await read('/api/agents/'+randomUUID()+'/nonsense')).status,404);
   assert.equal((await post('/api/agents/'+randomUUID()+'/archive',{revision:1,actor})).status,404);
   // The typed actions reach the same registry, and the same record.
+  const spoof=await post('/api/actions/execute',{id:'agent.create',params:{draft:draft({name:'Spoofed'}),actor:{kind:'agent',identity:agent.id}}});
+  assert.equal(spoof.status,403);
   const viaAction=await (await post('/api/actions/execute',{id:'agent.list',params:{}})).json();
   assert.equal(viaAction.result.agents.length,1);
   assert.equal(viaAction.result.fileEdit.enabled,false);
@@ -1481,6 +1547,9 @@ test('the session agent binding is owner-only, revision-checked and reported wit
   const before=await (await read(base)).json();
   assert.equal(before.binding,null);
   assert.equal(before.authority.agentId,agent.agent.id);
+  // Owner endpoints cannot claim that an agent performed the binding.
+  const spoof=await post('/api/sessions/'+session.session.id+'/agent',{projectId:project.id,revision:0,agentId:agent.agent.id,actor:{kind:'agent',identity:agent.agent.id}});
+  assert.equal(spoof.status,403);
   // Binding revision 0 produces revision 1; the authority follows the bound agent.
   const bound=await (await post('/api/sessions/'+session.session.id+'/agent',{projectId:project.id,revision:0,agentId:agent.agent.id,actor:{kind:'owner',identity:'local'}})).json();
   assert.deepEqual([bound.binding.revision,bound.binding.agentId],[1,agent.agent.id]);
@@ -1526,6 +1595,13 @@ test('the file-edit routes are owner-only, disabled by default, and contained to
   // the default mode is propose-only rather than an assumption.
   const before=await (await read(base)).json();
   assert.deepEqual([before.enabled,before.mode,before.edits.length],[true,'propose-only',0]);
+  const fakeAgent=randomUUID();
+  const spoofRequest={agentId:fakeAgent,path:'spoof.txt',content:'not an agent write'};
+  assert.equal((await post(base,{request:spoofRequest,actor:{kind:'agent',identity:fakeAgent}})).status,403);
+  assert.equal((await post(base,{request:spoofRequest,actor})).status,403);
+  assert.equal((await post('/api/actions/execute',{id:'file-edit.write',params:{request:spoofRequest,actor},scope:{projectId:project.id}})).status,403);
+  assert.equal((await post('/api/actions/execute',{id:'file-edit.write',params:{request:{...spoofRequest,agentId:null},actor:{kind:'agent',identity:fakeAgent}},scope:{projectId:project.id}})).status,403);
+  assert.equal((await (await read(base)).json()).edits.length,0);
   // A propose-only write records the change and its diff and writes no file at all.
   const proposed=await post(base,{request:{agentId:null,path:'src/probe.ts',content:'export const one = 1;\n'},actor});
   assert.equal(proposed.status,201);
@@ -1595,4 +1671,59 @@ test('the file-edit routes are owner-only, disabled by default, and contained to
   assert.equal(asking.status,503);
   assert.match((await asking.json()).error,/file-edit capability is disabled on this instance/);
  }finally{await off.close();offStore.close();await rm(offRoot,{recursive:true,force:true});}
+});
+
+test('active fork coding tools use the child worktree, not the parent',async()=>{
+ const {fauxProvider,fauxAssistantMessage,fauxToolCall}=await import('@earendil-works/pi-ai/providers/faux');
+ const root=await mkdtemp(join(tmpdir(),'pilot-fork-coding-')),data=join(root,'data');await mkdir(data,{recursive:true});
+ const store=new ControlStore(data),security=localConfig('http://127.0.0.1:0');
+ const app=await createApp({dataRoot:data,browseRoots:[],security,control:store,agents:'on',coding:{enabled:true,shell:true},fileEdit:{enabled:true}});await listen(app,security);
+ const token={'x-dashboard-token':security.token},writes={...token,'content-type':'application/json',origin:security.origin};
+ const post=(p:string,body:unknown)=>fetch(security.origin+p,{method:'POST',headers:writes,body:JSON.stringify(body)});
+ try{
+  const project=await app.catalog.register({name:'Fork coding',managed:true,confirm:true,repository:''});
+  const repo=join(app.catalog.root,'repositories',project.id,'agent');await mkdir(repo,{recursive:true});
+  await writeFile(join(repo,'marker.txt'),'parent baseline');await gitIn(repo,['init','-q']);await gitIn(repo,['config','user.email','pilot@example.invalid']);await gitIn(repo,['config','user.name','Pilot test']);await gitIn(repo,['add','.']);await gitIn(repo,['commit','-q','-m','base']);
+  const baseCommit=await gitIn(repo,['rev-parse','HEAD']);await app.catalog.attachWorktree(project.id);
+  const fake=fauxProvider({provider:'fork-coding-faux',models:[{id:'fixture'}]});app.providers.models.setProvider(fake.provider);
+  await app.providers.savePreferences({defaultModel:{provider:'fork-coding-faux',modelId:'fixture'},favourites:[],allowRealModels:true});
+  fake.setResponses([()=>fauxAssistantMessage('Ready to branch')]);
+  await app.agents.submit(project,{text:'parent context',mode:'followUp'});
+  const deadline=Date.now()+10000;let parentView=await app.agents.view(project);
+  while(!parentView.entries.some(e=>e.text.includes('Ready to branch'))){if(Date.now()>deadline)throw Error('parent did not settle');await new Promise(r=>setTimeout(r,20));parentView=await app.agents.view(project);}
+  await post('/api/sessions/migrate',{});
+  const sessions=await (await fetch(security.origin+'/api/sessions?projectId='+project.id,{headers:token})).json();const parent=sessions.sessions[0];
+  const cutoffEntryId=Number(parentView.entries.at(-1)!.id);
+  fake.setResponses([()=>fauxAssistantMessage([fauxToolCall('fork_context',{})],{stopReason:'toolUse'}),()=>fauxAssistantMessage([fauxToolCall('fork_create',{baseCommit,cutoffEntryId,target:'custom-child'})],{stopReason:'toolUse'}),()=>fauxAssistantMessage('Fork created by agent')]);
+  await app.agents.submit(project,{text:'Create a fork',mode:'followUp'});
+  const forkDeadline=Date.now()+10000;for(;;){const view=await app.agents.view(project);if(view.entries.some(e=>e.text.includes('Fork created by agent')))break;if(Date.now()>forkDeadline)throw Error('agent fork did not settle');await new Promise(r=>setTimeout(r,20));}
+  const created=app.forks!.list(project.id);assert.equal(created.length,1,'the model-facing fork tool created a fork');
+  const child=created[0];
+  const callsBeforePaused=fake.state.callCount;
+  const paused=await post('/api/projects/'+project.id+'/agents/input',{text:'try paused child',sessionId:child.childSessionId,mode:'followUp'});
+  assert.equal(paused.status,409);assert.match((await paused.json()).error,/fork is not active/);
+  await assert.rejects(()=>app.agents.submit(project,{text:'try paused child directly',sessionId:child.childSessionId,mode:'followUp'}),/fork is not active/);
+  assert.equal(fake.state.callCount,callsBeforePaused,'a paused child admits no model request');
+  const pausedView=await app.agents.sessionView(project,child.childSessionId);
+  assert.equal(pausedView?.entries.some(e=>e.text.includes('try paused child')),false,'a paused child admits no input');
+  assert.equal(await exists(join(child.worktreePath,'paused.txt')),false);assert.equal(await exists(join(repo,'paused.txt')),false);
+  // Lifecycle resumption is another admission path. Its refusal must precede a lifecycle write.
+  app.lifecycle!.markRunning({projectId:project.id,sessionId:child.childSessionId,requestId:'fixture-request'});
+  const running=app.lifecycle!.read(project.id,child.childSessionId);
+  const lifecycleBase='/api/sessions/'+child.childSessionId+'/lifecycle';
+  const lifecyclePause=await post(lifecycleBase+'/pause',{projectId:project.id,revision:running.revision,reason:'fixture'});
+  assert.equal(lifecyclePause.status,200);
+  const lifecyclePaused=app.lifecycle!.read(project.id,child.childSessionId);
+  const lifecycleResume=await post(lifecycleBase+'/resume',{projectId:project.id,revision:lifecyclePaused.revision});
+  assert.equal(lifecycleResume.status,409);assert.match((await lifecycleResume.json()).error,/fork is not active/);
+  assert.equal(app.lifecycle!.read(project.id,child.childSessionId).revision,lifecyclePaused.revision);
+  assert.equal(fake.state.callCount,callsBeforePaused);
+  await app.forks!.resume({projectId:project.id,childSessionId:child.childSessionId,revision:child.revision});
+  fake.setResponses([()=>fauxAssistantMessage([fauxToolCall('write',{path:'marker.txt',content:'child changed'})],{stopReason:'toolUse'}),()=>fauxAssistantMessage([fauxToolCall('bash',{command:'printf child > shell-result.txt'})],{stopReason:'toolUse'}),()=>fauxAssistantMessage('Fork coding finished')]);
+  await app.forks!.dispatchChild({projectId:project.id,parentSessionId:parent.id,childSessionId:child.childSessionId,text:'change child',invocationId:'http-coding-success'});
+  const completedView=await app.agents.sessionView(project,child.childSessionId);
+  assert.ok(completedView?.entries.some(e=>e.text.includes('Fork coding finished')),'awaited fork dispatch settles only after the child tool run completes');
+  assert.equal(await readFile(join(child.worktreePath,'marker.txt'),'utf8'),'child changed');assert.equal(await readFile(join(child.worktreePath,'shell-result.txt'),'utf8'),'child');
+  assert.equal(await readFile(join(repo,'marker.txt'),'utf8'),'parent baseline');assert.equal(await exists(join(repo,'shell-result.txt')),false);
+ }finally{await app.close();store.close();await rm(root,{recursive:true,force:true});}
 });

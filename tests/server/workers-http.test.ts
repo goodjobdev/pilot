@@ -1,5 +1,5 @@
 import { test } from 'node:test';
-import { MAX_OUTPUT_TOKENS_DEFAULT } from '../../src/shared/harness-settings';
+import { WORKER_MAX_OUTPUT_TOKENS_PER_TURN } from '../../src/shared/workers';
 import assert from 'node:assert/strict';
 import { appendFile, mkdtemp, readFile, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -346,9 +346,39 @@ test('workers: the legacy open-window seam cancels before a request, and Faux pr
     const finished = await waitForRun(f, projectRecord.id, second.id);
     assert.equal(finished.state, 'completed');
     assert.ok(requests.length >= 1);
-    assert.ok(requests.every((request) => request.maxTokens === MAX_OUTPUT_TOKENS_DEFAULT));
+    assert.ok(requests.every((request) => request.maxTokens === WORKER_MAX_OUTPUT_TOKENS_PER_TURN));
     assert.equal(requests[0].provider, 'faux');
   } finally { await f.close(); }
+});
+
+test('workers: a lost durable conversation binding prevents the provider call',async()=>{
+ const requests:{maxTokens:number}[]=[],f=await instance({acceptanceFauxWorkerDelayMs:350,onModelRequest:input=>requests.push(input)});
+ try{
+  const projectRecord=await project(f),view=await (await f.get('/settings/model-policy')).json() as {revision:number;models:{provider:string;modelId:string;available:boolean}[]};
+  const scripted=view.models.find(model=>model.provider==='faux'&&model.available)!;const model={provider:scripted.provider,modelId:scripted.modelId};
+  assert.equal((await f.post('/settings/model-policy',{revision:view.revision,policy:{allowedWorkerModels:[model],defaultWorkerModel:model}})).status,200);
+  const worker=(await (await f.post('/projects/'+projectRecord.id+'/workers',{name:'Binding-loss worker',scopes:['read_notes']})).json() as {worker:{id:string}}).worker;
+  const run=(await (await f.post('/projects/'+projectRecord.id+'/workers/'+worker.id+'/runs',{})).json() as {run:{id:string}}).run;
+  const deadline=Date.now()+3000;while(f.app.workerStore!.workerConversationIds(projectRecord.id).length===0&&Date.now()<deadline)await new Promise(resolve=>setTimeout(resolve,10));
+  assert.equal(f.app.workerStore!.workerConversationIds(projectRecord.id).length,1);
+  const store=f.app.workerStore!,original=store.runForConversation.bind(store);store.runForConversation=()=>null;
+  try { const settled=await waitForRun(f,projectRecord.id,run.id);assert.equal(settled.state,'failed');assert.equal(requests.length,0); }
+  finally { store.runForConversation=original; }
+ }finally{await f.close();}
+});
+
+test('workers: the worker token cap also respects a lower instance limit',async()=>{
+ const requests:{maxTokens:number}[]=[],f=await instance({onModelRequest:input=>requests.push(input)});
+ try{
+  const settings=await (await f.get('/settings/harness')).json() as {revision:number;settings:{preferences:{maxOutputTokens:number;maxModelTurns:number;defaultThinking:string|null};capabilities:{codingTools:boolean;shell:boolean;fileEdit:boolean}}};
+  const updated=await f.post('/settings/harness',{revision:settings.revision,settings:{capabilities:settings.settings.capabilities,preferences:{...settings.settings.preferences,maxOutputTokens:1024}}});assert.equal(updated.status,200,await updated.clone().text());
+  const projectRecord=await project(f),view=await (await f.get('/settings/model-policy')).json() as {revision:number;models:{provider:string;modelId:string;available:boolean}[]};
+  const scripted=view.models.find(model=>model.provider==='faux'&&model.available)!;const model={provider:scripted.provider,modelId:scripted.modelId};
+  assert.equal((await f.post('/settings/model-policy',{revision:view.revision,policy:{allowedWorkerModels:[model],defaultWorkerModel:model}})).status,200);
+  const worker=(await (await f.post('/projects/'+projectRecord.id+'/workers',{name:'Lower-limit worker',scopes:['read_notes']})).json() as {worker:{id:string}}).worker;
+  const run=(await (await f.post('/projects/'+projectRecord.id+'/workers/'+worker.id+'/runs',{})).json() as {run:{id:string}}).run;
+  assert.equal((await waitForRun(f,projectRecord.id,run.id)).state,'completed');assert.ok(requests.length>0);assert.ok(requests.every(request=>request.maxTokens===1024));
+ }finally{await f.close();}
 });
 
 test('workers: configured Faux acceptance delay is cancellable after durable binding; provider budget remains intact', async () => {
@@ -384,7 +414,7 @@ test('workers: configured Faux acceptance delay is cancellable after durable bin
     const finished = await waitForRun(f, projectRecord.id, second.id);
     assert.equal(finished.state, 'completed');
     assert.equal(requests.length >= 1, true);
-    assert.ok(requests.every((request) => request.maxTokens === MAX_OUTPUT_TOKENS_DEFAULT), 'the synthetic provider is bounded to the instance default');
+    assert.ok(requests.every((request) => request.maxTokens === WORKER_MAX_OUTPUT_TOKENS_PER_TURN), 'the synthetic provider receives the worker per-turn cap');
     assert.equal(requests[0].provider, 'faux');
   } finally { await f.close(); }
 });
@@ -444,7 +474,7 @@ test('workers: the ninth model request is refused at the real provider boundary'
     assert.equal(settled.report, null);
     assert.match(settled.reason ?? '', /eight-model-request budget/);
     assert.equal(requests.length, 8, 'exactly eight provider requests were made; the ninth was refused before the call');
-    assert.ok(requests.every((request) => request.maxTokens === MAX_OUTPUT_TOKENS_DEFAULT));
+    assert.ok(requests.every((request) => request.maxTokens === WORKER_MAX_OUTPUT_TOKENS_PER_TURN));
   } finally { await f.close(); }
 });
 

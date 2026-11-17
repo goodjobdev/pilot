@@ -14,6 +14,7 @@ this uses, so no image library was added.
 | Pixels on either side of one stored image, after any resize | 2000 (`MAX_IMAGE_DIMENSION`) |
 | Images in one message | 6 (`MAX_IMAGES_PER_MESSAGE`) |
 | Base64 the processor may produce for one image | 4,500,000 bytes |
+| Bytes of one stored image (decoded from that base64 limit) | 3,375,000 bytes |
 
 The constants live in one place, `src/shared/images.ts`, and both the server and the composer read
 them from there. Everything above the per-image byte cap is bounded again by the application's
@@ -100,21 +101,24 @@ storing bytes it could not verify.
 - **A media id is never a path.** It must be 64 lowercase hex characters; the path is derived from it
   as `media/<id>.bin`, so there is no separator to inject. An id of any other shape is simply
   unknown (404).
-- **The container itself is validated, never assumed.** `<data root>/media` must be a real directory
-  this process can write, and an upload checks exactly that before it decodes or stores anything — so a
-  broken data root is a named refusal, never a raw filesystem error the owner cannot act on. A `media`
-  that is a **symbolic link** is never followed, a `media` that is **not a directory** is not read as
-  an empty store, and a `media` that is **not writable by this process** is refused, each with its own
-  reason. An upload against any of those is `503` with code `media-container` and stores nothing; a
-  read of an object under such a container is a plain `404`, because a read goes through the
-  contained-path helper below, which refuses a symlink at every component. A data root that has never
-  stored an image has no `media` directory at all: the first accepted image creates it `0700`, as it
-  always has. A backup treats the same container as fail-closed rather than capturing nothing
-  ([Backup](BACKUP.md)).
-- Reads go through the same contained-path helper as the rest of the application
-  (`src/server/paths.ts`), which refuses absolute paths, `..` and **a symlink at any path
-  component** — so neither a symlinked object nor a symlinked `media` directory is ever followed.
-  The bytes are sniffed again on read, and bytes that are not a JPEG, PNG or WebP are not served.
+- **The container is checked before upload.** `<data root>/media` is checked as a writable directory;
+  an observed symlink, non-directory or unwritable directory is refused with `503` and code
+  `media-container`. A read through an observed symlink is reported as `404`. A data root that has
+  never stored an image has no `media` directory: the first accepted image creates it `0700`. A
+  backup treats an unusable container as fail-closed ([Backup](BACKUP.md)).
+- Reads use the Linux `/proc` descriptor-relative bounded reader only (`src/server/linux-procfs-read.ts`):
+  it pins each directory and regular-file inode, caps reads at the current processor output limit
+  (3,375,000 bytes), checks for file changes and has no pathname fallback. Missing paths, symlinks,
+  non-regular files, oversized files and bytes without an accepted image signature are reported as
+  ordinary misses. Reads sniff image signatures but do not fully decode images; recognized signatures
+  on truncated or corrupt content may still be served. Compatibility with every historic or externally
+  restored media object has not been established; objects above the current limit are refused as misses.
+  A procfs verification failure and unexpected read/traversal failures return `503`; `ENOENT` after
+  verification is ambiguous between a missing media object and a missing traversal component and is
+  treated as a miss. Descriptor pinning does not establish root identity or enforce mount, hardlink or
+  same-UID isolation; pinned parents can be renamed.
+- Writes remain pathname-based and are still vulnerable to parent/leaf races. The upload-time container
+  check is not atomic with subsequent writes.
 - **Retention:** nothing is deleted automatically. An object lives as long as the data root; a
   refused upload writes nothing, and removing media is a deliberate operator action on the data root
   (there is no delete route).

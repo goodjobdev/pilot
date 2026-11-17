@@ -1124,7 +1124,7 @@
  .agent-question.answered{opacity:.75}
  .agent-transcript-wrap{flex:1 1 0;min-height:160px;display:flex;flex-direction:column;min-width:0}
  .agent-transcript{flex:1 1 auto;min-height:0;overflow:auto;padding:14px 16px 20px}
- .agent-transcript-body{display:flex;flex-direction:column;gap:18px;width:100%;max-width:960px;margin:0 auto}
+ .agent-transcript-body{display:flex;flex-direction:column;gap:18px;width:100%;max-width:760px;margin:0 auto}
  .new-activity-row{flex:0 0 auto;display:flex;justify-content:center;padding:6px 12px;background:var(--bg);border-top:1px solid var(--line)}
  .sr-only{position:absolute;width:1px;height:1px;margin:-1px;padding:0;overflow:hidden;clip-path:inset(50%);white-space:nowrap}
  .new-activity{min-height:44px;min-width:44px;border:1px solid color-mix(in srgb,var(--accent) 45%,var(--line));border-radius:999px;background:var(--raised);color:var(--ink);font:12px var(--mono);padding:10px 18px}
@@ -1135,13 +1135,14 @@
  .agent-entry.assistant{background:transparent}
  .agent-entry.tool{border-left:2px solid var(--line);border-radius:0;color:var(--muted);padding:6px 12px}
  .agent-entry.system,.agent-entry.other{font-size:11px;color:var(--muted)}
- .agent-role{font:9px var(--mono);letter-spacing:1px;color:var(--muted);text-transform:uppercase}
- .agent-text{margin:7px 0 0;white-space:pre-wrap;overflow-wrap:anywhere;font:12px/1.6 var(--mono)}
+ .agent-role{font:11px var(--mono);letter-spacing:1px;color:var(--muted);text-transform:uppercase}
+ .agent-text{margin:7px 0 0;white-space:pre-wrap;overflow-wrap:anywhere;font-family:inherit;font-size:14px;line-height:1.65}
+ .agent-entry.tool .agent-text{font:12px/1.6 var(--mono)}
  .session-chips{display:flex;flex-wrap:wrap;gap:6px;padding:6px 12px 0;min-width:0}
  .session-chip{font:10px var(--mono);max-width:100%;overflow:hidden;text-overflow:ellipsis}
- .agent-time{margin-left:8px;font-size:10px;color:var(--muted);font-variant-numeric:tabular-nums}
+ .agent-time{margin-left:8px;font-size:11px;color:var(--muted);font-variant-numeric:tabular-nums}
  .agent-tool-run{margin:8px 0;border-left:2px solid var(--line);padding-left:8px}
- .agent-tool-run>summary{cursor:pointer;font-size:11px;color:var(--muted)}
+ .agent-tool-run>summary{cursor:pointer;font-size:12px;color:var(--muted)}
  .agent-tool-run .agent-entry{margin:6px 0}
  .attachment-strip{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:6px 0}
  .attachment-chip{display:inline-flex;align-items:center;gap:6px;border:1px solid var(--line);border-radius:999px;padding:2px 8px;font-size:11px;max-width:100%}
@@ -1176,13 +1177,13 @@
  .message-limit[data-message-limit=over]{color:var(--danger)}
  .agent-thinking{margin-top:7px}.agent-thinking pre{white-space:pre-wrap;font-size:11px;color:var(--muted)}
  .agent-tools{display:flex;gap:6px;flex-wrap:wrap;margin-top:7px}
- .agent-note{display:block;margin-top:6px;color:var(--muted);font-size:10px}.error-inline{color:var(--danger)}
+ .agent-note{display:block;margin-top:6px;color:var(--muted);font-size:11px}.error-inline{color:var(--danger)}
  .agent-queue{margin:0 12px;padding:10px 12px;border:1px solid color-mix(in srgb,#d6b879 30%,var(--line));background:color-mix(in srgb,#d6b879 5%,transparent);border-radius:5px}
  .agent-queue p{margin:6px 0 0;font-size:12px;display:flex;gap:7px;align-items:center}
  /* The composer stays in normal flow. The bottom inset is added as padding, never as an overlay,
     so a phone's home indicator cannot cover the controls and the transcript is never covered. */
  .agent-composer{border-top:1px solid var(--line);background:var(--panel);padding:10px 12px calc(10px + var(--safe-bottom,0px))}
- .agent-composer textarea{min-height:80px;font:12px/1.6 var(--mono)}
+ .agent-composer textarea{min-height:80px;font-family:inherit;font-size:14px;line-height:1.6}
  .agent-status{color:var(--muted)}
  .agent-status.connection{display:inline-flex;align-items:center;gap:5px}
  .connection-dot{width:7px;height:7px;border-radius:50%;background:var(--muted);flex:none}

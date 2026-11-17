@@ -55,11 +55,12 @@ export type ActionScope={projectId?:string;sessionId?:string};
 export interface ActionListView{readOnly:true;scope:{projectId:string|null;sessionId:string|null};actions:ActionDescriptor[]}
 /** One execution: the id that ran and the handler's own result. */
 export interface ActionExecution{action:string;result:unknown}
+export interface TerminalInfo{id:string;projectId:string;projectName:string;cwd:string;createdAt:string;connected:boolean}
 /** One scope of the closed vocabulary, with the one line that describes what granting it would allow. */
 export interface AgentScopeOption{scope:string;description:string;installed:boolean}
 /** The registry as the server offers it: every agent, the vocabulary, the offered models and the switch. */
 export interface AgentRegistryView{agents:AgentRecord[];scopes:AgentScopeOption[];models:AgentModelChoice[];fileEdit:{enabled:boolean;mode:string|null}}
-export interface AgentDetailView{agent:AgentRecord;history:AgentAuditEntry[]}
+export interface AgentDetailView{agent:AgentRecord;history:AgentAuditEntry[];budgetUsage:{requestsAccounted:number}}
 /** One project's worker records, its runs, the owner policy and the fixed limits. */
 export interface WorkerView{
   workers:WorkerRecord[];runs:WorkerRun[];
@@ -93,6 +94,9 @@ export interface SessionBindingView{
   authority:{agentId:string|null;scopes:string[]|null;projects:string[]|null;emptyReason:string|null};
   agents:AgentRecord[];
 }
+export interface AcceptedActionHistoryView{projectId:string;truncated:boolean;nextBefore:string|null;items:{id:string;revision:number;actionClass:string;state:'uncertain'|'not-started'|'receipt-recorded';agentId:string;sessionId:string;targetId:string;targetRevision:number;artifact:{revision:string;commit:string|null};receiptCommit:string|null;createdAt:string;updatedAt:string}[]}
+export type ActionObservation='checked-uncertain'|'checked-no-effect-visible'|'checked-effect-visible';
+export interface ActionObservationsView{action:AcceptedActionHistoryView['items'][number];limit:number;reviews:{revision:number;actionRevision:number;actionState:string;observation:ActionObservation;observedBy:string;observedAt:string}[]}
 /** One recorded file edit, as the read side reports it, with the diff that proves it. */
 export interface FileEditRecordView{
   id:string;projectId:string;agentId:string|null;path:string;mode:'propose-only'|'auto-apply';
@@ -118,7 +122,16 @@ export interface FileEditLedgerView{
   readOnly:true;projectId:string;enabled:boolean;mode:'propose-only'|'auto-apply';
   limits:{fileBytes:number;diffBytes:number;edits:number};edits:FileEditRecordView[];truncated:boolean;
 }
+export interface CommitTargetView{
+  target:null|{revision:number;enabled:boolean;definition:{kind:'commit';repositoryId:string;branch:string}};
+  available:false;reason:string;
+}
 export const api={
+  actionHistory:(projectId:string,before?:string)=>request<AcceptedActionHistoryView>('/projects/'+projectId+'/action-history'+(before?'?before='+encodeURIComponent(before):'')),
+  actionObservations:(projectId:string,id:string)=>request<ActionObservationsView>('/projects/'+projectId+'/action-history/'+id+'/observations'),
+  recordActionObservation:(projectId:string,id:string,actionRevision:number,revision:number,observation:ActionObservation)=>request<ActionObservationsView>('/projects/'+projectId+'/action-history/'+id+'/observations','POST',{actionRevision,revision,observation}),
+  commitTarget:(projectId:string)=>request<CommitTargetView>('/projects/'+projectId+'/action-targets/commit'),
+  saveCommitTarget:(projectId:string,revision:number,enabled:boolean)=>request<CommitTargetView>('/projects/'+projectId+'/action-targets/commit','POST',{revision,enabled}),
   projects:()=>request<Project[]>('/projects'),
   register:(data:unknown)=>request<Project>('/projects','POST',data),
   board:(id:string)=>request<Snapshot>('/projects/'+id+'/board'),
@@ -226,6 +239,10 @@ export const api={
   fileEdits:(projectId:string)=>request<FileEditLedgerView>('/projects/'+projectId+'/file-edits'),
   writeFileEdit:(projectId:string,body:{request:{agentId:string|null;path:string;content:string;mode?:'propose-only'|'auto-apply'};actor:AgentActorBody})=>request<{edit:FileEditRecordView;written:boolean}>('/projects/'+projectId+'/file-edits','POST',body),
   runAction:(id:string,body:{params?:Record<string,unknown>;scope?:ActionScope}={})=>request<ActionExecution>('/actions/execute','POST',{id,...body}),
+  terminals:(projectId:string)=>request<{terminals:TerminalInfo[]}>('/projects/'+encodeURIComponent(projectId)+'/terminals'),
+  openTerminal:(projectId:string,body:{cols:number;rows:number})=>request<{terminal:TerminalInfo}>('/projects/'+encodeURIComponent(projectId)+'/terminals','POST',body),
+  terminalTicket:(projectId:string,terminalId:string)=>request<{ticket:string}>('/terminals/'+encodeURIComponent(terminalId)+'/ticket','POST',{projectId}),
+  closeTerminal:(projectId:string,terminalId:string)=>request<{closed:boolean}>('/terminals/'+encodeURIComponent(terminalId),'DELETE',{projectId}),
 };
 export function assetUrl(id:string,path:string){return '/api/projects/'+id+'/docs/asset?path='+encodeURIComponent(path);}
 /**

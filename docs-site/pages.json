@@ -8,6 +8,26 @@
     "slug": "start/vision"
   },
   {
+    "source": "docs/specs/reusable-json-tools.md",
+    "slug": "specs/reusable-json-tools"
+  },
+  {
+    "source": "docs/specs/autonomy-milestone.md",
+    "slug": "specs/autonomy-milestone"
+  },
+  {
+    "source": "docs/specs/cloudflare-targets.md",
+    "slug": "specs/cloudflare-targets"
+  },
+  {
+    "source": "docs/specs/ci-deployment-contract.md",
+    "slug": "specs/ci-deployment-contract"
+  },
+  {
+    "source": "docs/specs/local-release-targets.md",
+    "slug": "specs/local-release-targets"
+  },
+  {
     "source": "docs/manual/first-project.md",
     "slug": "start/first-project"
   },
@@ -58,5 +78,13 @@
   {
     "source": "docs/specs/composer.md",
     "slug": "specs/composer"
+  },
+  {
+    "source": "docs/manual/terminal.md",
+    "slug": "guides/terminal"
+  },
+  {
+    "source": "docs/specs/terminal.md",
+    "slug": "specs/terminal"
   }
 ]

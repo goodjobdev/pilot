@@ -78,6 +78,9 @@ export class AgentStore {
     this.id = options.id ?? (() => randomUUID());
   }
 
+  /** Transactional guards must read authority through the very connection holding admission. */
+  usesControlStore(store: ControlStore): boolean { return this.store === store; }
+
   /** Every agent, oldest first, ties broken by id: a deterministic order. */
   list(): readonly AgentRecord[] {
     return Object.freeze(this.records());
@@ -106,13 +109,16 @@ export class AgentStore {
     return Object.freeze(this.records().filter((record) => projectScopeAllows(record.workspace.scope, id)));
   }
   /**
-   * The scopes in force for one project's dispatch. 'null' means no agent is bound to it, so the
-   * owner's own dispatch is in force and nothing is narrowed.
+   * Legacy project authority. A project with no agent history uses owner dispatch. Once an agent has
+   * governed it, disabling, archiving or moving that agent cannot silently restore owner privileges.
    */
   authority(projectId: unknown): { readonly agentId: string | null; readonly scopes: readonly AgentScope[] | null } {
     const id = parseAgentIdentifier(projectId, 'projectId');
-    const bound = this.forProject(id).filter((record) => record.enabled && !record.archived);
-    const scopes = scopesInForceFor(bound);
+    const records = this.records();
+    const bound = records.filter((record) => projectScopeAllows(record.workspace.scope, id) && record.enabled && !record.archived);
+    let scopes = scopesInForceFor(bound);
+    if (scopes === null && records.some(record => this.recordsFor(record.id).some(entry => projectScopeAllows(entry.record.workspace.scope, id))))
+      scopes = Object.freeze([]) as readonly AgentScope[];
     return Object.freeze({ agentId: scopes === null ? null : (bound.length === 1 ? bound[0].id : null), scopes });
   }
   /**
@@ -172,6 +178,7 @@ export class AgentStore {
     const sessionId = parseAgentIdentifier(data.sessionId, 'sessionId');
     const revision = requireRevision(data.revision);
     const actor = parseAgentActor(data.actor);
+    if (actor.kind !== 'owner') throw new AgentError('Only the owner may bind an agent to a session.', 'NOT_PERMITTED');
     const agentId = data.agentId === null ? null : parseAgentIdentifier(data.agentId, 'agentId');
     if (agentId !== null) this.require(agentId);
     const current = this.binding(projectId, sessionId);
@@ -225,6 +232,7 @@ export class AgentStore {
     if (typeof conversationId !== 'number' || !Number.isInteger(conversationId) || conversationId < 1)
       throw new AgentError('conversationId must be a positive integer', 'INVALID');
     const actor = parseAgentActor(data.actor);
+    if (actor.kind !== 'owner') throw new AgentError('Only the owner-controlled harness may bind a session to a conversation.', 'NOT_PERMITTED');
     const existing = this.conversation(projectId, sessionId);
     if (existing !== null) {
       if (existing.conversationId === conversationId) return existing;
@@ -250,13 +258,31 @@ export class AgentStore {
     const projectId = parseAgentIdentifier(input.projectId, 'projectId');
     const sessionId = parseAgentIdentifier(input.sessionId, 'sessionId');
     const binding = this.binding(projectId, sessionId);
-    if (binding === null) { const legacy = this.authority(projectId); const record = legacy.agentId === null ? null : this.require(legacy.agentId); return Object.freeze({ agentId: legacy.agentId, model: record === null || !record.enabled || record.archived ? null : record.model, scopes: legacy.scopes, projects: this.projectsInForce(projectId), emptyReason: null }); }
+    if (binding === null) {
+      const legacy = this.authority(projectId), record = legacy.agentId === null ? null : this.require(legacy.agentId);
+      const inactiveHistory = legacy.scopes !== null && !this.forProject(projectId).some(agent => agent.enabled && !agent.archived);
+      return Object.freeze({ agentId: legacy.agentId, model: record === null || !record.enabled || record.archived ? null : record.model, scopes: legacy.scopes, projects: this.projectsInForce(projectId), emptyReason: inactiveHistory ? 'No active agent currently governs this previously governed project; bind or enable an agent rather than restoring owner privileges implicitly.' : null });
+    }
     if (binding.agentId === null)
       return Object.freeze({ agentId: null, model: null, scopes: Object.freeze([]) as readonly AgentScope[], projects: Object.freeze([]) as readonly string[], emptyReason: 'No agent is bound to this session, so it has an empty privilege allowlist and every tool is refused. Bind an agent to grant tools.' });
     const record = this.require(binding.agentId);
     if (!agentInForce(record))
       return Object.freeze({ agentId: record.id, model: null, scopes: Object.freeze([]) as readonly AgentScope[], projects: Object.freeze([]) as readonly string[], emptyReason: 'The agent bound to this session (' + record.name + ', ' + record.id + ') is ' + (record.archived ? 'archived' : 'disabled') + ', so it is not in force and every tool is refused. Enable or re-bind an agent.' });
     return Object.freeze({ agentId: record.id, model: record.model, scopes: record.scopes, projects: projectScopeSet(record.workspace.scope), emptyReason: null });
+  }
+
+  /** One SQLite read snapshot for both effective authority and the conservative revision fingerprint. */
+  versionedAuthorityForSession(input:{readonly projectId:string;readonly sessionId:string}) {
+    this.store.db.exec('SAVEPOINT pilot_authority_snapshot');
+    try {
+      const authority=this.authorityForSession(input);
+      const authorityVersion=JSON.stringify({binding:this.binding(input.projectId,input.sessionId)?.revision??0,agents:this.list().map(agent=>[agent.id,agent.revision]).sort((a,b)=>String(a[0]).localeCompare(String(b[0])))});
+      this.store.db.exec('RELEASE pilot_authority_snapshot');
+      return Object.freeze({...authority,authorityVersion});
+    } catch(error) {
+      this.store.db.exec('ROLLBACK TO pilot_authority_snapshot; RELEASE pilot_authority_snapshot');
+      throw error;
+    }
   }
 
   /**
@@ -298,6 +324,8 @@ export class AgentStore {
     const revision = requireRevision(data.revision);
     const patch = parseAgentPatch(data.patch);
     const actor = parseAgentActor(data.actor);
+    if (actor.kind === 'agent' && Object.keys(patch).some(key => key !== 'scopes'))
+      throw new AgentError('An agent may change only another agent’s scopes; the owner controls workspace, budgets, model, enabled state and other fields.', 'NOT_PERMITTED');
     const current = this.require(agentId);
     if (current.archived) throw new AgentError('Agent ' + agentId + ' is archived, so it is refused; an archived agent is never changed', 'CONFLICT');
     if (current.revision !== revision)
@@ -351,7 +379,7 @@ export class AgentStore {
     if (actor.kind !== 'agent') return null;
     try {
       const record = this.require(actor.identity);
-      return record.archived ? null : record.scopes;
+      return record.archived || !record.enabled ? null : record.scopes;
     } catch {
       return null;
     }
@@ -388,15 +416,32 @@ export class AgentStore {
   }
   /** The one write path: a strict record, one admission, and the store's own conflict verdict. */
   private write(record: AgentRecord, action: AgentAuditEntry['action']): AgentRecord {
+    let refusal: AgentError | undefined;
+    const guard = () => {
+      try {
+        if (!record.archived) this.assertNameFree(this.records(), record.name, record.id);
+        if (record.updatedBy.kind === 'agent') {
+          const current = this.require(record.id);
+          if (current.revision !== record.revision - 1 || current.archived)
+            throw new AgentError('The target agent changed before admission; nothing was written.', 'CONFLICT');
+          const verdict = decideScopeChange({ actor: record.updatedBy, actorScopes: this.actorScopes(record.updatedBy), current, next: record.scopes });
+          if (!verdict.permitted) throw new AgentError(verdict.reason, 'NOT_PERMITTED');
+        }
+      } catch (error) {
+        if (error instanceof AgentError) refusal = error;
+        throw error;
+      }
+    };
     try {
       this.store.admit({
         scope: { projectId: BUCKET, sessionId: record.id },
         idempotencyKey: 'agent.r' + record.revision,
         kind: OPERATION_KIND,
         input: record,
-        outbox: { kind: OUTBOX_KIND, payload: { version: 1, agentId: record.id, revision: record.revision, action, changedBy: record.updatedBy, changedAt: record.updatedAt } }
+        outbox: { kind: OUTBOX_KIND, payload: { version: 1, agentId: record.id, revision: record.revision, action, changedBy: record.updatedBy, changedAt: record.updatedAt } }, guard
       });
     } catch (error) {
+      if (refusal) throw refusal;
       if (error instanceof ControlStoreError && error.code === 'CONFLICT')
         throw new AgentError('Agent ' + record.id + ' revision ' + record.revision + ' was already written with different content (' + error.message + '); the record is unchanged', 'CONFLICT');
       throw storage('The durable store refused the agent write: ' + (error as Error).message);
@@ -428,7 +473,14 @@ export class AgentStore {
         idempotencyKey: 'conversation.r' + binding.revision,
         kind: CONVERSATION_OPERATION_KIND,
         input: binding,
-        outbox: { kind: CONVERSATION_OUTBOX_KIND, payload: { version: 1, projectId: binding.projectId, sessionId: binding.sessionId, conversationId: binding.conversationId, revision: binding.revision, createdBy: binding.createdBy, createdAt: binding.createdAt } }
+        outbox: { kind: CONVERSATION_OUTBOX_KIND, payload: { version: 1, projectId: binding.projectId, sessionId: binding.sessionId, conversationId: binding.conversationId, revision: binding.revision, createdBy: binding.createdBy, createdAt: binding.createdAt } },
+        // A session identity is global, whereas this admission key is project-scoped. Re-read the
+        // global binding under the same write transaction so competing projects cannot both win.
+        guard: () => {
+          const current = this.conversation(binding.projectId, binding.sessionId);
+          if (current !== null && current.conversationId !== binding.conversationId)
+            throw new AgentError('The session was bound to a different conversation before admission.', 'CONFLICT');
+        }
       });
     } catch (error) {
       if (error instanceof ControlStoreError && error.code === 'CONFLICT')

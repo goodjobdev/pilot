@@ -16,6 +16,7 @@ export interface EffectiveConfig {
   readonly dataRoot: string;
   readonly browseRoots: readonly string[];
   readonly security: Readonly<SecurityConfig>;
+  readonly agentEvidenceRecording: boolean;
 }
 
 export interface EffectiveConfigDiagnostics {
@@ -98,6 +99,8 @@ export function effectiveConfig(env: NodeJS.ProcessEnv): EffectiveConfig {
     return resolve(path);
   });
 
+  const evidenceSetting=env.DASHBOARD_AGENT_EVIDENCE_RECORDING??'off';
+  if(evidenceSetting!=='on'&&evidenceSetting!=='off')throw new Error('DASHBOARD_AGENT_EVIDENCE_RECORDING must be on or off');
   const immutableSecurity = Object.freeze({ ...security });
   return Object.freeze({
     mode,
@@ -108,7 +111,8 @@ export function effectiveConfig(env: NodeJS.ProcessEnv): EffectiveConfig {
     bindHost: bindValue as EffectiveConfig['bindHost'],
     dataRoot,
     browseRoots: Object.freeze(browseRoots),
-    security: immutableSecurity
+    security: immutableSecurity,
+    agentEvidenceRecording: evidenceSetting==='on'
   });
 }
 

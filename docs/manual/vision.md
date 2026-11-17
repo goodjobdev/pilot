@@ -34,11 +34,13 @@ This is a product policy, not a claim that the current product has complete docu
 
 - Markdown in the repository owns intent and specifications. Rendered sites and boards are views, not competing sources.
 - A design must describe loading, empty, error, conflict and recovery states, not only a happy-path screen.
-- The owner approves consequential actions. Agent scope, progress, uncertainty and limitations must be visible.
+- The owner controls which consequential actions require approval and which may be delegated. Agent scope, policy, progress, uncertainty and limitations must be visible; a policy decision is not proof an action ran.
 - Planned, partially implemented, implemented-but-unreleased and available features are different states.
 - A local commit is history, not a remote backup. A passing automated test is evidence, not a claim of real-device acceptance.
 - Existing work, drafts, credentials and project isolation take precedence over convenient automation.
 
 ## Design direction and non-goals
 
-Design artifacts will become first-class inputs and linked acceptance evidence. A design editor, component authoring and design-to-code workflows remain **planned**. Existing static mockups and diagrams support documentation today. This vision does not authorize arbitrary shell tools, automatic deployment, multi-tenant sharing or replacing the current Svelte application.
+Design artifacts will become first-class inputs and linked acceptance evidence. A design editor, component authoring and design-to-code workflows remain **planned**. Existing static mockups and diagrams support documentation today.
+
+The owner has directed Pilot toward opt-in, policy-controlled full-auto operation; see the [autonomy milestone](../specs/autonomy-milestone.md) for the decision, historical context and remaining work. This is product direction. Separate action tools now exist as installed, default-off capabilities with owner-configured local targets (see the milestone for exactly what each performs); a provider deployment and a sandbox still do not exist, and no tool is contained. An enabled shell runs as the application user and is not contained. Multi-tenant sharing and replacing the Svelte application remain non-goals.

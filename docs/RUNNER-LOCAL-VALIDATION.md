@@ -1,5 +1,12 @@
 # Local runner validation
 
+**Historical record only — do not repeat this procedure.** It describes an earlier legacy Docker
+port that is now unavailable because cancellation by a derived container name can affect an
+unrelated container and its deadline did not prove termination. The old observation does not validate
+the current disabled port, the uninstalled service-side prototype, or production isolation. A new
+identity-bound termination, recovery and cleanup design requires independent review before runtime
+testing. See [the runner status](RUNNER.md).
+
 ## Scope
 
 The first local acceptance check passed on 2026-10-24 against the implementation after `f278afb` and

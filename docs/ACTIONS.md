@@ -192,6 +192,15 @@ written inside the project's own tree, and the policy that decides who may accep
 `acceptance.accept` performs no commit, push, deploy, spend, provision or publish: it records the
 decision and returns it. Nothing in this registry performs the thing an acceptance is about.
 
+Two capabilities outside this registry now do perform the thing an acceptance is about, as
+**agent-facing harness tools** rather than palette actions: `commit_preview`, `commit_accepted`,
+`push_preview` and `push_accepted` (see [docs/AGENTS.md](AGENTS.md), *The bounded commit and push
+capability*). They are installed only behind the default-off deployment switches
+`DASHBOARD_AGENT_COMMIT` and `DASHBOARD_AGENT_PUSH`, only with the durable control store, only for a
+bound named agent whose allowlist grants `commit` or `push`, and only for an exact owner-configured
+target under an `agent-may-accept` policy whose class decision is `full-auto`. They are not action
+ids, so they do not appear in `/api/actions`, the palette or the slash surface.
+
 ### Forks — scope: `project`, and `project` + `session` for the fork itself
 
 A **fork** is one child session branched from a parent transcript at an exact cutoff entry, with its
@@ -211,8 +220,9 @@ None of the four commits, pushes, deploys, spends, provisions or publishes. `for
 the parent's working tree, never copies an uncommitted or staged change and never runs `git stash`;
 `fork.resume` makes no model request and grants nothing. Whether an *active* child is dispatched into
 is not an action of this registry in this build: the guarded dispatch lives in the fork store, and the
-owner surface offers creation, listing, resume and discard. See `docs/FORKS.md` for the model, the
-bounds and the honest limits.
+owner surface offers creation, listing, resume, discard and the two fence-recovery routes described in
+`docs/FORKS.md` (they release a held fence after a quiescence check and perform no dispatch, replay or
+removal). See `docs/FORKS.md` for the model, the bounds and the honest limits.
 
 ### The agent registry and its privilege scopes — scope: none
 
@@ -248,6 +258,37 @@ and from `/api/actions`** rather than present and failing, exactly as the coding
 all**; in **auto-apply** it writes the file atomically. The mode in force comes from the acceptance
 policy rather than from an assumption. Neither action commits, pushes, deploys, spends, provisions or
 publishes, and neither ever edits outside the connected worktree. See `docs/AGENTS.md`.
+
+### The local deploy and publish tools — scope: `deploy` and `publish`
+
+These are **agent-harness tools**, not palette actions, so no `ACTION_IDS` entry describes them and
+`/api/actions` does not list them. Each is installed only when its own deployment switch is on, and
+each is governed by the existing agent scope of the same name plus a bound named agent and the
+acceptance policy:
+
+| Tool | Scope | Instance switch | Effect |
+|---|---|---|---|
+| `deploy_preview` | `deploy` | `DASHBOARD_DEPLOY=on` | reads the project's configured built artifact and its SHA-256 manifest digest beside the owner-configured target; copies and promotes nothing |
+| `deploy_accepted` | `deploy` | `DASHBOARD_DEPLOY=on` | promotes exactly the accepted artifact: staged copy, read-back digest, immutable generation, atomic `current`-link swap, previous generation retained |
+| `publish_preview` | `publish` | `DASHBOARD_PUBLISH=on` | reads an exact, bounded set of reviewed files with their digests; copies and publishes nothing |
+| `publish_accepted` | `publish` | `DASHBOARD_PUBLISH=on` | copies exactly the accepted files into the owner-configured publication root through a staged copy and one atomic rename, then reads the digests back |
+
+The destination is **not a tool argument**. The owner sets the exact deployment target directory and
+artifact path, or publication root, through the authenticated, revision-checked route
+`POST /api/projects/:id/action-destinations/(deploy|publish)`; the target must already be a real
+directory under the operator-configured browse roots. The model supplies no path, directory, command
+or credential. `publish` does name the reviewed files it wants published, as paths relative to the
+project's connected worktree; a path that escapes the worktree, a symlink at any component, a
+non-regular file, a file over the per-file cap and a total over the total cap are refused before any
+copy.
+
+Both effects run through the existing `AcceptedActionExecutor`: same-session evidence must already be
+accepted for the exact target-bound artifact under `agent-may-accept` and the action class set to
+`full-auto`. The action intent is durable before the effect, a succeeded effect records a receipt and
+an outcome, and an interruption is reported as **uncertain** while its intent and barrier remain. A
+duplicate invocation is refused and never replayed. Neither tool talks to a provider, a CDN, Cloudflare
+or a CI system: they are local filesystem operations, and the same-UID shell can reach the same
+directories. See `docs/AGENTS.md` and `docs/specs/local-release-targets.md`.
 
 ## Preconditions, action by action
 
@@ -354,13 +395,11 @@ discarded first). No-op: resuming an already active fork returns the record unch
 revision.
 
 **`fork.discard`** — `PROJECT_REGISTERED`, `FORK_EXISTS`, `REVISION_MATCHES`,
-`TARGET_IN_FORK_ROOT` (the worktree path the *record* carries is still inside the designated fork
-root; a record that says otherwise is refused as an escape and nothing is removed), `WORKTREE_CLEAN`
-(the child worktree holds no uncommitted or untracked change, or the caller explicitly forces it — a
-dirty worktree becomes the named operator-attention state `worktree-dirty` and is left exactly where
-it is), `TRANSITION_LEGAL`. A worktree git will not remove or cannot report becomes
-`worktree-remove-refused` or `worktree-unreadable`; nothing is ever forced implicitly. No-op:
-discarding a fork whose worktree is already gone completes the discard and removes nothing.
+`TARGET_IN_FORK_ROOT`, `WORKTREE_CLEAN`, `TRANSITION_LEGAL`. Active forks cannot be discarded:
+input admission is not atomically coordinated with lifecycle changes. For a paused or failed fork,
+production closes the record only if its recorded worktree is already absent; automatic removal of an
+existing worktree is unavailable even with `force`. An already-discarded fork is a no-op. See
+[Forks](FORKS.md) for the remaining races and recovery limitations.
 
 **`agent.list`** — no precondition beyond the schema. No-op: a registry with no agent reads as an
 empty list beside the full scope vocabulary.
@@ -508,9 +547,60 @@ five actions exist because their handlers exist, and they are withheld from ever
 explicitly enabled the runner. That is an availability decision, not a stub — with the switch on the
 same handlers really submit, claim, run and settle jobs.
 
+The agent commit and push tools are deliberately **not** registry actions and are not listed here: they
+are harness tools bound to one project, one owner-configured target and one accepted artifact. They are
+installed per instance by `DASHBOARD_AGENT_COMMIT`/`DASHBOARD_AGENT_PUSH` and are absent from the
+harness entirely while those switches are off, rather than present and failing.
+
 Approvals record an authorisation and never perform the thing authorised: `approval.consume` returns
 the exact target it spent the grant on. Performing a commit, push, deploy, spend, provision or
 publish stays a separate, explicit step that no action in this registry takes.
+
+## Installed `spend` and `provision` agent tools (not registry actions)
+
+Two consequential classes now have a real, installed, **default-off** model-facing path. They are
+harness tools for a bound named agent, not registry actions: the palette does not offer them, no
+`/api/actions` id names them, and the command surface above still performs no spend or provision. The
+tools are described in `docs/AGENTS.md`; this section records what the installed code does and does
+not claim.
+
+Both need the deployment switch, the durable control store, a bound named agent holding the class's
+scope, a project inside that agent's project scope, evidence for the exact artifact, that agent's
+acceptance for the class, and `agent-may-accept` with `full-auto` for the class. The live scope,
+project, target and policy are rechecked around the effect. Evidence is still a claim: it is not proof
+that the charge is justified or that the resource is safe.
+
+**`spend`** (`spend_preview`, `spend_accepted`) sends one metered `POST` to one owner-configured
+billing endpoint. Deployment supplies `DASHBOARD_SPEND_BILLING_URL` (HTTPS, or HTTP only for a
+loopback stub), `DASHBOARD_SPEND_ACCOUNT_ID`, `DASHBOARD_SPEND_CURRENCY`,
+`DASHBOARD_SPEND_PROJECT_CAP_MINOR`, `DASHBOARD_SPEND_CHARGE_CAP_MINOR` and optionally
+`DASHBOARD_SPEND_TIMEOUT_MS`. The bearer credential is a private `credentials/spend-billing.json`
+file under the data root — outside every project root, never a model argument and never returned to
+the model. The adapter refuses an amount above the per-charge cap or one that would exceed the
+per-project cap before sending, reserves the amount durably in the same transaction it checks, and
+refuses a repeat of the same accepted artifact from its durable intent instead of sending it again.
+A reservation is not refunded: an admitted amount keeps counting against the cap even if the charge
+is later refused, fails or remains unknown.
+It refuses redirects, requires the exact JSON media type and a provider charge id, bounds the
+response, and never retries. A non-2xx status, redirect, timeout, lost response or unverifiable body
+is recorded as **unknown**; the intent and the cap reservation are retained and nothing replays
+automatically. It does **not** claim provider-side exactly-once (the provider decides whether to
+honour the idempotency key) and it is **not** a global spending cap: it bounds only charges Pilot
+sends through this one target. A revocation check cannot cancel a request already in flight.
+
+**`provision`** (`provision_preview`, `provision_accepted`) creates exactly one Pilot-owned local
+directory with a bounded `manifest.json` at `<approved root>/<projectId>/<targetId>` (the target is
+fixed; `DASHBOARD_PROVISION_ROOT` names the approved root and `DASHBOARD_PROVISION_ACTIONS=on`
+installs the tool). The manifest is written in a staging directory and published with one atomic
+`rename`; a repeat of the same content returns the recorded receipt and different content conflicts.
+Path escapes, symlinked roots, parents, targets or manifests, an existing target that is not a
+Pilot-owned resource and oversized input are refused before publication, and the approved root must
+overlap neither the data root nor a registered project. It creates no infrastructure, runs no
+template and calls no provider. It is not a sandbox: check-then-use on a filesystem is not atomic, so
+another same-user process can still substitute a path between calls.
+
+Neither tool makes an acceptance into an execution: the acceptance is one input, and the adapter's own
+target, artifact, cap and policy checks are what decide whether anything happens.
 
 ## The live projection
 
@@ -620,6 +710,10 @@ nothing is attached at all.
 | `/api/agents/:id/archive` | POST | closes one agent so it is never in force again: `{ "revision": n, "actor": { ... } }`. |
 | `/api/projects/:id/file-edits` | GET | one project's proposed and applied file edits, each with its diff, beside the mode in force. Read-only, and refused (503) while the capability is disabled. |
 | `/api/projects/:id/file-edits` | POST | records one bounded change: `{ "request": { "agentId": null, "path": "...", "content": "...", "mode": "propose-only" }, "actor": { ... } }`. The path must stay inside the project's connected repository worktree; `written` in the answer says whether a file was really written. |
+| `/api/projects/:id/action-destinations/deploy` | GET | the project's configured local deployment destination and revision, with whether this instance installs the deploy tool. Read-only. |
+| `/api/projects/:id/action-destinations/deploy` | POST | writes the next destination revision: `{ "revision": n, "enabled": true, "artifactPath": "dist", "targetDirectory": "/canonical/dir" }`. The directory must be an existing real directory under the configured browse roots; configuring it executes nothing. |
+| `/api/projects/:id/action-destinations/publish` | GET | the project's configured local publication root and revision, with whether this instance installs the publish tool. Read-only. |
+| `/api/projects/:id/action-destinations/publish` | POST | writes the next destination revision: `{ "revision": n, "enabled": true, "publicationRoot": "/canonical/dir" }`. The directory must be an existing real directory under the configured browse roots; configuring it executes nothing. |
 
 All three sit behind the same owner-only authentication as every other route, behind the unchanged
 Host check, and the write carries the same origin and CSRF enforcement. The scope may be supplied in
@@ -655,7 +749,8 @@ and the routes are what a script or a dispatcher calls directly.
 The fork routes are the same shape one more time: they call the same store methods the `fork.*`
 handlers call, so the two cannot disagree about what an operation does. The fork a write acts on is the
 one in the path — its child session, which is the fork's identity — so a caller addresses a fork and
-never a path, and the worktree it removes is the one the durable record carries. While the instance has
+never a path. Discard of an existing worktree is currently unavailable even with force; an absent
+worktree may be closed. While the instance has
 no fork capability (the agent harness is off) the routes refuse with a named reason (503) and the
 actions are absent from the registry rather than listed and failing. The queue's own claim and submit
 routes refuse a **fork child** (409) rather than dispatching its input into the project's root
@@ -663,11 +758,9 @@ conversation: this project's queue dispatcher submits into the root conversation
 input would reach the wrong transcript entirely. See `docs/FORKS.md`.
 
 The acceptance routes are the same shape again: they call the same store methods the `acceptance.*`
-handlers call. The policy write always acts as the authenticated owner. The acceptance write takes the
-actor the body **declares** — beside the request or inside it (`request.actor`), the shape the registry
-publishes for `acceptance.accept` — and takes the authenticated owner only when the body declares no
-actor at all; a body that declares both and disagrees is refused 422, so which identity is accepting is
-never ambiguous and a declared agent is never silently recorded as the owner. The completion record's
+handlers call. Policy and acceptance writes through these authenticated interfaces act as the owner;
+a submitted agent identity is refused, not treated as authentication. Agent acceptance is available
+only through an explicitly bound agent session. The completion record's
 Markdown is written inside the project the scope names, and the state the answer reports is the file
 read back rather than assumed.
 

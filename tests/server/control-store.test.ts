@@ -71,6 +71,96 @@ test('operation and outbox survive close/reopen; acknowledgement receipt persist
  });
 });
 
+test('tampered valid JSON is refused on idempotent admission and on reopen',async()=>{
+ for(const column of ['input_json','payload_json'] as const)await fixture(async root=>{
+  const store=new ControlStore(root),result=store.admit(admission());
+  if(column==='input_json')store.db.prepare('UPDATE operations SET input_json=? WHERE id=?').run('{"text":"tampered"}',result.operation.id);
+  else store.db.prepare('UPDATE outboxes SET payload_json=? WHERE id=?').run('{"text":"tampered"}',result.outbox.id);
+  assert.throws(()=>store.admit(admission()),(e:unknown)=>e instanceof ControlStoreError&&e.code==='CORRUPT');
+  store.close();assert.throws(()=>new ControlStore(root),(e:unknown)=>e instanceof ControlStoreError&&e.code==='CORRUPT'&&/digest/.test(e.message));
+ });
+});
+
+test('duplicate admission refuses a delivered outbox without a receipt',async()=>{
+ await fixture(async root=>{
+  const store=new ControlStore(root),result=store.admit(admission());
+  store.db.prepare("UPDATE outboxes SET state='delivered' WHERE id=?").run(result.outbox.id);
+  assert.throws(()=>store.admit(admission()),(e:unknown)=>e instanceof ControlStoreError&&e.code==='CORRUPT');
+  store.close();assert.throws(()=>new ControlStore(root),(e:unknown)=>e instanceof ControlStoreError&&e.code==='CORRUPT');
+ });
+});
+
+test('HEAD-format fixture reopens historically reachable states with every record field preserved',async()=>{
+ await fixture(async root=>{
+  const path=join(root,'control.sqlite'),db=new DatabaseSync(path);
+  // Provenance: git show 0cc6b82:src/server/state/control-store.ts. The schema and records
+  // below are constructed from its initializeNew(), admit(), updateOperation(), and
+  // acknowledgeOutbox() SQL/formulas. This is not an execution of the historical TypeScript.
+  // Reachability: each row starts at admit()'s (operation,outbox) revisions (1,1). The settled
+  // row applies updateOperation('succeeded') => (2,1). The delivered row acknowledges first
+  // => (2,2) with matching receipt, then updateOperation('succeeded') => (3,2), retaining it.
+  db.exec(`CREATE TABLE control_schema(version INTEGER PRIMARY KEY CHECK(version = 1));
+   CREATE TABLE operations(
+    id TEXT PRIMARY KEY, project_id TEXT NOT NULL, session_id TEXT NOT NULL, idempotency_key TEXT NOT NULL,
+    kind TEXT NOT NULL, input_digest TEXT NOT NULL, input_json TEXT NOT NULL, state TEXT NOT NULL,
+    revision INTEGER NOT NULL, receipt_json TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+    UNIQUE(project_id,session_id,idempotency_key));
+   CREATE TABLE outboxes(
+    id TEXT PRIMARY KEY, operation_id TEXT NOT NULL REFERENCES operations(id), project_id TEXT NOT NULL,
+    session_id TEXT NOT NULL, kind TEXT NOT NULL, payload_json TEXT NOT NULL, state TEXT NOT NULL,
+    revision INTEGER NOT NULL, receipt_json TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+   INSERT INTO control_schema(version) VALUES(1);`);
+  const createdAt='2025-01-02T03:04:05.000Z',deliveredAt='2025-01-02T03:05:05.000Z',settledAt='2025-01-02T03:06:05.000Z';
+  const rows=[
+   {id:'historical-pending',key:'historical-pending',digest:'34946665b5cb93a1abc42545ae947f810d33481f66d40e96e4315919c2f528d9',state:'pending',revision:1,updatedAt:createdAt,outState:'pending',outRevision:1,outUpdatedAt:createdAt,receipt:null},
+   {id:'historical-settled',key:'historical-settled',digest:'abcafd5b03a62a1ffd509c4fb72bc887a7b5a94c5a931ea6bbd14bf33f897c58',state:'succeeded',revision:2,updatedAt:settledAt,outState:'pending',outRevision:1,outUpdatedAt:createdAt,receipt:null},
+   {id:'historical-delivered',key:'historical-delivered',digest:'98689167b13d58e9df93712c3059006e936a0410f235e94733f0f6092d546c0e',state:'succeeded',revision:3,updatedAt:settledAt,outState:'delivered',outRevision:2,outUpdatedAt:deliveredAt,receipt:{deliveryId:'historical-receipt'}}
+  ];
+  for(const row of rows){
+   const input={text:row.key},payload={text:'hello'},outboxKind='agent.delivery';
+   const receipt=row.receipt===null?null:JSON.stringify(row.receipt);
+   db.prepare('INSERT INTO operations VALUES(?,?,?,?,?,?,?,?,?,?,?,?)').run(row.id,scope.projectId,scope.sessionId,row.key,'agent.input',row.digest,JSON.stringify(input),row.state,row.revision,receipt,createdAt,row.updatedAt);
+   db.prepare('INSERT INTO outboxes VALUES(?,?,?,?,?,?,?,?,?,?,?)').run('outbox-'+row.id,row.id,scope.projectId,scope.sessionId,outboxKind,JSON.stringify(payload),row.outState,row.outRevision,receipt,createdAt,row.outUpdatedAt);
+  }
+  db.close();await chmod(path,0o600);
+  const reopened=new ControlStore(root);
+  for(const row of rows){
+   const op=reopened.getOperation(row.id,scope),out=reopened.getOutbox('outbox-'+row.id,scope);
+   assert.equal(op.id,row.id);assert.equal(op.projectId,scope.projectId);assert.equal(op.sessionId,scope.sessionId);
+   assert.equal(op.idempotencyKey,row.key);assert.equal(op.kind,'agent.input');assert.equal(op.inputDigest,row.digest);
+   assert.deepEqual(op.input,{text:row.key});assert.equal(op.state,row.state);assert.equal(op.revision,row.revision);
+   assert.equal(op.createdAt,createdAt);assert.equal(op.updatedAt,row.updatedAt);
+   assert.equal(op.receiptPresent,row.receipt!==null);assert.deepEqual(op.receipt,row.receipt);
+   assert.equal(out.id,'outbox-'+row.id);assert.equal(out.operationId,op.id);
+   assert.equal(out.projectId,scope.projectId);assert.equal(out.sessionId,scope.sessionId);
+   assert.equal(out.kind,'agent.delivery');assert.deepEqual(out.payload,{text:'hello'});
+   assert.equal(out.state,row.outState);assert.equal(out.revision,row.outRevision);
+   assert.equal(out.createdAt,createdAt);assert.equal(out.updatedAt,row.outUpdatedAt);
+   assert.equal(out.receiptPresent,row.receipt!==null);assert.deepEqual(out.receipt,row.receipt);
+  }
+  reopened.close();
+ });
+});
+
+test('tampered valid JSON is refused on idempotent admission and on reopen',async()=>{
+ for(const column of ['input_json','payload_json'] as const)await fixture(async root=>{
+  const store=new ControlStore(root),result=store.admit(admission());
+  if(column==='input_json')store.db.prepare('UPDATE operations SET input_json=? WHERE id=?').run('{"text":"tampered"}',result.operation.id);
+  else store.db.prepare('UPDATE outboxes SET payload_json=? WHERE id=?').run('{"text":"tampered"}',result.outbox.id);
+  assert.throws(()=>store.admit(admission()),(e:unknown)=>e instanceof ControlStoreError&&e.code==='CORRUPT');
+  store.close();assert.throws(()=>new ControlStore(root),(e:unknown)=>e instanceof ControlStoreError&&e.code==='CORRUPT'&&/digest/.test(e.message));
+ });
+});
+
+test('duplicate admission refuses a delivered outbox without a receipt',async()=>{
+ await fixture(async root=>{
+  const store=new ControlStore(root),result=store.admit(admission());
+  store.db.prepare("UPDATE outboxes SET state='delivered' WHERE id=?").run(result.outbox.id);
+  assert.throws(()=>store.admit(admission()),(e:unknown)=>e instanceof ControlStoreError&&e.code==='CORRUPT');
+  store.close();assert.throws(()=>new ControlStore(root),(e:unknown)=>e instanceof ControlStoreError&&e.code==='CORRUPT');
+ });
+});
+
 test('stable scoped idempotency returns existing record and conflicting content rejects',async()=>{
  await fixture(async root=>{
   const store=new ControlStore(root);
@@ -372,6 +462,60 @@ test('corrupt records and oversized or malformed payloads are rejected',async()=
   store.db.prepare("UPDATE operations SET input_json='{' WHERE id=?").run(malformed.operation.id);
   assert.throws(()=>store.getOperation(malformed.operation.id,scope),/Corrupt operation input JSON/);
   store.close();
+ });
+});
+
+test('startup validation includes zero and negative operation and outbox rowids',async()=>{
+ for(const rowid of [-1,0]) for(const corruption of ['none','operation','outbox'] as const) await fixture(async root=>{
+  let store=new ControlStore(root);const first=store.admit(admission('nonpositive'));
+  store.db.prepare('UPDATE operations SET rowid=? WHERE id=?').run(rowid,first.operation.id);
+  store.db.prepare('UPDATE outboxes SET rowid=? WHERE id=?').run(rowid,first.outbox.id);
+  if(corruption==='operation') store.db.prepare("UPDATE operations SET input_json='{' WHERE id=?").run(first.operation.id);
+  if(corruption==='outbox') store.db.prepare("UPDATE outboxes SET payload_json='{' WHERE id=?").run(first.outbox.id);
+  store.close();
+  if(corruption==='none') {store=new ControlStore(root);assert.equal(store.getOperation(first.operation.id,scope).id,first.operation.id);store.close();}
+  else assert.throws(()=>new ControlStore(root),/Corrupt/);
+ });
+});
+
+test('startup validation reaches both sides of its 128-row page boundary',async()=>{
+ for(const table of ['operations','outboxes'] as const) for(const index of [127,128]) await fixture(async root=>{
+  const store=new ControlStore(root), rows=[];
+  for(let i=0;i<130;i++) rows.push(store.admit(admission('page-'+i)));
+  for(let i=0;i<130;i++) {
+   store.db.prepare('UPDATE operations SET rowid=? WHERE id=?').run(i-130,rows[i].operation.id);
+   store.db.prepare('UPDATE outboxes SET rowid=? WHERE id=?').run(i-130,rows[i].outbox.id);
+  }
+  if(table==='operations') store.db.prepare("UPDATE operations SET input_json='{' WHERE id=?").run(rows[index].operation.id);
+  else store.db.prepare("UPDATE outboxes SET payload_json='{' WHERE id=?").run(rows[index].outbox.id);
+  store.close();assert.throws(()=>new ControlStore(root),/Corrupt/);
+ });
+});
+
+test('startup validation includes zero and negative operation and outbox rowids',async()=>{
+ for(const rowid of [-1,0]) for(const corruption of ['none','operation','outbox'] as const) await fixture(async root=>{
+  let store=new ControlStore(root);const first=store.admit(admission('nonpositive'));
+  store.db.prepare('UPDATE operations SET rowid=? WHERE id=?').run(rowid,first.operation.id);
+  store.db.prepare('UPDATE outboxes SET rowid=? WHERE id=?').run(rowid,first.outbox.id);
+  if(corruption==='operation') store.db.prepare("UPDATE operations SET input_json='{' WHERE id=?").run(first.operation.id);
+  if(corruption==='outbox') store.db.prepare("UPDATE outboxes SET payload_json='{' WHERE id=?").run(first.outbox.id);
+  store.close();
+  if(corruption==='none') {store=new ControlStore(root);assert.equal(store.getOperation(first.operation.id,scope).id,first.operation.id);store.close();}
+  else assert.throws(()=>new ControlStore(root),/Corrupt/);
+ });
+});
+
+test('startup validation reaches both sides of its 128-row page boundary',async()=>{
+ for(const table of ['operations','outboxes'] as const) for(const index of [127,128]) await fixture(async root=>{
+  const store=new ControlStore(root), rows=[];
+  for(let i=0;i<130;i++) rows.push(store.admit(admission('page-'+i)));
+  for(let i=0;i<130;i++) {
+   store.db.prepare('UPDATE operations SET rowid=? WHERE id=?').run(i-130,rows[i].operation.id);
+   store.db.prepare('UPDATE outboxes SET rowid=? WHERE id=?').run(i-130,rows[i].outbox.id);
+  }
+  if(table==='operations') store.db.prepare("UPDATE operations SET input_json='{' WHERE id=?").run(rows[index].operation.id);
+  else store.db.prepare("UPDATE outboxes SET payload_json='{' WHERE id=?").run(rows[index].outbox.id);
+  store.close();assert.throws(()=>new ControlStore(root),/Corrupt/);
  });
 });
 

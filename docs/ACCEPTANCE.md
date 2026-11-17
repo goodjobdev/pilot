@@ -1,9 +1,10 @@
 # Completion records and acceptance
 
 A unit of work is not "done" because someone said so. It is done when there is a **completion
-record** — what was produced, from which revision, by which commands, with which real test counts —
-and, where something consequential follows from it, an **acceptance** of that exact artifact by an
-identity the policy permits.
+record** — a claim about what was produced, from which revision, by which commands, and with what
+test counts — and, where something consequential follows from it, an **acceptance** of that exact
+artifact by an identity the policy permits. The store checks the claim's internal consistency; it
+does not independently verify that commands ran, output is authentic, or the artifact matches.
 
 The model lives in `src/shared/acceptance.ts` (pure: the closed sets, the strict validation and the
 honesty rules) and the durable half in `src/server/state/acceptance-store.ts`. The actions are
@@ -14,6 +15,44 @@ record is written inside the project's own tree.
 
 Nothing here commits, pushes, deploys, spends, provisions or publishes. An acceptance records a
 decision about an artifact; performing anything with it stays a separate, explicit step.
+
+## Runner provenance bridge: not installed
+
+Runner-linked evidence is not currently an acceptance mode. Existing completion records remain
+self-reported and compatible; recording a runner job ID or copying runner output into a record does
+not upgrade its trust. No model-facing provenance tool is installed.
+
+The current bounded runner's durable job identifies a project, job revision, settled status and
+reported result. It does **not** bind that result to a named session, an observed artifact revision
+and content digest, or an independently protected receipt digest. A workspace name is not an artifact
+identity, and a synthetic execution port proves only the behaviour of that test double. The experimental
+runner snapshot validator likewise validates submitted bytes but explicitly does not prove they came
+from a Git revision or the live worktree. Thus this build cannot safely turn a settled job into
+acceptance-grade evidence.
+
+A future opt-in bridge requires all of these interfaces before it can be implemented honestly:
+
+1. A protected artifact-observation port that returns the canonical project/session binding, an
+   immutable artifact revision and digest, and the exact bytes or immutable snapshot identity tested.
+   The observation must be made by the trusted service, not supplied by the model.
+2. A protected runner receipt reader that authenticates integrity and returns project ID, named
+   session ID, job ID, terminal job revision, successful result/status, tested artifact revision and
+   digest, and a unique receipt digest. It must distinguish revoked, missing, uncertain and corrupt
+   receipts; the current runner broker record alone is not this interface.
+3. A shared durable-store transaction that revalidates the receipt, artifact binding and revocation
+   state while admitting the immutable acceptance evidence, with the same project and session scope.
+   If receipt authority can be revoked, revocation and evidence admission must serialize against the
+   same authoritative state. No match, stale revision, untrusted adapter or unavailable transaction
+   must refuse without writing.
+4. A content-derived idempotency binding over the exact receipt and artifact identities, plus durable
+   integrity validation on every read. Replays of identical linkage may return the same evidence;
+   changed linkage must never rewrite it or be treated as equivalent.
+
+The focused characterization in `tests/server/runner-broker.test.ts` uses a disposable store and a
+port whose output is controlled by the test. It demonstrates that successful storage of that canned
+output does not authenticate a real execution; it deliberately does not freeze the runner record schema.
+The bridge remains unavailable until the protected interfaces and their production wiring,
+transactional races, revocation, corruption and refusal cases are independently verified.
 
 ## The completion record
 
@@ -164,14 +203,11 @@ that moves an acceptance onto a different artifact.
 
 ## The operator flow
 
-**Declaring the accepting identity.** A caller may declare who is accepting: either beside the request
-(`{ projectId, request: { … }, actor }`) or **inside** it
-(`{ projectId, request: { evidenceId, artifact, actionClass, actor } }`), which is the shape the
-registry publishes for `acceptance.accept` and the shape the palette sends. Both are honoured, and
-what is declared is what the record carries — the route never substitutes an identity for a declared
-one. A body that declares **both** and gives them different values is refused `422` rather than one of
-them being silently used, because which identity accepted must never be ambiguous. A body that declares
-no actor at all is the authenticated owner, and only then.
+**Accepting identity.** The HTTP and action interfaces are owner-authenticated. They derive the
+recorded owner identity from the authenticated deployment, not from a submitted label. For compatibility,
+an owner actor may be supplied inside or beside the request; an agent actor is refused, and conflicting
+declarations are refused. An agent acceptance can only come through the bound agent session's
+`acceptance_accept` tool, not by naming an agent in an owner request.
 
 **Ask mode (the default; `owner-only`, every class `ask`).** Nothing an agent can do leads to an
 acceptance on its own.
@@ -194,15 +230,13 @@ acceptance on its own.
    `{ "revision": 0, "policy": { "mode": "agent-may-accept", "actionClasses": { "commit": "full-auto", "push": "ask", "deploy": "ask", "spend": "ask", "provision": "ask", "publish": "ask" } } }`.
    Only the classes the owner really wants decided without them are set to `full-auto`; the rest stay
    `ask`, and those classes still need the owner.
-2. The worker records the evidence, then accepts it, naming itself:
-   `POST /api/acceptance/accept` with `{ projectId, request: { evidenceId, artifact, actionClass:
-   "commit" }, actor: { kind: "agent", identity: "<worker>" } }`. The acceptance recorded carries
-   `acceptedBy.policyRule = "agent-may-accept:commit=full-auto"` and the policy revision it was
-   decided under.
-3. Through the command registry the same steps are `acceptance.evidence.record`, `acceptance.read`,
-   `acceptance.accept` and `acceptance.policy.update` — the registry validates the published schema,
-   enforces the declared scope, and the handler's own refusal keeps the status it has on the routes
-   (422 invalid, 404 not found, 403 not permitted, 409 conflict) with a path-free message.
+2. The evidence must already be recorded for the named session. Its explicitly bound agent, if granted
+   `accept`, can call `acceptance_accept` with the evidence ID, exact artifact and `commit` action class.
+   The recorded decision carries `agent-may-accept:commit=full-auto` and the policy revision. The
+   model does not choose the actor identity.
+3. The owner can use the registry's evidence, policy and acceptance actions, but those authenticated
+   requests cannot impersonate an agent. The model-facing acceptance records a decision only; it does
+   not execute any subsequent action.
 
 ## Statuses
 
@@ -220,11 +254,9 @@ never a secret.
 
 ## What this does not prove
 
-- **An agent identity is declared, not authenticated.** The HTTP surface is owner-authenticated (local
-  token or the hosted owner's Access assertion); an agent acceptance is a *declared* identity on a
-  request only the owner's credential can make. The policy is therefore an acceptance-control rule
-  over a decision procedure — it decides who may accept, and records why — and **not** a separate
-  agent credential. There is no agent token in this build, and this file does not claim one.
+- **An agent is not a separate security principal.** Owner HTTP requests cannot claim an agent
+  identity; the model-facing tool resolves its identity from the durable session binding and rechecks
+  it at admission. There is no separate agent credential or same-UID process isolation.
 - **The artifact identity is not re-read from git.** Acceptance is bound to the revision the evidence
   itself recorded; this build has no Git plumbing that would re-read the live tree or the live commit.
   A caller with such a source can enforce the stronger check at the point where it produces the
@@ -233,11 +265,22 @@ never a secret.
   the project is checked for registration and a named session for existence, but the job id is not
   resolved against the coding runner's job list.
 - **There is no documented maximum on how many completion records a project may hold.** Each record is
-  bounded (the control store's 64 KiB JSON limit, and the per-field bounds above) and the read is
-  capped at 200 records with `truncated: true`, but growth is only bounded by those.
-- **The Markdown file is repository-readable and hand-editable.** The store is authoritative and the
-  edit is reported as `stale`; re-recording the same evidence rewrites the file. Editing it can never
-  change the record, and it can never change an acceptance.
+  bounded (the control store's 64 KiB JSON limit, and the per-field bounds above). A read returns the
+  oldest 200 matching records and reports `truncated: true` when more exist; agent reads select their
+  session before applying this cap. Policy history also has no total bound: each project read validates
+  it once in a SQLite read snapshot, so its time and memory costs can still grow with history.
+- **The Markdown file is repository-readable and hand-editable.** The store is authoritative for these
+  acceptance records and an edit is reported as `stale`; re-recording the same evidence attempts to
+  rewrite the file. A render failure after admission reports the durable record with `written: false`
+  and the observed Markdown state; it does not mean admission was undone. Editing the file cannot
+  change the stored record or acceptance.
+- **Stored hashes are consistency checks, not authentication.** Reads check the operation and outbox
+  digest and linkage, acceptance-to-evidence fields, contiguous policy revisions, and the decision's
+  consistency with its cited historical policy. A writer able to
+  coordinate database changes can rewrite these together or remove all history. The evidence ID is
+  derived from the submitted request, but output-count normalization means that original request
+  cannot always be reconstructed from the stored record. Neither the ID nor the read checks prove
+  that claimed tests, diffs, or reviews really occurred.
 
 ## Tests
 
@@ -250,5 +293,45 @@ never a secret.
   declared precondition matched to a refusal the handler really produces.
 - `tests/server/http.test.ts` — the routes owner-only, behind the unchanged Host check and the origin
   enforcement for writes, with the real Markdown file asserted after both a recording and an
-  acceptance, the registry-shaped body (`request.actor`) accepted as the agent it declares, a body
-  that declares two disagreeing actors refused, and an agent refused under a policy that forbids it.
+  acceptance, attempted agent impersonation refused, and conflicting actor declarations rejected.
+
+## Offline operator control
+
+An operator with access to the stopped data root can explicitly set all acceptance classes to
+`full-auto` and the mode to `agent-may-accept` with
+`pnpm exec tsx scripts/full-auto-policy.ts <data-root> <expected-revision> <owner-identity> --execute`.
+The command requires an existing control store, refuses a paused restore and any existing service-lock
+evidence, acquires its own service lock, and records the change through the same revision-checked
+acceptance store used by the authenticated interface. It changes no agent's grants and does not run a
+command, commit, push, deploy, or publish. The shell remains an unrestricted direct tool if granted.
+
+## Agent-facing evidence tools
+
+When the durable control store is available, a named agent granted the `accept` scope can call
+`acceptance_read` (ten summaries per page), optional `acceptance_record` (self-reported evidence for the
+calling session, installed only with the default-off `DASHBOARD_AGENT_EVIDENCE_RECORDING=on` deployment
+switch), and `acceptance_accept` (an evidence ID, exact artifact and action class). Evidence
+is a claim: the store checks internal consistency, not that commands ran or that the diff matches the
+artifact. The record format does not distinguish model and owner producers, so no record should be
+assumed independently verified. The server
+uses the bound agent identity, never a model-supplied actor. The model-facing read shows only evidence
+whose recorded session is the calling session, and the acceptance path refuses an evidence ID from
+another session. An agent in a fork cannot call `acceptance_record` or `acceptance_accept`: Markdown rendering targets the
+parent workspace rather than the fork. The owner-authenticated project-wide interface is unchanged. The store refuses stale
+artifacts, repeated acceptance, policy-denied action classes, and missing evidence. Agent and project
+scope are rechecked after the evidence read. Scope, explicit session-to-agent binding and current
+policy are also rechecked synchronously inside the durable acceptance admission transaction. The
+transaction compares the dispatch authority and its agent/binding revisions, so a revoke-and-restore
+before admission does not revive the same call. A legacy project-wide agent match without an explicit
+session binding cannot accept. A read reports if the underlying store's bounded evidence list is truncated.
+Cancellation before durable admission prevents a new record; after admission the durable record remains
+and is reported even if rendering is skipped. Agent authority and cancellation are checked again before
+the final Markdown replacement. Those checks cannot retract a filesystem operation already issued or
+make the filesystem and SQLite one atomic transaction. These checks protect the recorded decision, not unrelated same-UID shell operations, and do not make
+untrusted test or diff claims true. An accepted record is not a commit, push, deployment, expense,
+provisioning operation or publication. The separate `commit_accepted` and `push_accepted` harness tools
+are the only agent-facing paths in this build that perform an accepted action class, and only where
+their own deployment switch (`DASHBOARD_AGENT_COMMIT`/`DASHBOARD_AGENT_PUSH`), an exact
+owner-configured target and a `full-auto` class decision are all in force; they consume the same
+single-use acceptance this section describes and never replay an uncertain intent. See
+[docs/AGENTS.md](AGENTS.md), *The bounded commit and push capability*.

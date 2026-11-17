@@ -7,9 +7,10 @@
  import { attentionAgeLabel } from '../shared/attention';
  import { APPROVAL_TARGET_FIELDS } from '../shared/approvals';
  import type { ApprovalView } from './api';
- let { projectId,questions=[],unlinked,alertState='off',alertBusy=false,alertMessage='',refreshKey=0,focusId=null,onopen,onopenquestion,onclose,oncount,onchanged,onenable,ondisable,ontest }:{
+ let { projectId,questions=[],questionsUnavailable=false,unlinked,alertState='off',alertBusy=false,alertMessage='',refreshKey=0,focusId=null,onopen,onopenquestion,onclose,oncount,onchanged,onenable,ondisable,ontest }:{
    projectId:string;
    questions:{ path:string; line:number; text:string; anchor:string|null; id:string }[];
+   questionsUnavailable?:boolean;
    unlinked:number;
    alertState?:AlertState; alertBusy?:boolean; alertMessage?:string;
    refreshKey?:number;
@@ -219,7 +220,7 @@
   {/if}
  </article>
  {:else}
- {#if !loading&&!missing&&count!==null&&count.complete&&count.open===0&&questions.length===0}<p class="inbox-empty">Nothing needs you. Questions, approvals, failures and interrupted runs appear here.</p>{/if}
+ {#if !loading&&!missing&&count!==null&&count.complete&&count.open===0&&questions.length===0&&!questionsUnavailable}<p class="inbox-empty">Nothing needs you. Questions, approvals, failures and interrupted runs appear here.</p>{/if}
  {/each}
 
  {#if page?.hasMore}
@@ -265,7 +266,7 @@
   <span class="inbox-text">{question.text}</span>
  </button>
  {/each}
- {:else if !items.length&&!loading}
+ {:else if !items.length&&!loading&&!questionsUnavailable}
  <p class="inbox-empty">No open questions in this project's documentation.</p>
  {/if}
 

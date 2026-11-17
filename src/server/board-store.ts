@@ -1,5 +1,5 @@
 import { createHash,randomUUID } from 'node:crypto';
-import { open,readFile,rename,unlink,mkdir,readdir } from 'node:fs/promises';
+import { open,rename,unlink,mkdir,readdir } from 'node:fs/promises';
 import { dirname,join } from 'node:path';
 import type { Project,Snapshot } from '../shared/model';
 import { applyOperation } from '../shared/schema';
@@ -7,14 +7,19 @@ import { parseBoard,serializeBoard } from '../shared/markdown';
 import { safePath } from './paths';
 import type { WorkspaceStore } from './workspace';
 import { PLAN_PATH } from '../shared/workspace';
+import { BoundedFileReadError,readBoundedFile } from './bounded-file-read';
 export const hash=(text:string)=>createHash('sha256').update(text).digest('hex');
 export class HttpError extends Error {constructor(public status:number,message:string,public code?:string){super(message);}}
-export async function atomicWrite(path:string,text:string) {
+export async function atomicWrite(path:string,text:string,beforeCommit?:()=>void|Promise<void>) {
   const tmp=path+'.'+randomUUID()+'.tmp';
   const file=await open(tmp,'wx',0o600);
-  try {await file.writeFile(text);await file.sync();}finally{await file.close();}
-  try {await rename(tmp,path);const dir=await open(dirname(path),'r');try{await dir.sync();}finally{await dir.close();}}
-  finally {await unlink(tmp).catch(()=>{});}
+  try {
+    try {await file.writeFile(text);await file.sync();}finally{await file.close();}
+    // A synchronous gate must issue rename without an intervening await/microtask. Async gates
+    // retain their existing semantics; neither form can retract an already-issued filesystem call.
+    const checked=beforeCommit?.();if(checked)await checked;
+    await rename(tmp,path);const dir=await open(dirname(path),'r');try{await dir.sync();}finally{await dir.close();}
+  } finally {await unlink(tmp).catch(()=>{});}
 }
 export class BoardStore {
   private tails=new Map<string,Promise<unknown>>();
@@ -32,7 +37,7 @@ export class BoardStore {
     const snapshots=(await readdir(dir)).filter(n=>n.endsWith('.md')).sort();
     for(const old of snapshots.slice(0,-20))await unlink(join(dir,old));
   }
-  async raw(project:Project){const path=await safePath(project.path,'docs/dashboard/board.md');return readFile(path,'utf8');}
+  async raw(project:Project){const path=await safePath(project.path,'docs/dashboard/board.md');try{return (await readBoundedFile(path,8*1024*1024)).toString('utf8');}catch(error){if(error instanceof BoundedFileReadError&&error.code==='OVERSIZE')throw new HttpError(413,'Board exceeds size limit');throw error;}}
   async read(project:Project):Promise<Snapshot>{
     let raw:string;try{raw=await this.raw(project);}catch(e){if((e as NodeJS.ErrnoException).code==='ENOENT')throw new HttpError(404,'Board missing; initialize only after confirming the location');throw e;}
     if(Buffer.byteLength(raw)>8*1024*1024)throw new HttpError(413,'Board exceeds size limit');
@@ -53,7 +58,11 @@ export class BoardStore {
     await this.backup(project,await this.raw(project));
     const path=await safePath(project.path,'docs/dashboard/board.md');
     if(hash(await this.raw(project))!==revision)throw new HttpError(409,'External edit detected before commit');
-    await atomicWrite(path,text);return {board,revision:hash(text)};
+    await atomicWrite(path,text,async()=>{
+      await verify?.();
+      if(hash(await this.raw(project))!==revision)throw new HttpError(409,'External edit detected before commit');
+      await verify?.();
+    });return {board,revision:hash(text)};
   }));}
   /** Wiki source editing and board operations share this revision/serialization boundary. */
   async writeDocument(project:Project,revision:string,text:string):Promise<Snapshot>{
@@ -65,7 +74,9 @@ export class BoardStore {
       await this.backup(project,before);
       const path=await safePath(project.path,PLAN_PATH);
       if(hash(await this.raw(project))!==revision)throw new HttpError(409,'External edit detected before saving the plan');
-      await atomicWrite(path,text);return {board,revision:hash(text)};
+      await atomicWrite(path,text,async()=>{
+        if(hash(await this.raw(project))!==revision)throw new HttpError(409,'External edit detected before saving the plan');
+      });return {board,revision:hash(text)};
     }));
   }
 }

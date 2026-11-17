@@ -42,9 +42,12 @@ serve: `.png`, `.jpg`, `.jpeg`, `.gif`, `.webp`, `.avif`, `.svg`, `.html`, `.htm
 inside a project tree is copied: a repository's source, tests and lockfiles are the repository's own
 backup, and generated or vendored folders (node_modules, dist, build, out, target, coverage, vendor,
 venv, .git, .astro, .svelte-kit, .next, .nuxt, .turbo, .cache, test-results, playwright-report,
-.runway, .kilo, .pi-web and tmp) are never planning data.
+.runway, .kilo, .pi-web and tmp) are never planning data. Other dot-prefixed directories are also
+excluded, except `.github`, which remains traversable and capturable.
 
-A symlink anywhere inside planning data fails the whole backup closed. Nothing is followed.
+A symlink anywhere inside planning data fails the whole backup closed. Nothing is followed. Managed project roots and their path components below the approved data root are checked with `lstat` before traversal and again when each captured source path is resolved. External project roots and all their ancestor components are checked from the filesystem root; the registered path is canonicalized when the project is added, so platform aliases such as macOS `/var` are resolved before this no-symlink check.
+
+These are pathname-based checks, not an atomic filesystem snapshot: a process able to mutate the same directories can race a check by replacing a component after `lstat` and before `readdir` or file open. The backup lock coordinates Pilot processes but is not a filesystem fence against a same-UID process. Run backups when project trees are not being modified; this tool does not claim race-free traversal against concurrent hostile mutation.
 
 ### What is deliberately excluded
 
@@ -61,6 +64,7 @@ entry, not an unrecognised one, so it is never listed here:
 | `service.lock` | Ownership evidence for the process holding the root. A backup is refused while **any** lock evidence is present — a live lock, a lock recorded for a process that is gone, a malformed one — and a lock is never part of a backup. It then takes its own lock (purpose `backup`) for the duration, so during a backup *this tool* is the holder; restore and promotion only refuse evidence, they never take a lock. |
 | `RESTORE-PAUSED.json` | The restore pause marker of a restored root, not application data. |
 | `snapshots/` | The bounded board revision history **the application itself writes**: `snapshots/<projectId>/<timestamp>-<uuid>.md`, the newest 20 per project, the older ones pruned automatically. It is derived from the boards, which *are* captured, and it is not the board a project is served from, so a restored root rebuilds it as boards are edited. |
+| `pnpm/` | The pnpm package-manager cache used by interactive terminal commands. It is derived download state, not canonical project or Pilot data; pnpm recreates the selected package-manager version when needed, so restoring this cache is unnecessary. |
 
 An unrecognised entry at the data root (or under `settings/` or `agents/`) is listed as excluded
 with the reason `not captured by this tool`, so the manifest never overstates what a preview of the
@@ -162,7 +166,7 @@ answer to "is this archive still intact, and will it restore?".
    GCM tag authenticates the whole archive and every file's bytes are checked against the digest its
    manifest records, in the manifest's own order, with the path allowlist refusing anything the tool
    never writes — no `.` or `..` segment, no empty segment, no leading slash, no backslash, and only
-   the documented shapes;
+   the documented shapes. Project documentation names may include ordinary Unicode, spaces and punctuation; control characters and path separators are refused, and each component is capped at 255 UTF-8 bytes. Verification and restore reject paths that collide after Unicode normalization and case folding;
    the staging tree is **paused from its first byte**: the marker is written into it before a single
    archive byte is read, so a tree that only a crash could leave behind is already paused, and a tree
    with a catalog but no control store is never served as if it were complete;

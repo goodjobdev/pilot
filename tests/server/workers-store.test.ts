@@ -443,6 +443,7 @@ test('workers: the conversation binding is durable before submit and survives a 
     await refusal(f.workers.recordConversation(PROJECT, run.id, recorded!.binding.conversationId + 1), 'CONFLICT');
     await f.reopen();
     assert.equal(f.workers.isWorkerConversation(PROJECT, recorded!.binding.conversationId), true, 'the durable lookup survives the restart');
+    assert.equal(f.workers.runForConversation(PROJECT, recorded!.binding.conversationId), run.id, 'the exact run binding survives the restart');
     assert.deepEqual(f.workers.workerConversationIds(PROJECT), [recorded!.binding.conversationId]);
   } finally { await f.close(); }
 });

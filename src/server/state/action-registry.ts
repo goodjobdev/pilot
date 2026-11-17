@@ -24,7 +24,7 @@ import type { ForkStore } from './fork-store';
 import { FORK_BASE_COMMIT_PATTERN } from '../../shared/forks';
 import { AGENT_ID_PATTERN, AGENT_SCOPES, type AgentScope } from '../../shared/agent-registry';
 import type { AgentStore } from './agent-store';
-import type { FileEditCapability } from './file-edit-tool';
+import { FileEditError, type FileEditCapability } from './file-edit-tool';
 
 /**
  * The server half of the command registry: the one place an action id is bound to the handler that
@@ -112,6 +112,8 @@ export type ActionControl = {
    * and asking for one anyway is refused as unavailable. The tool is disabled by default.
    */
   readonly fileEdit?: FileEditCapability;
+  /** Trusted deployment capability check; throws when currently disabled. */
+  readonly authorizeFileEdit?: () => Promise<number | void>;
   /** The legacy-conversation migration, planned (dryRun true) or applied (false). */
   readonly migrate: (dryRun: boolean) => Promise<SessionMigrationReport>;
 };
@@ -516,14 +518,16 @@ function buildHandlers(environment: ActionEnvironment): Readonly<Record<ActionId
     'agent.list': async () => {
       const registry = agentRegistry();
       const fileEdit = control().fileEdit;
+      let fileEditEnabled=fileEdit!==undefined;
+      if(fileEditEnabled&&control().authorizeFileEdit)try{await control().authorizeFileEdit!();}catch{fileEditEnabled=false;}
       return Object.freeze({
         readOnly: true as const,
         agents: Object.freeze(registry.list()),
-        scopes: Object.freeze(agentScopeVocabulary()),
+        scopes: Object.freeze(agentScopeVocabulary({acceptance:control().acceptance!==undefined,fork:control().forks!==undefined})),
         models: registry.offeredModels(),
         fileEdit: Object.freeze({
-          enabled: fileEdit !== undefined,
-          mode: fileEdit === undefined ? null : await fileEdit.mode()
+          enabled: fileEditEnabled,
+          mode: !fileEditEnabled || fileEdit === undefined ? null : await fileEdit.mode()
         })
       });
     },
@@ -536,13 +540,15 @@ function buildHandlers(environment: ActionEnvironment): Readonly<Record<ActionId
       Object.freeze({ agent: agentRegistry().update({ agentId: params.agentId, revision: params.revision, patch: params.patch, actor: params.actor }) }),
     'agent.archive': async (params: Record<string, unknown>) =>
       Object.freeze({ agent: agentRegistry().archive({ agentId: params.agentId, revision: params.revision, actor: params.actor }) }),
-    'file-edit.read': async (_params: Record<string, unknown>, scope: ActionScope) => fileEditTool().view(projectOf(scope)),
+    'file-edit.read': async (_params: Record<string, unknown>, scope: ActionScope) => { await environment.control?.authorizeFileEdit?.(); return fileEditTool().view(projectOf(scope)); },
     'file-edit.write': async (params: Record<string, unknown>, scope: ActionScope) => {
       const request = params.request as { agentId: string | null; path: string; content: string; mode?: 'propose-only' | 'auto-apply' };
       const actor = params.actor as { kind: 'owner' | 'agent'; identity: string };
+      const check=environment.control?.authorizeFileEdit,revision=await check?.();
+      const authorize=check?async()=>{if(await check()!==revision)throw new FileEditError('File-edit capability settings changed before the write.','NOT_PERMITTED');}:undefined;
       return fileEditTool().edit({
         projectId: projectOf(scope), agentId: request.agentId, path: request.path, content: request.content,
-        mode: request.mode ?? null, actor
+        mode: request.mode ?? null, actor, authorize
       });
     }
   };

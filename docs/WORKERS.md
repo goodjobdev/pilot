@@ -29,8 +29,10 @@ agents, and a worker run is not a queue.
   scope outside the set is refused, and a read tool is never claimed when it is not installed.
 - At most **1 active worker run per project**. A second request is refused as busy; W1 has no
   queue and does not route around the worker policy.
-- A run may use at most **8 model turns** and at most **4096 output tokens per turn**. Both are
-  enforced in the application harness, not in the runner.
+- A run may issue at most **8 model requests**. The harness asks the provider for at most **4096
+  output tokens per request**, or less when the instance limit is lower; the provider must honor the
+  requested cap. These owner-created worker requests are not charged to a named agent's ledger and
+  neither worker bound is a monetary spending cap.
 - Model turns run in the application's Pi Durable harness. The contained runner is unchanged:
   no network, no provider client, no credential and no new route into it.
 - Revocation is immediate. It **blocks every new run**, and it **cooperatively cancels** the
@@ -243,8 +245,11 @@ conversation alias or a session model setter:
   allowlist. The scope verdict is the same `authorizeToolUse` rule every agent dispatch uses;
 - a numeric alias cannot change the worker's model or scopes;
 - the provider boundary refuses the ninth model request **before** the provider is called, for
-  every provider including the scripted stand-in. The output-token limit is 4096 at that same
-  boundary, and every request revalidates the run, worker, policy, model and revocation.
+  every provider including the scripted stand-in. The requested output-token limit is at most 4096;
+  supported locked adapters' final payloads are checked before model dispatch and uncheckable transports,
+  omitted fields or expanded bounds are refused. The provider must honor the limit. The bound is not a
+  spending guarantee, and authentication refresh is a separate effect. Each model dispatch revalidates
+  the run, worker, policy, model and revocation; already-issued effects cannot be recalled.
 
 ## Acceptance-only Faux pre-submit delay
 

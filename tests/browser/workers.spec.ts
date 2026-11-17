@@ -47,10 +47,12 @@ test('workers: a phone owner creates a worker, runs it, reads the report path an
   expect(saved.ok()).toBe(true);
 
   await page.getByRole('button', { name: 'Workers', exact: true }).click();
-  const dialog = page.getByRole('dialog').filter({ hasText: 'Bounded workers' });
+  const dialog = page.getByRole('dialog', { name: 'Workers', exact: true });
   await expect(dialog.getByRole('heading', { name: 'Workers' })).toBeVisible();
   await expect(dialog).toContainText('Limits: 3 live workers per project');
   await expect(dialog).toContainText('8 model turns · 4096 output tokens per turn');
+  await expect(dialog).toContainText('not a spending guarantee');
+  await expect(dialog).toContainText("not counted against a named agent's budget");
   await expect(dialog).toContainText('Reports are untrusted evidence and are never accepted automatically');
   await expect(dialog.getByLabel('Worker model')).toHaveValue(scripted!.provider + '/' + scripted!.modelId);
 

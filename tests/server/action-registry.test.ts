@@ -179,15 +179,19 @@ async function fixture(): Promise<Fixture> {
   const forkWorktrees: ForkWorktreePort = {
     resolveCommit: async ({ commit }) => { forkCalls.push('resolveCommit'); if (forkWorktree.commitRefused) throw new Error('not a commit of this repository'); return commit; },
     create: async () => { forkCalls.push('create'); if (forkWorktree.createFails) throw new Error('git refused'); },
+    presence: async () => forkWorktree.state === 'absent' ? 'absent' : 'present',
     inspect: async () => { forkCalls.push('inspect'); return { state: forkWorktree.state, head: 'd'.repeat(40) }; },
+    identity: async () => 'a'.repeat(64),
     remove: async ({ force }) => { forkCalls.push('remove:' + (force ? 'force' : 'plain')); }
   };
   const forks = new ForkStore(store, {
     projectFolder: (id) => (id === project.id ? projectPath : undefined),
     forkRootParent: join(root, 'forks'),
     worktrees: forkWorktrees,
+    allowUnpinnedRemovalForTests: true,
     transcripts: forkTranscripts,
-    sessions
+    sessions,
+    assertQuiescent: async () => {} // This fixture has no harness or background work.
   });
   // The agent registry and the bounded file-edit capability: both over the same disposable control
   // store, with a synthetic offered-model list and this fixture's own project folder as the connected
@@ -466,16 +470,16 @@ test('every declared action is reachable and really acts through its own handler
         evidenceId: recordedEvidence.evidence.record.id,
         artifact: { revision: 'a'.repeat(64), commit: null },
         actionClass: 'commit',
-        actor: { kind: 'agent', identity: 'registry-worker' }
+        actor: { kind: 'owner', identity: 'registry-owner' }
       }
     }, scopeOf(f)) as AcceptanceResult;
     assert.deepEqual(
       [acceptedEvidence.acceptance.acceptedBy.kind, acceptedEvidence.acceptance.acceptedBy.identity, acceptedEvidence.acceptance.acceptedBy.policyRule, acceptedEvidence.acceptance.singleUse],
-      ['agent', 'registry-worker', agentPolicyRule('commit'), true]
+      ['owner', 'registry-owner', null, true]
     );
 
-    // The forks: created from a real cutoff through the parent session scope, listed, resumed and
-    // discarded, and finally discarded again so that the discard path really ran. The session scope of
+    // The forks: created from a cutoff through the parent session scope, listed and resumed. Active
+    // discard refuses because admission cannot yet be coordinated. The session scope of
     // a creation names the parent; the session scope of a resume or a discard names the *fork* — its
     // child session, which is the fork's own identity, so no caller ever addresses a path.
     const forked = await drive('fork.create', { baseCommit: 'a'.repeat(40), cutoffEntryId: 3 }, scopeOf(f, created.id)) as ForkCreationResult;
@@ -488,15 +492,15 @@ test('every declared action is reachable and really acts through its own handler
     // A paused child refuses to dispatch, and the transcript port is never reached: a paused fork
     // causes no submission and no model request at all.
     const beforeDispatch = f.forkCalls.filter((call) => call.startsWith('dispatch')).length;
-    const pausedChild = await refusal(f.forks.dispatchChild({ projectId: f.project.id, childSessionId: forked.fork.childSessionId, text: 'not yet' }));
+    const pausedChild = await refusal(f.forks.dispatchChild({parentSessionId:created.id,  projectId: f.project.id, childSessionId: forked.fork.childSessionId, text: 'not yet', invocationId: 'action-test' }));
     assert.ok(pausedChild instanceof ForkError && pausedChild.code === 'ILLEGAL' && /paused/.test(pausedChild.message));
     assert.equal(f.forkCalls.filter((call) => call.startsWith('dispatch')).length, beforeDispatch, 'a refused dispatch calls nothing at all');
     const resumedFork = await drive('fork.resume', { revision: forked.fork.revision }, scopeOf(f, forked.fork.childSessionId)) as ForkActionResult;
     assert.deepEqual([resumedFork.outcome, resumedFork.fork.state, resumedFork.fork.revision], ['resumed', 'active', 2]);
     assert.equal(f.forkCalls.filter((call) => call.startsWith('dispatch')).length, beforeDispatch, 'a resume dispatches nothing');
-    const discarded = await drive('fork.discard', { revision: resumedFork.fork.revision }, scopeOf(f, forked.fork.childSessionId)) as ForkActionResult;
-    assert.deepEqual([discarded.outcome, discarded.removed, discarded.fork.state], ['discarded', true, 'discarded']);
-    assert.ok(f.forkCalls.includes('remove:plain'), 'a clean worktree is removed without a force');
+    const activeDiscard = await refusal(drive('fork.discard', { revision: resumedFork.fork.revision }, scopeOf(f, forked.fork.childSessionId)));
+    assert.ok(activeDiscard instanceof ForkError && activeDiscard.code === 'UNAVAILABLE');
+    assert.equal(f.forkCalls.includes('remove:plain'), false, 'active discard did not attempt worktree removal');
 
     // The agent registry: one creation, one read with its durable audit trail, one change and one
     // archive, all through their own handlers. The record really is written.
@@ -864,8 +868,10 @@ test('every declared precondition matches a refusal the handlers really produce'
     error = await refusal(f.actions.run('acceptance.accept', { request: acceptRequest({ artifact: { revision: '9'.repeat(64), commit: null } }) }, acceptanceScope));
     assert.ok(error instanceof AcceptanceError && error.code === 'ARTIFACT_CHANGED' && /has changed since this evidence was produced/.test(error.message)); covered.add('ARTIFACT_UNCHANGED');
     // ARTIFACT_NOT_ACCEPTED: an acceptance is single use, and the second one names the first.
-    const acceptedOnce = await f.actions.run('acceptance.accept', { request: acceptRequest() }, acceptanceScope) as AcceptanceResult;
-    assert.deepEqual([acceptedOnce.acceptance.acceptedBy.policyRule, acceptedOnce.acceptance.policy.classDecision], [agentPolicyRule('commit'), 'full-auto']);
+    error = await refusal(f.actions.run('acceptance.accept', { request: acceptRequest() }, acceptanceScope));
+    assert.ok(error instanceof AcceptanceError && error.code === 'NOT_PERMITTED' && /trusted synchronous admission authority/.test(error.message));
+    const acceptedOnce = await f.actions.run('acceptance.accept', { request: acceptRequest({ actor: { kind: 'owner', identity: 'precondition-owner' } }) }, acceptanceScope) as AcceptanceResult;
+    assert.equal(acceptedOnce.acceptance.acceptedBy.kind, 'owner');
     error = await refusal(f.actions.run('acceptance.accept', { request: acceptRequest({ actor: { kind: 'owner', identity: 'precondition-owner' } }) }, acceptanceScope));
     assert.ok(error instanceof AcceptanceError && error.code === 'ALREADY_ACCEPTED' && /an acceptance is single use/.test(error.message)); covered.add('ARTIFACT_NOT_ACCEPTED');
 
@@ -1130,6 +1136,9 @@ test('the live projection is bounded, distinguishes not-knowing, and declares ex
   const f = await fixture();
   try {
     const first = await newSession(f, 'Bounded one'), second = await newSession(f, 'Bounded two');
+    const orderedSessions = f.sessions.list(f.project.id);
+    const firstByRegistryOrder = orderedSessions[0];
+    assert.equal(orderedSessions.length, 2);
     const twoCalls = environmentWith(f, async () => view({ conversationId: first.id, entries: [CALL, RESULT, CALL, RESULT] }));
 
     const capped = await liveActivity(twoCalls, { projectId: f.project.id, sessions: 1, toolEvents: 1 });
@@ -1137,7 +1146,8 @@ test('the live projection is bounded, distinguishes not-knowing, and declares ex
     assert.deepEqual([capped.harness.invocations.length, capped.harness.results.length, capped.harness.truncated], [1, 1, true], 'the bound keeps the most recent events and says it bit');
     assert.deepEqual(capped.harness.omitted, { invocations: 1, results: 1 }, 'the payload says exactly how many older events each list withheld');
     assert.deepEqual(capped.limits, { sessions: 1, toolEvents: 1 });
-    assert.equal(capped.sessions[0].sessionId, first.id);
+    assert.equal(capped.sessions[0].sessionId, firstByRegistryOrder.id, 'the cap retains the first session in the registry list order');
+    assert.ok([first.id, second.id].includes(firstByRegistryOrder.id));
     assert.notEqual(first.id, second.id);
 
     const full = await liveActivity(twoCalls, { projectId: f.project.id });

@@ -518,7 +518,7 @@ done until the owner accepts it on a phone.
   continuing to follow; a session switch resetting the count; two projects with equal-length
   conversations resetting between them; and a reload showing no phantom count.
 - Validation ran with this worktree's own binaries from
-  `/Users/john/dev/.archive/pilot-worktrees/integration-b23730b` (package `pilot` 0.1.0, Node
+  `[redacted local path]` (package `pilot` 0.1.0, Node
   26.8.1): `./node_modules/.bin/svelte-check --tsconfig ./tsconfig.json` and
   `./node_modules/.bin/tsc --noEmit` (0 errors, 0 warnings), `./node_modules/.bin/vite build` plus
   `./node_modules/.bin/esbuild …` (fresh build before the browser runs),
@@ -686,7 +686,7 @@ they are not docked over the transcript.
   controls and safe area; each session's draft across Back, Forward and reload; and a dirty
   document that refuses Back and then accepts it.
 - Validation ran with this worktree's own binaries from
-  `/Users/john/dev/.archive/pilot-worktrees/integration-b23730b` (package `pilot` 0.1.0, Node
+  `[redacted local path]` (package `pilot` 0.1.0, Node
   26.8.1): `./node_modules/.bin/svelte-check --tsconfig ./tsconfig.json` and
   `./node_modules/.bin/tsc --noEmit` (0 errors, 0 warnings), `./node_modules/.bin/vite build` plus
   `./node_modules/.bin/esbuild …` (fresh build before the browser runs),
@@ -952,7 +952,7 @@ deterministic delays are host-only test seams.
   the "between delay and append" boundary are the same durable `execute` checkpoint: both are
   before the append and both recover as interrupted, never repeated.
 - Validation ran with this worktree's own binaries from
-  `/Users/john/dev/.archive/pilot-worktrees/integration-b23730b` (package `pilot` 0.1.0, Node
+  `[redacted local path]` (package `pilot` 0.1.0, Node
   26.8.1): `./node_modules/.bin/tsc --noEmit`, `./node_modules/.bin/svelte-check --tsconfig
   ./tsconfig.json` (0 errors, 0 warnings), `./node_modules/.bin/vite build` plus
   `./node_modules/.bin/esbuild src/server/main.ts --bundle --platform=node --format=esm
@@ -1568,6 +1568,32 @@ claims tunnel, production or live-provider acceptance.
 | 9 Bounded owner-created workers | Partial. W1 is owner-approved for **Stop-only** at local commit `80b1bea`, with tests and hardening. This is not whole-step acceptance or real-phone acceptance. Wider worker scope remains unbuilt. |
 | 10 Disconnect, cancel and crash tests | Automated local criteria pass: 586 unit/server tests and 85 browser tests in 2 shards at `df2e1fe`. Real-phone owner acceptance pending; no tunnel, live-provider or production acceptance. |
 | Shared browser, runnable artifacts, unrestricted extensions, anonymous sharing | Deferred pending a security design. |
+
+### Planned follow-on design work (not implementation authorization)
+
+These are **planned, unimplemented and undeployed** items. They are separate from the numbered phone
+milestone. Nothing here authorizes configuration changes to a live service or public exposure.
+
+1. **Alternative owner-authenticated Tailscale/tailnet access** —
+   [specification](specs/tailnet-owner-access.md). Keep current Cloudflare Access mode intact. A
+   tailnet connection, node membership, IP address or client-supplied identity header is not proof of
+   owner identity. Before implementation, a security/design review must choose and approve the exact
+   owner identity proof, trust boundary, configuration, revocation and fail-closed behavior. Required
+   tests include non-owner tailnet member denial, forged-header/direct-backend refusal, provider
+   separation, route/terminal-WebSocket parity, and disposable deployment-boundary checks.
+2. **Isolated preview of an already-running terminal dev server** —
+   [pending design](specs/terminal-preview-design.md). This means a server already started by the
+   owner in an existing terminal session, not a disposable package-manager/server manager. No server
+   launch, preview endpoint, port forwarding, tunnel or other implementation is authorized. A
+   separate advisor/security review must resolve process binding, distinct-origin and cookie
+   isolation, owner authentication, network/backend isolation, revocation and hostile-server behavior.
+   Planned acceptance covers auth-before-upstream, exact session/process binding, origin and
+   websocket escape prevention, cleanup/restart, hostile responses, and disposable production-like
+   security tests. Until that review, Pilot does not serve active terminal preview content.
+
+Both designs remain `planned` and must not be labeled locally implemented or released. Cloudflare
+Access remains the existing hosted identity path; tailnet membership alone never grants Pilot owner
+access.
 
 ### Next manual owner checks
 

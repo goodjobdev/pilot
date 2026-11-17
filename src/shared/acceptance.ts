@@ -720,10 +720,19 @@ function fence(text: string): string {
 }
 function block(text: string): string {
   const marker = fence(text);
-  return marker + '\n' + text.replace(/\n$/, '') + '\n' + marker;
+  return marker + '\n' + text + (text.endsWith('\n') ? '' : '\n') + marker;
+}
+/** Inline code uses a delimiter longer than every run in the value, so data cannot end the span. */
+function inlineCode(text: string): string {
+  let longest = 0;
+  for (const match of text.matchAll(/`+/g)) longest = Math.max(longest, match[0].length);
+  const marker = '`'.repeat(longest + 1);
+  const padded = text.startsWith('`') || text.endsWith('`') ||
+    (text.length > 1 && text.startsWith(' ') && text.endsWith(' ') && !/^ +$/.test(text));
+  return marker + (padded ? ' ' : '') + text + (padded ? ' ' : '') + marker;
 }
 function actorLabel(actor: AcceptanceActor): string {
-  return actor.kind + ' `' + actor.identity + '`';
+  return actor.kind + ' ' + inlineCode(actor.identity);
 }
 
 /**
@@ -739,26 +748,28 @@ function actorLabel(actor: AcceptanceActor): string {
 export function acceptanceMarkdown(record: CompletionRecord, acceptance: AcceptanceRecord | null = null): string {
   const lines: string[] = [];
   lines.push('# Completion record ' + record.id, '');
+  lines.push('> **Unverified evidence claims.** Pilot validates internal consistency, but does not independently verify that commands ran, output came from them, the diff matches the artifact, or a recorded review occurred.');
+  lines.push('> **Provenance:** this record format does not record an authenticated evidence submitter; any reviewer identity and verdict below are submitted claims, not authenticated review proof.');
   lines.push('> Written by Pilot from the durable completion record. The control store is authoritative;');
   lines.push('> this file is its rendering, and recording the same evidence again rewrites it.', '');
   lines.push('| Field | Value |', '|---|---|');
-  lines.push('| Project | `' + record.projectId + '` |');
-  lines.push('| Session | ' + (record.sessionId === null ? 'none' : '`' + record.sessionId + '`') + ' |');
-  lines.push('| Work | ' + record.subject.kind + ' `' + record.subject.id + '` |');
-  lines.push('| Artifact revision | `' + record.artifact.revision + '` |');
-  lines.push('| Commit | ' + (record.artifact.commit === null ? 'not committed' : '`' + record.artifact.commit + '`') + ' |');
-  lines.push('| Produced at | ' + record.producedAt + ' |');
+  lines.push('| Project | ' + inlineCode(record.projectId) + ' |');
+  lines.push('| Session | ' + (record.sessionId === null ? 'none' : inlineCode(record.sessionId)) + ' |');
+  lines.push('| Work | ' + record.subject.kind + ' ' + inlineCode(record.subject.id) + ' |');
+  lines.push('| Artifact revision | ' + inlineCode(record.artifact.revision) + ' |');
+  lines.push('| Commit | ' + (record.artifact.commit === null ? 'not committed' : inlineCode(record.artifact.commit)) + ' |');
+  lines.push('| Produced at | ' + inlineCode(record.producedAt) + ' |');
   lines.push('| Frozen | yes — the record is written once and has no update path |', '');
   lines.push('## Commands run', '');
-  record.commands.forEach((command, index) => lines.push((index + 1) + '. `' + command + '`'));
+  record.commands.forEach((command, index) => lines.push((index + 1) + '. ' + inlineCode(command)));
   lines.push('', '## Diff', '');
   lines.push('- Files: ' + record.diff.files);
   lines.push('- Lines: +' + record.diff.linesAdded + ' / -' + record.diff.linesRemoved);
-  lines.push('- Full diff: ' + (record.diff.text === null ? 'by reference — `' + record.diff.reference + '`' : 'inlined below'), '');
+  lines.push('- Full diff: ' + (record.diff.text === null ? 'by reference — ' + inlineCode(record.diff.reference!) : 'inlined below'), '');
   if (record.diff.text !== null) lines.push(block(record.diff.text), '');
   lines.push('## Test evidence', '');
   for (const test of record.tests) {
-    lines.push('### `' + test.command + '`', '');
+    lines.push('### ' + inlineCode(test.command), '');
     lines.push('- Outcome: ' + test.outcome);
     if (test.counts !== null) lines.push('- Counts (read from the recorded output): ' + test.counts.passed + ' passed, ' + test.counts.failed + ' failed, ' + test.counts.skipped + ' skipped');
     else lines.push('- Counts: not asserted — ' + String(test.absenceReason) + ' — ' + (ACCEPTANCE_ABSENCE_DETAILS as Record<string, string>)[String(test.absenceReason)]);
@@ -769,20 +780,21 @@ export function acceptanceMarkdown(record: CompletionRecord, acceptance: Accepta
   if (record.review === null) lines.push('No review verdict is recorded for this evidence.', '');
   else {
     lines.push('- Verdict: ' + record.review.verdict + ' by ' + actorLabel(record.review.reviewer) + ' at ' + record.review.at);
-    lines.push('- Note: ' + (record.review.note === null ? 'none' : record.review.note), '');
+    if (record.review.note === null) lines.push('- Note: none', '');
+    else lines.push('- Note:', '', block(record.review.note), '');
   }
   lines.push('## Acceptance', '');
   if (acceptance === null) lines.push('No acceptance is recorded for this evidence.', '');
   else {
-    lines.push('- Accepted artifact: revision `' + acceptance.artifact.revision + '`, commit ' + (acceptance.artifact.commit === null ? 'not committed' : '`' + acceptance.artifact.commit + '`'));
+    lines.push('- Accepted artifact: revision ' + inlineCode(acceptance.artifact.revision) + ', commit ' + (acceptance.artifact.commit === null ? 'not committed' : inlineCode(acceptance.artifact.commit)));
     lines.push('- Accepted by: ' + actorLabel({ kind: acceptance.acceptedBy.kind, identity: acceptance.acceptedBy.identity }) + ' at ' + acceptance.acceptedAt);
     lines.push('- Action class: ' + acceptance.actionClass);
     lines.push('- Policy: revision ' + acceptance.policy.revision + (acceptance.policy.recorded ? '' : ' (the documented default, not a stored row)') + ', mode ' + acceptance.policy.mode + ', ' + acceptance.actionClass + '=' + acceptance.policy.classDecision);
-    lines.push('- Rule that permitted it: ' + (acceptance.acceptedBy.policyRule === null ? 'the owner decides, so no rule was needed' : '`' + acceptance.acceptedBy.policyRule + '`'));
-    lines.push('- Single use: yes — acceptance `' + acceptance.id + '` is the only one for this evidence');
+    lines.push('- Rule that permitted it: ' + (acceptance.acceptedBy.policyRule === null ? 'the owner decides, so no rule was needed' : inlineCode(acceptance.acceptedBy.policyRule)));
+    lines.push('- Single use: yes — acceptance ' + inlineCode(acceptance.id) + ' is the only one for this evidence');
     lines.push('');
   }
-  const rendered = lines.join('\n').replace(/\n{3,}/g, '\n\n');
+  const rendered = lines.join('\n');
   return rendered.endsWith('\n') ? rendered : rendered + '\n';
 }
 

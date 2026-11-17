@@ -30,7 +30,7 @@ test('the bound and the default thinking level are stored, revision-checked and 
   await assert.rejects(()=>s.update({revision:1,settings:{preferences:{maxModelTurns:10,maxOutputTokens:8000,defaultThinking:null},capabilities:{codingTools:true,shell:true,fileEdit:true}}}),(error:Error)=>error instanceof HttpError&&error.status===409);
   assert.equal(await s.maxModelTurns(),300,'the conflict left the stored value alone');
   await assert.rejects(()=>s.update({revision:2,settings:{preferences:{maxModelTurns:MAX_MODEL_TURNS_CEILING+1,maxOutputTokens:8000,defaultThinking:null},capabilities:{codingTools:true,shell:true,fileEdit:true}}}));
-  await assert.rejects(()=>s.update({revision:2,settings:{preferences:{maxModelTurns:0,maxOutputTokens:8000,defaultThinking:null},capabilities:{codingTools:true,shell:true,fileEdit:true}}}));
+  await assert.rejects(()=>s.update({revision:2,settings:{preferences:{maxModelTurns:-1,maxOutputTokens:8000,defaultThinking:null},capabilities:{codingTools:true,shell:true,fileEdit:true}}}));
   await assert.rejects(()=>s.update({revision:2,settings:{preferences:{maxModelTurns:5,maxOutputTokens:8000,defaultThinking:'enormous'},capabilities:{codingTools:true,shell:true,fileEdit:true}}}));
   assert.equal(await s.maxModelTurns(),300,'a refused write changed nothing');
   // The output bound is bounded in the same way, and the ceiling is refused rather than clamped.

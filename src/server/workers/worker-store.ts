@@ -422,12 +422,21 @@ export class WorkerStore {
    * error: an unreadable store must not turn a worker conversation into a session.
    */
   isWorkerConversation(projectId: unknown, conversationId: unknown): boolean {
+    return this.runForConversation(projectId, conversationId) !== null;
+  }
+
+  /** Resolve the exact durable run, refusing duplicate conversation bindings rather than guessing. */
+  runForConversation(projectId: unknown, conversationId: unknown): string | null {
     const project = this.requireProject(projectId);
-    if (!Number.isInteger(conversationId) || (conversationId as number) < 1) return false;
+    if (!Number.isInteger(conversationId) || (conversationId as number) < 1) return null;
+    let run: string | null = null;
     for (const operation of this.operations(project, CONVERSATION_KIND)) {
-      if (this.decodeConversation(operation, project).binding.conversationId === conversationId) return true;
+      const binding = this.decodeConversation(operation, project).binding;
+      if (binding.conversationId !== conversationId) continue;
+      if (run !== null) throw new WorkerError('Multiple worker runs claim the same conversation', 'CORRUPT');
+      run = binding.runId;
     }
-    return false;
+    return run;
   }
 
   /** The durable conversation ids recorded for this project, sorted. Read-only. */

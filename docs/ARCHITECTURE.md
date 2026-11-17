@@ -17,21 +17,34 @@ Three surfaces over one project's own files, plus derived state that can be rebu
    The SQLite index, the canvas layout, the alert subscriptions, the agent sessions and the
    named-session registry are derived or working state. Deleting them loses convenience, never
    documentation.
-2. **Writes are revision-checked.** A client sends the revision it read; a mismatch is a
-   conflict that preserves the draft. The application never overwrites a newer file.
-3. **Paths are contained.** Every read and write resolves through one containment helper that
-   refuses absolute paths, `..`, and symlinks. Generated folders (`node_modules`, `dist`, …)
+2. **Writes use revision checks, not filesystem compare-and-swap.** A client sends the
+   revision it read; a detected mismatch is a conflict that preserves the draft. An external
+   writer can still change a file after the final check and before replacement, so these checks
+   do not guarantee that a newer external edit cannot be overwritten.
+3. **Filesystem access is path-specific, not globally contained.** Generated folders (`node_modules`, `dist`, …)
    and app-managed paths are excluded from ordinary browsing. The canonical plan has an
    explicit, schema-validated Wiki bridge; source snapshots retain their existing read-only
-   source-reference route. Reads and writes are size-capped.
-4. **The agent harness is the execution surface for models.** No HTTP route runs a command and
-   there is no general file API: a model reaches a file only through a tool, and every tool resolves
-   its paths through the same containment helper, so a registered project root is the boundary for
-   question/note, documentation/planning and coding tools alike. The coding tools are installed only
-   when the instance switches them on, are offered to an agent only when its allowlist grants the
-   matching scope, and are documented as what they are: `read` and `write` stay inside the
-   connected worktree, the shell is not contained and reaches everything the application user can
-   reach. See [Coding tools](specs/coding-tools.md).
+   source-reference route. Ordinary Wiki document body and allowlisted image/static-mockup asset
+   reads use a Linux `/proc` descriptor-relative bounded reader and fail closed when that backend
+   is unavailable; those reads have no pathname fallback. The canonical plan's board-backed Wiki
+   bridge uses a separate pathname-based read. Linux document listing uses descriptor-pinned
+   procfs traversal with no pathname fallback, streamed enumeration and explicit depth/work budgets;
+   budget exhaustion fails unavailable rather than returning a partial list. Ordinary exclusive
+   document creation also pins directories, with no pathname fallback; failures after opening a new
+   file report an uncertain outcome for manual reconciliation, not automatic retry or deletion.
+   Subsequent history operations, board, write/revision-recheck, workspace, source-snapshot, import
+   and other paths remain unresolved and may use pathname operations. These narrow backends do not
+   establish trusted root identity, immutable files, mount or hardlink enforcement, or same-UID
+   isolation; pinned parents may be renamed. This is not whole-app containment.
+4. **Model execution stays in the agent harness.** There is no general-purpose HTTP command
+   endpoint or general file API. An optional owner-facing interactive terminal is a separate,
+   owner-authenticated WebSocket session; it is off unless `DASHBOARD_TERMINAL=on`, and its shell is
+   not contained. A model reaches a file only through a tool, and every tool resolves
+   its paths through project path checks. Those checks are not atomic with subsequent file operations
+   and do not isolate concurrent processes. The coding tools are installed only when the instance
+   switches them on and are offered to an agent only when its allowlist grants the matching scope.
+   `read` and `write` check paths against the connected worktree; the shell is not contained and
+   reaches everything the application user can reach. See [Coding tools](specs/coding-tools.md).
    Planning tools reuse the documentation and revision-checked board stores; see
    [Agent planning tools](PLANNING-TOOLS.md). Repository
    setup is a separate fixed-operation provisioning path (keygen, access check, clone and
@@ -104,6 +117,19 @@ the agent's own choices).
   when the owning session is not marked uncertain. Uncertain lifecycle guards block model requests
   and tool execution for named and root conversations. Recovery can journal and terminalize a
   blocked scheduler task without making a model request.
+- **Reusable definitions.** With `DASHBOARD_REUSABLE_TOOLS=on` and the `reusable_tools` scope granted
+  to a bound named agent, that agent can durably define, list and invoke named JSON field
+  projections for its own project. A definition is data — a name, a revision and a bounded list of
+  field names — never code, a command, a URL or a credential, and invoking one copies selected
+  fields from a bounded JSON object. Definitions are stored as revisioned operations in the control
+  store under a per-agent scope, so a stale revision writes nothing, and admission rechecks the
+  agent's current versioned authority inside the same transaction. Existing conversations acquire
+  the tools on enablement or on a later grant, while an explicit owner removal is preserved; an
+  unbound owner dispatch and a fork session cannot use them. Both mutation and invocation are
+  replay-unsafe, so an interrupted call is never re-run automatically. Input and output are capped,
+  and numbers must be safe integer literals because JavaScript would otherwise round them silently.
+  This is not arbitrary tool creation, code execution or Cloudflare MCP Code Mode; inputs and results
+  can appear in the transcript. See [Reusable JSON tools](specs/reusable-json-tools.md).
 - **Resumption.** Opening a harness can resume unfinished work from its checkpoint only when the
   uncertainty guards permit it. An uncertain interruption is not automatically continued. The
   owner must review the conversation and project files, then acknowledge only after the exact
@@ -279,6 +305,13 @@ store cannot be opened, or its schema version is not the one the release manifes
 names, the start fails closed: the message names the cause, the lock is released, the exit is
 non-zero and nothing serves. Readiness asks that live handle, so it describes the database this
 process is actually using instead of opening a second connection beside it.
+
+A fresh control database is initialized privately and atomically hard-linked into place; this requires
+filesystem support for hard links. A missing main file with a remaining SQLite sidecar is refused,
+not replaced. A process crash can leave `.control-init-*` staging files or journals: do not remove
+these while any initializer could be active; investigate and preserve evidence for offline recovery.
+This protects cooperating first-open processes, not same-UID pathname races or power-loss durability
+of the directory entry.
 
 Before anything listens, startup also reads the durable **promotion history** from that store: when a
 promotion is recorded and the identity this build runs as is not the promoted candidate — or the

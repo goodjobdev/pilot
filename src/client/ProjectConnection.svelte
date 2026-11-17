@@ -1,5 +1,6 @@
 <script lang="ts">
  import {onMount} from 'svelte';
+ import {showModalWithFocusReturn} from './modal-focus';
  import {request} from './api';
  import type {Project} from '../shared/model';
  import type {RepositoryConnection} from '../shared/settings';
@@ -7,7 +8,7 @@
  let dialog:HTMLDialogElement,connection=$state<RepositoryConnection|null>(null),busy=$state(false),problem=$state(''),message=$state(''),confirmed=$state(false);
  const base=$derived('/projects/'+project.id+'/repository');
  const settingsUrl=$derived(/^https:\/\/github\.com\/[a-zA-Z0-9-]+\/[a-zA-Z0-9_.-]+(?:\.git)?$/.test(project.repository)?project.repository.replace(/\.git$/,'')+'/settings/keys':/^git@github\.com:[a-zA-Z0-9-]+\/[a-zA-Z0-9_.-]+$/.test(project.repository)?'https://github.com/'+project.repository.slice(15).replace(/\.git$/,'')+'/settings/keys':null);
- onMount(()=>{dialog.showModal();void action(async()=>{connection=await request(base);});});
+ onMount(()=>{const close=showModalWithFocusReturn(dialog);void action(async()=>{connection=await request(base);});return close;});
  async function action(work:()=>Promise<void>){busy=true;problem='';message='';try{await work();}catch(e){problem=(e as Error).message;}finally{busy=false;}}
  async function generate(){await action(async()=>{connection=await request(base+'/key','POST',{});});}
  async function copy(){try{await navigator.clipboard.writeText(connection?.publicKey??'');message='Public key copied.';}catch{message='Select and copy the public key below.';}}
@@ -18,8 +19,8 @@
   await action(async()=>{connection=await request(base+'/key','DELETE',{});message='Key removed from Pilot. Revoke it in GitHub as well.';});
  }
 </script>
-<dialog bind:this={dialog} oncancel={e=>{if(busy)e.preventDefault();else onclose();}} class="project-connection">
- <header class="modal-head"><div><span class="eyebrow">PROJECT SETTINGS</span><h2>Repository &amp; deploy key</h2></div><button aria-label="Close project connection" onclick={onclose} disabled={busy}>×</button></header>
+<dialog bind:this={dialog} oncancel={e=>{if(busy)e.preventDefault();else onclose();}} class="project-connection" aria-labelledby="project-connection-title">
+ <header class="modal-head"><div><span class="eyebrow">PROJECT SETTINGS</span><h2 id="project-connection-title">Repository &amp; deploy key</h2></div><button aria-label="Close project connection" onclick={onclose} disabled={busy}>×</button></header>
  <p><strong>{project.name}</strong><br><code>{project.repository||'No repository URL on this project. Add a new managed project with its GitHub URL.'}</code></p>
  <p class="muted">Pilot creates one Ed25519 key per project. The private key stays on the server, outside project files and ordinary backups. Only the public key is displayed.</p>
  {#if connection?.publicKey}

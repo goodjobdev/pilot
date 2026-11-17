@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { lstat, mkdir, readFile } from 'node:fs/promises';
-import { dirname,relative,sep } from 'node:path';
+import { dirname,relative,resolve,sep } from 'node:path';
 import { canonicalJson, type ControlScope } from '../../shared/control-state';
 import { ControlStore, ControlStoreError } from './control-store';
 import { atomicWrite } from '../board-store';
@@ -67,7 +67,8 @@ export type FileEditRecord = {
   readonly agentId: string | null;
   readonly path: string;
   readonly mode: FileEditMode;
-  readonly applied: boolean;
+  /** True only with a durable write receipt; null means an auto-apply intent may or may not have written. */
+  readonly applied: boolean | null;
   readonly created: boolean;
   readonly bytes: number;
   readonly diff: string;
@@ -78,7 +79,7 @@ export type FileEditRecord = {
 };
 
 /** What one edit answers with: the durable record, and whether a file was really written. */
-export type FileEditOutcome = { readonly record: FileEditRecord; readonly written: boolean; readonly commit?:SaveCommit };
+export type FileEditOutcome = { readonly record: FileEditRecord; readonly written: boolean; readonly reused?: true; readonly commit?:SaveCommit };
 
 /** The read side: the mode in force, whether the tool is enabled, and every recorded change. */
 export type FileEditView = {
@@ -108,6 +109,8 @@ export interface FileEditCapability {
     readonly content: string;
     readonly mode?: FileEditMode | null;
     readonly signal?: AbortSignal;
+    /** Internal harness authority recheck, never supplied by model or HTTP input. */
+    readonly authorize?: () => Promise<void>;
     readonly actor: { readonly kind: 'owner' | 'agent'; readonly identity: string };
   }): Promise<FileEditOutcome>;
 }
@@ -124,14 +127,17 @@ export type FileEditToolOptions = {
    */
   readonly dataRoot?: string;
   /** The acceptance policy in force: the one owner switch that decides the mode. */
-  readonly policy: { readonly mode: () => FileEditMode | Promise<FileEditMode> };
+  readonly policy: { readonly mode: () => FileEditMode | Promise<FileEditMode>; readonly snapshot?:()=>{readonly mode:FileEditMode;readonly revision:number}|Promise<{readonly mode:FileEditMode;readonly revision:number}> };
   readonly clock?: () => Date;
   readonly id?: () => string;
   readonly saveMarkdown?: (projectId:string,path:string,write:()=>Promise<void>)=>Promise<SaveCommit>;
+  /** Test-only pause after the temporary file is synced but before authority is rechecked. */
+  readonly beforeFileCommit?: () => Promise<void>;
 };
 
 const OPERATION_KIND = 'agent.file-edit';
 const OUTBOX_KIND = 'agent.file-edit-record';
+const CONFIRMED_KIND = 'agent.file-edit-confirmed';
 const OWNER_BUCKET = 'owner';
 const identifierPattern = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$/;
 
@@ -247,6 +253,7 @@ function lineOps(before: string[], after: string[]): LineOp[] {
  * --------------------------------------------------------------------------------------------- */
 
 export class FileEditTool implements FileEditCapability {
+  private readonly tails=new Map<string,Promise<unknown>>();
   private readonly clock: () => Date;
   private readonly id: () => string;
   constructor(private readonly store: ControlStore, private readonly options: FileEditToolOptions) {
@@ -290,15 +297,17 @@ export class FileEditTool implements FileEditCapability {
    * the size cap. Only then is a diff computed, the change recorded, and — in auto-apply — the file
    * written atomically. A refusal writes nothing at all.
    */
-  async edit(input: {
-    readonly projectId: string;
-    readonly agentId: string | null;
-    readonly path: string;
-    readonly content: string;
-    readonly mode?: FileEditMode | null;
-    readonly signal?: AbortSignal;
-    readonly actor: { readonly kind: 'owner' | 'agent'; readonly identity: string };
-  }): Promise<FileEditOutcome> {
+  async edit(input: Parameters<FileEditCapability['edit']>[0]): Promise<FileEditOutcome> {
+    const root=typeof input?.projectId==='string'?this.options.projectRoot(input.projectId):undefined;
+    // Cooperating calls through this instance serialize on the resolved target. This does not lock
+    // other processes or prevent same-user path replacement.
+    const key=root!==undefined&&typeof input?.path==='string'?resolve(root,input.path):String(input?.projectId)+'\0'+String(input?.path);
+    const previous=this.tails.get(key)??Promise.resolve();
+    const current=previous.catch(()=>{}).then(()=>this.editSerial(input));this.tails.set(key,current);
+    try{return await current;}finally{if(this.tails.get(key)===current)this.tails.delete(key);}
+  }
+
+  private async editSerial(input: Parameters<FileEditCapability['edit']>[0]): Promise<FileEditOutcome> {
     if (!this.options.enabled)
       throw new FileEditError('The file-edit tool is disabled on this instance, so no file is proposed or written', 'UNAVAILABLE');
     const projectId = requireIdentifier(input?.projectId, 'projectId');
@@ -315,7 +324,12 @@ export class FileEditTool implements FileEditCapability {
     const contentBytes = byteLength(content);
     if (contentBytes > FILE_EDIT_MAX_FILE_BYTES)
       throw new FileEditError('The change is ' + contentBytes + ' bytes, which is over the ' + FILE_EDIT_MAX_FILE_BYTES + '-byte cap for one file; nothing was written', 'BOUNDED');
-    const mode = await this.resolveMode(input?.mode ?? null);
+    const policySnapshot=this.options.policy.snapshot?await this.options.policy.snapshot():{mode:await this.mode(),revision:undefined};
+    const mode = await this.resolveMode(input?.mode ?? null,policySnapshot.mode);
+    const verifyPolicy=async()=>{
+      const current=this.options.policy.snapshot?await this.options.policy.snapshot():{mode:await this.mode(),revision:undefined};
+      if(current.mode!=='auto-apply'||current.revision!==policySnapshot.revision)throw new FileEditError('The file-edit policy changed before the write.','NOT_PERMITTED');
+    };
 
     const root = this.options.projectRoot(projectId);
     if (root === undefined)
@@ -326,27 +340,50 @@ export class FileEditTool implements FileEditCapability {
       throw new FileEditError('That path resolves inside the application\u2019s own '+state+', which this tool never writes to; nothing was written', 'OUTSIDE_WORKTREE');
 
     const before = await this.readExisting(file);
-    const diff = unifiedDiff(before, content);
+    const diff = unifiedDiff(before ?? '', content);
+    input.signal?.throwIfAborted(); await input.authorize?.();
     input.signal?.throwIfAborted();
     const record = this.materialize({ projectId, agentId, path: rawPath, mode, content, before, diff, actor });
     const existing = this.byKey(projectId, agentId, record.id);
-    if (existing !== null) return Object.freeze({ record: existing, written: false });
+    if (existing !== null) return Object.freeze({ record: existing, written: false, reused:true as const });
 
-    // The record is written before the file is, so a crash between the two leaves evidence of a change
-    // that was proposed and never applied — which is exactly what the record says — rather than a
-    // changed file nothing accounts for.
-    this.write(record);
+    // An auto-apply intent is durable before the effect, but it cannot claim a write happened.
+    // Duplicate intents never replay, even if a prior result was interrupted or lost.
+    if(!this.write(record)) {
+      const prior=this.byKey(projectId,agentId,record.id);
+      if(!prior)throw storage('The file-edit intent could not be inspected; do not retry automatically.');
+      return Object.freeze({record:prior,written:false,reused:true as const});
+    }
     let commit:SaveCommit|undefined;
     if (mode === 'auto-apply') {
-      const write=async()=>{input.signal?.throwIfAborted();if(await this.readExisting(file)!==before)throw new FileEditError('The file changed while this edit waited; review it before trying again','CONFLICT');await mkdir(dirname(file), { recursive: true, mode: 0o755 });input.signal?.throwIfAborted();await atomicWrite(file, content);};
+      let writeInvoked=false,writeCompleted=false;
+      const write=async()=>{
+        if(writeInvoked)throw new FileEditError('The file write callback was invoked more than once; inspect the file before retrying.','CONFLICT');
+        writeInvoked=true;input.signal?.throwIfAborted();
+        if(await this.readExisting(file)!==before)throw new FileEditError('The file changed while this edit waited; review it before trying again','CONFLICT');
+        await mkdir(dirname(file), { recursive: true, mode: 0o755 });
+        await input.authorize?.();
+        await verifyPolicy();
+        await input.authorize?.();input.signal?.throwIfAborted();
+        await atomicWrite(file,content,async()=>{
+          await this.options.beforeFileCommit?.();
+          input.signal?.throwIfAborted();await input.authorize?.();
+          await verifyPolicy();
+          if(await this.readExisting(file)!==before)throw new FileEditError('The file changed while this edit waited; review it before trying again','CONFLICT');
+          await input.authorize?.();input.signal?.throwIfAborted();
+        });writeCompleted=true;
+      };
       if(this.options.saveMarkdown&&isMarkdownPath(rawPath))commit=await this.options.saveMarkdown(projectId,rawPath,write);else await write();
+      if(!writeCompleted)throw new FileEditError('The file write could not be confirmed; inspect the intent and file before retrying.','STORAGE');
+      if(input.signal?.aborted)return Object.freeze({record,written:true,...(commit?{commit}:{})});
+      try { this.confirm(record); return Object.freeze({record:Object.freeze({...record,applied:true}),written:true,...(commit?{commit}:{})}); }
+      catch { return Object.freeze({record,written:true,...(commit?{commit}:{})}); }
     }
-    return Object.freeze({ record, written: mode === 'auto-apply',...(commit?{commit}:{}) });
+    return Object.freeze({ record, written:false });
   }
 
   /** The mode one request leaves in force: the request's own, or the policy's, and never a widening. */
-  private async resolveMode(requested: FileEditMode | null): Promise<FileEditMode> {
-    const inForce = await this.mode();
+  private async resolveMode(requested: FileEditMode | null,inForce:FileEditMode): Promise<FileEditMode> {
     if (requested === null) return inForce;
     if (requested !== 'propose-only' && requested !== 'auto-apply')
       throw new FileEditError('mode must be propose-only or auto-apply', 'INVALID');
@@ -407,7 +444,7 @@ export class FileEditTool implements FileEditCapability {
     const target = root.replace(/\/+$/, '') + '/';
     return candidate === root || candidate.startsWith(target);
   }
-  private async readExisting(file: string): Promise<string> {
+  private async readExisting(file: string): Promise<string | null> {
     try {
       const info = await lstat(file);
       if (info.size > FILE_EDIT_MAX_FILE_BYTES)
@@ -415,7 +452,7 @@ export class FileEditTool implements FileEditCapability {
       return await readFile(file, 'utf8');
     } catch (error) {
       if (error instanceof FileEditError) throw error;
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return '';
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
       throw new FileEditError('The existing file could not be read, so nothing was written', 'OUTSIDE_WORKTREE');
     }
   }
@@ -426,7 +463,7 @@ export class FileEditTool implements FileEditCapability {
     readonly path: string;
     readonly mode: FileEditMode;
     readonly content: string;
-    readonly before: string;
+    readonly before: string | null;
     readonly diff: { readonly text: string; readonly truncated: boolean };
     readonly actor: { readonly kind: 'owner' | 'agent'; readonly identity: string };
   }): FileEditRecord {
@@ -441,8 +478,8 @@ export class FileEditTool implements FileEditCapability {
       agentId: input.agentId,
       path: input.path,
       mode: input.mode,
-      applied: input.mode === 'auto-apply',
-      created: input.before === '',
+      applied: input.mode === 'auto-apply' ? null : false,
+      created: input.before === null,
       bytes: byteLength(input.content),
       diff: input.diff.text,
       diffBytes: byteLength(input.diff.text),
@@ -451,21 +488,26 @@ export class FileEditTool implements FileEditCapability {
       changedBy: Object.freeze({ kind: input.actor.kind, identity: input.actor.identity })
     }) as FileEditRecord;
   }
-  private write(record: FileEditRecord): void {
+  private write(record: FileEditRecord): boolean {
     const scope: ControlScope = { projectId: record.projectId, sessionId: record.agentId ?? OWNER_BUCKET };
     try {
-      this.store.admit({
+      const result=this.store.admit({
         scope,
         idempotencyKey: 'file-edit.' + record.id.slice(3),
         kind: OPERATION_KIND,
         input: record,
         outbox: { kind: OUTBOX_KIND, payload: { version: 1, editId: record.id, path: record.path, applied: record.applied } }
       });
+      return !result.existing;
     } catch (error) {
       if (error instanceof ControlStoreError && error.code === 'CONFLICT')
         throw new FileEditError('That change was already recorded with different content; nothing was written', 'CONFLICT');
       throw storage('The durable store refused the file-edit record: ' + (error as Error).message);
     }
+  }
+  private confirm(record:FileEditRecord):void {
+    const scope:ControlScope={projectId:record.projectId,sessionId:record.agentId??OWNER_BUCKET};
+    this.store.admit({scope,idempotencyKey:'file-edit-confirmed.'+record.id.slice(3),kind:CONFIRMED_KIND,input:{version:1,editId:record.id},outbox:{kind:CONFIRMED_KIND,payload:{version:1,editId:record.id}}});
   }
   private byKey(projectId: string, agentId: string | null, editId: string): FileEditRecord | null {
     const rows = this.rows(
@@ -492,7 +534,18 @@ export class FileEditTool implements FileEditCapability {
     for (const field of required) if (!(field in value)) throw storage('A stored file-edit record is missing ' + field);
     if (value.version !== 1 || value.projectId !== scope.projectId) throw storage('A stored file-edit record is outside its own scope');
     if (value.mode !== 'propose-only' && value.mode !== 'auto-apply') throw storage('A stored file-edit record names no known mode');
-    return Object.freeze(value) as unknown as FileEditRecord;
+    if(value.mode==='propose-only')return Object.freeze({...value,applied:false}) as unknown as FileEditRecord;
+    // Older versions wrote applied=true before writing the file. Without a new confirmation that is
+    // not evidence of success; preserve uncertainty rather than upgrading a legacy claim to fact.
+    const confirmed=this.rows('SELECT id FROM operations WHERE project_id=? AND session_id=? AND kind=? AND idempotency_key=? LIMIT 2',[scope.projectId,scope.sessionId,CONFIRMED_KIND,'file-edit-confirmed.'+String(value.id).slice(3)]);
+    if(confirmed.length>1)throw storage('The file-edit confirmation is ambiguous.');
+    if(confirmed.length===0)return Object.freeze({...value,applied:null}) as unknown as FileEditRecord;
+    const op=this.store.getOperation(String(confirmed[0].id),scope), receipt=op.input as {version?:unknown;editId?:unknown}|null;
+    const outboxes=this.rows('SELECT id FROM outboxes WHERE operation_id=? LIMIT 2',[op.id]);
+    if(op.kind!==CONFIRMED_KIND||!receipt||receipt.version!==1||receipt.editId!==value.id||outboxes.length!==1)throw storage('The file-edit confirmation is corrupt.');
+    const out=this.store.getOutbox(String(outboxes[0].id),scope), payload=out.payload as {version?:unknown;editId?:unknown}|null;
+    if(out.kind!==CONFIRMED_KIND||!payload||payload.version!==1||payload.editId!==value.id)throw storage('The file-edit confirmation is corrupt.');
+    return Object.freeze({...value,applied:true}) as unknown as FileEditRecord;
   }
   private rows(sql: string, params: (string | number)[]): Record<string, unknown>[] {
     try {

@@ -1,5 +1,6 @@
 <script lang="ts">
  import {onMount} from 'svelte';
+ import {showModalWithFocusReturn} from './modal-focus';
  import {api,ApiError} from './api';
  import type {WorkerView} from './api';
  import {modelKey} from '../shared/settings';
@@ -19,12 +20,12 @@
  let name=$state(''),choice=$state(''),scopes=$state<string[]>(['read_notes']);
  let problem=$state(''),message=$state(''),busy=$state(false);
  onMount(()=>{
-  dialog.showModal();
+  const close=showModalWithFocusReturn(dialog);
   void load();
   // Bounded refresh while the dialog is open: it also picks up a changed canonical report, so an
   // integrity warning is visible without a reload. The server reads at most the newest 20 reports.
   const timer=setInterval(()=>void load(true),2000);
-  return ()=>clearInterval(timer);
+  return ()=>{close();clearInterval(timer);};
  });
  async function load(quiet=false){
   try{
@@ -79,11 +80,12 @@
  function activeRun():WorkerRun|null{return (view?.runs??[]).find(run=>run.state==='running')??null;}
 </script>
 
-<dialog bind:this={dialog} oncancel={onclose} class="workers">
- <header class="modal-head"><div><span class="eyebrow">BOUNDED WORKERS</span><h2>Workers</h2></div><button aria-label="Close workers" onclick={onclose}>×</button></header>
+<dialog bind:this={dialog} oncancel={onclose} class="workers" aria-labelledby="workers-title">
+ <header class="modal-head"><div><span class="eyebrow">BOUNDED WORKERS</span><h2 id="workers-title">Workers</h2></div><button aria-label="Close workers" onclick={onclose}>×</button></header>
  <p class="muted">Only the owner creates a worker. Its model is pinned from the allowed worker set, its scopes are default-deny, and one run at a time uses the application harness. Reports are untrusted evidence and are never accepted automatically.</p>
  {#if view}
   <p class="limits" aria-label="Worker limits">Limits: {view.limits.maxLiveWorkersPerProject} live workers per project · {view.limits.maxActiveRunsPerProject} active run · {view.limits.maxModelTurnsPerRun} model turns · {view.limits.maxOutputTokensPerTurn} output tokens per turn</p>
+  <p class="limits">The output cap is requested from the provider, not a spending guarantee. Worker requests are not counted against a named agent's budget.</p>
   <p class="muted">This project has {view.liveWorkers} live worker{view.liveWorkers===1?'':'s'}.</p>
  {/if}
  {#if problem}<p class="problem" role="alert">{problem}</p>{/if}

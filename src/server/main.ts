@@ -1,4 +1,6 @@
 import { createServer } from 'node:http';
+import { WebSocketServer } from 'ws';
+import type { Duplex } from 'node:stream';
 import { createConnection } from 'node:net';
 import { constants,writeSync } from 'node:fs';
 import { access,lstat,mkdir,readFile,realpath } from 'node:fs/promises';
@@ -7,7 +9,7 @@ import { previewImport,applyImport,documentsSchema,type ImportPreview } from './
 import { safePath } from './paths';
 import { atomicWrite } from './board-store';
 import { z } from 'zod';
-import { join,resolve,extname } from 'node:path';
+import { join,resolve,extname,dirname } from 'node:path';
 import { fileURLToPath,pathToFileURL } from 'node:url';
 import { BoardStore,HttpError } from './board-store';
 import { DocStore } from './docs-store';
@@ -16,7 +18,9 @@ import { writeWorkerReport } from './workers/report';
 import { PLAN_PATH } from '../shared/workspace';
 import { isMarkdownPath } from '../shared/docs';
 import { HarnessHost,type AgentDeliveryPort,type AgentImage,type SessionLifecycleHooks } from './agents/harness-host';
-import { MEDIA_CONTAINER_CODE, MediaContainerError, MediaStore } from './media-store';
+import { TerminalService } from './agents/terminal-service';
+import { acceptAgentEvidence, verifyAgentAcceptanceDispatch } from './agents/accept-evidence';
+import { MEDIA_CONTAINER_CODE, MediaContainerError, MediaReadUnavailableError, MediaStore } from './media-store';
 import { AlertStore,type AlertPayload,type AlertTransport } from './alerts';
 import { Catalog } from './catalog';
 import { ProviderStore } from './providers';
@@ -24,13 +28,14 @@ import { RepositoryStore,type RepositoryCommand } from './repositories';
 import { ATTACHMENT_MAX_BYTES,AttachmentStore,type StoredAttachment } from './attachments';
 import { HarnessSettingsStore } from './harness-settings-store';
 import { RemoteStore } from './remote';
-import { browse,within } from './paths';
+import { approvedDirectory,browse,within } from './paths';
 import { authorize,headers,establishSession,type SecurityConfig } from './security';
 import { effectiveConfig } from './effective-config';
 import { ACCEPTANCE_FAUX_WORKER_DELAY_MAX_MS, acceptanceFauxWorkerDelayFromEnvironment, resolveNoteDelaySeams } from './agent-test-seams';
+import { BoundedFileReadError,readBoundedFile } from './bounded-file-read';
 import { acquireServiceLock,inspectServiceLock,type ServiceLockHandle } from './service-lock';
 import { loadReleaseManifest,observeStorageSchema,resolveRelease,schemaVersionForId,SUPPORTED_SCHEMA_IDS,RELEASE_MANIFEST_ENV,RELEASE_MANIFEST_FILENAME,UNRELEASED_LOCAL,type StorageSchemaObservation } from './release';
-import { ControlStore,CONTROL_SCHEMA_VERSION } from './state/control-store';
+import { ControlStore,ControlStoreError,CONTROL_SCHEMA_VERSION } from './state/control-store';
 import { ReleaseStore } from './state/release-store';
 import { matchReleaseIdentity,type ReleaseDifference,type ReleaseTarget } from '../shared/releases';
 import { ApprovalStore } from './state/approval-store';
@@ -39,12 +44,35 @@ import { SessionRegistry,createSessionResourcePort,legacyConversationPort,migrat
 import { SessionLifecycleStore,SessionLifecycleService,adoptRunningSessions } from './state/session-lifecycle';
 import { QueueStore,type QueueImageResolver,type QueueResult } from './state/queue-store';
 import { RunnerBroker,createProjectWorkspaceResolver,dockerRunnerPort,type RunnerPort } from './state/runner-broker';
+import { acceptedActionHistory,ActionHistoryCursorError } from './state/accepted-action-history';
+import { AcceptedActionReviewStore,ActionReviewConflict,ACTION_OBSERVATIONS } from './state/accepted-action-review';
 import { RunnerError } from '../shared/runner';
 import { AcceptanceError, parseAcceptanceActor, type AcceptanceActor } from '../shared/acceptance';
 import { AcceptanceStore } from './state/acceptance-store';
+import { AcceptedActionExecutor } from './state/accepted-action';
+import { ActionTargetStore } from './state/action-target-store';
+import { AcceptedCommitService } from './agents/accepted-commit';
+import { AcceptedPushService } from './agents/accepted-push';
+import { LocalGitPushTransport, listLocalPushRemotes, resolveLocalPushRemote } from './state/local-git-push-transport';
+import { ROOT_CONVERSATION_ID } from '@earendil-works/pi-durable';
+import { SpendBudget } from './state/spend-budget';
+import { AcceptedProvisionService, ProvisionStore } from './agents/accepted-provision';
+import { AcceptedSpendService, HttpBillingTransport, readSpendBillingToken } from './agents/accepted-spend';
+import { PROVISION_TARGET_ID, SPEND_TARGET_ID, resolveProvisionConfiguration, resolveSpendConfiguration } from './agents/action-config';
+import { LocalReleaseStore } from './state/local-release-store';
+import { LocalReleaseError } from './agents/local-release';
+import { LocalDeployService } from './agents/local-deploy';
+import { LocalPublishService } from './agents/local-publish';
 import { FORK_ROOT_DIRECTORY, ForkStore, createForkWorktreePort, type ForkTranscriptPort } from './state/fork-store';
+import { ForkDispatchNotStarted } from './state/fork-dispatch-not-started';
+import { ForkActivityUncertain } from './state/fork-activity-uncertain';
 import { FORK_MAX_ENTRY_SCAN, ForkError } from '../shared/forks';
 import { AgentStore } from './state/agent-store';
+import { LocalTestRunner } from './state/local-test-runner';
+import { localTestPort } from './agents/local-test-dispatch';
+import { ReusableToolStore } from './state/reusable-tools';
+import { CloudflareConnectionStore } from './state/cloudflare-connection-store';
+import { AgentBudgetLedger, AgentBudgetExceeded } from './state/agent-budget';
 import { WorkerModelPolicyStore } from './state/model-policy-store';
 import { WorkerService, WorkerStore, type WorkerStoreOptions } from './workers/worker-store';
 import { harnessWorkerPort } from './workers/harness-port';
@@ -86,7 +114,25 @@ export type ReleasePromotionObservation =
   | {readonly state:'unreadable';readonly reason:string};
 /** What the running service reports about itself, and the one read-only seam that answers for promotion. */
 export interface ReleaseReportOptions {readonly version:string;readonly source:'manifest'|'unreleased-local';readonly buildId?:string;readonly sourceDigest?:string;readonly observe:()=>ReleasePromotionObservation}
-export interface AppOptions {repositoryCommand?:RepositoryCommand;maxModelTurns?:number;harnessSettings?:HarnessSettingsStore;coding?:{readonly enabled?:boolean;readonly shell?:boolean};dataRoot:string;browseRoots:string[];security:SecurityConfig;allowedHosts?:readonly string[];clientRoot?:string;registry?:string;agents?:'on'|'off';agentPauseMs?:number;recordNoteDelayMs?:number;recordNoteAfterWriteMs?:number;recordNoteStarted?:()=>void;readNotesSeam?:{delayMs?:number;onExecute?:()=>void};alertTransport?:AlertTransport;alertSubject?:string;alertCooldownMs?:number;readiness?:ReadinessOptions;control?:ControlStore;runner?:{readonly enabled?:boolean;readonly port?:RunnerPort};fileEdit?:{readonly enabled?:boolean};release?:ReleaseReportOptions;workerOpenDelayMs?:number;acceptanceFauxWorkerDelayMs?:number;onModelRequest?:(input:{provider:string;modelId:string;maxTokens:number})=>void;workerProbe?:{tool:string;args:Record<string,unknown>};workerProbeDelayMs?:number;workerGuard?:(input:{projectId:string;runId:string;tool:string})=>string|null;workerRequestGuard?:(input:{projectId:string;runId:string})=>string|null;onWorkerGuard?:(input:{tool:string;refusal:string|null})=>void}
+export interface AppOptions {reusableTools?:boolean;agentEvidenceRecording?:boolean;repositoryCommand?:RepositoryCommand;maxModelTurns?:number;harnessSettings?:HarnessSettingsStore;coding?:{readonly enabled?:boolean;readonly shell?:boolean};provision?:{readonly enabled?:boolean;readonly root?:string};spend?:{readonly enabled?:boolean;readonly endpoint?:string;readonly accountId?:string;readonly currency?:string;readonly projectCapMinor?:number;readonly chargeCapMinor?:number;readonly timeoutMs?:number};dataRoot:string;browseRoots:string[];security:SecurityConfig;allowedHosts?:readonly string[];clientRoot?:string;registry?:string;agents?:'on'|'off';agentPauseMs?:number;recordNoteDelayMs?:number;recordNoteAfterWriteMs?:number;recordNoteStarted?:()=>void;readNotesSeam?:{delayMs?:number;onExecute?:()=>void};alertTransport?:AlertTransport;alertSubject?:string;alertCooldownMs?:number;readiness?:ReadinessOptions;control?:ControlStore;runner?:{readonly enabled?:boolean;readonly port?:RunnerPort};fileEdit?:{readonly enabled?:boolean};localTests?:{readonly enabled?:boolean};acceptedCommit?:{readonly enabled?:boolean};acceptedPush?:{readonly enabled?:boolean};deploy?:{readonly enabled?:boolean};publish?:{readonly enabled?:boolean};cloudflareConnection?:{readonly enabled?:boolean};release?:ReleaseReportOptions;terminal?:{readonly enabled?:boolean};workerOpenDelayMs?:number;acceptanceFauxWorkerDelayMs?:number;onModelRequest?:(input:{provider:string;modelId:string;maxTokens:number})=>void;workerProbe?:{tool:string;args:Record<string,unknown>};workerProbeDelayMs?:number;workerGuard?:(input:{projectId:string;runId:string;tool:string})=>string|null;workerRequestGuard?:(input:{projectId:string;runId:string})=>string|null;onWorkerGuard?:(input:{tool:string;refusal:string|null})=>void}
+
+/**
+ * The Cloudflare connection store's own refusals, in the store's own words. A stale revision is a
+ * conflict that wrote nothing, an enable without a credential or a malformed record is an invalid
+ * request, and every storage, permission or corruption fault is an unavailable capability rather
+ * than a partial success. The store never puts a token, account id or script name in a message, and
+ * the fixed reason thrown below says nothing more than the store did.
+ */
+function cloudflareConnectionFailure(error:unknown):never {
+  if(error instanceof HttpError)throw error;
+  const message=error instanceof Error?error.message:'';
+  if(message==='Cloudflare connection revision conflict.')throw new HttpError(409,message);
+  if(message==='A credential is required to enable a Cloudflare connection.')throw new HttpError(422,message);
+  if(message==='Invalid Cloudflare connection configuration.')throw new HttpError(422,message);
+  if(message==='Only the owner may configure a Cloudflare connection.')throw new HttpError(403,message);
+  console.error('Cloudflare connection storage failure: '+(message||'unknown error'));
+  throw new HttpError(503,'The Cloudflare connection storage is unavailable or corrupt on this instance. Nothing was read or written.');
+}
 /**
  * Approvals answer with a status that says what happened: an invalid request is 422, an approval
  * outside the caller's scope is 403, a missing one is 404, a storage fault is 500, and every
@@ -252,6 +298,16 @@ export function fileEditHttpStatus(code:FileEditError['code']):number {
   if(code==='UNAVAILABLE')return 503;
   if(code==='CONFLICT')return 409;
   if(code==='CORRUPT'||code==='STORAGE')return 500;
+  return 422;
+}
+/** The local release capabilities' own refusals. A destination outside the approved roots is a permission refusal. */
+export function localReleaseHttpStatus(code:LocalReleaseError['code']):number {
+  if(code==='NOT_FOUND')return 404;
+  if(code==='REFUSED')return 403;
+  if(code==='BOUNDED')return 413;
+  if(code==='UNAVAILABLE')return 503;
+  if(code==='CONFLICT')return 409;
+  if(code==='STORAGE')return 500;
   return 422;
 }
 export function forkHttpStatus(code:ForkError['code']):number {
@@ -484,6 +540,14 @@ export async function createApp(options:AppOptions){
   // stored bytes. It validates and processes (decode, orient, resize, re-encode) with the documented
   // ImageProcessor the pinned packages ship; see docs/MEDIA.md for the rules and the honest limits.
   const media=new MediaStore(options.dataRoot);
+  const readMedia=async(id:string)=>{
+    try { return await media.get(id); }
+    catch(error) {
+      if(error instanceof MediaReadUnavailableError)
+        throw new HttpError(503,'Media reads are unavailable because the required Linux descriptor-pinned backend could not complete the read.','media-read-unavailable');
+      throw error;
+    }
+  };
   // Attachments are written into the project's connected worktree and nothing else.
   const attachments=new AttachmentStore(projectId=>{const found=catalog.projects.find(candidate=>candidate.id===projectId);return found===undefined?undefined:repositories.worktreePath(found);});
   const providers=new ProviderStore(catalog.root),repositories=new RepositoryStore(catalog.root,options.repositoryCommand);
@@ -511,8 +575,142 @@ export async function createApp(options:AppOptions){
   // registry is deployment-level state over the same control store; the harness is created before it,
   // so the two holders below are read at call time rather than captured at construction.
   const agentHolder:{store?:AgentStore}={};
-  const fileEditModeHolder:{mode:()=>FileEditMode}={mode:()=>'propose-only'};
+  /** The installed local test runner, created after the agent registry the harness is built before. */
+  const localTestHolder:{runner?:LocalTestRunner}={};
+  const agentBudgets=options.control?new AgentBudgetLedger(options.control):undefined;
+  const forkHolder:{store?:ForkStore}={};
+  const assertForkDispatchable=(projectId:string,sessionId:string)=>{
+    if(options.control&&!forkHolder.store)throw new HttpError(503,'Fork state is not ready; no work was admitted.');
+    try { forkHolder.store?.assertCreationDispatchable(projectId,sessionId); }
+    catch (error) { if(error instanceof ForkError)throw new HttpError(forkHttpStatus(error.code),error.message);throw error; }
+    const fork=forkHolder.store?.read(projectId,sessionId);
+    if(fork&&fork.state!=='active')throw new HttpError(409,'This fork is not active; no work was admitted.');
+  };
+  const reusableTools=options.control&&(options.reusableTools??process.env.DASHBOARD_REUSABLE_TOOLS==='on') ? new ReusableToolStore(options.control) : undefined;
+  const checkReusableAuthority=(input:{projectId:string;sessionId:string;agentId:string;expectedAuthority:string})=>{
+    assertForkDispatchable(input.projectId,input.sessionId);
+    if(forkHolder.store?.read(input.projectId,input.sessionId))throw new HttpError(403,'Reusable definitions are unavailable in forks.');
+    const store=agentHolder.store;
+    if(!store||!options.control||!store.usesControlStore(options.control))throw new HttpError(403,'Reusable authority unavailable.');
+    const binding=store.binding(input.projectId,input.sessionId);
+    const authority=store.versionedAuthorityForSession(input);
+    if(!binding||binding.agentId!==input.agentId||authority.agentId!==input.agentId||authority.scopes===null||!authority.scopes.includes('reusable_tools')||(authority.projects!==null&&!authority.projects.includes(input.projectId))||JSON.stringify(authority)!==input.expectedAuthority)throw new HttpError(403,'Reusable authority changed.');
+  };
+  const acceptance=options.control?new AcceptanceStore(options.control,{projectRoot:(projectId:string)=>catalog.projects.find(candidate=>candidate.id===projectId)?.path}):undefined;
+  const actionTargets=options.control?new ActionTargetStore(options.control):undefined;
+  const localRelease=options.control?new LocalReleaseStore(options.control):undefined;
+  /**
+   * The two installed consequential adapters, both default off and both needing an owner-configured
+   * target. The configuration comes from the deployment (or an explicit host option, which is what a
+   * test uses); a switch that is on without a usable target refuses startup rather than installing a
+   * tool whose honest answer would be "there is nothing to act on".
+   *
+   * Provisioning writes only under one approved root. That root must be a real directory outside the
+   * data root and outside every registered project, so the resource the model can create can never
+   * contain Pilot's own store, credentials or a project tree.
+   */
+  const provisionEnabled=options.provision?.enabled??process.env.DASHBOARD_PROVISION_ACTIONS==='on';
+  const spendEnabled=options.spend?.enabled??process.env.DASHBOARD_SPEND_ACTIONS==='on';
+  const provisionConfiguration=await resolveProvisionConfiguration({
+    enabled:provisionEnabled,
+    configured:options.provision?.root??process.env.DASHBOARD_PROVISION_ROOT,
+    hasControlStore:options.control!==undefined,
+    dataRoot:options.dataRoot,
+    projectRoots:catalog.projects.map(project=>project.path)
+  });
+  const spendTarget=await resolveSpendConfiguration({
+    enabled:spendEnabled,
+    hasControlStore:options.control!==undefined,
+    endpoint:options.spend?.endpoint??process.env.DASHBOARD_SPEND_BILLING_URL,
+    accountId:options.spend?.accountId??process.env.DASHBOARD_SPEND_ACCOUNT_ID,
+    currency:options.spend?.currency??process.env.DASHBOARD_SPEND_CURRENCY,
+    projectCapMinor:options.spend?.projectCapMinor??process.env.DASHBOARD_SPEND_PROJECT_CAP_MINOR,
+    chargeCapMinor:options.spend?.chargeCapMinor??process.env.DASHBOARD_SPEND_CHARGE_CAP_MINOR,
+    timeoutMs:options.spend?.timeoutMs??process.env.DASHBOARD_SPEND_TIMEOUT_MS
+  });
+  // Fail fast on an unusable credential: installing a spend tool whose first charge is certain not to
+  // be sent would report `unknown` and consume the project cap for nothing. A credential that becomes
+  // unusable later is still an uncertain outcome, and that limitation is documented.
+  if(spendTarget!==undefined)await readSpendBillingToken(options.dataRoot);
+  const spendConfiguration=options.control===undefined||spendTarget===undefined?undefined:{
+    ...spendTarget,
+    budget:new SpendBudget(options.control,{projectCapMinor:spendTarget.projectCapMinor,chargeCapMinor:spendTarget.chargeCapMinor}),
+    transport:new HttpBillingTransport({endpoint:spendTarget.endpoint,accountId:spendTarget.accountId,token:()=>readSpendBillingToken(options.dataRoot),timeoutMs:spendTarget.timeoutMs})
+  };
+  const acceptedActionExecutor=options.control&&(provisionConfiguration!==undefined||spendConfiguration!==undefined)?new AcceptedActionExecutor(options.control):undefined;
+  const provisionServices=new Map<string,AcceptedProvisionService>(), spendServices=new Map<string,AcceptedSpendService>();
+  const provisionFor=(projectId:string)=>{
+    const existing=provisionServices.get(projectId);if(existing)return existing;
+    if(!provisionConfiguration||!acceptance||!acceptedActionExecutor)throw new HttpError(503,'Provisioning is not configured on this instance.');
+    const root=provisionConfiguration.root;
+    const service=new AcceptedProvisionService({projectId,targetId:PROVISION_TARGET_ID,targetRevision:1,root,store:new ProvisionStore({root,targetId:PROVISION_TARGET_ID}),acceptance,executor:acceptedActionExecutor});
+    provisionServices.set(projectId,service);return service;
+  };
+  const spendFor=(projectId:string)=>{
+    const existing=spendServices.get(projectId);if(existing)return existing;
+    if(!spendConfiguration||!acceptance||!acceptedActionExecutor)throw new HttpError(503,'Spending is not configured on this instance.');
+    const service=new AcceptedSpendService({projectId,targetId:SPEND_TARGET_ID,targetRevision:1,endpoint:spendConfiguration.endpoint,accountId:spendConfiguration.accountId,currency:spendConfiguration.currency,acceptance,executor:acceptedActionExecutor,budget:spendConfiguration.budget,transport:spendConfiguration.transport});
+    spendServices.set(projectId,service);return service;
+  };
+  const actionReviews=options.control?new AcceptedActionReviewStore(options.control):undefined;
+  // Agent commit and push are installed capabilities, each behind its own default-off deployment
+  // switch. A configured target or a granted scope never installs them, and installing them never
+  // widens a scope: the tools exist only where the switch is on, the agent's allowlist names the
+  // scope, and the acceptance policy still decides whether the class may be accepted at all.
+  const acceptedCommitEnabled=options.acceptedCommit?.enabled??process.env.DASHBOARD_AGENT_COMMIT==='on';
+  const acceptedPushEnabled=options.acceptedPush?.enabled??process.env.DASHBOARD_AGENT_PUSH==='on';
+  const acceptedExecutor=options.control?new AcceptedActionExecutor(options.control):undefined;
+  // The push adapter can reach one owner-configured *local* repository and no network transport.
+  const pushTransport=acceptedPushEnabled&&options.control?new LocalGitPushTransport({projectFor:projectId=>{
+    const found=catalog.projects.find(candidate=>candidate.id===projectId);
+    return found!==undefined&&repositories.isConnected(found)?found:undefined;
+  }}):undefined;
+  // The trusted session/target check every accepted action re-reads before and around its effect: the
+  // target must still be the enabled revision that was configured, the session must be one of this
+  // project's own sessions (or its root conversation), and a named agent must be bound to it.
+  const acceptedTargetCurrent=async(projectId:string,sessionId:string,targetId:string,revision:number):Promise<boolean>=>{
+    if(!actionTargets)return false;
+    try{
+      const target=actionTargets.read(projectId,targetId);
+      if(!target||!target.enabled||target.revision!==revision)return false;
+      if(!sessionHolder.sessions?.has(projectId,sessionId)&&sessionId!==String(ROOT_CONVERSATION_ID))return false;
+      return (agentHolder.store?.binding(projectId,sessionId)??null)!==null;
+    }catch{return false;}
+  };
+  /** The one owner-configured commit target of a project, read at call time rather than captured. */
+  const acceptedCommitService=(projectId:string)=>{
+    if(!acceptedExecutor||!acceptance||!actionTargets)throw new Error('The accepted commit capability is unavailable on this instance.');
+    const project=catalog.projects.find(candidate=>candidate.id===projectId);
+    if(!project||!repositories.isConnected(project))throw new Error('This project has no connected repository worktree, so no commit target applies.');
+    const configured=actionTargets.read(project.id,'pilot-commit');
+    if(!configured||configured.definition.kind!=='commit')throw new Error('No commit target is configured for this project.');
+    return new AcceptedCommitService({project,targetId:'pilot-commit',targetRevision:configured.revision,workspace,acceptance,executor:acceptedExecutor,targets:actionTargets,targetCurrent:acceptedTargetCurrent});
+  };
+  /** The one owner-configured push target of a project, read at call time rather than captured. */
+  const acceptedPushService=(projectId:string)=>{
+    if(!acceptedExecutor||!acceptance||!actionTargets||!pushTransport)throw new Error('The accepted push capability is unavailable on this instance.');
+    if(!catalog.projects.some(candidate=>candidate.id===projectId))throw new Error('The project is unavailable.');
+    const configured=actionTargets.read(projectId,'pilot-push');
+    if(!configured||configured.definition.kind!=='push')throw new Error('No push target is configured for this project.');
+    return new AcceptedPushService({projectId,targetId:'pilot-push',targetRevision:configured.revision,targets:actionTargets,acceptance,executor:acceptedExecutor,transport:pushTransport,targetCurrent:acceptedTargetCurrent});
+  };
+  const acceptedCommitTools=acceptedCommitEnabled&&acceptedExecutor!==undefined&&acceptance!==undefined&&actionTargets!==undefined?{
+    preview:(input:Parameters<AcceptedCommitService['preview']>[0])=>acceptedCommitService(input.projectId).preview(input),
+    commit:(input:Parameters<AcceptedCommitService['commit']>[0])=>acceptedCommitService(input.projectId).commit(input)
+  }:undefined;
+  const acceptedPushTools=acceptedPushEnabled&&pushTransport!==undefined&&acceptedExecutor!==undefined&&acceptance!==undefined&&actionTargets!==undefined?{
+    preview:(input:Parameters<AcceptedPushService['preview']>[0])=>acceptedPushService(input.projectId).preview(input),
+    push:(input:Parameters<AcceptedPushService['push']>[0])=>acceptedPushService(input.projectId).push(input)
+  }:undefined;
+  const fileEditModeHolder:{snapshot:()=>{mode:FileEditMode;revision:number}}={snapshot:()=>({mode:'propose-only',revision:0})};
   const fileEditEnabled=options.fileEdit?.enabled??process.env.DASHBOARD_FILE_EDIT==='on';
+  const terminalEnabled=options.terminal?.enabled??process.env.DASHBOARD_TERMINAL==='on';
+  const terminal=terminalEnabled?new TerminalService():undefined;
+  // The two local release capabilities are opt-in per instance. Each switch decides whether its tool
+  // exists at all; the agent scope still decides who may call it, and the acceptance policy decides
+  // whether an agent's own acceptance authorizes the effect. Default off.
+  const deployEnabled=options.deploy?.enabled??process.env.DASHBOARD_DEPLOY==='on';
+  const publishEnabled=options.publish?.enabled??process.env.DASHBOARD_PUBLISH==='on';
   // The coding tools are opt-in per instance, and the shell has its own switch: a build that offers
   // `read` and `write` does not thereby offer arbitrary commands. `DASHBOARD_SHELL=on` without
   // coding tools enables nothing, because a shell with no worktree root is refused instead of run.
@@ -525,6 +723,12 @@ export async function createApp(options:AppOptions){
   })();
   const codingToolsEnabled=options.coding?.enabled??process.env.DASHBOARD_CODING_TOOLS==='on';
   const shellEnabled=codingToolsEnabled&&(options.coding?.shell??process.env.DASHBOARD_SHELL==='on');
+  // Default-off: the Cloudflare connection route refuses every method before opening a store.
+  const cloudflareConnectionEnabled=options.cloudflareConnection?.enabled??process.env.DASHBOARD_CLOUDFLARE_CONNECTION==='on';
+  // Default-off. The switch installs the `run_tests` tool only together with a durable control store
+  // and the agent registry; the tool runs the fixed `node --test` recipe as the application user and
+  // is not a sandbox. docs/RUNNER.md states exactly what it can reach.
+  const localTestRunnerEnabled=options.localTests?.enabled??process.env.DASHBOARD_TEST_RUNNER==='on';
   /**
    * The owner's harness settings: the turn bound and the default thinking level, and a disable-only
    * word on each capability. The deployment flags above stay the ceiling; this can only narrow them.
@@ -538,23 +742,62 @@ export async function createApp(options:AppOptions){
     projectRoot:(projectId:string)=>catalog.projects.find(candidate=>candidate.id===projectId)?.path,
     dataRoot:options.dataRoot,
     // The mode comes from the acceptance policy in force, never from an assumption.
-    policy:{mode:()=>fileEditModeHolder.mode()},
+    policy:{mode:()=>fileEditModeHolder.snapshot().mode,snapshot:()=>fileEditModeHolder.snapshot()},
     saveMarkdown:async(projectId,path,write)=>(await workspace.save(catalog.get(projectId),[path],async()=>{await write();return {};})).commit
+  }):undefined;
+  // Local release destinations are owner-configured and local filesystem targets only. The services
+  // perform a real staged copy and atomic swap; both recheck the destination, the exact content and
+  // the accepting authority at admission and again immediately before the effect. They are installed
+  // only when their switch is on, so a build without them has no such tool and no such scope tool.
+  const releaseSessionGate=(projectId:string,sessionId:string)=>{
+    assertForkDispatchable(projectId,sessionId);
+    if(forkHolder.store?.read(projectId,sessionId))throw new HttpError(403,'Local deploy and publish are unavailable in a fork: they would write a parent-owned target.');
+  };
+  const localDeploy=localRelease&&acceptance&&deployEnabled?new LocalDeployService({
+    store:localRelease,acceptance,executor:new AcceptedActionExecutor(options.control!),
+    projectRoot:(projectId:string)=>catalog.projects.find(candidate=>candidate.id===projectId)?.path,
+    approvedRoots:options.browseRoots,sessionGate:releaseSessionGate
+  }):undefined;
+  const localPublish=localRelease&&acceptance&&publishEnabled?new LocalPublishService({
+    store:localRelease,acceptance,executor:new AcceptedActionExecutor(options.control!),
+    projectRoot:(projectId:string)=>catalog.projects.find(candidate=>candidate.id===projectId)?.path,
+    approvedRoots:options.browseRoots,sessionGate:releaseSessionGate
   }):undefined;
   // The durable worker conversation lookup. The harness is constructed before the worker store, so
   // the holder is read at call time and a store failure is treated as "worker" (fail closed).
   const workerHolder:{store?:WorkerStore}={};
+  // Awaited provider and tool work share the fork lifecycle fence; this is not process containment.
+  const withForkActivity=async<T>(projectId:string,sessionId:string,work:()=>Promise<T>):Promise<T>=>{
+    if(options.control&&!forkHolder.store)throw new HttpError(503,'Fork state is not ready; the activity was not started.');
+    try{return forkHolder.store?await forkHolder.store.withToolFence(projectId,sessionId,work):await work();}
+    catch(error){if(error instanceof ForkError)throw new HttpError(forkHttpStatus(error.code),error.message);throw error;}
+  };
   // The agent harness is the only execution surface. It is off unless the instance enables it explicitly.
-  const agents=new HarnessHost({
+  const agents:HarnessHost=new HarnessHost({
     dataRoot:options.dataRoot,providers,delivery,lifecycle:lifecycleHooks, docs, boards, workspace,projectGate:assertProjectAvailable,maxModelTurns,
-    allowedCapabilities:()=>harnessSettings.view().then(view=>({codingTools:view.effective.capabilities.codingTools.enabled,shell:view.effective.capabilities.shell.enabled,fileEdit:view.effective.capabilities.fileEdit.enabled})),
+    sessionGate:assertForkDispatchable,
+    withSessionTool:withForkActivity,
+    withSessionProvider:withForkActivity,
+    currentMaxModelTurns:()=>harnessSettings.maxModelTurns(),
+    allowedCapabilities:()=>harnessSettings.view().then(view=>({codingTools:view.effective.capabilities.codingTools.enabled,shell:view.effective.capabilities.shell.enabled,fileEdit:view.effective.capabilities.fileEdit.enabled,revision:view.revision})),
     defaultThinking:()=>harnessSettings.defaultThinking(),
     maxOutputTokens:()=>harnessSettings.maxOutputTokens(),
     sessionModel:async(projectId,sessionId)=>{if(!sessions)return null;try{return sessions.read(projectId,sessionId).model ?? null;}catch{return null;}},
     // The coding tools, with the two switches that decide whether they exist at all. `root` answers
     // only for a project whose repository is connected: without a worktree there is nothing to bind
     // a path to, so no coding tool is installed for that project.
-    coding:{enabled:codingToolsEnabled,shell:shellEnabled,root:id=>{const found=catalog.projects.find(candidate=>candidate.id===id);return found===undefined?undefined:repositories.worktreePath(found);}},
+    coding:{enabled:codingToolsEnabled,shell:shellEnabled,root:id=>{const found=catalog.projects.find(candidate=>candidate.id===id);return found===undefined?undefined:repositories.worktreePath(found);},
+      isFork:(projectId,sessionId)=>{if(options.control&&!forkHolder.store)throw new HttpError(503,'Fork state is not ready; the file edit was refused.');return forkHolder.store?.read(projectId,sessionId)!==null&&forkHolder.store!==undefined;},
+      sessionRoot:async(projectId,sessionId)=>{
+        if(options.control&&!forkHolder.store)throw new HttpError(503,'Fork state is not ready; the coding call was refused.');
+        const fork=forkHolder.store?.read(projectId,sessionId);
+        if(!fork){const project=catalog.get(projectId),root=repositories.worktreePath(project);if(!root)throw new HttpError(409,'The project has no connected worktree.');return root;}
+        if(fork.state!=='active')throw new HttpError(409,'This fork is not active; its coding tools are unavailable.');
+        const dataRoot=await realpath(options.dataRoot),parent=resolve(dataRoot,FORK_ROOT_DIRECTORY,projectId),path=resolve(fork.worktreePath);
+        if(dirname(path)!==parent)throw new HttpError(409,'The fork worktree path is outside its project fork root.');
+        for(const candidate of [resolve(dataRoot,FORK_ROOT_DIRECTORY),parent,path]){const info=await lstat(candidate);if(!info.isDirectory()||info.isSymbolicLink()||await realpath(candidate)!==candidate)throw new HttpError(409,'The fork worktree is not a real contained directory.');}
+        return path;
+      }},
     recovery:lifecycle?{read:(projectId,sessionId)=>{const record=lifecycle.read(projectId,sessionId);return {state:record.state,uncertain:record.uncertain,requestId:record.requestId};}}:undefined,
     enabled:(options.agents??(process.env.DASHBOARD_AGENTS==='on'?'on':'off'))==='on',
     pauseMs:options.agentPauseMs??Number(process.env.DASHBOARD_AGENT_PAUSE_MS??2500),
@@ -573,7 +816,55 @@ export async function createApp(options:AppOptions){
     // to, and its durable binding (written through this same store) decides the authority, so a
     // binding or scope change takes effect at the next dispatch with no restart. With no registry
     // open, the owner's own dispatch is in force and nothing is narrowed.
-    privileges:{authority:async({projectId,sessionId})=>agentHolder.store?agentHolder.store.authorityForSession({projectId,sessionId:sessionId??''}):Object.freeze({agentId:null,model:null,scopes:null,projects:null,emptyReason:null})},
+    privileges:{authority:async({projectId,sessionId})=>{
+      const store=agentHolder.store;
+      if(!store)return Object.freeze({agentId:null,model:null,scopes:null,projects:null,emptyReason:null});
+      // Read effective authority and revisions from one SQLite snapshot, including archived agents.
+      return store.versionedAuthorityForSession({projectId,sessionId:sessionId??''});
+    }},
+    agentRequestBudget:agentBudgets?async(projectId,sessionId)=>{
+      const store=agentHolder.store;
+      if(!store)throw new HttpError(503,'Agent budgets are unavailable; no provider request was sent.');
+      const authority=store.versionedAuthorityForSession({projectId,sessionId});
+      const signature=JSON.stringify(authority);
+      const assertAmbiguousSafe=()=>{
+        if(authority.agentId===null&&authority.scopes!==null&&authority.emptyReason===null&&store.forProject(projectId).some(agent=>agent.enabled&&!agent.archived&&Object.values(agent.budgets).some(value=>value!==null)))
+          throw new HttpError(409,'Several agents govern this session and a budget is configured; bind one agent before sending a provider request.');
+      };
+      assertAmbiguousSafe();
+      if(authority.agentId===null&&authority.scopes!==null&&authority.emptyReason!==null)
+        throw new HttpError(403,'The session has no active governing agent; no provider request was sent.');
+      if(authority.agentId===null){
+        return {maxOutputTokens:null,check:()=>{
+          if(JSON.stringify(store.versionedAuthorityForSession({projectId,sessionId}))!==signature)throw new HttpError(409,'Agent authority changed before the provider request.');
+          assertAmbiguousSafe();
+        }};
+      }
+      const agent=store.read(authority.agentId);
+      if(!agent.enabled||agent.archived)throw new HttpError(403,'The bound agent is disabled or archived; no provider request was sent.');
+      if(authority.projects!==null&&!authority.projects.includes(projectId))throw new HttpError(403,'The project is outside this dispatch’s project scope; no provider request was sent.');
+      let changed=false;
+      const check=()=>{
+        const current=store.read(agent.id);
+        if(current.revision!==agent.revision||!current.enabled||current.archived||JSON.stringify(store.versionedAuthorityForSession({projectId,sessionId}))!==signature){
+          changed=true; throw new HttpError(409,'Agent authority or budget changed before the provider request.');
+        }
+      };
+      if(!store.usesControlStore(options.control!))throw new HttpError(503,'Agent budget authority is unavailable; no provider request was sent.');
+      try {agentBudgets.reserve({agentId:agent.id,projectId,kind:'request',limit:agent.budgets.maxRequests,guard:check});}
+      catch(error){if(changed)throw new HttpError(409,'Agent authority or budget changed before the provider request.');if(error instanceof AgentBudgetExceeded)throw new HttpError(409,error.message);throw new HttpError(503,'The agent budget could not be reserved; no provider request was sent.');}
+      return {maxOutputTokens:agent.budgets.maxOutputTokens,check};
+    }:undefined,
+    // The installed `run_tests` capability, present only when the instance switch is on. The store,
+    // registry and runner are resolved at call time because they are created after this harness;
+    // `localTestPort` owns the authority, project-grant and rolling-hour budget enforcement.
+    localTests: localTestRunnerEnabled && options.control ? localTestPort({
+      control: () => options.control,
+      agents: () => agentHolder.store,
+      runner: () => localTestHolder.runner,
+      projectRoot: projectId => catalog.projects.find(candidate => candidate.id === projectId)?.path,
+      isFork: (projectId, sessionId) => forkHolder.store?.read(projectId, sessionId) !== null
+    }) : undefined,
     // The durable conversation binding port. It resolves the control-store holder at call time because
     // the registry is wired later in createApp; with no control store, writes fail closed rather than
     // claiming that an in-memory mapping is durable.
@@ -597,7 +888,57 @@ export async function createApp(options:AppOptions){
       }
     },
     fileEdit,
-    workerBinding:{isWorkerConversation:(projectId,conversationId)=>workerHolder.store?.isWorkerConversation(projectId,conversationId)??false},
+    ...(acceptedCommitTools?{acceptedCommitTools}:{}),
+    ...(acceptedPushTools?{acceptedPushTools}:{}),
+    ...(localDeploy?{localDeployTools:{preview:(input:Parameters<LocalDeployService['preview']>[0])=>localDeploy.preview(input),deploy:(input:Parameters<LocalDeployService['deploy']>[0])=>localDeploy.deploy(input)}}:{}),
+    ...(localPublish?{localPublishTools:{preview:(input:Parameters<LocalPublishService['preview']>[0])=>localPublish.preview(input),publish:(input:Parameters<LocalPublishService['publish']>[0])=>localPublish.publish(input)}}:{}),
+    ...(options.control?{forkTools:{
+      context:async(projectId:string,sessionId:string)=>{if(!forkHolder.store)throw new HttpError(503,'Fork state is not ready.');const view=await agents.sessionView(catalog.get(projectId),sessionId);if(!view)throw new HttpError(404,'Session is unavailable.');return view.entries.map(entry=>({id:String(entry.id)}));},
+      create:async(input:{projectId:string;parentSessionId:string;baseCommit:string;cutoffEntryId:number;target?:string})=>{if(!forkHolder.store)throw new HttpError(503,'Fork state is not ready.');return forkHolder.store.create(input);},
+      dispatch:async(input:{projectId:string;parentSessionId:string;childSessionId:string;invocationId:string;text:string})=>{if(!forkHolder.store)throw new HttpError(503,'Fork state is not ready.');return forkHolder.store.dispatchChild(input);}
+    }}:{}),
+    ...(reusableTools?{reusableTools:{
+      list:(input:Parameters<typeof checkReusableAuthority>[0])=>{checkReusableAuthority(input);return reusableTools.list(input.projectId,input.agentId);},
+      write:(input:Parameters<typeof checkReusableAuthority>[0]&{name:string;revision:number;fields:string[];signal?:AbortSignal})=>{input.signal?.throwIfAborted();return reusableTools.write({...input,guard:()=>{input.signal?.throwIfAborted();checkReusableAuthority(input);input.signal?.throwIfAborted();}});},
+      invoke:(input:Parameters<typeof checkReusableAuthority>[0]&{name:string;json:string})=>{checkReusableAuthority(input);return reusableTools.invoke(input.projectId,input.agentId,input.name,input.json);}
+    }}:{}),
+    ...(options.control?{acceptanceTools:{
+      read:(projectId:string,sessionId:string)=>{if(!acceptance)throw new HttpError(503,'Acceptance is unavailable');return acceptance.readProject({projectId,sessionId});},
+      ...(options.agentEvidenceRecording===true?{record:async(input:{projectId:string;sessionId:string;agentId:string;evidence:import('../shared/acceptance').CompletionRecordRequest;expectedAuthority:string;authorize:()=>Promise<void>;signal?:AbortSignal})=>{
+        input.signal?.throwIfAborted();
+        if(!acceptance)throw new HttpError(503,'Acceptance is unavailable');
+        if(input.evidence.sessionId!==input.sessionId||input.evidence.subject.kind!=='session'||input.evidence.subject.id!==input.sessionId)throw new HttpError(403,'Evidence must belong to this session.');
+        await input.authorize();input.signal?.throwIfAborted();
+        return acceptance.recordEvidence({projectId:input.projectId,evidence:input.evidence,signal:input.signal,authorizeAdmission:()=>{
+          assertForkDispatchable(input.projectId,input.sessionId);
+          if(forkHolder.store?.read(input.projectId,input.sessionId))throw new Error('Agent evidence cannot write the parent workspace from a fork.');
+          const store=agentHolder.store;
+          if(!store||!options.control||!store.usesControlStore(options.control)||!acceptance.usesControlStore(options.control))throw new Error('Evidence authority is unavailable on the admission connection.');
+          verifyAgentAcceptanceDispatch(store,input);
+        }});
+      }}:{}),
+      accept:async(input:{projectId:string;sessionId:string;evidenceId:string;artifact:import('../shared/acceptance').ArtifactIdentity;actionClass:import('../shared/acceptance').AcceptanceActionClass;agentId:string;expectedAuthority:string;authorize:()=>Promise<void>;signal?:AbortSignal})=>{
+        if(!acceptance)throw new HttpError(503,'Acceptance is unavailable');
+        return acceptAgentEvidence(acceptance,{...input,verifyAdmission:()=>{
+          assertForkDispatchable(input.projectId,input.sessionId);
+          if(forkHolder.store?.read(input.projectId,input.sessionId))throw new Error('Agent acceptance cannot write the parent workspace from a fork.');
+          const store=agentHolder.store;
+          if(!store||!options.control||!store.usesControlStore(options.control)||!acceptance.usesControlStore(options.control))throw new Error('Agent authority is unavailable on the admission connection.');
+          verifyAgentAcceptanceDispatch(store,input);
+        }});
+      }
+    }}:{}),
+    ...(provisionConfiguration?{acceptedProvisionTools:{
+      // One service per project: each project has its own target resource under the approved root.
+      preview:input=>provisionFor(input.projectId).preview(input),
+      provision:input=>provisionFor(input.projectId).provision(input)
+    }}:{}),
+    ...(spendConfiguration?{acceptedSpendTools:{
+      // One service per project: the caps are per project even though the billing target is shared.
+      preview:input=>spendFor(input.projectId).preview(input),
+      spend:input=>spendFor(input.projectId).spend(input)
+    }}:{}),
+    workerBinding:{isWorkerConversation:(projectId,conversationId)=>workerHolder.store?.isWorkerConversation(projectId,conversationId)??false,runForConversation:(projectId,conversationId)=>workerHolder.store?.runForConversation(projectId,conversationId)??null},
     workerOpenDelayMs:options.workerOpenDelayMs,
     acceptanceFauxWorkerDelayMs,
     onModelRequest:options.onModelRequest,
@@ -660,7 +1001,7 @@ export async function createApp(options:AppOptions){
     // Asked before a dispatching action writes anything, so an instance that cannot dispatch refuses
     // without claiming a revision. It performs no model work and opens no harness: opening one would
     // resume unfinished work, which is itself a model request.
-    authoriseDispatch:({projectId})=>{if(!agents.enabled)throw new HttpError(503,'Agents are disabled on this instance');assertProjectAvailable(projectId);catalog.get(projectId);},
+    authoriseDispatch:({projectId,sessionId})=>{if(!agents.enabled)throw new HttpError(503,'Agents are disabled on this instance');assertProjectAvailable(projectId);catalog.get(projectId);assertForkDispatchable(projectId,sessionId);},
     resume:async({projectId,sessionId,requestId})=>{if(!agents.enabled)throw new HttpError(503,'Agents are disabled on this instance');return agents.dispatchLifecycle(catalog.get(projectId),requestId,sessionId);},
     retry:async({projectId,sessionId,requestId})=>{if(!agents.enabled)throw new HttpError(503,'Agents are disabled on this instance');return agents.dispatchLifecycle(catalog.get(projectId),requestId,sessionId);},
     // A cancel on an instance with no harness has nothing to stop, so it is a harmless no-op; a
@@ -669,6 +1010,63 @@ export async function createApp(options:AppOptions){
   }):undefined;
   // Which projects already have a conversation, and what to call the adopted session.
   const legacy:LegacyConversationPort=legacyConversationPort({dataRoot:options.dataRoot,projects:async()=>catalog.projects.map(p=>({id:p.id,name:p.name,path:p.path}))});
+  /**
+   * The forks of this instance: a child transcript branched from a parent at one entry, a paused child
+   * session, and a child worktree created from a recorded commit.
+   *
+   * A fork needs the agent harness — it branches a transcript and reads the parent's entries — so with
+   * the harness off the store is absent rather than present-and-failing, exactly as the coding runner
+   * is when it is switched off. Nothing here opens a second persistence: a fork is one control-store
+   * operation per revision inside the child session's own scope.
+   *
+   * - `projectFolder` is the repository a child worktree is added to: the registered project's own
+   *   folder. A project this instance does not know has none, and the store refuses rather than guess.
+   * - `forkRootParent` is the designated fork root's parent inside the data root, so every child
+   *   worktree lives under this instance's own data and nowhere else.
+   * - the worktree port is the only git this build runs for a fork: one `git worktree add` from the
+   *   recorded commit, one `git worktree remove`, and one read of the child's own status. Hooks are
+   *   off, submodule recursion is off, no network command is ever issued, both file and external
+   *   protocols are refused, and no stash is created, read or applied anywhere.
+   * - the transcript port is the harness: the parent conversation, a bounded search for the cutoff
+   *   entry, Pi Durable's own `fork(at)` (which makes no model request) and — only for a fork the
+   *   store has already found active — one submission to the child under a stable request identity.
+   */
+  const forkTranscripts:ForkTranscriptPort={
+    parentSession:async({projectId,parentSessionId})=>{
+      const project=catalog.projects.find(candidate=>candidate.id===projectId);
+      return project!==undefined&&await agents.hasSession(project,parentSessionId);
+    },
+    hasEntry:async({projectId,parentSessionId,cutoffEntryId})=>{
+      const project=catalog.projects.find(candidate=>candidate.id===projectId);
+      if(project===undefined)return false;
+      return await agents.hasEntry(project,parentSessionId,cutoffEntryId,FORK_MAX_ENTRY_SCAN);
+    },
+    fork:async({projectId,parentSessionId,cutoffEntryId})=>{
+      const project=catalog.projects.find(candidate=>candidate.id===projectId);
+      if(project===undefined)throw new HttpError(404,'Unknown project');
+      return await agents.forkTranscript(project,parentSessionId,cutoffEntryId);
+    },
+    dispatch:async({projectId,childSessionId,requestId,text})=>{
+      const project=catalog.projects.find(candidate=>candidate.id===projectId);
+      if(project===undefined)throw new ForkDispatchNotStarted();
+      try { assertProjectAvailable(projectId); }
+      catch { throw new ForkDispatchNotStarted(); }
+      await agents.dispatchToSession(project,childSessionId,{requestId,text});
+    }
+  };
+  const forks=options.control&&agents.enabled&&sessions!==undefined?new ForkStore(options.control,{
+    projectFolder:(projectId:string)=>catalog.projects.find(candidate=>candidate.id===projectId)?.path,
+    forkRootParent:join(options.dataRoot,FORK_ROOT_DIRECTORY),
+    worktrees:createForkWorktreePort(),
+    transcripts:forkTranscripts,
+    sessions,
+    assertQuiescent:async(projectId,childSessionId)=>{
+      const view=await agents.sessionView(catalog.get(projectId),childSessionId);
+      if(!view||view.working||view.inbox.length>0)throw new HttpError(409,'Stop the fork and settle its queued input before discarding its worktree.');
+    }
+  }):undefined;
+  forkHolder.store=forks;
+
   // The start-time reconciliation of the delivery ledger: the read-only report plus the only acts
   // that report licenses. It runs before the server listens, so a row a crash left behind is
   // re-sent (and only where the stored payload proves the effect idempotent) before anything is
@@ -732,7 +1130,7 @@ export async function createApp(options:AppOptions){
   const queueImages:QueueImageResolver={resolve:async(ids)=>{
     const refs:QueueImageRef[]=[];
     for(const id of ids){
-      const stored=await media.get(id);
+      const stored=await readMedia(id);
       if(!stored)throw new HttpError(422,'An attached image is not in the media store. Remove it and send again.','unknown-media');
       const inspected=inspectImage(stored.bytes);
       if(!inspected)throw new HttpError(422,'A stored image could not be read back as an image. Remove it and send again.','unknown-media');
@@ -746,7 +1144,7 @@ export async function createApp(options:AppOptions){
       if(!agents.enabled)throw new HttpError(503,'Agents are disabled on this instance');
       const attached:AgentImage[]=[];
       for(const image of images){
-        const stored=await media.get(image.id);
+        const stored=await readMedia(image.id);
         if(!stored)throw new HttpError(422,'An attached image is not in the media store. Remove it and send again.','unknown-media');
         attached.push({mimeType:stored.mimeType,data:Buffer.from(stored.bytes).toString('base64')});
       }
@@ -755,79 +1153,17 @@ export async function createApp(options:AppOptions){
       return {requestId,entryId,submissionId:submission.submissionId,acceptedAt:new Date().toISOString()};
     }
   }):undefined;
-  /**
-   * The forks of this instance: a child transcript branched from a parent at one entry, a paused child
-   * session, and a child worktree created from a recorded commit.
-   *
-   * A fork needs the agent harness — it branches a transcript and reads the parent's entries — so with
-   * the harness off the store is absent rather than present-and-failing, exactly as the coding runner
-   * is when it is switched off. Nothing here opens a second persistence: a fork is one control-store
-   * operation per revision inside the child session's own scope.
-   *
-   * - `projectFolder` is the repository a child worktree is added to: the registered project's own
-   *   folder. A project this instance does not know has none, and the store refuses rather than guess.
-   * - `forkRootParent` is the designated fork root's parent inside the data root, so every child
-   *   worktree lives under this instance's own data and nowhere else.
-   * - the worktree port is the only git this build runs for a fork: one `git worktree add` from the
-   *   recorded commit, one `git worktree remove`, and one read of the child's own status. Hooks are
-   *   off, submodule recursion is off, no network command is ever issued, both file and external
-   *   protocols are refused, and no stash is created, read or applied anywhere.
-   * - the transcript port is the harness: the parent conversation, a bounded search for the cutoff
-   *   entry, Pi Durable's own `fork(at)` (which makes no model request) and — only for a fork the
-   *   store has already found active — one submission to the child under a stable request identity.
-   */
-  const forkTranscripts:ForkTranscriptPort={
-    parentSession:async({projectId,parentSessionId})=>{
-      const project=catalog.projects.find(candidate=>candidate.id===projectId);
-      return project!==undefined&&await agents.hasSession(project,parentSessionId);
-    },
-    hasEntry:async({projectId,parentSessionId,cutoffEntryId})=>{
-      const project=catalog.projects.find(candidate=>candidate.id===projectId);
-      if(project===undefined)return false;
-      return await agents.hasEntry(project,parentSessionId,cutoffEntryId,FORK_MAX_ENTRY_SCAN);
-    },
-    fork:async({projectId,parentSessionId,cutoffEntryId})=>{
-      const project=catalog.projects.find(candidate=>candidate.id===projectId);
-      if(project===undefined)throw new HttpError(404,'Unknown project');
-      return await agents.forkTranscript(project,parentSessionId,cutoffEntryId);
-    },
-    dispatch:async({projectId,childSessionId,requestId,text})=>{
-      const project=catalog.projects.find(candidate=>candidate.id===projectId);
-      if(project===undefined)throw new HttpError(404,'Unknown project');
-      assertProjectAvailable(projectId);
-      await agents.dispatchToSession(project,childSessionId,{requestId,text});
-    }
-  };
-  const forks=options.control&&agents.enabled&&sessions!==undefined?new ForkStore(options.control,{
-    projectFolder:(projectId:string)=>catalog.projects.find(candidate=>candidate.id===projectId)?.path,
-    forkRootParent:join(options.dataRoot,FORK_ROOT_DIRECTORY),
-    worktrees:createForkWorktreePort(),
-    transcripts:forkTranscripts,
-    sessions
-  }):undefined;
-  /**
-   * The bounded coding runner: one typed job per submission, run in a container created from
-   * deploy/runner/Dockerfile, under the documented containment. It is **disabled by default** behind
-   * an explicit switch (DASHBOARD_RUNNER=on), and while it is disabled its actions are absent from the
-   * offered registry rather than present-and-failing.
-   *
-   * - `createProjectWorkspaceResolver` turns a job's relative workspace reference into the one host
-   *   path a container may see, and refuses anything that is not an existing directory inside the
-   *   registered project's own root with no symlink in it.
-   * - `dockerRunnerPort` is the only execution path this build ships: it builds one `docker run`
-   *   command line with no network, a read-only root filesystem, a non-root user, all capabilities
-   *   dropped, no-new-privileges, no runtime socket, exactly one mount and hard limits. It refuses
-   *   every job when the runtime or the image is missing, and there is no fallback anywhere in this
-   *   build to running a job in this process, in the application container or on the host.
-   * - An injected port is for tests only: the unit suite never starts a container.
-   */
-  const runnerEnabled=options.runner?.enabled??process.env.DASHBOARD_RUNNER==='on';
+  /** The legacy Docker port cannot establish safe, identity-bound termination and is unavailable.
+   * Only a separately injected port (used by disposable tests) can activate the broker. The
+   * environment switch alone must not advertise an execution capability that cannot run. */
+  const runnerRequested=options.runner?.enabled??process.env.DASHBOARD_RUNNER==='on';
+  const runnerEnabled=runnerRequested&&options.runner?.port!==undefined;
   const runner=options.control&&runnerEnabled?new RunnerBroker(options.control,options.runner?.port??dockerRunnerPort({image:process.env.DASHBOARD_RUNNER_IMAGE,docker:process.env.DASHBOARD_RUNNER_DOCKER}),{
     workspace:createProjectWorkspaceResolver({projectRoot:projectId=>catalog.projects.find(candidate=>candidate.id===projectId)?.path}),
     projectKnown:projectId=>catalog.projects.some(candidate=>candidate.id===projectId)
   }):undefined;
-  if(runnerEnabled&&!options.control)console.error('The coding runner is enabled but no durable control store is open, so no job can be submitted; nothing was started.');
-  if(runner&&options.runner?.port===undefined&&!(process.env.DASHBOARD_RUNNER_IMAGE??'').trim())console.error('The coding runner is enabled but DASHBOARD_RUNNER_IMAGE is not set, so every job will be refused until it names the image built from deploy/runner/Dockerfile.');
+  if(runnerRequested&&!options.control)console.error('The coding runner was requested but no durable control store is open; nothing was started.');
+  if(runnerRequested&&options.runner?.port===undefined)console.error('The legacy Docker runner is unavailable: identity-bound termination and a wall-clock container bound are not established; nothing was started.');
   /**
    * The start-time reconciliation of the coding runner: a job a previous process left running is
    * settled from what the durable record proves — its recorded result when there is one, and otherwise
@@ -848,9 +1184,13 @@ export async function createApp(options:AppOptions){
    *   accept. `docs/ACCEPTANCE.md` states exactly what that does and does not prove.
    */
   const ownerActor:AcceptanceActor=Object.freeze({kind:'owner' as const,identity:options.security.mode==='hosted'?(options.security.owner??'owner'):'local'});
-  const acceptance=options.control?new AcceptanceStore(options.control,{
-    projectRoot:(projectId:string)=>catalog.projects.find(candidate=>candidate.id===projectId)?.path
-  }):undefined;
+  // An actor label in an owner-authenticated request is not proof that an agent acted. Preserve
+  // older clients' owner labels but derive the audit identity from the authenticated deployment.
+  const authenticatedOwnerActor=(declared:unknown):AcceptanceActor=>{
+    const actor=parseAcceptanceActor(declared,'the declared actor');
+    if(actor.kind!=='owner')throw new HttpError(403,'This owner interface cannot act as an agent.');
+    return ownerActor;
+  };
   /**
    * The agent registry: a durable, revision-checked record per agent, with an explicit scope
    * allowlist, a declared model this instance really offers, a workspace scope inside a registered
@@ -862,6 +1202,21 @@ export async function createApp(options:AppOptions){
     projectKnown:(projectId)=>catalog.projects.some(candidate=>candidate.id===projectId)
   }):undefined;
   agentHolder.store=agentStore;
+  /**
+   * The local test runner: one fixed `node --test` recipe in the registered project root, with a
+   * durable intent written before the process starts and a bounded receipt afterwards. It has no
+   * container, no cgroup limit and no sandbox: it runs as this application's user.
+   */
+  const localTestRunner=options.control?new LocalTestRunner(options.control):undefined;
+  localTestHolder.runner=localTestRunner;
+  if(localTestRunnerEnabled&&!options.control)console.error('The local test runner was requested but no durable control store is open; the run_tests tool is not installed.');
+  // A test intent left pending by an earlier process may have started and lost its result. It becomes
+  // `unknown` once, before anything listens, and is never re-run. This pass is independent of the
+  // switch: turning the capability off must not leave an unreadable pending record behind.
+  if(localTestRunner){
+    try{const reconciled=localTestRunner.reconcile();if(reconciled.recovered>0)console.log('Test job reconciliation: '+JSON.stringify(reconciled));}
+    catch(error){console.error('Test job reconciliation failed (nothing was re-run): '+(error as Error).message);}
+  }
   /**
    * The owner's worker model policy: future owner-created workers only. It is configuration, not
    * execution. The existing global default, per-session model and per-agent model remain the
@@ -964,7 +1319,7 @@ export async function createApp(options:AppOptions){
   };
   // The one owner switch that decides the file-edit mode: the acceptance policy in force. The
   // documented default is owner-only, which is propose-only; only agent-may-accept permits auto-apply.
-  fileEditModeHolder.mode=()=>acceptance!==undefined&&acceptance.readPolicy().mode==='agent-may-accept'?'auto-apply':'propose-only';
+  fileEditModeHolder.snapshot=()=>{const policy=acceptance?.readPolicy();return {mode:policy?.mode==='agent-may-accept'?'auto-apply':'propose-only',revision:policy?.revision??0};};
   if(runner) {
     try {
       const reconciliation=await runner.reconcile();
@@ -979,6 +1334,7 @@ export async function createApp(options:AppOptions){
   const actionEnvironment:ActionEnvironment={
     control:sessions&&lifecycle&&lifecycleService&&approvals&&ledger&&queueStore&&agentStore?{
       sessions,lifecycle:lifecycleService,approvals,ledger,queue:queueStore,media:queueImages,runner,acceptance,forks,agents:agentStore,fileEdit,
+      authorizeFileEdit:async()=>{const view=await harnessSettings.view();if(!view.effective.capabilities.fileEdit.enabled)throw new HttpError(409,'The file-edit capability is switched off in this instance’s harness settings.');return view.revision;},
       // Whether the store really holds a lifecycle row for one session, read-only. The projection
       // needs it because the lifecycle store answers an unwritten session with its initial record,
       // and that must not be reported as the state it reads at.
@@ -1160,15 +1516,43 @@ export async function createApp(options:AppOptions){
         }
         if(path==='/api/session' && req.method==='GET'){json(establishSession(req,res,options.security,subject));return;}
         if(path==='/api/roots' && req.method==='GET'){json(options.browseRoots);return;}
+        const projectTerminals=path.match(/^\/api\/projects\/([a-f0-9-]{36})\/terminals$/);
+        if(projectTerminals){
+          if(!terminal)throw new HttpError(503,'The terminal is disabled on this instance; set DASHBOARD_TERMINAL=on and restart to enable it.');
+          const project=catalog.get(projectTerminals[1]);
+          if(req.method==='GET'){json({terminals:terminal.list(project.id)});return;}
+          if(req.method==='POST'){
+            const data=z.strictObject({cols:z.number().int().min(2).max(240).optional(),rows:z.number().int().min(2).max(100).optional()}).parse(payload);
+            try{json({terminal:terminal.open(project,data)},201);}catch(error){throw new HttpError(409,(error as Error).message);}
+            return;
+          }
+          throw new HttpError(405,'Method not allowed');
+        }
+        const terminalRoute=path.match(/^\/api\/terminals\/([a-f0-9-]{36})(?:\/(ticket))?$/);
+        if(terminalRoute){
+          if(!terminal)throw new HttpError(503,'The terminal is disabled on this instance.');
+          const id=terminalRoute[1];
+          if(terminalRoute[2]==='ticket'&&req.method==='POST'){
+            const data=z.strictObject({projectId:z.string().uuid()}).parse(payload);
+            try{terminal.read(id,data.projectId);json({ticket:terminal.issueTicket(id,data.projectId)});}catch(error){throw new HttpError(404,(error as Error).message);}
+            return;
+          }
+          if(!terminalRoute[2]&&req.method==='DELETE'){
+            const data=z.strictObject({projectId:z.string().uuid()}).parse(payload);
+            if(!terminal.closeTerminal(id,data.projectId))throw new HttpError(404,'Terminal not found');
+            json({closed:true});return;
+          }
+          throw new HttpError(405,'Method not allowed');
+        }
         // Media: owner-only like every other route, behind the same Host check. A media id is the hex
         // hash of the stored bytes, so it is never a path; the response carries the type sniffed from
-        // the bytes, nosniff, and an immutable cache header. Nothing outside the media directory is
-        // served and a symlink is refused, because the helper refuses one at every path component.
+        // the bytes, nosniff, and an immutable cache header. Path checks refuse observed symlinks,
+        // but are not atomic with reads and do not prevent concurrent path swaps.
         if(path.startsWith('/api/media/')){
           const route=path.match(/^\/api\/media\/([a-f0-9]{64})$/);
           if(!route)throw new HttpError(404,'Unknown media');
           if(!['GET','HEAD'].includes(req.method??''))throw new HttpError(405,'Method not allowed');
-          const stored=await media.get(route[1]);
+          const stored=await readMedia(route[1]);
           if(!stored)throw new HttpError(404,'Unknown media');
           res.statusCode=200;
           res.setHeader('Content-Type',stored.mimeType);
@@ -1259,6 +1643,7 @@ export async function createApp(options:AppOptions){
                 }
                 if(req.method!=='POST')throw new HttpError(405,'Method not allowed');
                 const bound=parseBody(z.strictObject({projectId:z.unknown(),revision:z.unknown(),agentId:z.unknown(),actor:z.unknown()}),payload,'The session binding request');
+                const bindingActor=authenticatedOwnerActor(bound.actor);
                 const project=catalog.get(String(bound.projectId));
                 // A worker conversation is never a session to bind, before or after a restart.
                 await agents.assertSessionAliasAvailable(project,identity);
@@ -1271,7 +1656,7 @@ export async function createApp(options:AppOptions){
                   catch(error){if(!(error instanceof SessionError&&error.code==='DUPLICATE_NAME'))throw error;await sessions.adopt({projectId:project.id,sessionId:identity,name:'Conversation '+identity});}
                 }
                 sessions.read(project.id,identity);
-                const binding=agentStore.bindSession({projectId:project.id,sessionId:identity,revision:bound.revision,agentId:bound.agentId,actor:bound.actor});
+                const binding=agentStore.bindSession({projectId:project.id,sessionId:identity,revision:bound.revision,agentId:bound.agentId,actor:bindingActor});
                 // A binding is what makes an agent's declared model apply to that session, so it is
                 // applied here rather than described: the session's own choice still wins.
                 await agents.applySessionModel(project,identity).catch(()=>{});
@@ -1393,6 +1778,123 @@ export async function createApp(options:AppOptions){
             throw error;
           }
         }
+        // Owner observations are immutable attestations only: they do not unblock or retry effects.
+        const actionReviewRoute=path.match(/^\/api\/projects\/([a-f0-9-]{36})\/action-history\/([a-f0-9-]{36})\/observations$/);
+        if(actionReviewRoute){
+          if(!actionReviews)throw new HttpError(503,'Action observations require the durable control store.');
+          const project=catalog.get(actionReviewRoute[1]),actionId=actionReviewRoute[2];
+          try{
+            if(req.method==='GET'){json(actionReviews.read(project.id,actionId));return;}
+            if(req.method!=='POST')throw new HttpError(405,'Method not allowed');
+            const body=parseBody(z.strictObject({actionRevision:z.number().int().positive().safe(),revision:z.number().int().nonnegative().max(99),observation:z.enum(ACTION_OBSERVATIONS)}),payload,'The action observation');
+            json(actionReviews.record({projectId:project.id,actionId,...body,actor:ownerActor}),201);return;
+          }catch(error){if(error instanceof HttpError)throw error;if(error instanceof ActionReviewConflict)throw new HttpError(409,error.message);if(error instanceof ControlStoreError&&(error.code==='NOT_FOUND'||error.code==='SCOPE'))throw new HttpError(404,'Action not found.');throw new HttpError(500,req.method==='POST'?'The observation could not be confirmed; it may have been recorded. Reload before trying again. No action was executed or unblocked.':'Action observations could not be verified.');}
+        }
+        // Read-only durable action inspection: no replay, reset, reconciliation or external call.
+        const actionHistoryRoute=path.match(/^\/api\/projects\/([a-f0-9-]{36})\/action-history$/);
+        if(actionHistoryRoute){
+          if(req.method!=='GET')throw new HttpError(405,'Method not allowed');
+          if(!options.control)throw new HttpError(503,'Action history requires the durable control store.');
+          const project=catalog.get(actionHistoryRoute[1]);
+          if(url.searchParams.getAll('before').length>1)throw new HttpError(422,'Invalid action history cursor.');
+          try{json(acceptedActionHistory(options.control,project.id,url.searchParams.get('before')??undefined));}catch(error){if(error instanceof ActionHistoryCursorError)throw new HttpError(422,'Invalid action history cursor.');throw new HttpError(500,'Action history could not be verified. No action was changed.');}
+          return;
+        }
+        // Owner-configured local release destinations. The route is authenticated, revision-checked
+        // and owner-only, and its body carries no model or agent path: the target must already be a
+        // real directory under the operator-configured browse roots, and the canonical path is what
+        // is stored. Configuring a destination executes nothing; the tool is installed only when its
+        // separate default-off switch is on, and a missing switch is reported rather than implied.
+        const localDestinationRoute=path.match(/^\/api\/projects\/([a-f0-9-]{36})\/action-destinations\/(deploy|publish)$/);
+        if(localDestinationRoute){
+          if(!localRelease)throw new HttpError(503,'Local release destinations require the durable control store.');
+          const project=catalog.get(localDestinationRoute[1]);
+          const kind=localDestinationRoute[2]==='deploy'?'deploy' as const:'publish' as const;
+          const available=kind==='deploy'?deployEnabled:publishEnabled;
+          const reason=available?null:'The local '+kind+' tool is not installed on this instance; set DASHBOARD_'+(kind==='deploy'?'DEPLOY':'PUBLISH')+'=on and restart. Configuring a destination executes nothing.';
+          const current=localRelease.readDestination(project.id,kind);
+          if(req.method==='GET'){json({destination:current,available,reason});return;}
+          if(req.method!=='POST')throw new HttpError(405,'Method not allowed');
+          let revision:number,enabled:boolean,definition:unknown;
+          if(kind==='deploy'){
+            const body=parseBody(z.strictObject({revision:z.number().int().nonnegative().safe(),enabled:z.boolean(),artifactPath:z.string(),targetDirectory:z.string()}),payload,'The local deploy destination request');
+            revision=body.revision;enabled=body.enabled;
+            if((current?.revision??0)!==revision)throw new HttpError(409,'The local deployment destination changed. Reload before saving.');
+            try{definition={kind:'deploy-local' as const,artifactPath:body.artifactPath,targetDirectory:await approvedDirectory(body.targetDirectory,options.browseRoots)};}
+            catch{throw new HttpError(422,'The deployment target must be an existing real directory under the configured browse roots; nothing was saved.');}
+          }else{
+            const body=parseBody(z.strictObject({revision:z.number().int().nonnegative().safe(),enabled:z.boolean(),publicationRoot:z.string()}),payload,'The local publish destination request');
+            revision=body.revision;enabled=body.enabled;
+            if((current?.revision??0)!==revision)throw new HttpError(409,'The local publication destination changed. Reload before saving.');
+            try{definition={kind:'publish-local' as const,publicationRoot:await approvedDirectory(body.publicationRoot,options.browseRoots)};}
+            catch{throw new HttpError(422,'The publication root must be an existing real directory under the configured browse roots; nothing was saved.');}
+          }
+          try{
+            const destination=localRelease.writeDestination({projectId:project.id,kind,revision,enabled,definition,actor:ownerActor});
+            json({destination,available,reason});return;
+          }catch(error){
+            if(error instanceof LocalReleaseError)throw new HttpError(localReleaseHttpStatus(error.code),error.message);
+            throw error;
+          }
+        }
+        // Fixed commit-target configuration only. This is not an action executor: enabling a target
+        // grants no agent scope or policy, and the tool exists only behind its deployment switch. No
+        // client-supplied branch, repository, identifier, actor, credential or command is accepted.
+        const commitTargetReason=()=>acceptedCommitTools===undefined
+          ?'The accepted commit tool is not installed on this instance: set DASHBOARD_AGENT_COMMIT=on and grant an agent the commit scope. Configuring a target cannot execute a commit.'
+          :'The commit tool is installed. An agent with the commit scope can preview the exact staged tree and commit it under the acceptance policy, which must be full-auto for this class. It never stages files and never pushes.';
+        const commitTargetRoute=path.match(/^\/api\/projects\/([a-f0-9-]{36})\/action-targets\/commit$/);
+        if(commitTargetRoute){
+          if(!actionTargets)throw new HttpError(503,'Action target configuration requires the durable control store.');
+          const project=catalog.get(commitTargetRoute[1]);
+          const targetId='pilot-commit',definition={kind:'commit' as const,repositoryId:project.id,branch:'refs/heads/work/pilot-'+project.id.slice(0,8)};
+          const current=actionTargets.read(project.id,targetId);
+          if(current&&(current.definition.kind!=='commit'||current.definition.repositoryId!==definition.repositoryId||current.definition.branch!==definition.branch))throw new HttpError(409,'The recorded commit target does not match this project; inspect it before making changes.');
+          if(req.method==='GET'){json({target:current,available:acceptedCommitTools!==undefined,reason:commitTargetReason()});return;}
+          if(req.method!=='POST')throw new HttpError(405,'Method not allowed');
+          const body=parseBody(z.strictObject({revision:z.number().int().nonnegative().safe(),enabled:z.boolean()}),payload,'The commit target request');
+          if((current?.revision??0)!==body.revision)throw new HttpError(409,'The commit target changed. Reload before saving.');
+          try{
+            const target=actionTargets.write({projectId:project.id,targetId,revision:body.revision,enabled:body.enabled,definition,actor:ownerActor});
+            json({target,available:acceptedCommitTools!==undefined,reason:commitTargetReason()});return;
+          }catch(error){
+            if(error instanceof Error&&/target changed|admission was refused/i.test(error.message))throw new HttpError(409,'The commit target changed. Reload before saving.');
+            throw error;
+          }
+        }
+        // The push target is the owner's exact choice of one configured *local* remote for the same
+        // fixed Pilot branch. The route resolves the remote itself and stores only its name and the
+        // digest of its canonical local path; the model supplies no repository, remote, branch or
+        // command, and this instance has no hosted credential integration.
+        const pushTargetReason=()=>acceptedPushTools===undefined
+          ?'The accepted push tool is not installed on this instance: set DASHBOARD_AGENT_PUSH=on and grant an agent the push scope. Configuring a target cannot push anything.'
+          :'The push tool is installed. An agent with the push scope can push exactly one accepted commit to this local remote, without force, under the acceptance policy, which must be full-auto for this class.';
+        const pushTargetRoute=path.match(/^\/api\/projects\/([a-f0-9-]{36})\/action-targets\/push$/);
+        if(pushTargetRoute){
+          if(!actionTargets)throw new HttpError(503,'Action target configuration requires the durable control store.');
+          const project=catalog.get(pushTargetRoute[1]);
+          const targetId='pilot-push',connected=repositories.isConnected(project),branch='refs/heads/work/pilot-'+project.id.slice(0,8);
+          const current=actionTargets.read(project.id,targetId);
+          if(current&&current.definition.kind!=='push')throw new HttpError(409,'The recorded push target does not match this project; inspect it before making changes.');
+          if(req.method==='GET'){
+            json({target:current,branch,remotes:connected?await listLocalPushRemotes(project):[],connected,available:acceptedPushTools!==undefined,reason:pushTargetReason()});return;
+          }
+          if(req.method!=='POST')throw new HttpError(405,'Method not allowed');
+          const body=parseBody(z.strictObject({revision:z.number().int().nonnegative().safe(),enabled:z.boolean(),remoteId:z.string().min(1).max(160)}),payload,'The push target request');
+          if((current?.revision??0)!==body.revision)throw new HttpError(409,'The push target changed. Reload before saving.');
+          if(!connected)throw new HttpError(409,'This project has no connected repository worktree, so no push target was configured. Connect the repository first.');
+          let resolvedRemote:{remoteId:string;repositoryDigest:string};
+          try{resolvedRemote=await resolveLocalPushRemote({project,remoteId:body.remoteId});}
+          catch(error){throw new HttpError(422,error instanceof Error?error.message:'The named remote is not a local repository, so no push target was configured.');}
+          const definition={kind:'push' as const,remoteId:resolvedRemote.remoteId,repositoryDigest:resolvedRemote.repositoryDigest,branch};
+          try{
+            const target=actionTargets.write({projectId:project.id,targetId,revision:body.revision,enabled:body.enabled,definition,actor:ownerActor});
+            json({target,available:acceptedPushTools!==undefined,reason:pushTargetReason()});return;
+          }catch(error){
+            if(error instanceof Error&&/target changed|admission was refused/i.test(error.message))throw new HttpError(409,'The push target changed. Reload before saving.');
+            throw error;
+          }
+        }
         // The command registry, the live projection and action execution: owner-only like every other
         // route, behind the same Host check, with the same origin/CSRF enforcement for the write. The
         // registry answers only what this instance can really do, executing validates the parameters
@@ -1407,7 +1909,10 @@ export async function createApp(options:AppOptions){
           };
           const actionStatus=(code:ActionError['code'])=>code==='UNKNOWN'?404:code==='UNAVAILABLE'?503:code==='SCOPE'?403:422;
           try{
-            if(path==='/api/actions'&&req.method==='GET'){json(actions.list(normaliseActionScope(scopeFromQuery())));return;}
+            if(path==='/api/actions'&&req.method==='GET'){
+              const listed=actions.list(normaliseActionScope(scopeFromQuery()));
+              json(await harnessSettings.capability('fileEdit')?listed:{...listed,actions:listed.actions.filter(action=>!action.id.startsWith('file-edit.'))});return;
+            }
             if(path==='/api/actions/activity'&&req.method==='GET'){
               // The order is the one every other project route uses: an invalid request first, then an
               // instance that cannot answer at all, then a project this instance does not know.
@@ -1427,7 +1932,23 @@ export async function createApp(options:AppOptions){
               if(!availability.available)throw new ActionError('Action '+descriptor.id+' is unavailable on this instance: '+availability.reason,'UNAVAILABLE');
               const scope=normaliseActionScope(envelope.scope);
               actions.assertScope(descriptor,scope);
-              json({action:descriptor.id,result:await actions.run(descriptor.id,envelope.params??{},scope)});return;
+              let parameters=envelope.params??{};
+              if(parameters&&typeof parameters==='object'&&!Array.isArray(parameters)) {
+                const params=parameters as Record<string,unknown>;
+                if(['agent.create','agent.update','agent.archive','acceptance.policy.update','file-edit.write'].includes(descriptor.id)&&params.actor!==undefined) {
+                  const actor=authenticatedOwnerActor(params.actor);
+                  if(descriptor.id==='file-edit.write') {
+                    const edit=params.request as {agentId?:unknown}|null;
+                    if(edit&&typeof edit==='object'&&edit.agentId!=null)throw new HttpError(403,'An owner file edit cannot be attributed to an agent.');
+                  }
+                  parameters={...params,actor};
+                }
+                if(descriptor.id==='acceptance.accept'&&params.request&&typeof params.request==='object'&&!Array.isArray(params.request)) {
+                  const request=params.request as Record<string,unknown>;
+                  if(request.actor!==undefined)parameters={...params,request:{...request,actor:authenticatedOwnerActor(request.actor)}};
+                }
+              }
+              json({action:descriptor.id,result:await actions.run(descriptor.id,parameters,scope)});return;
             }
             throw new HttpError(405,'Method not allowed');
           }catch(error){
@@ -1453,7 +1974,7 @@ export async function createApp(options:AppOptions){
         const runnerClaim=path.match(/^\/api\/projects\/([a-f0-9-]{36})\/runner\/jobs\/claim$/);
         const runnerJob=path.match(/^\/api\/projects\/([a-f0-9-]{36})\/runner\/jobs\/([A-Za-z0-9][A-Za-z0-9._:-]{0,159})\/(run|settle)$/);
         if(runnerJobs||runnerClaim||runnerJob){
-          if(!runner)throw new HttpError(503,'The coding runner is disabled on this instance: set DASHBOARD_RUNNER=on and point DASHBOARD_RUNNER_IMAGE at the image built from deploy/runner/Dockerfile before any job can be submitted');
+          if(!runner)throw new HttpError(503,'The coding runner is unavailable: the legacy Docker port cannot establish safe container termination. Nothing was started.');
           const projectId=(runnerJobs??runnerClaim??runnerJob)![1];
           catalog.get(projectId);
           try{
@@ -1498,7 +2019,7 @@ export async function createApp(options:AppOptions){
               json(await acceptance.readProject({projectId:projectScope()}));return;
             }
             if(path==='/api/acceptance/policy'){
-              if(req.method==='GET'){json({policy:acceptance.readPolicy()});return;}
+              if(req.method==='GET'){json({policy:acceptance.readPolicy(),agentEvidenceRecording:options.agentEvidenceRecording===true});return;}
               if(req.method!=='POST')throw new HttpError(405,'Method not allowed');
               const body=parseBody(z.strictObject({revision:z.unknown(),policy:z.unknown()}),payload,'The acceptance policy request');
               json({policy:acceptance.updatePolicy({revision:body.revision,policy:body.policy,actor:ownerActor})});return;
@@ -1510,11 +2031,9 @@ export async function createApp(options:AppOptions){
               const recorded=await acceptance.recordEvidence({projectId:body.projectId,evidence:body.evidence});
               json({evidence:recorded.evidence,written:recorded.written},201);return;
             }
-            // The accepting identity is **declared**, never assumed. A caller may declare it beside the
-            // request (this route's own documented form) or inside it (the shape the registry publishes
-            // and the palette sends); both are honoured, and a body that carries both and disagrees is
-            // refused as an invalid request rather than silently overriding one of them. Only a body
-            // that declares no actor at all is recorded as the authenticated owner.
+            // Both documented actor locations remain accepted, but this authenticated owner route
+            // can record only the actual owner. A model's agent identity is authorized separately at
+            // same-store admission; a declared identity is not evidence that an agent acted.
             const body=parseBody(z.strictObject({projectId:z.unknown(),request:z.unknown(),actor:z.unknown().optional()}),payload,'The acceptance request');
             catalog.get(String(body.projectId));
             const plain=(value:unknown):Record<string,unknown>|null=>value!==null&&typeof value==='object'&&!Array.isArray(value)?value as Record<string,unknown>:null;
@@ -1530,7 +2049,8 @@ export async function createApp(options:AppOptions){
             } else if(declared!==undefined)accepting=declared;
             else if(body.actor!==undefined)accepting=body.actor;
             else accepting=ownerActor;
-            const request=requestBody===null?body.request:{...requestBody,actor:accepting};
+            authenticatedOwnerActor(accepting);
+            const request=requestBody===null?body.request:{...requestBody,actor:ownerActor};
             json(await acceptance.accept({projectId:body.projectId,request}));return;
           }catch(error){
             if(error instanceof AcceptanceError)throw new HttpError(acceptanceHttpStatus(error.code),error.message);
@@ -1540,25 +2060,51 @@ export async function createApp(options:AppOptions){
         // The forks of one project: one read route and the three writes. Owner-only like every other
         // route, behind the unchanged Host check, with the same origin/CSRF enforcement for the writes.
         // The fork a write acts on is the one in the path — its child session, which *is* the fork's
-        // identity — so a caller addresses a fork and never a path: the worktree it removes is the one
-        // the durable record carries, re-checked against the designated fork root by the store itself.
+        // identity — so a caller addresses a fork and never a path. Active discard is unavailable;
+        // for other forks production closes only an already-absent recorded worktree and never removes it.
         // While this instance has no fork capability (the agent harness is off) these routes refuse
         // with a named reason rather than pretending, exactly as the runner's do.
         const forkList=path.match(/^\/api\/projects\/([a-f0-9-]{36})\/forks$/);
-        const forkAction=path.match(/^\/api\/projects\/([a-f0-9-]{36})\/forks\/([A-Za-z0-9][A-Za-z0-9._:-]{0,159})\/(resume|discard)$/);
-        if(forkList||forkAction){
+        const forkCreationRecovery=path.match(/^\/api\/projects\/([a-f0-9-]{36})\/forks\/recover-creation$/);
+        const forkAction=path.match(/^\/api\/projects\/([a-f0-9-]{36})\/forks\/([A-Za-z0-9][A-Za-z0-9._:-]{0,159})\/(resume|discard|dispatch|recover)$/);
+        if(forkList||forkAction||forkCreationRecovery){
           if(!forks)throw new HttpError(503,'The fork capability needs the agent harness, which is not enabled on this instance: enable agents before a fork is created, resumed or discarded');
-          const projectId=(forkList??forkAction)![1];
+          const projectId=(forkList??forkAction??forkCreationRecovery)![1];
           catalog.get(projectId);
           try{
-            if(forkList&&req.method==='GET'){json(forks.view(projectId));return;}
+            if(forkList&&req.method==='GET'){
+              const view=forks.view(projectId);
+              json({...view,creationFence:forks.creationStatus(projectId),lifecycleFences:view.forks.flatMap(fork=>{const held=forks.lifecycleStatus(projectId,fork.childSessionId);return held?[held]:[];})});return;
+            }
             if(forkList&&req.method==='POST'){
               const body=parseBody(z.strictObject({parentSessionId:z.unknown(),baseCommit:z.unknown(),cutoffEntryId:z.unknown(),target:z.unknown().optional()}),payload,'The fork request');
               const created=await forks.create({projectId,parentSessionId:body.parentSessionId,baseCommit:body.baseCommit,cutoffEntryId:body.cutoffEntryId,target:body.target});
               json({fork:created.fork,created:created.created,adopted:created.adopted},created.created?201:200);return;
             }
+            if(forkCreationRecovery&&req.method==='POST'){
+              // Owner recovery for a held creation fence: the same rules as a lifecycle fence — exact
+              // revision, a quiescent parent session, and no creation, removal or replay.
+              const body=parseBody(z.strictObject({parentSessionId:z.unknown(),revision:z.unknown()}),payload,'The fork creation-fence recovery request');
+              const recovered=await forks.recoverCreationFence({projectId,parentSessionId:body.parentSessionId,revision:body.revision});
+              json({recovered:true,revision:recovered.revision});return;
+            }
             if(forkAction&&req.method==='POST'){
               const childSessionId=forkAction[2];
+              if(forkAction[3]==='dispatch'){
+                // The one production caller of the fenced child dispatch: a stable invocation identity
+                // makes an exact repeat return its receipt, changed text conflicts, and an uncertain
+                // outcome keeps the fence held for review instead of replaying the submission.
+                const body=parseBody(z.strictObject({parentSessionId:z.unknown(),invocationId:z.unknown(),text:z.unknown()}),payload,'The fork dispatch request');
+                const dispatched=await forks.dispatchChild({projectId,parentSessionId:body.parentSessionId,childSessionId,invocationId:body.invocationId,text:body.text});
+                json({requestId:dispatched.requestId});return;
+              }
+              if(forkAction[3]==='recover'){
+                // Owner recovery for a held lifecycle fence. It releases only the fence, after the
+                // child is proven quiescent, and dispatches, replays and removes nothing.
+                const body=parseBody(z.strictObject({revision:z.unknown()}),payload,'The fork fence recovery request');
+                const recovered=await forks.recoverLifecycleFence({projectId,childSessionId,revision:body.revision});
+                json({recovered:true,revision:recovered.revision});return;
+              }
               if(forkAction[3]==='resume'){
                 const body=parseBody(z.strictObject({revision:z.unknown()}),payload,'The fork resume request');
                 const resumed=await forks.resume({projectId,childSessionId,revision:body.revision});
@@ -1571,6 +2117,7 @@ export async function createApp(options:AppOptions){
             throw new HttpError(405,'Method not allowed');
           }catch(error){
             if(error instanceof ForkError)throw new HttpError(forkHttpStatus(error.code),error.message);
+            if(error instanceof ForkActivityUncertain)throw new HttpError(409,error.message+' Inspect the child session before retrying; nothing is replayed automatically.');
             if(error instanceof SessionError)throw new HttpError(sessionHttpStatus(error.code),error.message);
             throw error;
           }
@@ -1584,10 +2131,10 @@ export async function createApp(options:AppOptions){
           if(!agentStore)throw new HttpError(503,'The agent registry is unavailable: no durable control store is open on this instance');
           try{
             if(path==='/api/agents'){
-              if(req.method==='GET'){json({agents:agentStore.list(),scopes:agentScopeVocabulary(await harnessSettings.view().then(view=>({fileEdit:view.effective.capabilities.fileEdit.enabled,fileRead:view.effective.capabilities.codingTools.enabled,fileWrite:view.effective.capabilities.codingTools.enabled,shell:view.effective.capabilities.shell.enabled}))),models:agentStore.offeredModels(),fileEdit:{enabled:fileEdit!==undefined&&fileEdit.enabled,mode:fileEdit===undefined||!fileEdit.enabled?null:await fileEdit.mode()}});return;}
+              if(req.method==='GET'){json({agents:agentStore.list(),scopes:agentScopeVocabulary(await harnessSettings.view().then(view=>({fileEdit:view.effective.capabilities.fileEdit.enabled,fileRead:view.effective.capabilities.codingTools.enabled,fileWrite:view.effective.capabilities.codingTools.enabled,shell:view.effective.capabilities.shell.enabled,acceptance:acceptance!==undefined,fork:forks!==undefined,reusableTools:reusableTools!==undefined,runTests:localTestRunnerEnabled,acceptedCommit:acceptedCommitTools!==undefined,acceptedPush:acceptedPushTools!==undefined,acceptedDeploy:localDeploy!==undefined,localPublish:localPublish!==undefined,acceptedProvision:provisionConfiguration!==undefined,acceptedSpend:spendConfiguration!==undefined}))),models:agentStore.offeredModels(),fileEdit:{enabled:fileEdit!==undefined&&fileEdit.enabled&&await harnessSettings.capability('fileEdit'),mode:fileEdit===undefined||!fileEdit.enabled||!await harnessSettings.capability('fileEdit')?null:await fileEdit.mode()}});return;}
               if(req.method==='POST'){
                 const body=parseBody(z.strictObject({draft:z.unknown(),actor:z.unknown()}),payload,'The agent request');
-                json({agent:agentStore.create({draft:body.draft,actor:body.actor})},201);return;
+                json({agent:agentStore.create({draft:body.draft,actor:authenticatedOwnerActor(body.actor)})},201);return;
               }
               throw new HttpError(405,'Method not allowed');
             }
@@ -1596,15 +2143,15 @@ export async function createApp(options:AppOptions){
             const agentId=agentRoute[1];
             if(agentRoute[2]===undefined){
               if(req.method!=='GET')throw new HttpError(405,'Method not allowed');
-              json({agent:agentStore.read(agentId),history:agentStore.history(agentId)});return;
+              json({agent:agentStore.read(agentId),history:agentStore.history(agentId),budgetUsage:{requestsAccounted:agentBudgets!.requestsAccounted(agentId)}});return;
             }
             if(req.method!=='POST')throw new HttpError(405,'Method not allowed');
             if(agentRoute[2]==='update'){
               const body=parseBody(z.strictObject({revision:z.unknown(),patch:z.unknown(),actor:z.unknown()}),payload,'The agent change request');
-              json({agent:agentStore.update({agentId,revision:body.revision,patch:body.patch,actor:body.actor})});return;
+              json({agent:agentStore.update({agentId,revision:body.revision,patch:body.patch,actor:authenticatedOwnerActor(body.actor)})});return;
             }
             const body=parseBody(z.strictObject({revision:z.unknown(),actor:z.unknown()}),payload,'The agent archive request');
-            json({agent:agentStore.archive({agentId,revision:body.revision,actor:body.actor})});return;
+            json({agent:agentStore.archive({agentId,revision:body.revision,actor:authenticatedOwnerActor(body.actor)})});return;
           }catch(error){
             if(error instanceof AgentError)throw new HttpError(agentHttpStatus(error.code),error.message);
             throw error;
@@ -1625,20 +2172,54 @@ export async function createApp(options:AppOptions){
             if(req.method!=='POST')throw new HttpError(405,'Method not allowed');
             const body=parseBody(z.strictObject({request:z.unknown(),actor:z.unknown()}),payload,'The file-edit request');
             const request=body.request as {agentId?:unknown;path?:unknown;content?:unknown;mode?:unknown};
-            const actor=body.actor as {kind:'owner'|'agent';identity:string};
+            const actor=authenticatedOwnerActor(body.actor);
+            if(request.agentId!=null)throw new HttpError(403,'An owner file edit cannot be attributed to an agent.');
+            const check=actionEnvironment.control?.authorizeFileEdit,revision=await check?.();
+            const authorize=check?async()=>{if(await check()!==revision)throw new HttpError(409,'File-edit capability settings changed before the write.');}:undefined;
             const outcome=await fileEdit.edit({
               projectId:fileEditRoute[1],
-              agentId:(request.agentId??null) as string|null,
+              agentId:null,
               path:request.path as string,
               content:request.content as string,
               mode:(request.mode??null) as FileEditMode|null,
+              authorize,
               actor
             });
-            json({edit:outcome.record,written:outcome.written},201);return;
+            json({edit:outcome.record,written:outcome.written,reused:outcome.reused??false},201);return;
           }catch(error){
             if(error instanceof FileEditError)throw new HttpError(fileEditHttpStatus(error.code),error.message);
             throw error;
           }
+        }
+        // The owner-only Cloudflare connection configuration: one exact Workers account and script
+        // per project, configured once and reused across sessions. Every method is behind the same
+        // owner authentication, Host check, and origin/CSRF enforcement as the rest of `/api`. The
+        // body carries a revision, the exact target and a credential action (keep, replace, remove);
+        // the owner keeps, replaces or removes. It is a local write only. No route reads the credential
+        // back, no provider or network request is made, nothing is deployed, and no agent scope or
+        // tool is installed. It is default-off: while the switch is not `on` every method refuses
+        // with a named reason before a store is opened or a file is created.
+        const cloudflareConnectionRoute=path.match(/^\/api\/projects\/([a-f0-9-]{36})\/cloudflare-connections\/([A-Za-z0-9][A-Za-z0-9._:-]{0,159})$/);
+        if(cloudflareConnectionRoute){
+          if(!cloudflareConnectionEnabled)throw new HttpError(503,'Cloudflare connection configuration is disabled on this instance: set DASHBOARD_CLOUDFLARE_CONNECTION=on before a connection is read or configured');
+          const projectId=cloudflareConnectionRoute[1],connectionId=cloudflareConnectionRoute[2];
+          catalog.get(projectId);
+          // The store must see every registered project root at open time and be reopened when that
+          // set changes, so one request opens, uses and closes its own handle. Every store call is
+          // synchronous, so no other request interleaves inside the read or write transaction.
+          let store:CloudflareConnectionStore|undefined;
+          try{
+            store=new CloudflareConnectionStore(options.dataRoot,catalog.projects.map(project=>project.path));
+            if(req.method==='GET'){json({connection:store.read(projectId,connectionId)});return;}
+            if(req.method!=='POST'&&req.method!=='PUT')throw new HttpError(405,'Method not allowed');
+            // The project comes from this path and the owner from the authenticated session; the body
+            // supplies neither, so a caller cannot configure a connection as another project or actor.
+            // The record is validated by the store after this route's own shape check, and the token
+            // is only ever an input: no response or refusal repeats it.
+            const body=parseBody(z.strictObject({revision:z.unknown(),target:z.unknown(),enabled:z.unknown().optional(),credential:z.unknown()}),payload,'The Cloudflare connection request');
+            json({connection:store.write({projectId,connectionId,revision:body.revision,target:body.target,enabled:body.enabled??false,credential:body.credential,actor:ownerActor})});return;
+          }catch(error){cloudflareConnectionFailure(error);}
+          finally{store?.close();}
         }
         if(path==='/api/browse' && req.method==='GET'){json(await browse(url.searchParams.get('path')??options.browseRoots[0]??'',options.browseRoots));return;}
         if(path==='/api/preview' && req.method==='POST'){json(await catalog.preview(payload.path));return;}
@@ -1775,7 +2356,7 @@ export async function createApp(options:AppOptions){
               throw new HttpError(422,tooManyImagesReason(attached.length),TOO_MANY_IMAGES_CODE);
             const images:AgentImage[]=[];
             for(const id of attached){
-              const image=await media.get(id);
+              const image=await readMedia(id);
               if(!image)throw new HttpError(422,'An attached image is not in the media store. Remove it and send again.','unknown-media');
               images.push({mimeType:image.mimeType,data:Buffer.from(image.bytes).toString('base64')});
             }
@@ -1957,8 +2538,14 @@ export async function createApp(options:AppOptions){
           const materializeSources=async()=>{for(const path of sourcePaths){
             const candidate=candidates.find(candidate=>candidate.source.path===path)!,doc=pending.documents.find(d=>d.name===candidate.documentName)!;
             const file=await safePath(p.path,path,true);
-            try{if(await readFile(file,'utf8')!==doc.content)throw new HttpError(409,'A retained source snapshot differs; operator review is required');}
-            catch(e){if((e as NodeJS.ErrnoException).code!=='ENOENT')throw e;await atomicWrite(file,doc.content);}
+            try{
+              const retained=await readBoundedFile(file,Buffer.byteLength(doc.content));
+              if(retained.toString('utf8')!==doc.content)throw new HttpError(409,'A retained source snapshot differs; operator review is required');
+            }catch(e){
+              if(e instanceof BoundedFileReadError&&(e.code==='OVERSIZE'||e.code==='CHANGED'))throw new HttpError(409,'A retained source snapshot differs; operator review is required');
+              if((e as NodeJS.ErrnoException).code!=='ENOENT')throw e;
+              await atomicWrite(file,doc.content);
+            }
           }};
           const result=await boards.mutate(p,current.revision,{op:'restore',board},sourcePaths,verifySources,materializeSources);previews.delete(data.token);json(result);return;
         }
@@ -1966,7 +2553,8 @@ export async function createApp(options:AppOptions){
         if(sourceRoute&&req.method==='GET'){
           const p=catalog.get(sourceRoute[1]),board=await boards.read(p),source=board.board.sources.find(s=>s.id===sourceRoute[2]);
           if(!source)throw new HttpError(404,'Source not registered');
-          json({text:await readFile(await safePath(p.path,source.path),'utf8'),source});return;
+          let text:string;try{text=(await readBoundedFile(await safePath(p.path,source.path),2*1024*1024)).toString('utf8');}catch(error){if(error instanceof BoundedFileReadError&&error.code==='OVERSIZE')throw new HttpError(413,'Source exceeds the text read limit');throw error;}
+          json({text,source});return;
         }
         const match=path.match(/^\/api\/projects\/([a-f0-9-]{36})(?:\/(board|initialize|export|relocate))?$/);
         if(match){
@@ -1995,13 +2583,32 @@ export async function createApp(options:AppOptions){
       res.statusCode=code;res.setHeader('Content-Type','application/json');res.end(JSON.stringify({error:err.message,...(e instanceof HttpError&&e.code?{code:e.code}:{})}));
     }finally{for(const id of leasedProjects){const count=(projectRequests.get(id)??1)-1;if(count)projectRequests.set(id,count);else projectRequests.delete(id);}}
   });
+  const terminalWebSockets=new WebSocketServer({noServer:true,maxPayload:8192,handleProtocols:protocols=>protocols.has('pilot-terminal')?'pilot-terminal':false});
+  const upgradedSockets=new Set<Duplex>();
+  server.on('upgrade',(req,socket,head)=>{
+    upgradedSockets.add(socket);socket.once('close',()=>upgradedSockets.delete(socket));
+    try{
+      const url=new URL(req.url??'/',options.security.origin);
+      const route=url.pathname.match(/^\/api\/terminals\/([a-f0-9-]{36})\/stream$/);
+      const origin=req.headers.origin?new URL(req.headers.origin).origin:'';
+      const protocols=(req.headers['sec-websocket-protocol']??'').split(',').map(value=>value.trim()).filter(Boolean);
+      if(!terminal||!route||!allowedHosts().includes(req.headers.host??'')||origin!==new URL(options.security.origin).origin||protocols.length!==2||protocols[0]!=='pilot-terminal'||!terminal.consumeTicket(route[1],protocols[1]))throw new Error('refused');
+      terminalWebSockets.handleUpgrade(req,socket,head,websocket=>terminal.attach(route[1],websocket));
+    }catch{
+      if(!socket.destroyed)socket.end('HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');
+    }
+  });
   server.requestTimeout=30000;server.headersTimeout=10000;
-  return {server,catalog,boards,docs,agents,alerts,providers,repositories,sessions,lifecycle,actions,media,queue:queueStore,runner,acceptance,forks,agentStore,fileEdit,workerModelPolicy,workerStore,workerService,close:async()=>{
+  return {server,catalog,boards,docs,agents,alerts,providers,repositories,sessions,lifecycle,actions,media,queue:queueStore,runner,localTests:localTestRunner,acceptance,forks,agentStore,fileEdit,terminal,localRelease,localDeploy,localPublish,workerModelPolicy,workerStore,workerService,close:async()=>{
     // A server that never opened reports ERR_SERVER_NOT_RUNNING, which means "already closed", not
     // "close failed". A failed start (for example a port already in use) must still drain and
     // release the lock that this same start created, and must report the original failure instead.
     // Any other close error stays fatal and remains, with the deadline, the only retention cause.
     closing=true;
+    await terminal?.close();
+    for(const websocket of terminalWebSockets.clients)websocket.terminate();
+    for(const socket of upgradedSockets)socket.destroy();
+    terminalWebSockets.close(()=>{});
     const httpClosed=new Promise<void>((ok,fail)=>server.close(error=>{
       if(!error||(error as NodeJS.ErrnoException).code==='ERR_SERVER_NOT_RUNNING')ok();else fail(error);
     }));
@@ -2384,7 +2991,7 @@ async function main(){
     // of rows a crash left behind (below, before anything listens) because it is the layer that also
     // holds the notification channel and the harness.
     // Readiness reports the schema observed from this live handle, never from a second connection.
-    const app=await createApp({dataRoot:canonicalRoot,browseRoots:[...config.browseRoots],security:config.security,allowedHosts:[...config.allowedHosts],clientRoot:resolve(fileURLToPath(new URL('./client',import.meta.url))),registry:env.DASHBOARD_REGISTRY,control:store,release:{version:identityVersion,source:release.state==='released'?'manifest':'unreleased-local',...(identityBuildId===undefined?{}:{buildId:identityBuildId}),...(identitySourceDigest===undefined?{}:{sourceDigest:identitySourceDigest}),observe:observeRelease},readiness:{releaseId,schemaId,manifestValid:true,lockHeld:()=>lockHeld,observeSchema:()=>{
+    const app=await createApp({agentEvidenceRecording:config.agentEvidenceRecording,dataRoot:canonicalRoot,browseRoots:[...config.browseRoots],security:config.security,allowedHosts:[...config.allowedHosts],clientRoot:resolve(fileURLToPath(new URL('./client',import.meta.url))),registry:env.DASHBOARD_REGISTRY,control:store,release:{version:identityVersion,source:release.state==='released'?'manifest':'unreleased-local',...(identityBuildId===undefined?{}:{buildId:identityBuildId}),...(identitySourceDigest===undefined?{}:{sourceDigest:identitySourceDigest}),observe:observeRelease},readiness:{releaseId,schemaId,manifestValid:true,lockHeld:()=>lockHeld,observeSchema:()=>{
       try {return {state:'present' as const,version:store.schemaVersion()};}
       catch(error) {return {state:'malformed' as const,reason:(error as Error).message};}
     }}});

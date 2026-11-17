@@ -61,3 +61,37 @@ test('migration preserves owner removals and a later grant works without changin
     assert.equal(fake.state.callCount, 2);
   } finally { await host.close(); await providers.close(); await rm(root, { recursive: true, force: true }); }
 });
+
+test('existing sessions gain granted Pi editing without changing explicit removals', async () => {
+  const root=await mkdtemp(join(tmpdir(),'pilot-coding-selection-'));
+  const project:Project={id:randomUUID(),name:'Fixture',path:join(root,'project'),managed:true,repository:'',created:''};
+  await mkdir(project.path,{recursive:true});await writeFile(join(project.path,'file.txt'),'before\n');
+  const fake=fauxProvider({provider:'coding-selection-faux',models:[{id:'fixture'}]});
+  const providers=new ProviderStore(root,[fake.provider]);
+  await providers.savePreferences({defaultModel:{provider:'coding-selection-faux',modelId:'fixture'},favourites:[],allowRealModels:true});
+  let scopes:readonly AgentScope[]=['file_read'];
+  const options={dataRoot:root,enabled:true,providers,coding:{enabled:true,shell:true,root:()=>project.path},privileges:{authority:async()=>({model:null,agentId:'fixture-agent',scopes,projects:[project.id],emptyReason:null})}};
+  let host=new HarnessHost(options);
+  try {
+    const opened=await (host as any).open(project);
+    await opened.conversation.configure({tools:{remove:[{name:'bash'}]},instructions:'Keep this instruction.'},BACKGROUND_CONTEXT);
+    await host.close();host=new HarnessHost(options);
+    scopes=['file_read','file_write','shell'];
+    fake.setResponses([()=>fauxAssistantMessage([fauxToolCall('edit',{path:'file.txt',edits:[{oldText:'before',newText:'after'}]})],{stopReason:'toolUse'}),()=>fauxAssistantMessage('Edit completed.')]);
+    await host.submit(project,{text:'Edit the file',mode:'followUp'});
+    const deadline=Date.now()+10000;
+    while(!(await host.view(project)).entries.some(e=>e.text.includes('Edit completed.'))){if(Date.now()>deadline)throw Error('Coding selection run timed out');await new Promise(resolve=>setTimeout(resolve,20));}
+    const {readFile}=await import('node:fs/promises');
+    assert.equal(await readFile(join(project.path,'file.txt'),'utf8'),'after\n');
+    const current=await (host as any).open(project),state=await current.conversation.viewState(BACKGROUND_CONTEXT);
+    try {assert.deepEqual(state.value.docs['pi.agent'].tools.remove,['bash']);assert.equal(state.value.docs['pi.agent'].instructions,'Keep this instruction.');}finally{state.dispose();}
+    await current.conversation.configure({tools:{remove:[{name:'bash'},{name:'edit'}]}},BACKGROUND_CONTEXT);
+    fake.setResponses([()=>fauxAssistantMessage([fauxToolCall('edit',{path:'file.txt',edits:[{oldText:'after',newText:'must-not-write'}]})],{stopReason:'toolUse'}),()=>fauxAssistantMessage('Removed edit observed.')]);
+    await host.submit(project,{text:'Attempt removed edit',mode:'followUp'});
+    const secondDeadline=Date.now()+10000;
+    while(!(await host.view(project)).entries.some(e=>e.text.includes('Removed edit observed.'))){if(Date.now()>secondDeadline)throw Error('Removed edit run timed out');await new Promise(resolve=>setTimeout(resolve,20));}
+    assert.equal(await readFile(join(project.path,'file.txt'),'utf8'),'after\n');
+    const after=await current.conversation.viewState(BACKGROUND_CONTEXT);
+    try {assert.deepEqual(after.value.docs['pi.agent'].tools.remove,['bash','edit']);}finally{after.dispose();}
+  }finally{await host.close();await providers.close();await rm(root,{recursive:true,force:true});}
+});

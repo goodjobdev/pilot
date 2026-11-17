@@ -2,6 +2,13 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { diagnosticProjection, effectiveConfig } from '../../src/server/effective-config';
 
+test('agent evidence recording is an explicit default-off deployment capability',()=>{
+  assert.equal(effectiveConfig({DASHBOARD_MODE:'local'}).agentEvidenceRecording,false);
+  assert.equal(effectiveConfig({DASHBOARD_MODE:'local',DASHBOARD_AGENT_EVIDENCE_RECORDING:'off'}).agentEvidenceRecording,false);
+  assert.equal(effectiveConfig({DASHBOARD_MODE:'local',DASHBOARD_AGENT_EVIDENCE_RECORDING:'on'}).agentEvidenceRecording,true);
+  assert.throws(()=>effectiveConfig({DASHBOARD_MODE:'local',DASHBOARD_AGENT_EVIDENCE_RECORDING:'true'}),/DASHBOARD_AGENT_EVIDENCE_RECORDING/);
+});
+
 const hosted = (overrides: NodeJS.ProcessEnv = {}) => effectiveConfig({
   DASHBOARD_MODE: 'hosted',
   DASHBOARD_ORIGIN: 'https://pilot.example.test',

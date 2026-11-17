@@ -1,19 +1,21 @@
 import { NodeExecutionEnv } from '@earendil-works/pi-durable/env/node';
-import { createReadTool, createWriteTool, createBashTool } from '@earendil-works/pi-durable/tools';
+import { createReadTool, createWriteTool, createEditTool, createBashTool } from '@earendil-works/pi-durable/tools';
 import type { Extension, ToolRegistration } from '@earendil-works/pi-durable';
 import type { Context } from '@earendil-works/chord/context';
 import { resolve,relative,isAbsolute } from 'node:path';
 import { HttpError } from '../board-store';
+import { safePath } from '../paths';
+import { FILE_EDIT_REFUSED_DIRECTORIES } from '../state/file-edit-tool';
 
 /**
- * The coding tools: `read`, `write` and `bash`, the same tools a person gets at a terminal running
+ * The coding tools: `read`, `write`, `edit` and `bash`, the same tools a person gets at a terminal running
  * Pi, installed into this project's agent harness **only** when the owner has switched them on and
  * **only** for a connected repository worktree.
  *
  * What this module does and does not promise, because the difference decides whether the owner
  * should grant it:
  *
- * - `read` and `write` are bounded to the connected worktree. Every path a model supplies is
+ * - `read`, `write` and `edit` are bounded to the connected worktree. Every path a model supplies is
  *   resolved against the worktree root and refused when it leaves it or traverses a symlink, using
  *   the same contained-path helper every other read and write in this application uses.
  * - `bash` is **not** contained. It runs through the environment's shell as the application user,
@@ -23,14 +25,15 @@ import { HttpError } from '../board-store';
  * - No tool here inspects, filters or blacklists a command. A pattern list that pretends to make a
  *   shell safe would be worse than useless: it would be a claim this code cannot keep.
  *
- * `edit` is deliberately not installed here. The bounded file-edit tool owns that name and stays
- * governed by the acceptance policy in force, so propose-only keeps meaning something even when
- * these direct-write tools are granted.
+ * `edit` is Pi’s direct text-replacement tool, governed by file_write just like `write`. It is
+ * distinct from `file_edit`, the separately gated proposal and audit tool.
  */
 export interface CodingToolOptions {
   /** The connected worktree root every path must stay inside. */
   readonly root: string;
-  /** Whether `bash` is installed. `read` and `write` are installed whenever this module is used. */
+  /** Resolve a live session workspace before each call; errors refuse the call. */
+  readonly rootForConversation?: (conversationId: string) => Promise<string>;
+  /** Whether `bash` is installed. `read`, `write` and `edit` are installed whenever this module is used. */
   readonly shell: boolean;
 }
 
@@ -60,8 +63,14 @@ function contained(root: string, tool: ToolRegistration): ToolRegistration {
     ...tool,
     execute: async (args: unknown, api: unknown, context: Context) => {
       const path = (args as { path?: unknown }).path;
-      if (typeof path !== 'string' || !insideWorktree(root, path)) outside(String(path));
-      return execute(args, api, context);
+      if (typeof path !== 'string') return outside(String(path));
+      if (!insideWorktree(root, path)) return outside(path);
+      const rel = relative(resolve(root), resolve(root, path));
+      if (!rel || rel.split(/[\\/]/).some(part => FILE_EDIT_REFUSED_DIRECTORIES.includes(part))) outside(path);
+      let checked: string;
+      try { checked = await safePath(resolve(root), rel); } catch { return outside(path); }
+      // Pass the checked absolute path: NodeExecutionEnv otherwise expands ~ and file:// again.
+      return execute({ ...(args as Record<string, unknown>), path: checked }, api, context);
     }
   } as unknown as ToolRegistration;
 }
@@ -79,7 +88,11 @@ export function codingTools(options: CodingToolOptions): { readonly extension: E
     name: 'coding-tools-write',
     tools: [contained(options.root, createWriteTool() as unknown as ToolRegistration)]
   };
-  const extensions: Extension[] = [read, write];
+  const edit: Extension = {
+    name: 'coding-tools-edit',
+    tools: [contained(options.root, createEditTool() as unknown as ToolRegistration)]
+  };
+  const extensions: Extension[] = [read, write, edit];
   if (options.shell) {
     extensions.push({
       name: 'coding-tools-shell',
@@ -91,8 +104,21 @@ export function codingTools(options: CodingToolOptions): { readonly extension: E
       })]
     });
   }
+  const resolvedExtensions = options.rootForConversation ? extensions.map(extension => ({
+    ...extension,
+    tools: extension.tools?.map(tool => {
+        const registration = tool as unknown as ToolRegistration;
+        return { ...registration, execute: async (args: unknown, api: { conversationId?: unknown }, context: Context) => {
+          if (api.conversationId === undefined) throw new HttpError(409, 'The coding session cannot be verified.');
+          const root = await options.rootForConversation!(String(api.conversationId));
+          const selected = codingTools({ root, shell: options.shell }).extension.tools?.find(candidate => candidate.name === registration.name) as unknown as ToolRegistration | undefined;
+          if (!selected) throw new HttpError(503, 'The coding tool is unavailable for this session.');
+          return (selected.execute as (args:unknown,api:unknown,context:Context)=>Promise<unknown>)(args,api,context);
+        }} as unknown as typeof tool;
+      })
+  })) : extensions;
   return {
-    extension: extensions.reduce<Extension>((merged, extension) => ({
+    extension: resolvedExtensions.reduce<Extension>((merged, extension) => ({
       name: 'coding-tools',
       tools: [...(merged.tools ?? []), ...(extension.tools ?? [])]
     }), { name: 'coding-tools', tools: [] }),
@@ -104,5 +130,5 @@ export function codingTools(options: CodingToolOptions): { readonly extension: E
 
 /** The tools this module installs for one capability set, for the prompt and for the audit trail. */
 export function codingToolNames(shell: boolean): readonly string[] {
-  return shell ? ['read', 'write', 'bash'] : ['read', 'write'];
+  return shell ? ['read', 'write', 'edit', 'bash'] : ['read', 'write', 'edit'];
 }

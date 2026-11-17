@@ -4,6 +4,7 @@ import {
   HistoryStack,
   cloneSnapshot,
   isPrefix,
+  isView,
   narrowView,
   parseRoute,
   readEntry,
@@ -76,6 +77,12 @@ function subjectFor(options: {
     },
   };
 }
+
+test('Terminal is a navigable project view and persists in direct links', () => {
+  assert.equal(isView('Terminal'), true);
+  assert.equal(parseRoute('?project=p1&view=Terminal').view, 'Terminal');
+  assert.equal(urlForRoute({ ...base, view: 'Terminal' }, '/').includes('view=Terminal'), true);
+});
 
 test('a document or a session in the address implies its own view', () => {
   assert.deepEqual(parseRoute('?project=p1&doc=docs/a.md'), {

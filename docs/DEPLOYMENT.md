@@ -2,8 +2,11 @@
 
 Pilot is a single-owner application. It assumes a private host you control, a hostname you
 own, and one person allowed through the door. Do not expose it directly to the internet:
-put an authenticating proxy in front of it (the examples here use Cloudflare Access) or keep
-it on a private network you trust.
+put an authenticating proxy in front of it (the current hosted example uses Cloudflare Access).
+A private network or tailnet is not owner authentication by itself. An alternative
+owner-authenticated Tailscale mode is only planned; see the
+[planned tailnet access design](specs/tailnet-owner-access.md). Until it is reviewed and implemented,
+Cloudflare Access remains the documented hosted identity path.
 
 ## Requirements
 
@@ -188,7 +191,12 @@ The schema it reports is not re-read from disk: startup opens the durable contro
 listens) and readiness asks that live handle. A start that cannot open the store, or whose schema is
 not the `schemaId` the release names, refuses to serve rather than answering `503` forever. The
 reported facts are `releaseId`, `schemaId`, `lockHeld`, `dataRootWritable` and `reasons` — never a
-filesystem path or secret. The reasons are `release-manifest-invalid`, `service-lock-not-held`,
+filesystem path or secret. A fresh data root must support atomic hard links for control-store
+initialization. An absent main database with remaining SQLite sidecars fails closed. Interrupted
+initialization can leave `.control-init-*` files or journals; preserve them and investigate only with
+all initializers stopped, rather than automatically deleting possible live evidence. This publication
+does not establish power-loss durability or protection against same-UID pathname races.
+The reasons are `release-manifest-invalid`, `service-lock-not-held`,
 `data-root-not-writable`, `storage-schema-absent`, `storage-schema-unreadable`,
 `storage-schema-busy` (a live writer held the file), `storage-schema-mismatch`,
 `release-identity-mismatch` and `release-promotion-unreadable`. Readiness is read-only and takes no
@@ -224,6 +232,18 @@ control store — see [Releases](RELEASES.md).
 A supervisor should gate on readiness rather than liveness: a responding process that cannot hold
 its lock or match its expected schema is not ready to serve. Health checks stay cheap and
 unauthenticated; a readiness probe carries the owner's identity.
+
+### Offline control-store outbox index maintenance
+
+Older valid control stores may lack the optional `outboxes_operation_id` index. The explicit offline maintenance command can add it without changing the control schema version:
+
+```sh
+node scripts/data-tools.mjs migrate-outbox-index '<existing canonical data root>'
+```
+
+Stop the service and its supervisor first. Make and verify a backup before proceeding. The command refuses a missing root or database, non-private or symlinked paths/sidecars, or any existing `service.lock` evidence (including stale or malformed evidence); it never clears a lock or creates a database. It acquires the same cooperative service lock, validates the schema and exact target index name on one SQLite connection inside `BEGIN IMMEDIATE`, creates the optional index, then validates every stored record using it before commit. Re-running against a store with the exact index is idempotent. Validation, busy-writer, index-name collision, and injected/DDL failures roll back without repairing the store. The command is not run during startup and does not alter the schema marker. Backups made before the index remain valid; SQLite backups made after it preserve the index, and older releases accept the optional index.
+
+The lock and pathname checks are cooperative safeguards, **not hostile-writer isolation**. A process with the same UID can ignore/remove the lock or race filesystem pathnames; SQLite access here is path-based and does not claim descriptor-pinned protection against such an actor. Do not run this command with a hostile same-UID writer or while Pilot may restart.
 
 ### The read-only doctor
 
@@ -292,7 +312,18 @@ all capabilities dropped, `no-new-privileges`, its own bridge network, no Docker
 host networking, CPU/memory/PID limits and rotated logs. It publishes on loopback only, and
 a second service in the same compose project runs the tunnel so the application never needs a
 public port. Keep the environment file beside the compose file (it is excluded from the build
-context) and mount a named volume at `/data`.
+context) and mount a named volume at `/data`. The image provisions `/data/pnpm` for UID 10001;
+pnpm uses it to cache the version selected by a project's `packageManager` field. Thus an
+interactive terminal can resolve a project's pinned pnpm version without attempting to write
+under the read-only root filesystem. This cache shares the application's persistent data volume
+and is not part of the documented backup payload.
+
+To verify this behaviour against a built image with a disposable project and volume, run
+`deploy/pilot/pnpm-store-smoke.sh <image>`. The smoke removes `/data/pnpm` from the disposable
+volume first, simulating an existing data volume from before the cache path was introduced. It
+starts as UID 10001 with a read-only root and the trusted application PATH unchanged, then resolves
+pnpm 12.10.1 and runs `pnpm check` in a pinned project. It requires registry access when that
+manager version is not already cached.
 
 Inside its network namespace the container must bind `0.0.0.0`, which the exposure policy
 allows only in hosted mode: `DASHBOARD_MODE=hosted`,
@@ -424,6 +455,21 @@ on its own; checking that the lock is gone before you switch, and clearing a sta
 it is not, is the runbook step for the *start*, not something the tool relies on you to remember. Never
 clear `service.lock` to force a promotion or a rollback.
 
+## Interactive terminal
+
+The browser terminal is a separate, default-off owner capability. Set `DASHBOARD_TERMINAL=on` in
+Pilot's service environment and restart to enable it; leave it unset to keep terminal endpoints
+unavailable. This does not enable the agent shell or change the existing `DASHBOARD_CODING_TOOLS`
+/ `DASHBOARD_SHELL` switches and agent scope enforcement.
+
+The terminal runs an interactive login shell as the Pilot service user. The project path is only its
+initial directory, not a sandbox; its environment and filesystem permissions include anything the
+service user can reach, including credentials. It uses the ordinary owner authentication for its
+API, a short-lived single-use stream ticket and same-origin WebSocket checks. Sessions are in memory,
+limited to eight, stop on Pilot shutdown, and are not recovered. There is no active-content preview
+route: preview remains disabled until a distinct, owner-authenticated origin has been designed and
+approved. See [Terminal sessions](manual/terminal.md) and the [terminal contract](specs/terminal.md).
+
 ## Operational notes
 
 Provider credentials and model preferences are configured through **Providers & models**.
@@ -432,13 +478,30 @@ Project deploy keys and review worktrees are configured through **Board actions 
 [Project connections](PROJECT-CONNECTIONS.md) for storage, revocation and backup limitations.
 The container includes Git and OpenSSH for fixed provisioning, for the owner-reviewed repository
 updates, and — only when `DASHBOARD_CODING_TOOLS=on` (and `DASHBOARD_SHELL=on` for commands) —
-for the agent's own coding tools. Those switches are the operator's decision, per instance, and
+for the agent's own coding tools. The separate owner-facing terminal is controlled by
+`DASHBOARD_TERMINAL=on`. Those switches are the operator's decision, per instance, and
 the per-agent scopes are the owner's: see [Coding tools](specs/coding-tools.md). Once a deployment
 offers a capability, an owner can switch it **off** in Pilot's **Harness** settings without a
 restart; switching one on is still this deployment switch. The turn bound and the default thinking
-level also live there, with the environment value as the default for a fresh instance. Read the
+level also live there, with the environment value as the default for a fresh instance. The Cloudflare
+connection configuration is separate: its own default-off owner route (`DASHBOARD_CLOUDFLARE_CONNECTION=on`)
+stores one unencrypted Workers API token in `credentials/`, makes no provider request or deployment,
+has no Harness settings toggle and no agent tool, and revoking it through this instance is local only.
+See [Cloudflare connection configuration](specs/cloudflare-connection-store.md). `DASHBOARD_REUSABLE_TOOLS=on`
+is another separate, default-off switch for the bounded JSON projection tools; it needs a bound named
+agent with the `reusable_tools` scope and executes nothing (see
+[Reusable JSON tools](specs/reusable-json-tools.md)). Read the
 credential warning there before enabling the shell, because it is the same user as the
-application and is not contained. Git 2.39+
+application and is not contained. `DASHBOARD_AGENT_COMMIT=on` and `DASHBOARD_AGENT_PUSH=on` are separate,
+default-off switches that install the agent commit and push tools. Each needs a control store, an
+exact owner-configured target and a `full-auto` class decision in the acceptance policy; commit never
+pushes, and push reaches only a locally configured filesystem remote with no hosted credential
+integration. They have no Harness settings toggle: turning one on is this deployment switch, and the
+project target is the owner's choice. `DASHBOARD_AGENT_EVIDENCE_RECORDING=on` is a separate,
+default-off deployment switch for agent-submitted evidence: it expands the existing `accept` scope
+to permit self-reported Markdown evidence writes. It requires a restart, a named bound agent and that
+scope. Test and diff claims are not independently verified; the Harness settings show whether the
+switch is on. Leave it off until this capability has been independently reviewed. Git 2.39+
 is required for the safe merge preview. These features do not change the Access application,
 tunnel policy, credential layout or storage schema. No dependency install or push occurs in
 a project update. Transient reviews disappear on restart and cannot be replayed; an

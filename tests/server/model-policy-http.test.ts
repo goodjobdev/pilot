@@ -139,12 +139,18 @@ test('saving the policy during a run changes neither the running generation nor 
     assert.equal(started.status, 200);
     let before: { working: boolean; model: ModelChoice | null } | null = null;
     for (let attempt = 0; attempt < 40; attempt++) {
-      const view = await (await f.get('/projects/' + projectRecord.id + '/agents')).json() as { view: { working: boolean; model: ModelChoice | null } };
+      const response = await f.get('/projects/' + projectRecord.id + '/agents');
+      const view = await response.json() as { view?: { working: boolean; model: ModelChoice | null } };
+      assert.equal(response.status, 200, `agent view failed: ${JSON.stringify(view)}`);
+      assert.ok(view.view && typeof view.view.working === 'boolean', `invalid agent view: ${JSON.stringify(view)}`);
       if (view.view.working) { before = view.view; break; }
       await new Promise((ok) => setTimeout(ok, 50));
     }
     assert.ok(before?.working, 'the scripted run is working');
-    const initial = await (await f.get('/settings/model-policy')).json() as { models: { provider: string; modelId: string; known: boolean; available: boolean }[] };
+    const policyResponse = await f.get('/settings/model-policy');
+    const initial = await policyResponse.json() as { models: { provider: string; modelId: string; known: boolean; available: boolean }[] };
+    assert.equal(policyResponse.status, 200, `model policy read failed: ${JSON.stringify(initial)}`);
+    assert.ok(Array.isArray(initial.models), `model policy response has no models array: ${JSON.stringify(initial)}`);
     const scripted = pick(initial.models, (model) => model.provider === 'faux' && model.available);
     const saved = await f.post('/settings/model-policy', { revision: 0, policy: { allowedWorkerModels: [scripted], defaultWorkerModel: scripted } });
     assert.equal(saved.status, 200);

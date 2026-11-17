@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, writeFile, symlink, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, writeFile, symlink, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -59,6 +59,41 @@ test('planning tools contain reads and use checked board revisions', async () =>
     assert.equal((await boards.read(project)).revision, batch.revision);
     await assert.rejects(() => call('write_board', { revision: batch.revision, operation: { op: 'putTask', task: third }, operations: [] }));
   } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test('a queued board write rechecks its execution authority',async()=>{
+ const root=await mkdtemp(join(tmpdir(),'pilot-planning-authority-'));
+ try{
+  const project:Project={id:'fixture',name:'Fixture',path:join(root,'project'),managed:true,repository:'',created:''};
+  await mkdir(join(project.path,'docs/dashboard'),{recursive:true});await mkdir(join(root,'data'));
+  const file=join(project.path,'docs/dashboard/board.md');await writeFile(file,serializeBoard(emptyBoard()));
+  const boards=new BoardStore(join(root,'data'));const original=await boards.read(project);
+  let enter!:()=>void,release!:()=>void;const entered=new Promise<void>(resolve=>{enter=resolve;});const gate=new Promise<void>(resolve=>{release=resolve;});
+  const held=boards.serial(project.id,async()=>{enter();await gate;});await entered;
+  let admitted!:()=>void;const started=new Promise<void>(resolve=>{admitted=resolve;});
+  const mutate=boards.mutate.bind(boards);boards.mutate=async(...args)=>{admitted();return mutate(...args);};
+  let allowed=true;const extension=planningExtension(project,new DocStore(),boards,()=>async()=>{if(!allowed)throw Error('authority revoked');});
+  const tool=extension.tools!.find(item=>item.name==='write_board')!;
+  const execute=tool.execute as unknown as (args:unknown,api:unknown,context:unknown)=>Promise<unknown>;
+  const write=execute({revision:original.revision,operation:{op:'putTask',task:newTask(randomUUID(),'must not write')}},{taskId:'task',conversationId:'1'},{});
+  await started;allowed=false;release();await held;
+  await assert.rejects(write,/authority revoked/);assert.equal((await boards.read(project)).revision,original.revision);
+ }finally{await rm(root,{recursive:true,force:true});}
+});
+
+test('late external board edits are noticed before rename',async()=>{
+ for(const mode of ['mutate','document'] as const){
+  const root=await mkdtemp(join(tmpdir(),'pilot-board-external-'));
+  try{
+   const project:Project={id:'fixture',name:'Fixture',path:join(root,'project'),managed:true,repository:'',created:''};
+   await mkdir(join(project.path,'docs/dashboard'),{recursive:true});await mkdir(join(root,'data'));
+   const file=join(project.path,'docs/dashboard/board.md'),original=serializeBoard(emptyBoard());await writeFile(file,original);
+   const boards=new BoardStore(join(root,'data'));const revision=(await boards.read(project)).revision,raw=boards.raw.bind(boards);let reads=0;
+   boards.raw=async p=>{reads++;if(reads===(mode==='mutate'?4:3))await writeFile(file,original+'\n# external\n');return raw(p);};
+   const work=mode==='mutate'?boards.mutate(project,revision,{op:'putTask',task:newTask(randomUUID(),'new')}):boards.writeDocument(project,revision,original);
+   await assert.rejects(work,/External edit detected/);assert.match(await readFile(file,'utf8'),/# external/);
+  }finally{await rm(root,{recursive:true,force:true});}
+ }
 });
 
 test('planning scope mappings deny absent grants and report optional file edit', () => {

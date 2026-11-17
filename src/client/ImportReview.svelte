@@ -1,5 +1,6 @@
 <script lang="ts">
  import { onMount } from 'svelte';
+ import {showModalWithFocusReturn} from './modal-focus';
  import { request } from './api';
  import type { Snapshot } from '../shared/model';
  import type { ImportPreview } from '../server/importer';
@@ -9,7 +10,7 @@
  let repoDocs=$state<DocEntry[]>([]),paths=$state<string[]>([]);
  let dialog:HTMLDialogElement;
  let docs=$state<{name:string;content:string}[]>([]),preview=$state<ImportPreview|null>(null),token=$state(''),selected=$state<string[]>([]),edges=$state<string[]>([]),error=$state(''),busy=$state(false);
- onMount(()=>{dialog.showModal();if(repositoryMode)void loadSources();});
+ onMount(()=>{const close=showModalWithFocusReturn(dialog);if(repositoryMode)void loadSources();return close;});
  async function loadSources(){try{repoDocs=(await request<{documents:DocEntry[]}>('/projects/'+projectId+'/docs')).documents.filter(doc=>doc.path!==PLAN_PATH);paths=repoDocs.filter(doc=>/(?:plan|roadmap|tasks|milestone)/i.test(doc.path)).map(doc=>doc.path);}catch(e){error=(e as Error).message;}}
  async function files(event:Event){const list=(event.currentTarget as HTMLInputElement).files;if(!list)return;error='';try{
    const added=await Promise.all([...list].map(async f=>{if(f.size>2*1024*1024)throw Error('Document too large: '+f.name);return {name:f.name,content:await f.text()};}));
@@ -19,8 +20,8 @@
  async function apply(){busy=true;try{const s=await request<Snapshot>('/projects/'+projectId+'/import/apply','POST',{token,selected,edgeIds:edges});onapplied(s);onclose();}catch(e){error=(e as Error).message;}finally{busy=false;}}
  function toggle(id:string){selected=selected.includes(id)?selected.filter(x=>x!==id):[...selected,id];}
 </script>
-<dialog class="import-dialog" bind:this={dialog} oncancel={onclose}>
- <header class="modal-head"><div><span class="eyebrow">REVIEW BEFORE WRITING</span><h2>{repositoryMode?'Sync plan':'Import planning documents'}</h2></div><button aria-label="Close import" onclick={onclose}>×</button></header>
+<dialog class="import-dialog" bind:this={dialog} oncancel={onclose} aria-labelledby="import-review-title">
+ <header class="modal-head"><div><span class="eyebrow">REVIEW BEFORE WRITING</span><h2 id="import-review-title">{repositoryMode?'Sync plan':'Import planning documents'}</h2></div><button aria-label="Close import" onclick={onclose}>×</button></header>
  {#if repositoryMode}
  <p class="muted">Preview task checklists and explicit milestone dependencies from repository docs. Apply reviewed changes to the canonical plan document in one local commit. Source specs remain evidence, not a second task-status database. Prose-only specs need interpretation by your agent.</p>
  <fieldset class="source-picker"><legend>Source documents</legend>{#each repoDocs as doc}<label><input type="checkbox" checked={paths.includes(doc.path)} onchange={()=>{paths=paths.includes(doc.path)?paths.filter(path=>path!==doc.path):[...paths,doc.path];preview=null;}}>{doc.path}</label>{/each}{#if !repoDocs.length}<p>No source documents available.</p>{/if}</fieldset>

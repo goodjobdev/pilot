@@ -1,7 +1,8 @@
 <script lang="ts">
  import {onMount} from 'svelte';
+ import {showModalWithFocusReturn} from './modal-focus';
  import {api,request,ApiError} from './api';
- import type {AgentDraftBody,AgentRegistryView,FileEditLedgerView} from './api';
+ import type {AgentDraftBody,AgentRegistryView,FileEditLedgerView,CommitTargetView,AcceptedActionHistoryView,ActionObservationsView,ActionObservation} from './api';
  import type {AgentRecord} from '../shared/agent-registry';
  import type {Project} from '../shared/model';
  import Icon from './Icon.svelte';
@@ -19,8 +20,14 @@
  let dialog:HTMLDialogElement;
  let registry=$state<AgentRegistryView|null>(null),projects=$state<Project[]>([]);
  let ledger=$state<FileEditLedgerView|null>(null);
+ let targetProject=$state(''),targetView=$state<CommitTargetView|null>(null),targetProblem=$state(''),targetBusy=$state(false),targetChoice=$state(false);
+ let targetGeneration=0,historyGeneration=0;
+ let actionHistory=$state<AcceptedActionHistoryView|null>(null),historyProblem=$state('');
+ let observationId=$state(''),observationView=$state<ActionObservationsView|null>(null),observationChoice=$state<ActionObservation|''>(''),observationProblem=$state(''),observationBusy=$state(false),observationMessage=$state('');
+ let observationGeneration=0;
  let problem=$state(''),message=$state(''),busy=$state(false);
  let selected=$state<string|null>(null),creating=$state(false);
+ let requestsAccounted=$state<number|null>(null);
  /** The per-field refusals the server reported, keyed by the field name it named. */
  let fieldErrors=$state<Record<string,string>>({});
  /** The draft being edited: a new record, or a copy of the selected one. */
@@ -67,13 +74,14 @@
   const text=error instanceof ApiError?error.message:(error as Error).message;
   const {field,message:shown}=attribute(text);
   fieldErrors=field?{...fieldErrors,[field]:shown}:{};
-  problem=field?'':shown;
+  problem=field&&['name','description','model','workspace','budgets','scopes'].includes(field)?'':shown;
   return field;
  }
 
  onMount(()=>{
-  dialog.showModal();
+  const close=showModalWithFocusReturn(dialog);
   void load();
+  return close;
  });
  async function load(){
   problem='';
@@ -91,7 +99,7 @@
   if(first)void select(first.id);
  }
  async function select(id:string){
-  creating=false;selected=id;fieldErrors={};problem='';message='';
+  creating=false;selected=id;requestsAccounted=null;fieldErrors={};problem='';message='';
   const record=registry?.agents.find(agent=>agent.id===id);
   if(record)draft={name:record.name,description:record.description,enabled:record.enabled,model:{...record.model},workspace:draftWorkspace(record.workspace),budgets:{...record.budgets},scopes:[...record.scopes]};
   await loadOne(id);
@@ -99,13 +107,15 @@
  async function loadOne(id:string){
   try{
    const detail=await api.agent(id);
+   if(selected!==id||creating)return;
+   requestsAccounted=detail.budgetUsage.requestsAccounted;
    // The server is the authority: the form shows the record it just read back, never the draft alone.
    draft={name:detail.agent.name,description:detail.agent.description,enabled:detail.agent.enabled,model:{...detail.agent.model},workspace:draftWorkspace(detail.agent.workspace),budgets:{...detail.agent.budgets},scopes:[...detail.agent.scopes]};
    registry=registry?{...registry,agents:registry.agents.map(agent=>agent.id===id?detail.agent:agent)}:registry;
   }catch(e){problem=(e as Error).message;}
  }
  function startCreate(){
-  creating=true;selected=null;fieldErrors={};problem='';message='';
+  creating=true;selected=null;requestsAccounted=null;fieldErrors={};problem='';message='';
   draft=blank();
   draft={...draft,workspace:{scope:projects[0]?{kind:'projects' as const,projectIds:[projects[0].id]}:{kind:'projects' as const,projectIds:[]},subpath:''},model:registry?.models[0]?{...registry.models[0]}:{provider:'',modelId:''}};
  }
@@ -179,6 +189,36 @@
   }catch(e){report(e);}
   finally{busy=false;}
  }
+ async function loadTarget(projectId:string){
+  const generation=++targetGeneration;targetView=null;targetProblem='';targetChoice=false;
+  if(!projectId)return;
+  try{const view=await api.commitTarget(projectId);if(generation!==targetGeneration)return;targetView=view;targetChoice=view.target?.enabled??false;}
+  catch(e){if(generation===targetGeneration)targetProblem=(e as Error).message;}
+ }
+ async function loadHistory(projectId:string,before?:string){
+  const generation=++historyGeneration;actionHistory=null;historyProblem='';observationId='';observationView=null;observationGeneration++;if(!projectId)return;
+  try{const view=await api.actionHistory(projectId,before);if(generation===historyGeneration)actionHistory=view;}
+  catch(e){if(generation===historyGeneration)historyProblem=(e as Error).message;}
+ }
+ async function loadObservations(id:string,preserve=false){
+  const generation=++observationGeneration,projectId=targetProject;observationId=id;observationView=null;observationProblem='';observationMessage='';if(!preserve)observationChoice='';
+  try{const view=await api.actionObservations(projectId,id);if(generation===observationGeneration)observationView=view;}
+  catch(e){if(generation===observationGeneration)observationProblem=(e as Error).message;}
+ }
+ async function saveObservation(){
+  if(observationBusy||!observationView||!observationChoice)return;
+  const generation=observationGeneration,projectId=targetProject,id=observationId,view=observationView,choice=observationChoice;observationBusy=true;observationProblem='';observationMessage='';
+  try{const saved=await api.recordActionObservation(projectId,id,view.action.revision,view.reviews.length,choice);if(generation===observationGeneration){observationView=saved;observationChoice='';observationMessage='Observation recorded. The action and any barrier remain unchanged.';}}
+  catch(e){if(generation===observationGeneration)observationProblem=(e as Error).message+' Your selection is preserved; reload observations before trying again.';}
+  finally{observationBusy=false;}
+ }
+ async function saveTarget(){
+  if(!targetProject||!targetView||targetBusy)return;
+  const projectId=targetProject,generation=targetGeneration;targetBusy=true;targetProblem='';
+  try{const view=await api.saveCommitTarget(projectId,targetView.target?.revision??0,targetChoice);if(generation===targetGeneration)targetView=view;}
+  catch(e){if(generation===targetGeneration)targetProblem=(e as Error).message+' Your selection is preserved; reload before retrying.';}
+  finally{targetBusy=false;}
+ }
  /** The recorded file edits of the selected agent's project, with their diffs. Read-only. */
  async function loadLedger(projectId:string){
   ledger=null;
@@ -188,9 +228,9 @@
  $effect(()=>{const projectId=workspaceProject();if(registry?.fileEdit.enabled)void loadLedger(projectId);});
  const summary=(agent:AgentRecord)=>agent.scopes.length?agent.scopes.map(scope=>scopeAvailable(scope)?scope:scope+' (unavailable)').join(', '):'no scopes';
 </script>
-<dialog bind:this={dialog} oncancel={onclose} class="agent-manager">
+<dialog bind:this={dialog} oncancel={onclose} class="agent-manager" aria-labelledby="agent-manager-title">
  <header class="modal-head">
-  <div><span class="eyebrow">PILOT SETTINGS</span><h2>Agents &amp; privileges</h2></div>
+  <div><span class="eyebrow">PILOT SETTINGS</span><h2 id="agent-manager-title">Agents &amp; privileges</h2></div>
   <button aria-label="Close agent manager" onclick={onclose}>×</button>
  </header>
  <div class="manager-scroll">
@@ -219,48 +259,51 @@
    {#if registry}
    <fieldset disabled={busy}>
     <legend>{creating?'New agent':(selected?'Change this agent':'Choose an agent')}</legend>
-    <label>Name<input aria-label="Agent name" bind:value={draft.name} maxlength="80" spellcheck="false"></label>
-    {#if fieldErrors.name}<small class="field-error" role="alert">{fieldErrors.name}</small>{/if}
-    <label>Description<textarea aria-label="Agent description" bind:value={draft.description} maxlength="400"></textarea></label>
-    {#if fieldErrors.description}<small class="field-error" role="alert">{fieldErrors.description}</small>{/if}
+    <label>Name<input aria-label="Agent name" aria-invalid={!!fieldErrors.name} aria-describedby={fieldErrors.name?'agent-name-error':undefined} bind:value={draft.name} maxlength="80" spellcheck="false"></label>
+    {#if fieldErrors.name}<small id="agent-name-error" class="field-error" role="alert">{fieldErrors.name}</small>{/if}
+    <label>Description<textarea aria-label="Agent description" aria-invalid={!!fieldErrors.description} aria-describedby={fieldErrors.description?'agent-description-error':undefined} bind:value={draft.description} maxlength="400"></textarea></label>
+    {#if fieldErrors.description}<small id="agent-description-error" class="field-error" role="alert">{fieldErrors.description}</small>{/if}
     <label class="row"><input type="checkbox" aria-label="Agent enabled" checked={draft.enabled} onchange={e=>draft={...draft,enabled:e.currentTarget.checked}}>Enabled</label>
-    <label>Model<select aria-label="Agent model" value={draft.model.provider+'/'+draft.model.modelId} onchange={e=>{const chosen=registry?.models.find(candidate=>candidate.provider+'/'+candidate.modelId===e.currentTarget.value);draft={...draft,model:chosen?{...chosen}:{provider:'',modelId:''}};}}>
+    <label>Model<select aria-label="Agent model" aria-invalid={!!fieldErrors.model} aria-describedby={fieldErrors.model?'agent-model-error':undefined} value={draft.model.provider+'/'+draft.model.modelId} onchange={e=>{const chosen=registry?.models.find(candidate=>candidate.provider+'/'+candidate.modelId===e.currentTarget.value);draft={...draft,model:chosen?{...chosen}:{provider:'',modelId:''}};}}>
      {#if !registry.models.length}<option value="">No model is offered on this instance</option>{/if}
      {#each registry.models as model (model.provider+'/'+model.modelId)}<option value={model.provider+'/'+model.modelId}>{model.provider} / {model.modelId}</option>{/each}
     </select></label>
-    {#if fieldErrors.model}<small class="field-error" role="alert">{fieldErrors.model}</small>{/if}
+    {#if fieldErrors.model}<small id="agent-model-error" class="field-error" role="alert">{fieldErrors.model}</small>{/if}
     <span class="popover-heading">PROJECT SCOPE</span>
     <small class="muted">Where this agent may act. A call that acts on a project outside this scope is refused server-side, even when the tool is otherwise permitted.</small>
-    <label class="row"><input type="checkbox" aria-label="All projects" checked={draft.workspace.scope.kind==='all'} onchange={e=>setAllProjects(e.currentTarget.checked)}>All projects</label>
+    <label class="row"><input type="checkbox" aria-label="All projects" aria-invalid={!!fieldErrors.workspace} aria-describedby={fieldErrors.workspace?'agent-workspace-error':undefined} checked={draft.workspace.scope.kind==='all'} onchange={e=>setAllProjects(e.currentTarget.checked)}>All projects</label>
     {#if draft.workspace.scope.kind!=='all'}
-    <div class="scopes" aria-label="Allowed projects">
+    <div class="scopes" role="group" aria-label="Allowed projects">
      {#each projects as project (project.id)}
-     <label class="scope"><input type="checkbox" aria-label={'Project '+project.name} checked={allowsProject(project.id)} onchange={e=>toggleProject(project.id,e.currentTarget.checked)}><span><strong>{project.name}</strong></span></label>
+     <label class="scope"><input type="checkbox" aria-label={'Project '+project.name} aria-invalid={!!fieldErrors.workspace} aria-describedby={fieldErrors.workspace?'agent-workspace-error':undefined} checked={allowsProject(project.id)} onchange={e=>toggleProject(project.id,e.currentTarget.checked)}><span><strong>{project.name}</strong></span></label>
      {/each}
     </div>
     {/if}
-    <label>Subpath inside each project<input aria-label="Agent workspace subpath" bind:value={draft.workspace.subpath} placeholder="empty is each project root" spellcheck="false"></label>
-    {#if fieldErrors.workspace}<small class="field-error" role="alert">{fieldErrors.workspace}</small>{/if}
+    <label>Declared subpath inside each project<input aria-label="Agent workspace subpath" aria-invalid={!!fieldErrors.workspace} aria-describedby={fieldErrors.workspace?'agent-workspace-error':undefined} bind:value={draft.workspace.subpath} placeholder="empty is each project root" spellcheck="false"></label>
+    <small class="muted">The subpath is recorded but does not confine coding or shell tools. Shell access can reach files beyond this project.</small>
+    {#if fieldErrors.workspace}<small id="agent-workspace-error" class="field-error" role="alert">{fieldErrors.workspace}</small>{/if}
+    <p class="muted" role="note">Named-agent session requests are counted across projects from when accounting was installed. The owner can change the request limit; raising it permits further requests without resetting the count. Owner-created workers use separate limits and are not included in this agent’s count. The jobs-per-hour limit is enforced for the test-execution tool (run_tests) through this agent’s durable ledger; no other job path uses it. These are not spending limits, and providers must honor the requested per-request token cap.</p>
+    {#if requestsAccounted!==null&&!creating}<p class="muted">Accounted request reservations: {requestsAccounted}. Failed or uncertain attempts are included.</p>{/if}
     <div class="budgets">
-     <label>Max requests<input aria-label="Agent max requests" value={draft.budgets.maxRequests??''} inputmode="numeric" oninput={e=>budget('maxRequests',e.currentTarget.value)}></label>
-     <label>Max output tokens<input aria-label="Agent max output tokens" value={draft.budgets.maxOutputTokens??''} inputmode="numeric" oninput={e=>budget('maxOutputTokens',e.currentTarget.value)}></label>
-     <label>Max jobs per hour<input aria-label="Agent max jobs per hour" value={draft.budgets.maxJobsPerHour??''} inputmode="numeric" oninput={e=>budget('maxJobsPerHour',e.currentTarget.value)}></label>
+     <label>Max accounted requests<input aria-label="Agent max requests" aria-invalid={!!fieldErrors.budgets} aria-describedby={fieldErrors.budgets?'agent-budgets-error':undefined} value={draft.budgets.maxRequests??''} inputmode="numeric" oninput={e=>budget('maxRequests',e.currentTarget.value)}></label>
+     <label>Max output tokens per request<input aria-label="Agent max output tokens" aria-invalid={!!fieldErrors.budgets} aria-describedby={fieldErrors.budgets?'agent-budgets-error':undefined} value={draft.budgets.maxOutputTokens??''} inputmode="numeric" oninput={e=>budget('maxOutputTokens',e.currentTarget.value)}></label>
+     <label>Jobs per hour (test execution)<input aria-label="Jobs per hour (test execution)" aria-invalid={!!fieldErrors.budgets} aria-describedby={fieldErrors.budgets?'agent-budgets-error':undefined} value={draft.budgets.maxJobsPerHour??''} inputmode="numeric" oninput={e=>budget('maxJobsPerHour',e.currentTarget.value)}></label>
     </div>
-    {#if fieldErrors.budgets}<small class="field-error" role="alert">{fieldErrors.budgets}</small>{/if}
+    {#if fieldErrors.budgets}<small id="agent-budgets-error" class="field-error" role="alert">{fieldErrors.budgets}</small>{/if}
     <div class="scopes-head"><span class="popover-heading">PRIVILEGE SCOPES</span>
      <div class="scopes-all">
       <button class="compact-button" aria-label="Grant every available scope" disabled={!registry.scopes.some(entry=>scopeAvailable(entry.scope)&&!draft.scopes.includes(entry.scope))} onclick={()=>grantAll(true)}>Select all available</button>
       <button class="compact-button" aria-label="Remove every scope from this draft" disabled={draft.scopes.length===0} onclick={()=>grantAll(false)}>Clear all</button>
      </div></div>
     <small class="muted">Installed tools require a grant. Unavailable scopes cannot be newly granted. Existing unavailable grants stay saved unless you remove them; they do not make tools available.</small>
-    <div class="scopes" aria-label="Privilege scopes">
+    <div class="scopes" role="group" aria-label="Privilege scopes">
      {#each registry.scopes as entry (entry.scope)}
      {@const available=scopeAvailable(entry.scope)}
      {@const granted=draft.scopes.includes(entry.scope)}
-     <label class="scope" class:unavailable={!available}><input type="checkbox" aria-label={'Scope '+entry.scope} aria-describedby={'scope-status-'+entry.scope} checked={granted} disabled={!available&&!granted} onchange={e=>toggleScope(entry.scope,e.currentTarget.checked)}><span><strong>{entry.scope}</strong><small>{entry.description}</small><small id={'scope-status-'+entry.scope}>{available?'Installed and available':entry.scope==='file_edit'&&!registry.fileEdit.enabled?'Unavailable: optional file editing is disabled on this deployment.':'Unavailable: no tool is installed for this scope.'}{!available&&granted?' Existing grant; uncheck to remove.':''}</small></span></label>
+     <label class="scope" class:unavailable={!available}><input type="checkbox" aria-label={'Scope '+entry.scope} aria-invalid={!!fieldErrors.scopes} aria-describedby={'scope-status-'+entry.scope+(fieldErrors.scopes?' agent-scopes-error':'')} checked={granted} disabled={!available&&!granted} onchange={e=>toggleScope(entry.scope,e.currentTarget.checked)}><span><strong>{entry.scope}</strong><small>{entry.description}</small><small id={'scope-status-'+entry.scope}>{available?'Installed and available':entry.scope==='file_edit'&&!registry.fileEdit.enabled?'Unavailable: optional file editing is disabled on this deployment.':'Unavailable: no tool is installed for this scope.'}{!available&&granted?' Existing grant; uncheck to remove.':''}</small></span></label>
      {/each}
     </div>
-    {#if fieldErrors.scopes}<small class="field-error" role="alert">{fieldErrors.scopes}</small>{/if}
+    {#if fieldErrors.scopes}<small id="agent-scopes-error" class="field-error" role="alert">{fieldErrors.scopes}</small>{/if}
     <div class="row">
      <button class="primary" aria-label={creating?'Create agent':'Save agent'} disabled={busy||!selected&&!creating} onclick={()=>void save()}>{creating?'Create agent':'Save'}</button>
      {#if !creating&&selected}
@@ -272,6 +315,49 @@
    {/if}
   </section>
  </div>
+ <section class="ledger" aria-label="Commit target configuration">
+  <span class="popover-heading">COMMIT TARGET</span>
+  <p class="muted">Configure the fixed Pilot branch for a project. This does not install a commit tool, grant an agent permission, or make any commit.</p>
+  <label>Project<select aria-label="Commit target project" value={targetProject} onchange={e=>{targetProject=e.currentTarget.value;void loadTarget(targetProject);void loadHistory(targetProject);}}>
+   <option value="">Choose a project</option>{#each projects as project (project.id)}<option value={project.id}>{project.name}</option>{/each}
+  </select></label>
+  {#if targetProblem}<p class="error" role="alert">{targetProblem}</p>{/if}
+  {#if targetView}
+   <p class="muted">{targetView.reason}</p>
+   <p class="muted">{targetView.target?'Revision '+targetView.target.revision+' · '+targetView.target.definition.branch:'Not configured yet.'}</p>
+   <label class="row"><input type="checkbox" aria-label="Enable commit target" bind:checked={targetChoice} disabled={targetBusy}>Enable target configuration</label>
+   <div class="row"><button disabled={targetBusy} onclick={()=>void saveTarget()}>Save commit target</button><button disabled={targetBusy} onclick={()=>void loadTarget(targetProject)}>Reload target</button></div>
+  {/if}
+  {#if targetProject}
+   <h3>Action history</h3>
+   <p class="muted">Read-only durable intents for this project. Pending or uncertain effects may have happened; inspect the target before any new action. A recorded receipt is not independent verification. This list cannot retry or clear an action and may not include effects made outside this store.</p>
+   <button onclick={()=>void loadHistory(targetProject)}>Reload action history</button>
+   {#if historyProblem}<p class="error" role="alert">{historyProblem}</p>{/if}
+   {#if actionHistory}
+    {#if actionHistory.items.length===0}<p class="muted">No action intents recorded in this store.</p>{/if}
+    {#each actionHistory.items as item (item.id)}
+     <article class="action-history-item"><strong>{item.actionClass} · {item.state}</strong><p>Target {item.targetId} revision {item.targetRevision} · agent {item.agentId} · session {item.sessionId}</p><p>Artifact {item.artifact.revision}{item.artifact.commit?' · bound commit '+item.artifact.commit:''}{item.receiptCommit?' · reported commit '+item.receiptCommit:''}</p><small>Intent {item.id} · updated {item.updatedAt}</small><div><button aria-label={'Review observations for '+item.actionClass+' '+item.id} onclick={()=>void loadObservations(item.id)}>Review observations</button></div></article>
+     {#if observationId===item.id}
+      <div class="observation-panel">
+       <p class="muted">An owner observation is an unverified statement about what was visible when checked. It does not establish that an effect stopped, clear a barrier, authorize a retry or alter the action.</p>
+       {#if observationProblem}<p class="error" role="alert">{observationProblem}</p>{/if}
+       {#if observationMessage}<p role="status">{observationMessage}</p>{/if}
+       {#if observationView}
+        <p>Action revision {observationView.action.revision} · {observationView.action.state}</p>
+        {#each observationView.reviews as review (review.revision)}<p>Owner observation {review.revision}: {review.observation} · action revision {review.actionRevision} · {review.observedBy} · {review.observedAt}</p>{/each}
+        <label>What did you observe?<select aria-label="Action observation" bind:value={observationChoice} disabled={observationBusy||observationView.reviews.length>=observationView.limit}>
+         <option value="">Choose an observation</option><option value="checked-uncertain">Checked; outcome still uncertain</option><option value="checked-no-effect-visible">Checked; no effect visible</option><option value="checked-effect-visible">Checked; effect visible</option>
+        </select></label>
+        {#if observationView.reviews.length>=observationView.limit}<p class="muted">Observation limit reached; no more can be recorded here.</p>{/if}
+        <div class="row"><button disabled={observationBusy||!observationChoice||observationView.reviews.length>=observationView.limit} onclick={()=>void saveObservation()}>Record observation</button><button disabled={observationBusy} onclick={()=>void loadObservations(item.id,true)}>Reload observations</button></div>
+       {:else if observationProblem}<button onclick={()=>void loadObservations(item.id,true)}>Reload observations</button>{/if}
+      </div>
+     {/if}
+    {/each}
+    {#if actionHistory.nextBefore}<button onclick={()=>void loadHistory(targetProject,actionHistory?.nextBefore??undefined)}>Earlier actions</button><p class="muted">Showing up to 50 intents per page.</p>{/if}
+   {/if}
+  {/if}
+ </section>
  <section class="ledger" aria-label="Recorded file edits">
   <span class="popover-heading">RECORDED FILE EDITS</span>
   {#if !registry?.fileEdit.enabled}
@@ -281,7 +367,7 @@
   {#if ledger?.edits.length}
   {#each ledger.edits.slice(-10).reverse() as edit (edit.id)}
   <details class="edit">
-   <summary><strong>{edit.path}</strong> · {edit.mode} · {edit.applied?'written':'proposed'} · {edit.changedBy.kind}</summary>
+   <summary><strong>{edit.path}</strong> · {edit.mode} · {edit.applied===true?'write confirmed':edit.applied===null?'write outcome unknown':'proposed'} · {edit.changedBy.kind}</summary>
    <pre>{edit.diff}</pre>
   </details>
   {/each}
@@ -320,6 +406,7 @@
  .scope.unavailable{border-style:dashed}
  .field-error{display:block;color:var(--danger);line-height:1.5;margin:4px 0 2px}
  .ledger{margin-top:14px;border:1px solid var(--line);border-radius:5px;padding:10px 12px}
+ .action-history-item,.observation-panel{overflow-wrap:anywhere}
  .edit{margin-top:8px}
  .edit pre{white-space:pre-wrap;overflow-wrap:anywhere;font:11px/1.5 var(--mono);max-height:220px;overflow:auto}
  small{color:var(--muted);line-height:1.6}

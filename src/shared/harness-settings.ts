@@ -58,7 +58,7 @@ export function defaultHarnessSettings(maxModelTurns: number, maxOutputTokens = 
 const settingsSchema = z.strictObject({
   version: z.literal(HARNESS_SETTINGS_VERSION),
   preferences: z.strictObject({
-    maxModelTurns: z.number().int().min(1).max(MAX_MODEL_TURNS_CEILING),
+    maxModelTurns: z.number().int().min(0).max(MAX_MODEL_TURNS_CEILING),
     maxOutputTokens: z.number().int().min(1).max(MAX_OUTPUT_TOKENS_CEILING),
     defaultThinking: z.enum(THINKING_LEVELS).nullable()
   }),

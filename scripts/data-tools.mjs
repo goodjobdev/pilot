@@ -32,12 +32,13 @@ import { constants,createReadStream } from 'node:fs';
 import { chmod,lstat,mkdir,mkdtemp,open,readdir,readFile,realpath,rename,rm,rmdir,unlink,writeFile } from 'node:fs/promises';
 import { DatabaseSync } from 'node:sqlite';
 import { tmpdir } from 'node:os';
-import { basename,dirname,join,resolve,sep } from 'node:path';
+import { basename,dirname,join,parse,relative,resolve,sep } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { ARCHIVE_FORMAT,ARCHIVE_FORMAT_VERSION,KDF_PARAMETERS,NONCE_BYTES,PASSPHRASE_ENV,PASSPHRASE_STDIN_ENV,SALT_BYTES,PayloadReader,buildHeader,digestFile,encodeRecord,isAuthenticationFailure,openArchive,resolvePassphrase,writeArchive } from './backup-crypto.mjs';
 import { AUTHENTICATION_FAILURE } from './backup-crypto.mjs';
 import { acquireServiceLock,inspectServiceLock } from '../src/server/service-lock.ts';
 import { SUPPORTED_SCHEMA_IDS,UNRELEASED_LOCAL,observeStorageSchema,resolveRelease } from '../src/server/release.ts';
+import { ControlStore } from '../src/server/state/control-store.ts';
 
 /** The marker a restore writes; startup refuses to serve a root that carries it. */
 export const PAUSED_MARKER = 'RESTORE-PAUSED.json';
@@ -60,9 +61,9 @@ const SQLITE_SUFFIXES = new Set(['.sqlite','.sqlite3']);
 const MEDIA_OBJECT = /^[a-f0-9]{64}\.bin$/;
 /** Documentation and the media the wiki may serve. Mirrors src/shared/docs.ts (assetTypes) and DocStore. */
 const DOCUMENT_EXTENSIONS = new Set(['.md','.mdx','.png','.jpg','.jpeg','.gif','.webp','.avif','.svg','.html','.htm']);
-/** Derived or vendored folders hold nothing the application owns. Mirrors the application's own exclusions. */
+/** Named derived or vendored folders that hold nothing the application owns. */
 const generatedSegments = new Set(['node_modules','dist','build','out','target','coverage','vendor','venv','.git','.astro','.svelte-kit','.next','.nuxt','.turbo','.cache','test-results','playwright-report','.runway','.kilo','.pi-web','tmp']);
-const GENERATED_LIST = 'node_modules, dist, build, out, target, coverage, vendor, venv, .git, .astro, .svelte-kit, .next, .nuxt, .turbo, .cache, test-results, playwright-report, .runway, .kilo, .pi-web and tmp';
+const GENERATED_LIST = 'node_modules, dist, build, out, target, coverage, vendor, venv, .git, .astro, .svelte-kit, .next, .nuxt, .turbo, .cache, test-results, playwright-report, .runway, .kilo, .pi-web, tmp, and all other dot-prefixed directories except .github';
 const payloadSegment = '[A-Za-z0-9._-]{1,200}';
 const PAYLOAD_PATTERNS = [
   /^catalog\.json$/,
@@ -70,14 +71,15 @@ const PAYLOAD_PATTERNS = [
   new RegExp('^settings\\/' + payloadSegment + '\\.json$'),
   new RegExp('^agents\\/[a-f0-9-]{36}\\/' + payloadSegment + '\\.sqlite$'),
   new RegExp('^media\\/[a-f0-9]{64}\\.bin$'),
-  new RegExp('^projects\\/[a-f0-9-]{36}\\/(?:' + payloadSegment + '\\/)*' + payloadSegment + '\\.(?:md|mdx|png|jpg|jpeg|gif|webp|avif|svg|html|htm)$')
 ];
 
 const digest = data => createHash('sha256').update(data).digest('hex');
 const extensionOf = name => { const dot = name.lastIndexOf('.'); return dot <= 0 ? '' : name.slice(dot).toLowerCase(); };
 const isDirectoryDatabase = name => SQLITE_SUFFIXES.has(extensionOf(name));
 const isCapturedDocument = name => DOCUMENT_EXTENSIONS.has(extensionOf(name));
-const isGenerated = relative => relative.split('/').slice(0,-1).some(part => generatedSegments.has(part) || (part.startsWith('.') && part !== '.github'));
+/** Exclude every dot-prefixed directory except .github, in addition to the named generated folders. */
+const isGeneratedSegment = part => generatedSegments.has(part) || (part.startsWith('.') && part !== '.github');
+const isGenerated = relative => relative.split('/').slice(0,-1).some(isGeneratedSegment);
 const quoteLiteral = value => "'" + value.replaceAll("'","''") + "'";
 
 /**
@@ -102,10 +104,37 @@ const isSafeSegment = segment => segment.length > 0 && segment !== '.' && segmen
 export function isPayloadPath(path) {
   if (typeof path !== 'string' || path.length === 0 || path.length > PAYLOAD_PATH_MAX) return false;
   if (path.includes('\\') || path.startsWith('/') || path.includes('\u0000')) return false;
-  if (!path.split('/').every(isSafeSegment)) return false;
+  const parts = path.split('/');
+  if (!parts.every(isSafeSegment)) return false;
+  if (parts[0] === 'projects') {
+    if (parts.length < 3 || !uuid.test(parts[1])) return false;
+    const projectParts = parts.slice(2);
+    // Project documentation can have ordinary Unicode and punctuation, but never control
+    // characters, oversized filesystem components, generated paths, or an unsupported type.
+    if (projectParts.some(part => /[\u0000-\u001f\u007f]/u.test(part) || Buffer.byteLength(part,'utf8') > 255)) return false;
+    if (isGenerated(projectParts.join('/'))) return false;
+    return isCapturedDocument(projectParts.at(-1));
+  }
   return PAYLOAD_PATTERNS.some(pattern => pattern.test(path));
 }
-function isInside(root,path) { return path === root || path.startsWith(root + sep); }
+/** Fail closed for paths that collide on common case-insensitive or Unicode-normalizing filesystems. */
+const portablePathKey = path => path.normalize('NFC').toLowerCase();
+function isInside(root,path) { return path === root || path.startsWith(root.endsWith(sep) ? root : root + sep); }
+async function assertRealDirectoryPath(path,boundary) {
+  const root=resolve(boundary),target=resolve(path);
+  if(!isInside(root,target))throw new Error('A managed project path is outside the approved data root');
+  let at=root;
+  const suffix=relative(root,target);
+  for(const part of suffix ? suffix.split(sep) : []) {
+    const info=await lstat(at);
+    if(info.isSymbolicLink())throw new Error('A symbolic link in a project root path is never followed');
+    if(!info.isDirectory())throw new Error('A project root path component is not a directory');
+    at=join(at,part);
+  }
+  const info=await lstat(at);
+  if(info.isSymbolicLink())throw new Error('A symbolic link in a project root path is never followed');
+  if(!info.isDirectory())throw new Error('A project root path component is not a directory');
+}
 
 /**
  * Where one archived path may land inside a staging root: the second containment layer behind the
@@ -122,20 +151,24 @@ export function stagedTarget(stage,path) {
 }
 
 /** Contained, symlink-free resolution used when reading the legacy plaintext format. */
-async function safe(root,relative) {
+async function safe(root,relative,boundary=root) {
   if (relative.startsWith('/') || relative.includes('\\') || relative.split('/').some(part => !part || part === '..' || part === '.')) throw new Error('Unsafe backup path');
+  await assertRealDirectoryPath(root,boundary);
   let at = root;
   for (const part of relative.split('/')) { at = join(at,part); const info = await lstat(at); if (info.isSymbolicLink()) throw new Error('Symlinks are never followed in back up data'); }
   return at;
 }
-/** Every documentation or media file under a root, never following a symlink. */
-async function walk(root,relative = '') {
+/** Every documentation or media file under a root, pruning generated directories before descent. */
+async function walk(root,relative = '',boundary=root) {
+  await assertRealDirectoryPath(join(root,relative),boundary);
   const result = [];
   for (const entry of await readdir(join(root,relative),{ withFileTypes: true })) {
     const path = relative ? relative + '/' + entry.name : entry.name;
     if (entry.isSymbolicLink()) throw new Error('A symbolic link inside planning data is never followed');
-    if (entry.isDirectory()) result.push(...await walk(root,path));
-    else if (entry.isFile() && isCapturedDocument(entry.name)) result.push(path);
+    if (entry.isDirectory()) {
+      if (isGeneratedSegment(entry.name)) continue;
+      result.push(...await walk(root,path,boundary));
+    } else if (entry.isFile() && isCapturedDocument(entry.name)) result.push(path);
   }
   return result;
 }
@@ -195,6 +228,7 @@ async function collectSources(root,catalog) {
     { path: 'service.lock',reason: 'the live service lock is ownership evidence for the process holding this root, and a backup is never taken while one is held' },
     { path: PAUSED_MARKER,reason: 'the restore pause marker of a restored root, not application data' },
     { path: 'snapshots/',reason: 'the bounded board revision history this application writes itself (snapshots/<projectId>/<timestamp>-<uuid>.md, the newest 20 per project, the older ones pruned automatically): it is derived from the boards that are captured, so a restore rebuilds it as boards are edited, and it is not the board a project is served from' },
+    { path: 'pnpm/',reason: 'the pnpm package-manager cache is derived download state under the writable data volume; pnpm recreates it when needed, so it is not restored' },
     { path: GENERATED_LIST,reason: 'generated or vendored folders hold nothing the application owns' }
   ];
   const rootEntries = await readdir(root,{ withFileTypes: true });
@@ -266,19 +300,20 @@ async function collectSources(root,catalog) {
   for (const project of catalog.projects) {
     if (!uuid.test(project.id)) throw new Error('The catalog holds an invalid project ID');
     if (project.managed) {
-      for (const relative of await walk(project.path)) {
+      for (const relative of await walk(project.path,'',root)) {
         if (isGenerated(relative)) continue;
         const path = 'projects/' + project.id + '/' + relative;
         if (!isPayloadPath(path)) throw new Error('A project file outside the documented documentation and media shapes cannot be archived: ' + path);
-        entries.push({ path,kind: 'file',source: await safe(project.path,relative) });
+        entries.push({ path,kind: 'file',source: await safe(project.path,relative,root) });
       }
     } else {
       const base = join(project.path,'docs','dashboard');
-      await safe(project.path,'docs/dashboard');
-      for (const relative of await walk(base)) {
+      const externalRoot = parse(project.path).root;
+      await safe(project.path,'docs/dashboard',externalRoot);
+      for (const relative of await walk(base,'',externalRoot)) {
         const path = 'projects/' + project.id + '/docs/dashboard/' + relative;
         if (!isPayloadPath(path)) throw new Error('A project file outside the documented documentation and media shapes cannot be archived: ' + path);
-        entries.push({ path,kind: 'file',source: await safe(base,relative) });
+        entries.push({ path,kind: 'file',source: await safe(base,relative,externalRoot) });
       }
     }
   }
@@ -544,8 +579,9 @@ async function stageArchive(source,stage,options) {
       if (!entry || entry.path !== record.path || entry.size !== record.size)
         throw new Error('The archive payload does not match its manifest at file ' + index + ': the archive is corrupted or was altered');
       const target = stagedTarget(stageRoot,entry.path);
-      if (landed.has(target)) throw new Error('Two archived paths land on the same restored file: ' + entry.path);
-      landed.add(target);
+      const targetKey = portablePathKey(target);
+      if (landed.has(targetKey)) throw new Error('Two archived paths land on the same restored file: ' + entry.path);
+      landed.add(targetKey);
       const handle = writing ? await openStaged(target) : null;
       const hash = createHash('sha256');
       let bytes = 0;
@@ -603,8 +639,9 @@ async function stageLegacy(source,stage) {
   const restored = new Set();
   for (const [path,bytes] of data) {
     const target = stagedTarget(stage,path);
-    if (restored.has(target)) throw new Error('Two archived paths land on the same restored file: ' + path);
-    restored.add(target);
+    const targetKey = portablePathKey(target);
+    if (restored.has(targetKey)) throw new Error('Two archived paths land on the same restored file: ' + path);
+    restored.add(targetKey);
     await mkdir(dirname(target),{ recursive: true,mode: 0o700 });
     await writeFile(target,bytes,{ flag: 'wx',mode: 0o600 });
   }
@@ -760,14 +797,111 @@ export async function verifyArchive(source,options = {}) {
   };
 }
 
+const OUTBOX_INDEX = 'outboxes_operation_id';
+const OUTBOX_INDEX_SQL = 'CREATE INDEX outboxes_operation_id ON outboxes(operation_id)';
+const MIGRATION_RELEASE_ID = 'offline-outbox-index-migration';
+const MIGRATION_BUSY_TIMEOUT_MS = 1000;
+
+function assertPrivateRegularFile(path,info,label) {
+  if (!info.isFile() || info.isSymbolicLink()) throw new Error('Refusing migration: ' + label + ' must be a regular, non-symlink file');
+  if ((info.mode & 0o077) !== 0) throw new Error('Refusing migration: ' + label + ' must have private permissions (0600 or stricter)');
+}
+async function inspectMigrationDatabase(root) {
+  const path = join(root,'control.sqlite');
+  const before = await lstat(path).catch(error => { if (error.code === 'ENOENT') throw new Error('Refusing migration: control.sqlite does not exist; no database is created'); throw error; });
+  assertPrivateRegularFile(path,before,'control.sqlite');
+  for (const suffix of ['-wal','-shm','-journal']) {
+    const sidecar = await lstat(path + suffix).catch(error => { if (error.code === 'ENOENT') return undefined; throw error; });
+    if (sidecar) assertPrivateRegularFile(path + suffix,sidecar,'SQLite sidecar ' + suffix);
+  }
+  return {path,dev:before.dev,ino:before.ino};
+}
+async function verifyMigrationDatabaseIdentity(root,expected,{checkSidecars = true} = {}) {
+  const rootInfo = await lstat(root);
+  if (rootInfo.isSymbolicLink() || !rootInfo.isDirectory() || await realpath(root) !== root)
+    throw new Error('Refusing migration: the canonical data root changed');
+  const current = await lstat(expected.path);
+  assertPrivateRegularFile(expected.path,current,'control.sqlite');
+  if (current.dev !== expected.dev || current.ino !== expected.ino)
+    throw new Error('Refusing migration: control.sqlite changed during migration');
+  if (checkSidecars) for (const suffix of ['-wal','-shm','-journal']) {
+    const sidecar = await lstat(expected.path + suffix).catch(error => { if (error.code === 'ENOENT') return undefined; throw error; });
+    if (sidecar) assertPrivateRegularFile(expected.path + suffix,sidecar,'SQLite sidecar ' + suffix);
+  }
+}
+function outboxIndexState(db) {
+  const object = db.prepare('SELECT type,tbl_name,sql FROM sqlite_master WHERE name=?').get(OUTBOX_INDEX);
+  if (!object) return 'absent';
+  if (object.type !== 'index' || object.tbl_name !== 'outboxes' || typeof object.sql !== 'string')
+    throw new Error('Refusing migration: the target index name is occupied by an incompatible SQLite object');
+  const listed = db.prepare('PRAGMA index_list(outboxes)').all().find(index => index.name === OUTBOX_INDEX);
+  const columns = db.prepare('PRAGMA index_info(outboxes_operation_id)').all().map(row => row.name);
+  const sql = object.sql.replaceAll('"','').replaceAll('`','').replaceAll('[','').replaceAll(']','').replace(/\s+/g,' ').trim().replace(/;$/,'').toLowerCase();
+  if (!listed || listed.unique !== 0 || listed.partial !== 0 || columns.join(',') !== 'operation_id' || sql !== OUTBOX_INDEX_SQL.toLowerCase())
+    throw new Error('Refusing migration: the target index exists with a different definition');
+  return 'exact';
+}
+
+/** Explicit offline operation; lock and SQLite transaction are cooperative, not same-UID isolation. */
+export async function migrateOutboxOperationIndex(dataRoot,options = {}) {
+  const requested = resolve(dataRoot);
+  const rootInfo = await lstat(requested).catch(error => { if (error.code === 'ENOENT') throw new Error('Refusing migration: the data root does not exist'); throw error; });
+  if (rootInfo.isSymbolicLink() || !rootInfo.isDirectory()) throw new Error('Refusing migration: data root must be a real directory');
+  if ((rootInfo.mode & 0o077) !== 0) throw new Error('Refusing migration: data root must have private permissions (0700 or stricter)');
+  const root = await realpath(requested);
+  const catalogInfo = await lstat(join(root,'catalog.json')).catch(() => undefined);
+  if (!catalogInfo?.isFile() || catalogInfo.isSymbolicLink()) throw new Error('Refusing migration: no regular catalog.json identifies this as an existing Pilot data root');
+  const identity = await inspectMigrationDatabase(root);
+  const lockState = await inspectServiceLock(root);
+  if (lockState.classification !== 'absent') throw new Error('Refusing migration: service.lock evidence exists (' + lockState.classification + '); do not clear or replace it automatically');
+  const lock = await acquireServiceLock({root,purpose:'backup',rootId:createHash('sha256').update(root).digest('hex').slice(0,16),releaseId:MIGRATION_RELEASE_ID,schemaId:SUPPORTED_SCHEMA_IDS[0]});
+  let db;
+  let result;
+  try {
+    await verifyMigrationDatabaseIdentity(root,identity);
+    db = new DatabaseSync(identity.path);
+    await verifyMigrationDatabaseIdentity(root,identity);
+    db.exec('PRAGMA busy_timeout=' + MIGRATION_BUSY_TIMEOUT_MS + '; BEGIN IMMEDIATE;');
+    try {
+      ControlStore.validateSchemaConnection(db);
+      const state = outboxIndexState(db);
+      if (state === 'exact') result = {root,changed:false};
+      else {
+        db.exec(OUTBOX_INDEX_SQL);
+        if (options.afterIndexCreated) options.afterIndexCreated();
+        if (outboxIndexState(db) !== 'exact') throw new Error('Created outbox index failed its definition check');
+        result = {root,changed:true};
+      }
+      // The initial schema-only check avoids quadratic linkage scans without the accelerator.
+      // Full record validation now observes the target index and remains in the same transaction.
+      ControlStore.validateConnection(db);
+      await verifyMigrationDatabaseIdentity(root,identity,{checkSidecars:false});
+      db.exec('COMMIT;');
+    } catch (error) {
+      if (db.isTransaction) { try { db.exec('ROLLBACK;'); } catch {} }
+      throw error;
+    }
+    db.close(); db = undefined;
+    await verifyMigrationDatabaseIdentity(root,identity);
+    const check = new DatabaseSync(identity.path,{readOnly:true});
+    try {
+      if (outboxIndexState(check) !== 'exact') throw new Error('Committed outbox index failed read-only verification');
+    } finally { check.close(); }
+  } finally {
+    try { db?.close(); } finally { await lock.release(); }
+  }
+  return result;
+}
+
 const USAGE = [
   'Usage:',
   '  node scripts/data-tools.mjs backup DATA_ROOT NEW_ARCHIVE_FILE',
   '  node scripts/data-tools.mjs verify ARCHIVE',
   '  node scripts/data-tools.mjs restore ARCHIVE NEW_ISOLATED_DATA_ROOT',
   '  node scripts/data-tools.mjs promote ISOLATED_DATA_ROOT',
+  '  node scripts/data-tools.mjs migrate-outbox-index EXISTING_DATA_ROOT',
   '',
-  'Stop the service that owns the data root before a backup: a held service lock refuses it.',
+  'Stop the service that owns the data root before a backup or migration: any lock evidence refuses it.',
   'The passphrase comes from ' + PASSPHRASE_ENV + ' in the environment, or from stdin when',
   PASSPHRASE_STDIN_ENV + '=1 is set. It is never taken from the command line, because a command',
   'line is visible in the process table and the shell history.',
@@ -803,6 +937,11 @@ async function main(argv) {
   if (command === 'promote' && rest.length === 1) {
     const result = await promote(rest[0]);
     console.log('Promoted ' + result.root + ': ' + PAUSED_MARKER + ' was removed deliberately. Start the service when you are ready.');
+    return 0;
+  }
+  if (command === 'migrate-outbox-index' && rest.length === 1) {
+    const result = await migrateOutboxOperationIndex(rest[0]);
+    console.log((result.changed ? 'Created' : 'Already present:') + ' outboxes_operation_id in ' + result.root + '. This optional index does not change the control schema version.');
     return 0;
   }
   console.error(USAGE);

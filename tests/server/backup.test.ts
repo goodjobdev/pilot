@@ -4,7 +4,7 @@ import {chmod,mkdtemp,mkdir,readFile,readdir,rm,stat,symlink,unlink,writeFile} f
 import {createHash,randomBytes,randomUUID} from 'node:crypto';
 import {DatabaseSync} from 'node:sqlite';
 import {tmpdir} from 'node:os';
-import {join} from 'node:path';
+import {dirname,join} from 'node:path';
 const digestOf=(data:Uint8Array)=>createHash('sha256').update(data).digest('hex');
 import {archivePayload,backup,isPayloadPath,restore,promote,stagedTarget,verifyArchive,PAUSED_MARKER,DATABASE_COPY_METHOD} from '../../scripts/data-tools.mjs';
 import {KDF_PARAMETERS,buildHeader,encodeRecord,writeArchive} from '../../scripts/backup-crypto.mjs';
@@ -58,6 +58,8 @@ test('a pristine catalog supports an offline encrypted backup and an isolated pa
  const held=await acquireServiceLock({root:data,purpose:'service',rootId:'fixture-root-id',releaseId:'fixture-release',schemaId:'pilot-state-1'});
  try{
   await c.init();assert.deepEqual(JSON.parse(await readFile(join(data,'catalog.json'),'utf8')),{version:1,projects:[]});
+  await mkdir(join(data,'pnpm','package-manager-store'),{recursive:true,mode:0o700});
+  await writeFile(join(data,'pnpm','package-manager-store','cache-entry'),'derived manager cache');
   const before=await readFile(join(data,'service.lock'),'utf8');
   await assert.rejects(backup(data,archiveAt(root,'blocked.pbkp'),{passphrase:PASSPHRASE}));
   assert.equal(await readFile(join(data,'service.lock'),'utf8'),before,'a refused backup leaves the holder\'s lock byte-identical');
@@ -71,6 +73,9 @@ test('a pristine catalog supports an offline encrypted backup and an isolated pa
   assert.equal(manifest.databaseCopyMethod,DATABASE_COPY_METHOD);
   assert.ok(manifest.excluded.some((entry:{path:string})=>entry.path==='credentials/'),'the manifest states what it excluded');
   assert.ok(manifest.excluded.some((entry:{path:string})=>entry.path==='service.lock'));
+  const pnpmExclusion=manifest.excluded.find((entry:{path:string;reason:string})=>entry.path==='pnpm/') as {reason:string};
+  assert.match(pnpmExclusion.reason,/pnpm package-manager cache.*derived download state/);
+  assert.equal(manifest.files.some((entry:{path:string})=>entry.path.startsWith('pnpm/')),false,'the package-manager cache is not captured');
   assert.equal(await exists(join(data,'service.lock')),false,'a completed backup releases the lock it took');
   // A restore refuses a live root and a non-empty destination, changing neither.
   const live=join(root,'live');await mkdir(live,{recursive:true,mode:0o700});
@@ -85,6 +90,7 @@ test('a pristine catalog supports an offline encrypted backup and an isolated pa
   assert.equal(result.projects,0);
   assert.equal(result.paused,true,'a restored root is explicitly paused');
   assert.deepEqual(JSON.parse(await readFile(join(root,'restored','catalog.json'),'utf8')),{version:1,projects:[]});
+  assert.equal(await exists(join(root,'restored','pnpm')),false,'the package-manager cache is not restored');
   const marker=JSON.parse(await readFile(join(root,'restored',PAUSED_MARKER),'utf8'));
   assert.equal(marker.format,'pilot-restore-pause');
   assert.equal(marker.archive.formatVersion,2);
@@ -99,16 +105,27 @@ test('a pristine catalog supports an offline encrypted backup and an isolated pa
  }finally{await held.release();await c.close();await rm(root,{recursive:true,force:true});}
 });
 
-test('a managed project backs up its documentation and media; an external one only its board',async()=>{
- const root=await mkdtemp(join(tmpdir(),'dashboard-backup-scope-')),data=join(root,'data'),c=new Catalog(data,[root],new BoardStore(data));await c.init();
+test('a connected managed project backs up its documentation and media; an external one only its board',async()=>{
+ const root=await mkdtemp(join(tmpdir(),'dashboard-backup-scope-')),data=join(root,'data'),boards=new BoardStore(data),c=new Catalog(data,[root],boards);await c.init();
  try{
-  const managed=await c.register({name:'Managed',managed:true,confirm:true});
+  const managed=await c.register({name:'Managed',managed:true,repository:'git@github.com:example/managed.git',confirm:true});
+  await mkdir(join(data,'repositories',managed.id,'agent'),{recursive:true});
+  await c.attachWorktree(managed.id);
+  await boards.initialize(managed,serializeBoard(emptyBoard()));
   await mkdir(join(managed.path,'docs','spec'),{recursive:true});
   await writeFile(join(managed.path,'docs','spec','alpha.md'),'# Alpha\n\nA spec the wiki owns.\n');
   await writeFile(join(managed.path,'docs','spec','mock.html'),'<!doctype html><html><body>mockup</body></html>\n');
+  await mkdir(join(managed.path,'r&d'),{recursive:true});
+  await writeFile(join(managed.path,'r&d','Plan café.HTML'),'<!doctype html><title>Fixture</title>');
+  await mkdir(join(managed.path,'.private'),{recursive:true});
+  await writeFile(join(managed.path,'.private','hidden.md'),'# Hidden directory\n');
+  await mkdir(join(managed.path,'.github','workflows'),{recursive:true});
+  await writeFile(join(managed.path,'.github','workflows','notes.md'),'# GitHub notes\n');
   await writeFile(join(managed.path,'docs','spec','diagram.png'),Buffer.from([0x89,0x50,0x4e,0x47,0x0d,0x0a,0x1a,0x0a]));
-  await mkdir(join(managed.path,'node_modules','pkg'),{recursive:true});
-  await writeFile(join(managed.path,'node_modules','pkg','readme.md'),'# Vendored\n');
+  const pnpmPackage=join(managed.path,'node_modules','.pnpm','pkg@1','node_modules','pkg');
+  await mkdir(pnpmPackage,{recursive:true});
+  await writeFile(join(pnpmPackage,'readme.md'),'# Vendored\n');
+  await symlink('.pnpm/pkg@1/node_modules/pkg',join(managed.path,'node_modules','pkg'));
   const externalPath=join(root,'external');await mkdir(join(externalPath,'docs','dashboard'),{recursive:true});
   await writeFile(join(externalPath,'README.md'),'# Repository readme\n');
   await writeFile(join(externalPath,'docs','notes.md'),'# Repository notes\n');
@@ -120,19 +137,108 @@ test('a managed project backs up its documentation and media; an external one on
   assert.ok(paths.includes('projects/'+managed.id+'/docs/spec/alpha.md'),'managed documentation is included');
   assert.ok(paths.includes('projects/'+managed.id+'/docs/spec/mock.html'),'a static mockup is included as media');
   assert.ok(paths.includes('projects/'+managed.id+'/docs/spec/diagram.png'),'an image is included as media');
+  assert.ok(paths.includes('projects/'+managed.id+'/r&d/Plan café.HTML'),'ordinary punctuation, Unicode and uppercase extensions are captured');
+  assert.ok(paths.includes('projects/'+managed.id+'/.github/workflows/notes.md'),'.github is the dot-directory exception');
+  assert.ok(!paths.includes('projects/'+managed.id+'/.private/hidden.md'),'other dot-prefixed directories are pruned');
+  assert.ok(manifest.excluded.some((entry:{path:string})=>entry.path.includes('all other dot-prefixed directories except .github')),'the manifest states the blanket dot-directory exclusion');
   assert.ok(paths.includes('projects/'+managed.id+'/docs/dashboard/board.md'),'the managed board is included');
-  assert.ok(!paths.some(path=>path.includes('node_modules')),'generated folders are excluded');
+  assert.ok(!paths.some(path=>path.includes('node_modules')),'generated folders and their pnpm symlinks are excluded');
+  const verified=await verifyArchive(archiveAt(root),{passphrase:PASSPHRASE});
+  assert.equal(verified.verified,true,'the backup with a generated pnpm symlink verifies');
   assert.deepEqual(paths.filter(path=>path.startsWith('projects/'+external.id+'/')),['projects/'+external.id+'/docs/dashboard/board.md'],'an external project contributes only its board');
   await restore(archiveAt(root),join(root,'restored'),{passphrase:PASSPHRASE});
   const catalog=JSON.parse(await readFile(join(root,'restored','catalog.json'),'utf8'));
   const restoredManaged=catalog.projects.find((project:{id:string})=>project.id===managed.id).path;
   assert.ok(restoredManaged.startsWith(join(root,'restored','workspaces')),'a restored project points inside the restored root, never at the live one');
+  assert.equal(await exists(join(restoredManaged,'node_modules')),false,'generated dependencies are not restored');
   assert.equal(await readFile(join(restoredManaged,'docs','spec','alpha.md'),'utf8'),'# Alpha\n\nA spec the wiki owns.\n');
+  assert.equal(await readFile(join(restoredManaged,'r&d','Plan café.HTML'),'utf8'),'<!doctype html><title>Fixture</title>');
   assert.deepEqual(await readFile(join(restoredManaged,'docs','spec','diagram.png')),Buffer.from([0x89,0x50,0x4e,0x47,0x0d,0x0a,0x1a,0x0a]));
   assert.equal(await readFile(join(restoredManaged,'docs','dashboard','board.md'),'utf8'),await readFile(join(managed.path,'docs','dashboard','board.md'),'utf8'));
   const restoredExternal=catalog.projects.find((project:{id:string})=>project.id===external.id).path;
   assert.equal(await readFile(join(restoredExternal,'docs','dashboard','board.md'),'utf8'),'---\nversion: 1\n---\n');
   assert.equal(await exists(join(restoredExternal,'README.md')),false,'a repository readme is not copied');
+ }finally{await c.close().catch(()=>{});await rm(root,{recursive:true,force:true});}
+});
+
+test('a symlink at a managed project canonical board path refuses backup',async()=>{
+ const root=await mkdtemp(join(tmpdir(),'dashboard-backup-board-symlink-')),data=join(root,'data'),c=new Catalog(data,[root],new BoardStore(data));await c.init();
+ try{
+  const managed=await c.register({name:'Managed',managed:true,confirm:true});
+  const board=join(managed.path,'docs','dashboard','board.md'),outside=join(root,'outside-board.md');
+  await writeFile(outside,'---\\nversion: 1\\n---\\n');
+  await unlink(board);
+  await symlink(outside,board);
+  await c.close();
+  const archive=archiveAt(root);
+  await assert.rejects(backup(data,archive,{passphrase:PASSPHRASE}),/symbolic link inside planning data/);
+  assert.equal(await exists(archive),false,'refusing a canonical planning symlink creates no backup');
+ }finally{await c.close().catch(()=>{});await rm(root,{recursive:true,force:true});}
+});
+
+test('a managed project root symlink to an external directory refuses backup',async()=>{
+ const root=await mkdtemp(join(tmpdir(),'dashboard-backup-project-root-symlink-')),data=join(root,'data'),c=new Catalog(data,[root],new BoardStore(data));await c.init();
+ try{
+  const managed=await c.register({name:'Managed',managed:true,confirm:true});
+  const original=managed.path,outside=join(root,'outside');
+  await mkdir(join(outside,'docs','dashboard'),{recursive:true});
+  await writeFile(join(outside,'docs','dashboard','board.md'),'# Outside\n');
+  await rm(original,{recursive:true,force:true});
+  await symlink(outside,original);
+  await c.close();
+  const archive=archiveAt(root);
+  await assert.rejects(backup(data,archive,{passphrase:PASSPHRASE}),/symbolic link in a project root path/);
+  assert.equal(await exists(archive),false,'a root symlink is rejected before any archive is created');
+ }finally{await c.close().catch(()=>{});await rm(root,{recursive:true,force:true});}
+});
+
+test('a symlinked parent inside the data root refuses managed-project backup',async()=>{
+ const root=await mkdtemp(join(tmpdir(),'dashboard-backup-project-parent-symlink-')),data=join(root,'data'),c=new Catalog(data,[root],new BoardStore(data));await c.init();
+ try{
+  const managed=await c.register({name:'Managed',managed:true,confirm:true});
+  const workspaces=join(data,'workspaces'),outside=join(root,'outside-workspaces');
+  await rm(workspaces,{recursive:true,force:true});
+  await mkdir(join(outside,managed.id,'docs','dashboard'),{recursive:true});
+  await writeFile(join(outside,managed.id,'docs','dashboard','board.md'),'# Outside\n');
+  await symlink(outside,workspaces);
+  await c.close();
+  const archive=archiveAt(root);
+  await assert.rejects(backup(data,archive,{passphrase:PASSPHRASE}),/symbolic link in a project root path/);
+  assert.equal(await exists(archive),false,'an ancestor symlink under the data root is rejected');
+ }finally{await c.close().catch(()=>{});await rm(root,{recursive:true,force:true});}
+});
+
+test('a symlinked ancestor of an external project refuses backup',async()=>{
+ const root=await mkdtemp(join(tmpdir(),'dashboard-backup-external-parent-symlink-')),data=join(root,'data'),c=new Catalog(data,[root],new BoardStore(data));await c.init();
+ try{
+  const parent=join(root,'external-parent'),externalPath=join(parent,'project');
+  await mkdir(join(externalPath,'docs','dashboard'),{recursive:true});
+  await writeFile(join(externalPath,'docs','dashboard','board.md'),'# External board\\n');
+  const project=await c.register({name:'External',path:externalPath,managed:false,confirm:true});
+  const canonicalParent=dirname(project.path),outside=join(root,'outside');
+  await mkdir(join(outside,'project','docs','dashboard'),{recursive:true});
+  await writeFile(join(outside,'project','docs','dashboard','board.md'),'# Outside board\\n');
+  await c.close();
+  await rm(canonicalParent,{recursive:true,force:true});
+  await symlink(outside,canonicalParent);
+  const archive=archiveAt(root);
+  await assert.rejects(backup(data,archive,{passphrase:PASSPHRASE}),/symbolic link in a project root path/);
+  assert.equal(await exists(archive),false,'an external root ancestor symlink is rejected before archive creation');
+ }finally{await c.close().catch(()=>{});await rm(root,{recursive:true,force:true});}
+});
+
+test('a symlink masquerading as an excluded generated directory still refuses backup',async()=>{
+ const root=await mkdtemp(join(tmpdir(),'dashboard-backup-generated-symlink-')),data=join(root,'data'),c=new Catalog(data,[root],new BoardStore(data));await c.init();
+ try{
+  const managed=await c.register({name:'Managed',managed:true,confirm:true});
+  const outside=join(root,'outside-node-modules');
+  await mkdir(outside);
+  await writeFile(join(outside,'outside.md'),'# Not project planning data\\n');
+  await symlink(outside,join(managed.path,'node_modules'));
+  await c.close();
+  const archive=archiveAt(root);
+  await assert.rejects(backup(data,archive,{passphrase:PASSPHRASE}),/symbolic link inside planning data/);
+  assert.equal(await exists(archive),false,'a generated-name symlink is refused without archiving its target');
  }finally{await c.close().catch(()=>{});await rm(root,{recursive:true,force:true});}
 });
 
@@ -239,21 +345,26 @@ test('credentials and device secrets are never in an archive, and a bad digest o
  await writeFile(join(data,'credentials','projects',projectId,'id_ed25519'),'-----BEGIN OPENSSH PRIVATE KEY-----\nSYNTHETIC-DEPLOY-KEY\n');
  await mkdir(join(data,'alerts'),{recursive:true,mode:0o700});
  await writeFile(join(data,'alerts','vapid.json'),JSON.stringify({privateKey:'SYNTHETIC-VAPID-PRIVATE'}));
+ await mkdir(join(data,'pnpm','package-manager-store','v11','tmp'),{recursive:true,mode:0o700});
+ await writeFile(join(data,'pnpm','package-manager-store','v11','tmp','synthetic-cache-entry'),'derived pnpm cache');
  const manifest=await backup(data,archiveAt(root),{passphrase:PASSPHRASE});
  assert.ok(!manifest.files.some((entry:{path:string})=>entry.path.startsWith('credentials')));
  assert.ok(!manifest.files.some((entry:{path:string})=>entry.path.startsWith('alerts')));
- for(const excluded of ['credentials/','alerts/','service.lock',PAUSED_MARKER,'snapshots/']) assert.ok(manifest.excluded.some((entry:{path:string})=>entry.path===excluded),excluded+' is stated as excluded');
+ for(const excluded of ['credentials/','alerts/','service.lock',PAUSED_MARKER,'snapshots/','pnpm/']) assert.ok(manifest.excluded.some((entry:{path:string})=>entry.path===excluded),excluded+' is stated as excluded');
  // The application's own snapshot history is named for what it is, never reported as an entry the
  // tool failed to recognise, and it is not in the archive.
  const snapshotExclusion=manifest.excluded.find((entry:{path:string;reason:string})=>entry.path==='snapshots/') as {reason:string};
  assert.match(snapshotExclusion.reason,/board revision history/,'the snapshot history has an honest reason of its own');
+ const pnpmExclusion=manifest.excluded.find((entry:{path:string;reason:string})=>entry.path==='pnpm/') as {reason:string};
+ assert.match(pnpmExclusion.reason,/pnpm package-manager cache.*derived download state/,'the pnpm cache has an honest reason of its own');
+ assert.equal(manifest.files.some((entry:{path:string})=>entry.path.startsWith('pnpm/')),false,'pnpm manager cache is not captured');
  assert.equal(manifest.excluded.some((entry:{reason:string})=>entry.reason.startsWith('not captured by this tool')),false,'nothing the application itself writes falls into the unrecognised-entry branch');
  assert.equal(manifest.files.some((entry:{path:string})=>entry.path.startsWith('snapshots/')),false,'the snapshot history is not captured');
  const bytes=await readFile(archiveAt(root));
  for(const secret of ['sk-SYNTHETIC-PROVIDER-SECRET','SYNTHETIC-DEPLOY-KEY','SYNTHETIC-VAPID-PRIVATE'])
   assert.equal(bytes.includes(Buffer.from(secret)),false,'the archive bytes never carry '+secret);
  await restore(archiveAt(root),join(root,'restored'),{passphrase:PASSPHRASE});
- for(const unwanted of ['credentials','alerts','snapshots']) assert.equal(await exists(join(root,'restored',unwanted)),false,unwanted+' is not restored');
+ for(const unwanted of ['credentials','alerts','snapshots','pnpm']) assert.equal(await exists(join(root,'restored',unwanted)),false,unwanted+' is not restored');
  // A manifest whose digest the payload cannot match is refused, and nothing is written.
  const catalogBytes=await readFile(join(data,'catalog.json'));
  const good=digestOf(catalogBytes),wrong=(good[0]==='a'?'b':'a')+good.slice(1);

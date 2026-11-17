@@ -1,11 +1,12 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { lstat,readFile,readdir,realpath } from 'node:fs/promises';
+import { lstat,readdir,realpath } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { Project } from '../shared/model';
 import { isWorkspacePath,isWorkspaceImagePath,type SaveCommit,type WorkspaceState,type WorkspaceDocument } from '../shared/workspace';
 import { safePath } from './paths';
 import { hash,HttpError } from './board-store';
+import { BoundedFileReadError,readBoundedFile } from './bounded-file-read';
 const exec=promisify(execFile);
 const maxBytes=2*1024*1024;
 /** Fixed local Git operations only. No shell, remote access, hooks, signing or configured filters. */
@@ -42,7 +43,7 @@ export class WorkspaceStore {
  async read(p:Project,value:string):Promise<WorkspaceDocument>{
   const path=this.path(value),file=await safePath(p.path,path);let info;try{info=await lstat(file);}catch{throw new HttpError(404,'File not found');}
   if(!info.isFile())throw new HttpError(404,'File not found');if(info.size>maxBytes)throw new HttpError(413,'File exceeds the text preview limit');
-  const bytes=await readFile(file);if(bytes.length>maxBytes)throw new HttpError(413,'File exceeds the text preview limit');
+  let bytes:Buffer;try{bytes=await readBoundedFile(file,maxBytes);}catch(error){if(error instanceof BoundedFileReadError&&error.code==='OVERSIZE')throw new HttpError(413,'File exceeds the text preview limit');throw error;}
   if(bytes.includes(0))throw new HttpError(415,'Binary files cannot be shown as text');
   const text=bytes.toString('utf8');if(!Buffer.from(text,'utf8').equals(bytes))throw new HttpError(415,'Only valid UTF-8 text can be previewed');return {path,text,revision:hash(text)};
  }
@@ -97,7 +98,7 @@ export class WorkspaceStore {
    for(const name of names){try{await this.git(p,['ls-files','--error-unmatch','--',name]);}catch{await this.git(p,['add','--intent-to-add','--',name]);}}
    const diff=await this.git(p,['diff','--name-only','-z','--',...names]);if(!diff)return {status:'unchanged',message:'No content changes'};
    committing=true;
-   await this.git(p,['-c','user.name=Pilot','-c','user.email=pilot@localhost','commit','--only','--no-verify','--no-gpg-sign','-m',message,'--',...names]);
+   await this.git(p,['-c','user.name=Pilot','-c','user.email=pilot@localhost','-c','author.name=Pilot','-c','author.email=pilot@localhost','-c','committer.name=Pilot','-c','committer.email=pilot@localhost','commit','--only','--no-verify','--no-gpg-sign','-m',message,'--',...names]);
    const commit=(await this.git(p,['rev-parse','HEAD'])).trim();return {status:'committed',hash:commit,message:'Saved and committed locally'};
   }catch{return {status:committing?'uncertain':'failed',message:committing?'The saved file is retained, but Git did not confirm the commit. Inspect history before retrying; no automatic retry, push or merge occurred.':'Git could not prepare the commit. The saved file is retained; inspect Changes. No push or merge was attempted.'};}
  }

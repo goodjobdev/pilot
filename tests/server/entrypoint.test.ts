@@ -15,7 +15,7 @@ import { acquireServiceLock } from '../../src/server/service-lock';
 import { observeStorageSchema } from '../../src/server/release';
 import { doctorStartBlockers,restorePauseRefusal } from '../../src/server/main';
 import { PAUSED_MARKER,backup,promote,restore } from '../../scripts/data-tools.mjs';
-import { ControlStore } from '../../src/server/state/control-store';
+import { ControlStore,operationDigest } from '../../src/server/state/control-store';
 import { ReleaseStore } from '../../src/server/state/release-store';
 import { DeliveryLedger } from '../../src/server/state/delivery';
 import { SessionLifecycleStore } from '../../src/server/state/session-lifecycle';
@@ -708,7 +708,11 @@ test('the running service reports its release identity, refuses a release the st
  const event=await brokenReleases.promote({candidateId:'cand-1',expectedRevision:0,actor:'owner'});
  brokenStore.close();
  const tamper=new DatabaseSync(join(await realpath(brokenData),'control.sqlite'));
- tamper.prepare("UPDATE operations SET input_json=? WHERE kind='release.promotion'").run(JSON.stringify({...event,actor:'someone-else'}));
+ const operation=tamper.prepare("SELECT id FROM operations WHERE kind='release.promotion'").get() as {id:string};
+ const outbox=tamper.prepare('SELECT kind,payload_json FROM outboxes WHERE operation_id=?').get(operation.id) as {kind:string;payload_json:string};
+ const altered={...event,actor:'someone-else'};
+ const digest=operationDigest('release.promotion',{input:altered,outbox:{kind:outbox.kind,payload:JSON.parse(outbox.payload_json)}});
+ tamper.prepare("UPDATE operations SET input_json=?,input_digest=? WHERE id=?").run(JSON.stringify(altered),digest,operation.id);
  tamper.close();
  const brokenPort=await freePort();
  const brokenChild=spawnServer(join(broken,'current','server.mjs'),{DASHBOARD_MODE:'local',DASHBOARD_DATA:brokenData,PORT:String(brokenPort),DASHBOARD_REGISTRY:'',DASHBOARD_ROOTS:''});
@@ -720,6 +724,21 @@ test('the running service reports its release identity, refuses a release the st
   await expectNothingListening(brokenPort);
  }finally{
   await stop(brokenChild,brokenExited,'SIGKILL');
+ }
+ // Digest tampering is a separate startup integrity failure, before release-history semantics run.
+ const stale=new DatabaseSync(join(await realpath(brokenData),'control.sqlite'));
+ stale.prepare("UPDATE operations SET input_digest=? WHERE kind='release.promotion'").run('0'.repeat(64));
+ stale.close();
+ const stalePort=await freePort();
+ const staleChild=spawnServer(join(broken,'current','server.mjs'),{DASHBOARD_MODE:'local',DASHBOARD_DATA:brokenData,PORT:String(stalePort),DASHBOARD_REGISTRY:'',DASHBOARD_ROOTS:''});
+ const staleLogs=collect(staleChild),staleExited=once(staleChild,'exit');
+ try{
+  const [code]=await staleExited as [number];
+  assert.notEqual(code,0,'a stale operation digest must fail closed on startup');
+  assert.match(staleLogs.stderr(),/Corrupt operation input digest/);
+  await expectNothingListening(stalePort);
+ }finally{
+  await stop(staleChild,staleExited,'SIGKILL');
   await rm(broken,{recursive:true,force:true});
  }
 });
@@ -810,7 +829,11 @@ test('a real start reconciles the delivery ledger it finds: it re-sends only wha
  const tampered=ledger.admitQuestion({...scope,questionId:'22222222-2222-4222-8222-222222222222',text:'Which provider?',askedAt:1700000000001});
  const outboxRows=(id:string)=>JSON.stringify(store.db.prepare('SELECT * FROM outboxes WHERE operation_id=?').all(id));
  const refusedWas=outboxRows(tampered.operation.id);
- store.db.prepare('UPDATE outboxes SET payload_json=? WHERE operation_id=?').run(JSON.stringify({version:1,delivery:'question',questionId:'22222222-2222-4222-8222-222222222222',tag:'question:someone-else',requestId:null}),tampered.operation.id);
+ const outbox=store.db.prepare('SELECT kind FROM outboxes WHERE operation_id=?').get(tampered.operation.id) as {kind:string};
+ const alteredPayload={version:1,delivery:'question',questionId:'22222222-2222-4222-8222-222222222222',tag:'question:someone-else',requestId:null};
+ store.db.prepare('UPDATE outboxes SET payload_json=? WHERE operation_id=?').run(JSON.stringify(alteredPayload),tampered.operation.id);
+ const digest=operationDigest(tampered.operation.kind,{input:tampered.operation.input,outbox:{kind:outbox.kind,payload:alteredPayload}});
+ store.db.prepare('UPDATE operations SET input_digest=? WHERE id=?').run(digest,tampered.operation.id);
  const refusedIs=outboxRows(tampered.operation.id);
  store.close();
  const port=await freePort();

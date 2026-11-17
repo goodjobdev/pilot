@@ -12,10 +12,9 @@
  * (`@earendil-works/pi-durable/images/node`). An image that cannot be decoded is refused rather than
  * stored unverified.
  *
- * The container is validated too: `<data root>/media` must be a real directory this process can
- * write, and it is never followed through a symlink, so an image is never written somewhere the
- * documented layout does not own and a broken data root is refused by name rather than as an
- * unclassified failure (docs/MEDIA.md).
+ * The container is checked as a writable directory and observed symlinks are refused, with
+ * broken data roots reported by name (docs/MEDIA.md). These pathname checks are not atomic with
+ * use: a concurrent swap can redirect a read or write outside the intended layout.
  *
  * Metadata honesty: the processor returns an image within the limits unchanged when it is already
  * upright and small enough, and re-encodes it otherwise. A re-encoded image carries no metadata at all
@@ -30,6 +29,7 @@ import { join } from 'node:path';
 import { createNodePhotonImages } from '@earendil-works/pi-durable/images/node';
 import type { ImageLimits, ImageProcessor } from '@earendil-works/pi-durable/tools';
 import { safePath } from './paths';
+import { LinuxProcfsReadError, readLinuxProcfsRegularFileBeneath } from './linux-procfs-read';
 import {
   IMAGE_CAPABILITY,
   MAX_IMAGE_BYTES,
@@ -55,6 +55,9 @@ import {
  */
 export const MAX_PREPARED_BASE64_BYTES = 4_500_000;
 
+/** Exact largest byte sequence representable by the prepared-base64 output limit. */
+export const MAX_STORED_MEDIA_BYTES = Math.floor(MAX_PREPARED_BASE64_BYTES / 4) * 3;
+
 /**
  * The code a *container* refusal is reported with. The media directory not being a usable directory is
  * a server-side condition of the data root, not a refusal of one image, so it carries a code of its own
@@ -75,6 +78,12 @@ export class MediaContainerError extends Error {
 export interface MediaRefusal { ok: false; code: MediaRefusalCode; reason: string }
 export interface MediaRecord extends MediaView { ok: true }
 export type MediaAcceptance = MediaRecord | MediaRefusal;
+
+/** The required Linux descriptor-pinned reader is unavailable; never disguise this as a missing id. */
+export class MediaReadUnavailableError extends Error {
+  readonly code = 'media-read-unavailable';
+  constructor() { super('Linux descriptor-pinned media reads are unavailable'); this.name = 'MediaReadUnavailableError'; }
+}
 
 /** Human-facing megabytes for one refusal, so the reason names the rule the caller broke. */
 const mb = (bytes: number) => (bytes / (1024 * 1024)).toFixed(0);
@@ -130,28 +139,34 @@ export class MediaStore {
   }
 
   /**
-   * The stored bytes and their sniffed type, or `null`. The id is a hash and never a path: an id that
-   * is not 64 hex characters is unknown, and a stored path that is a symlink or outside the media
-   * directory is refused by the same contained-path helper the rest of the application uses.
+   * The stored bytes and their sniffed type, or `null`. The id is a hash and never a path.
+   * Reads use the fixed Linux procfs reader only; unavailable is distinct from an ordinary miss.
    */
   async get(id: string): Promise<{ bytes: Uint8Array; mimeType: AcceptedImageType } | null> {
     if (!MEDIA_ID_PATTERN.test(id)) return null;
-    let path: string;
-    try { path = await safePath(this.dataRoot, 'media/' + id + '.bin'); }
-    catch { return null; }
+    let bytes: Buffer;
     try {
-      const info = await lstat(path);
-      if (!info.isFile() || info.isSymbolicLink()) return null;
-      const bytes = new Uint8Array(await readFile(path));
-      const type = sniffImageType(bytes);
-      if (type === null) return null;
-      return { bytes, mimeType: type };
-    } catch { return null; }
+      bytes = await readLinuxProcfsRegularFileBeneath(
+        this.dataRoot, 'media/' + id + '.bin', MAX_STORED_MEDIA_BYTES
+      );
+    } catch (error) {
+      if (error instanceof LinuxProcfsReadError) {
+        if (error.code === 'NOT_REGULAR' || error.code === 'OVERSIZE') return null;
+        throw new MediaReadUnavailableError();
+      }
+      const code = (error as NodeJS.ErrnoException | null)?.code;
+      // ENOENT cannot distinguish a missing media name from a failed procfs traversal component.
+      if (code === 'ENOENT' || code === 'ENOTDIR' || code === 'ELOOP') return null;
+      throw new MediaReadUnavailableError();
+    }
+    const type = sniffImageType(bytes);
+    if (type === null) return null;
+    return { bytes: new Uint8Array(bytes), mimeType: type };
   }
 
   /**
-   * The container is a real directory this process can write, and it is never followed through a
-   * symlink. A container that does not exist yet is not an error: the first accepted image creates it
+   * Checks that the container is a writable directory and refuses an observed symlink. This
+   * pathname check does not prevent a concurrent swap. A missing container is not an error: the first accepted image creates it
    * 0700, exactly as this store always has. Everything else is refused by name.
    */
   private async container(): Promise<void> {
@@ -163,7 +178,7 @@ export class MediaStore {
       throw new MediaContainerError('The media directory of this data root could not be inspected, so no image was stored: ' + (error as Error).message);
     }
     if (info.isSymbolicLink())
-      throw new MediaContainerError('The media directory of this data root is a symbolic link, and a symlink is never followed, so no image was stored in it. Replace it with a real directory and try again.');
+      throw new MediaContainerError('The media directory of this data root is a symbolic link, so no image was stored in it. Replace it with a real directory and try again.');
     if (!info.isDirectory())
       throw new MediaContainerError('The media directory of this data root is not a directory, so no image was stored in it. Move it aside and let the application create its own.');
     try { await access(media, constants.W_OK | constants.X_OK); }

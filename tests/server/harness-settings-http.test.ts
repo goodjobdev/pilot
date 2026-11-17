@@ -60,4 +60,15 @@ test('switching a capability off refuses the tool from the next call; switching 
   const propose=await f.call('/projects/'+project.id+'/file-edits',{path:'docs/x.md',content:'x',mode:'propose-only'});
   assert.equal(propose.status,409);
   assert.match((await propose.json()).error,/switched off in this instance/);
+  const list=await (await f.call('/actions?projectId='+project.id)).json() as {actions:{id:string}[]};
+  assert.equal(list.actions.some(action=>action.id.startsWith('file-edit.')),false);
+  const actor={kind:'owner',identity:'local'};
+  const write=await f.call('/actions/execute',{id:'file-edit.write',params:{request:{agentId:null,path:'sample.txt',content:'no write'},actor},scope:{projectId:project.id}});
+  assert.equal(write.status,409);assert.match((await write.json()).error,/switched off/);
+  const read=await f.call('/actions/execute',{id:'file-edit.read',params:{},scope:{projectId:project.id}});
+  assert.equal(read.status,409);
+  const agentView=await (await f.call('/agents')).json() as {fileEdit:{enabled:boolean;mode:string|null}};
+  assert.deepEqual(agentView.fileEdit,{enabled:false,mode:null});
+  const actionView=await (await f.call('/actions/execute',{id:'agent.list',params:{}})).json() as {result:{fileEdit:{enabled:boolean;mode:string|null}}};
+  assert.deepEqual(actionView.result.fileEdit,{enabled:false,mode:null});
 });

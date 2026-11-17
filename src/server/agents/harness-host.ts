@@ -13,11 +13,23 @@ import { GenerationTask } from '@earendil-works/pi-durable';
 import { Type } from 'typebox';
 import { safePath } from '../paths';
 import { abortableDelay } from './abortable';
+import { ForkActivityUncertain } from '../state/fork-activity-uncertain';
+import { ForkDispatchNotStarted } from '../state/fork-dispatch-not-started';
+import { supportsBoundedProviderApi, assertProviderOutputBound } from './provider-output-bound';
 import { selectWorkerPreSubmitDelay } from '../agent-test-seams';
 import { modelAcceptsImages } from '../../shared/images';
 import { projectStoredImage } from './image-projection';
 import { authorizeToolUse, installedAgentScopes, unavailableAgentScopes, scopeToolIsInstalled, type AgentPrivilegePort, type AgentScope, type DispatchAuthority, type InstalledCapabilities } from '../../shared/agent-registry';
 import { codingTools } from './coding-tools';
+import { runAgentTests } from './run-tests';
+import type { AcceptedCommitService } from './accepted-commit';
+import type { AcceptedPushService } from './accepted-push';
+import type { AcceptedDeployService } from './accepted-deploy';
+import type { AcceptedProvisionService } from './accepted-provision';
+import { SPEND_MAX_AMOUNT_MINOR, type AcceptedSpendService } from './accepted-spend';
+import type { LocalDeployPort } from './local-deploy';
+import type { LocalPublishPort } from './local-publish';
+import type { RunnerBroker } from '../state/runner-broker';
 import { FILE_EDIT_MAX_FILE_BYTES, FILE_EDIT_MAX_PATH_LENGTH, type FileEditCapability } from '../state/file-edit-tool';
 import { agentViewFrom, type AgentQuestion, type AgentView } from '../../shared/agent';
 import type { Project } from '../../shared/model';
@@ -27,9 +39,12 @@ import type { WorkspaceStore } from '../workspace';
 import { applyOperation } from '../../shared/schema';
 import type { ProviderStore } from '../providers';
 import type { SessionLifecycleDispatchOutcome } from '../state/session-lifecycle';
+import type { ProjectAcceptanceView, AcceptanceResult, EvidenceResult } from '../state/acceptance-store';
+import type { AcceptanceActionClass, ArtifactIdentity, CompletionRecordRequest } from '../../shared/acceptance';
 import type { ModelChoice } from '../../shared/settings';
 import { MAX_MODEL_TURNS_DEFAULT, type ThinkingLevel } from '../../shared/agent';
 import { MAX_OUTPUT_TOKENS_DEFAULT } from '../../shared/harness-settings';
+import { WORKER_MAX_OUTPUT_TOKENS_PER_TURN } from '../../shared/workers';
 
 export type AgentInputMode = 'followUp' | 'steer' | 'reject';
 /** One stored image attached to an input, as base64 and its sniffed type. */
@@ -198,6 +213,15 @@ function workerRunIdOf(messages: readonly unknown[]): string | null {
   }
   return null;
 }
+/** A prompt marker is only a hint: a known worker must agree with its run binding. */
+export function workerRequestRun(input:{conversationId:number|undefined;marker:string|null;cachedRun:string|null;durableRun:string|null;requireDurable:boolean}):string|null {
+  if(input.conversationId===undefined)throw new HttpError(409,'The model request conversation cannot be verified; no provider request was sent.');
+  if(input.requireDurable&&input.cachedRun!==null&&input.durableRun===null)throw new HttpError(409,'The durable worker conversation binding is unavailable; no provider request was sent.');
+  const expected=input.durableRun??input.cachedRun;
+  if(input.cachedRun!==null&&input.durableRun!==null&&input.cachedRun!==input.durableRun)throw new HttpError(409,'The worker conversation bindings disagree; no provider request was sent.');
+  if(expected!==input.marker)throw new HttpError(409,'The worker request role does not match its conversation binding; no provider request was sent.');
+  return expected;
+}
 const uuidPattern = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
 /** The request identity rule, aligned with the durable lifecycle's own rule. */
 const requestIdPattern = /^[^\s\u0000-\u001f\u007f]{1,200}$/;
@@ -361,7 +385,10 @@ export interface ReadNotesSeam {
   readonly onExecute?: () => void;
 }
 
-function notesExtension(project: Project, seam: RecordNoteSeam, readSeam: ReadNotesSeam = {},workspace?:WorkspaceStore){
+type EffectAuthority = (tool:string,taskId:string,conversationId:string)=>()=>Promise<void>;
+type EffectTicket = {readonly tool:string;readonly conversationId:string;readonly sessionId:string;readonly authority:string;readonly capabilityRevision?:number};
+
+function notesExtension(project: Project, seam: RecordNoteSeam, readSeam: ReadNotesSeam = {},workspace?:WorkspaceStore, effectAuthority?:EffectAuthority){
   return defineExtension({
     name: 'notes',
     sections: [section('notes-protocol', () => 'Use record_note to append a short note to this project documentation, and read_notes to read the notes back. Saves attempt narrow local Git commits on the project Pilot branch; report the returned commit status honestly. They never push or merge.', { tag: false })],
@@ -371,8 +398,10 @@ function notesExtension(project: Project, seam: RecordNoteSeam, readSeam: ReadNo
         description: 'Append one line to this project notes file.',
         parameters: Type.Object({ text: Type.String({ minLength: 1, maxLength: 400, description: 'One line to append' }) }),
         replay: 'unsafe',
-        execute: async (args, _api, context) => {
+        execute: async (args, api, context) => {
+          const authorize=effectAuthority?.('record_note',String(api.taskId),String(api.conversationId));
           const signal = context.abortSignal;
+          await authorize?.();
           const beforeWriteMs = seam.beforeWriteMs ?? 0;
           const afterWriteMs = seam.afterWriteMs ?? 0;
           // Cancellation is cooperative. Every check below is immediately before the effect it
@@ -380,14 +409,14 @@ function notesExtension(project: Project, seam: RecordNoteSeam, readSeam: ReadNo
           signal?.throwIfAborted();
           seam.onExecute?.();
           await abortableDelay(beforeWriteMs, signal);
-          signal?.throwIfAborted();
+          signal?.throwIfAborted();await authorize?.();signal?.throwIfAborted();
           await mkdir(join(project.path,'docs'),{ recursive: true, mode: 0o755 });
           const file = await safePath(project.path,notesPath);
           // The last window: an abort that lands after this check but before `appendFile` starts
           // cannot prevent the write. The call is then reported as aborted (uncertain), never as
           // a rollback, because the bytes may already be committed.
           signal?.throwIfAborted();
-          const append=async()=>{signal?.throwIfAborted();await appendFile(file,args.text.trim()+'\n');return {};};
+          const append=async()=>{signal?.throwIfAborted();await authorize?.();signal?.throwIfAborted();await appendFile(file,args.text.trim()+'\n');return {};};
           const saved=workspace?await workspace.save(project,[notesPath],append):await append();
           // The append is committed. A later cancellation is reported as uncertain; it never
           // removes the line and the result never claims the line was not written.
@@ -407,7 +436,10 @@ function notesExtension(project: Project, seam: RecordNoteSeam, readSeam: ReadNo
           try {
             const file = await safePath(project.path,notesPath);
             return { output: [{ type: 'text', text: await readFile(file,'utf8') }] };
-          } catch { return { output: [{ type: 'text', text: 'No notes yet.' }] }; }
+          } catch (error) {
+            if((error as NodeJS.ErrnoException).code==='ENOENT')return { output: [{ type: 'text', text: 'No notes yet.' }] };
+            throw new HttpError(500,'Notes could not be read safely; their contents are unknown.');
+          }
         }
       })
     ]
@@ -415,7 +447,7 @@ function notesExtension(project: Project, seam: RecordNoteSeam, readSeam: ReadNo
 }
 
 /** Project-contained planning tools. Writes are revision checked and never replayed. */
-export function planningExtension(project: Project, docs: DocStore, boards: BoardStore) {
+export function planningExtension(project: Project, docs: DocStore, boards: BoardStore, effectAuthority?:EffectAuthority) {
   const result = (value: unknown) => {
     const text = JSON.stringify(value);
     if (Buffer.byteLength(text) > 256 * 1024) throw new HttpError(413, 'Tool result exceeds the size limit');
@@ -452,7 +484,9 @@ export function planningExtension(project: Project, docs: DocStore, boards: Boar
         return result({ path: doc.path, revision: doc.revision, text: doc.text.slice(offset, end), offset, nextOffset: end < doc.text.length ? end : null, totalCharacters: doc.text.length });
       } }),
       defineTool({ name: 'read_board', description: 'Read the project board and its revision.', parameters: Type.Object({}), replay: 'safe', execute: async () => result(await boards.read(project)) }),
-      defineTool({ name: 'write_board', description: 'Atomically apply revision-checked planning changes. Supply exactly one of operation or operations. Only task upserts, dependency upserts and metadata are allowed; no deletion or arbitrary file write.', parameters: Type.Object({ revision: Type.String({ minLength: 1, maxLength: 128 }), operation: Type.Optional(operationSchema), operations: Type.Optional(Type.Array(operationSchema, { minItems: 1, maxItems: 100 })) }, { additionalProperties: false }), replay: 'unsafe', execute: async (args, _api, context) => {
+      defineTool({ name: 'write_board', description: 'Atomically apply revision-checked planning changes. Supply exactly one of operation or operations. Only task upserts, dependency upserts and metadata are allowed; no deletion or arbitrary file write.', parameters: Type.Object({ revision: Type.String({ minLength: 1, maxLength: 128 }), operation: Type.Optional(operationSchema), operations: Type.Optional(Type.Array(operationSchema, { minItems: 1, maxItems: 100 })) }, { additionalProperties: false }), replay: 'unsafe', execute: async (args, api, context) => {
+        const authorize=effectAuthority?.('write_board',String(api.taskId),String(api.conversationId));
+        await authorize?.();
         if ((args.operation === undefined) === (args.operations === undefined)) throw new HttpError(422, 'Supply exactly one of operation or operations');
         const operations = args.operations ?? [args.operation!];
         if (!Array.isArray(operations) || operations.length < 1 || operations.length > 100) throw new HttpError(422, 'Supply between 1 and 100 operations');
@@ -472,7 +506,7 @@ export function planningExtension(project: Project, docs: DocStore, boards: Boar
         context.abortSignal?.throwIfAborted();
         // The candidate contains only validated allowed changes. BoardStore rechecks the original
         // revision inside its serialization boundary and commits the complete result once.
-        const updated = await boards.mutate(project, args.revision, { op: 'restore', board },[],async()=>{context.abortSignal?.throwIfAborted();});
+        const updated = await boards.mutate(project, args.revision, { op: 'restore', board },[],async()=>{context.abortSignal?.throwIfAborted();await authorize?.();context.abortSignal?.throwIfAborted();});
         return result({ revision: updated.revision, applied: operations.length, commit: updated.commit });
       } })
     ]
@@ -583,6 +617,11 @@ export interface HarnessHostOptions {
    * cheap, synchronous and side-effect free: it checks availability and throws a refusal.
    */
   projectGate?: (projectId: string) => void;
+  /** Refuse admission to a session whose durable fork state does not allow dispatch. */
+  sessionGate?: (projectId: string, sessionId: string) => void;
+  /** Hold a durable child-workspace fence around awaited activity, when configured. */
+  withSessionTool?: <T>(projectId: string, sessionId: string, work: () => Promise<T>) => Promise<T>;
+  withSessionProvider?: <T>(projectId: string, sessionId: string, work: () => Promise<T>) => Promise<T>;
   docs?: DocStore;
   boards?: BoardStore;
   workspace?: WorkspaceStore;
@@ -597,14 +636,14 @@ export interface HarnessHostOptions {
    * undefined for a project whose repository is not connected, because there is no worktree to
    * bound a path to and no honest way to offer `read` without one.
    */
-  coding?: { readonly enabled: boolean; readonly shell: boolean; readonly root: (projectId: string) => string | undefined };
+  coding?: { readonly enabled: boolean; readonly shell: boolean; readonly root: (projectId: string) => string | undefined; readonly sessionRoot?: (projectId: string, sessionId: string) => Promise<string>; readonly isFork?: (projectId: string, sessionId: string) => boolean };
   /**
    * Whether the owner still allows each capability, read per tool call. A capability the deployment
    * offers can be switched off in Pilot's harness settings, and that takes effect on the next call
    * rather than at the next restart. Turning one back on needs the deployment switch: this answers
    * only what the owner allows, never what the process was built with.
    */
-  allowedCapabilities?: () => Promise<{ readonly codingTools: boolean; readonly shell: boolean; readonly fileEdit: boolean }>;
+  allowedCapabilities?: () => Promise<{ readonly codingTools: boolean; readonly shell: boolean; readonly fileEdit: boolean; readonly revision?:number }>;
   /** The thinking level a new conversation starts with, or null for the host's default. */
   defaultThinking?: () => Promise<ThinkingLevel | null>;
   /**
@@ -615,11 +654,15 @@ export interface HarnessHostOptions {
   sessionModel?: (projectId: string, sessionId: string) => Promise<ModelChoice | null>;
   /**
    * How many model requests one dispatch may make in a row before it stops for review. Resolved at
-   * startup and stated in the refusal, so the bound a person meets is the bound the instance runs.
+   * startup as a fallback and stated in the refusal. The optional settings reader is consulted for
+   * each provider request, so an owner change applies without restarting the harness.
    */
   maxModelTurns?: number;
+  currentMaxModelTurns?: () => Promise<number>;
   /** How many tokens one model request may produce. Read per request; see the note at its use. */
   maxOutputTokens?: () => Promise<number>;
+  /** Reserve one agent request before sending it; the check revalidates its live authority. */
+  agentRequestBudget?: (projectId: string, sessionId: string) => Promise<{ maxOutputTokens: number | null; check: () => void }>;
   /**
    * Test-only windows around `record_note`'s append. They are reachable only through the harness
    * options (and the test environment), never through a model's tool arguments. Leave unset in
@@ -678,7 +721,98 @@ export interface HarnessHostOptions {
    * installed only when the capability is enabled, so a disabled tool does not exist at all rather
    * than existing and failing.
    */
+  reusableTools?: {
+    list(input:{projectId:string;sessionId:string;agentId:string;expectedAuthority:string}): unknown;
+    write(input:{projectId:string;sessionId:string;agentId:string;expectedAuthority:string;name:string;revision:number;fields:string[];signal?:AbortSignal}): unknown;
+    invoke(input:{projectId:string;sessionId:string;agentId:string;expectedAuthority:string;name:string;json:string}): unknown;
+  };
   fileEdit?: FileEditCapability;
+  /** Test-only pause after the file-edit privilege hook; never sourced from HTTP or environment. */
+  fileEditAuthorized?: () => Promise<void>;
+  /** Fork creation is always scoped to the calling conversation and the current project. */
+  forkTools?: {
+    context(projectId:string,sessionId:string):Promise<readonly {id:string}[]>;
+    create(input:{projectId:string;parentSessionId:string;baseCommit:string;cutoffEntryId:number;target?:string}):Promise<{created:boolean;fork:{childSessionId:string;state:string}}>;
+    /** The fenced, durably bound child submission: one stable invocation identity per logical send. */
+    dispatch(input:{projectId:string;parentSessionId:string;childSessionId:string;invocationId:string;text:string}):Promise<{requestId:string}>;
+  };
+  /** Explicitly installed test runner; the session check must refuse unsupported workspaces. */
+  runnerTests?: {
+    broker: Pick<RunnerBroker, 'submit' | 'claim' | 'run'>;
+    checkSession(projectId: string, sessionId: string): Promise<void>;
+    reserveJob(projectId: string, sessionId: string, agentId: string): Promise<void>;
+  };
+  /**
+   * The installed local test-execution capability. It is present only when the instance enables the
+   * local runner, so a disabled runner has no `run_tests` tool at all rather than one that fails.
+   * The port re-reads the bound agent's authority, reserves its job budget, writes the durable intent
+   * and runs the fixed `node --test` recipe in the registered project root. It is not a sandbox.
+   */
+  localTests?: {
+    run(input: {
+      readonly projectId: string;
+      readonly sessionId: string;
+      readonly conversationId: string;
+      readonly agentId: string;
+      readonly taskId: string;
+      /** The exact authority snapshot the privilege hook verified for this call. */
+      readonly expectedAuthority: string;
+      signal?: AbortSignal;
+    }): Promise<unknown>;
+  };
+  /**
+   * Installed only when this instance sets `DASHBOARD_AGENT_COMMIT=on`, with a control store and an
+   * owner-configured commit target for the project. The target, branch and command are never model input.
+   */
+  acceptedCommitTools?: {
+    preview(input: { projectId: string; sessionId: string; agentId: string; authorize: () => Promise<void> }): ReturnType<AcceptedCommitService['preview']>;
+    commit(input: { projectId: string; sessionId: string; agentId: string; evidenceId: string; acceptanceId: string; artifact: ArtifactIdentity; authorize: () => Promise<void>; signal?: AbortSignal }): ReturnType<AcceptedCommitService['commit']>;
+  };
+  /**
+   * Installed only when this instance sets `DASHBOARD_AGENT_PUSH=on`, with a control store and an
+   * owner-configured push target. The transport here is one local remote; no hosted credential integration.
+   */
+  acceptedPushTools?: {
+    preview(input: { projectId: string; sessionId: string; agentId: string; commit: string; authorize: () => Promise<void> }): ReturnType<AcceptedPushService['preview']>;
+    push(input: { projectId: string; sessionId: string; agentId: string; evidenceId: string; acceptanceId: string; artifact: ArtifactIdentity; authorize: () => Promise<void>; signal?: AbortSignal }): ReturnType<AcceptedPushService['push']>;
+  };
+  /**
+   * The installed local deploy capability: promote the project's configured built artifact into the
+   * owner-configured local directory. It is present only when this instance enables it, and the
+   * `deploy` scope still governs it.
+   */
+  localDeployTools?: LocalDeployPort;
+  /** The installed local publish capability: copy reviewed files into the owner-configured root. */
+  localPublishTools?: LocalPublishPort;
+  /** Experimental injection only; no deployment integration is installed in the application. */
+  acceptedDeployTools?: {
+    preview(input: { projectId: string; sessionId: string; agentId: string; versionId: string; authorize: () => Promise<void> }): ReturnType<AcceptedDeployService['preview']>;
+    deploy(input: { projectId: string; sessionId: string; agentId: string; versionId: string; evidenceId: string; acceptanceId: string; artifact: ArtifactIdentity; authorize: () => Promise<void>; signal?: AbortSignal }): ReturnType<AcceptedDeployService['deploy']>;
+  };
+  /**
+   * The owner-configured provisioning target, installed only when the deployment switch is on. The
+   * model supplies a resource slug, a version and a description; the service supplies the root,
+   * target id and path.
+   */
+  acceptedProvisionTools?: {
+    preview(input: { projectId: string; sessionId: string; agentId: string; resource: string; version: string; description?: string | null; authorize: () => Promise<void> }): ReturnType<AcceptedProvisionService['preview']>;
+    provision(input: { projectId: string; sessionId: string; agentId: string; resource: string; version: string; description?: string | null; evidenceId: string; acceptanceId: string; artifact: ArtifactIdentity; authorize: () => Promise<void>; signal?: AbortSignal }): ReturnType<AcceptedProvisionService['provision']>;
+  };
+  /**
+   * The owner-configured billing target, installed only when the deployment switch is on. The model
+   * supplies the amount in minor units; the service supplies the endpoint, credential, currency and
+   * caps, and never returns the endpoint or credential.
+   */
+  acceptedSpendTools?: {
+    preview(input: { projectId: string; sessionId: string; agentId: string; amountMinor: number; authorize: () => Promise<void> }): ReturnType<AcceptedSpendService['preview']>;
+    spend(input: { projectId: string; sessionId: string; agentId: string; amountMinor: number; evidenceId: string; acceptanceId: string; artifact: ArtifactIdentity; authorize: () => Promise<void>; signal?: AbortSignal }): ReturnType<AcceptedSpendService['spend']>;
+  };
+  /** A named agent may read and accept existing evidence under the instance policy. */
+  acceptanceTools?: {
+    read(projectId:string,sessionId:string):Promise<ProjectAcceptanceView>;
+    record?(input:{projectId:string;sessionId:string;agentId:string;evidence:CompletionRecordRequest;expectedAuthority:string;authorize:()=>Promise<void>;signal?:AbortSignal}):Promise<EvidenceResult>;
+    accept(input:{projectId:string;sessionId:string;evidenceId:string;artifact:ArtifactIdentity;actionClass:AcceptanceActionClass;agentId:string;expectedAuthority:string;authorize:()=>Promise<void>;signal?:AbortSignal}):Promise<AcceptanceResult>;
+  };
   /**
    * The durable lookup that says whether a numeric conversation belongs to a worker run. Every
    * generic conversation path asks it, so a worker transcript can never be handled as a session
@@ -686,6 +820,7 @@ export interface HarnessHostOptions {
    */
   workerBinding?: {
     isWorkerConversation(projectId: string, conversationId: number): boolean;
+    runForConversation(projectId: string, conversationId: number): string | null;
   };
   /** The authoritative per-tool re-check for a worker conversation. */
   workerGuard?: (input: { readonly projectId: string; readonly runId: string; readonly tool: string }) => string | null;
@@ -731,49 +866,64 @@ function permittedTools(extensions: readonly Extension[], scopes: readonly Agent
  * well-behaved model never attempts what would be refused.
  */
 /** Which capability governs which coding tool, for the per-call owner check. */
-const CAPABILITY_TOOLS: Readonly<Record<string, 'codingTools'|'shell'|'fileEdit'>> = Object.freeze({ read:'codingTools', write:'codingTools', bash:'shell', file_edit:'fileEdit' });
-function privilegeExtension(project: Project, authorityOf: (sessionId: string) => Promise<DispatchAuthority>, capabilities: InstalledCapabilities, allowedCapabilities?: () => Promise<{readonly codingTools:boolean;readonly shell:boolean;readonly fileEdit:boolean}>) {
+const CAPABILITY_TOOLS: Readonly<Record<string, 'codingTools'|'shell'|'fileEdit'>> = Object.freeze({ read:'codingTools', write:'codingTools', edit:'codingTools', bash:'shell', file_edit:'fileEdit' });
+function privilegeExtension(project: Project, authorityOf: (sessionId: string) => Promise<DispatchAuthority>, capabilities: InstalledCapabilities, allowedCapabilities?: () => Promise<{readonly codingTools:boolean;readonly shell:boolean;readonly fileEdit:boolean;readonly revision?:number}>, isFork?: (conversationId: string) => boolean, fileEditTickets?: Map<string,EffectTicket>, fileEditAuthorized?: () => Promise<void>, sessionOf?: (conversationId:string)=>string) {
   const fileEditEnabled = capabilities.fileEdit === true;
   return defineExtension({
     name: 'agent-privileges',
     sections: [section('agent-privileges', async (input) => {
       // The authority is resolved for the very conversation this request belongs to, so the section
       // tells the model exactly which session's allowlist and project scope govern it.
-      const authority = await authorityOf(String(input.conversationId));
-      if (authority.scopes === null)
-        return 'No agent is bound to this session, so the owner\u2019s own dispatch is in force: no agent allowlist narrows these tools. Bind an agent to a session to run it under an explicit allowlist.';
+      const conversationId = String(input.conversationId), authority = await authorityOf(conversationId);
+      const forkNote = isFork?.(conversationId) ? ' This is a fork: parent-workspace notes, documentation, board, file_edit, acceptance writes, commit, push, deploy, publish, provision and spend tools are unavailable even if their scopes are granted. Enabled coding tools target the fork worktree, but action-driven child dispatch can refuse later work when its lifecycle fence closes; do not assume coding will execute. Shell remains uncontained.' : '';
+      const pathNote = ' Project and worktree path checks are not process isolation: another process can change a path between validation and use.';
+      if (authority.scopes === null) {
+        let switches='Live capability settings could not be verified; unavailable tools will be refused.';
+        try {const live=await allowedCapabilities?.();if(live)switches='Live capability switches: coding tools '+(live.codingTools?'on':'off')+', shell '+(live.shell?'on':'off')+', bounded file edit '+(live.fileEdit?'on':'off')+'.';} catch {}
+        return 'No agent is bound to this session, so the owner\u2019s own dispatch is in force: no agent allowlist narrows these tools. Bind an agent to a session to run it under an explicit allowlist. '+switches+pathNote+forkNote;
+      }
       if (authority.scopes.length === 0)
         return 'This dispatch has no privilege scopes in force, so every tool is refused at dispatch. ' + (authority.emptyReason ?? 'No agent is bound.') + ' Do not attempt one.';
       // The capability switches decide which tools exist at all; the allowlist decides which of the
       // existing ones this dispatch may call. Both are stated, so a model never guesses.
       const granted = authority.scopes;
-      const installed = installedAgentScopes(capabilities);
+      let live={codingTools:capabilities.fileRead===true,shell:capabilities.shell===true,fileEdit:capabilities.fileEdit===true};
+      if(allowedCapabilities)try{live=await allowedCapabilities();}catch{live={codingTools:false,shell:false,fileEdit:false};}
+      const effective={...capabilities,fileEdit:capabilities.fileEdit===true&&live.fileEdit,fileRead:capabilities.fileRead===true&&live.codingTools,fileWrite:capabilities.fileWrite===true&&live.codingTools,shell:capabilities.shell===true&&live.shell};
+      const installed = installedAgentScopes(effective);
       const available = granted.filter((s) => (installed as readonly string[]).includes(s));
       const unavailable = granted.filter((s) => !(installed as readonly string[]).includes(s));
       const switchNote = (scope: AgentScope, on: boolean, what: string) => granted.includes(scope) && !on
-        ? ' The ' + scope + ' scope is granted but this instance has ' + what + ' disabled. A configuration change and process restart are required to install it. Existing conversations can retain their previous tool selection.' : '';
-      const fileEditNote = switchNote('file_edit', fileEditEnabled, 'the bounded file-edit tool')
-        + switchNote('file_read', capabilities.fileRead === true, 'the coding tools')
-        + switchNote('file_write', capabilities.fileWrite === true, 'the coding tools')
-        + switchNote('shell', capabilities.shell === true, 'the shell tool');
-      const codingNote = capabilities.shell === true && granted.includes('shell')
+        ? ' The ' + scope + ' scope is granted but this instance currently has ' + what + ' disabled. A deployment built without it requires reconfiguration; a live owner switch can also disable it.' : '';
+      const fileEditNote = switchNote('file_edit', fileEditEnabled && live.fileEdit, 'the bounded file-edit tool')
+        + switchNote('file_read', effective.fileRead, 'the coding tools')
+        + switchNote('file_write', effective.fileWrite, 'the coding tools')
+        + switchNote('shell', effective.shell, 'the shell tool');
+      const releaseNote = switchNote('deploy', effective.acceptedDeploy === true, 'the local deploy tool')
+        + switchNote('publish', effective.localPublish === true, 'the local publish tool');
+      const codingNote = effective.shell && granted.includes('shell')
         ? ' The shell tool runs as the application user and is not contained: it can reach other projects, the durable store and the stored credentials. Keep commands inside the project worktree and commit deliberately.' : '';
       const availLine = available.length > 0 ? ' Its scopes with an installed tool are: ' + available.join(', ') + '.' : ' None of its scopes has an installed tool in this build.';
-      const unavailLine = unavailable.length > 0 ? ' The following scopes are granted but have NO installed tool in this build and cannot be used: ' + unavailable.join(', ') + '.' : '';
-      const uninstalledAll = unavailableAgentScopes(capabilities).filter((s) => !['file_edit', 'file_read', 'file_write', 'shell'].includes(s.scope));
+      const unavailLine = unavailable.length > 0 ? ' The following scopes are granted but their tools are not currently usable in this instance: ' + unavailable.join(', ') + '.' : '';
+      const uninstalledAll = unavailableAgentScopes(effective).filter((s) => !['file_edit', 'file_read', 'file_write', 'shell', 'deploy', 'publish'].includes(s.scope));
       const uninstalledLine = uninstalledAll.length > 0 ? ' Scopes without an installed tool in this build: ' + uninstalledAll.map((s) => s.scope).join(', ') + '. They are declared in the vocabulary but the agent cannot call them.' : '';
-      const scopeLine = 'This dispatch runs as an agent' + (authority.agentId === null ? '' : ' (' + authority.agentId + ')') + '.' + availLine + unavailLine + fileEditNote + codingNote + uninstalledLine + ' A tool outside the granted scopes is refused at dispatch with no effect, so do not attempt one.';
+      // Commit and push have their own deployment switches and a per-project owner-configured target,
+      // so a granted scope with no installed tool says which of those is missing.
+      const actionNote = (granted.includes('commit') && capabilities.acceptedCommit !== true) || (granted.includes('push') && capabilities.acceptedPush !== true)
+        ? ' The commit and push scopes need a deployment with DASHBOARD_AGENT_COMMIT=on and/or DASHBOARD_AGENT_PUSH=on, an owner-configured target for this project, and an agent-may-accept policy whose class decision is full-auto; a scope grant alone installs nothing.' : '';
+      const scopeLine = 'This dispatch runs as an agent' + (authority.agentId === null ? '' : ' (' + authority.agentId + ')') + '.' + availLine + unavailLine + fileEditNote + releaseNote + codingNote + uninstalledLine + actionNote + ' A tool outside the granted scopes is refused at dispatch with no effect, so do not attempt one.';
       const projectLine = authority.projects === null ? '' : ' Its project scope is the explicit set ' + authority.projects.join(', ') + ', so a call that acts on any other project is refused at dispatch with no effect.';
-      return scopeLine + projectLine;
+      return scopeLine + projectLine + pathNote + forkNote;
     }, { tag: false })],
     hooks: [hook(ToolTask, {
       beforeTool: async (call, api) => {
         // The owner's own harness settings, checked per call: a capability switched off in Pilot is
         // refused from the next call, with the reason naming where the change belongs.
         const capability=CAPABILITY_TOOLS[call.name];
+        let capabilityRevision:number|undefined;
         if(capability!==undefined&&allowedCapabilities!==undefined){
           let allowed=true;
-          try{allowed=(await allowedCapabilities())[capability];}
+          try{const snapshot=await allowedCapabilities();allowed=snapshot[capability];capabilityRevision=snapshot.revision;}
           catch{allowed=false;}
           if(!allowed)return { block: 'The '+capability+' capability is switched off in this instance\u2019s harness settings, so the '+call.name+' tool is refused at dispatch with no effect. An owner turns it back on in Harness settings; a deployment that was built without it cannot be changed there.' };
         }
@@ -790,7 +940,16 @@ function privilegeExtension(project: Project, authorityOf: (sessionId: string) =
         if (authority.projects !== null && !authority.projects.includes(project.id))
           return { block: 'The project ' + project.id + ' is outside this dispatch\u2019s project scope (' + (authority.projects.length ? authority.projects.join(', ') : 'no project is allowed') + '), so the tool ' + call.name + ' is refused at dispatch with no effect. Widen the agent\u2019s project scope to use it here.' };
         const verdict = authorizeToolUse({ scopes: authority.scopes, tool: call.name });
-        if (verdict.permitted) return undefined;
+        if (verdict.permitted) {
+          if(['file_edit','record_note','write_board','acceptance_record','acceptance_accept','run_tests','reusable_define'].includes(call.name)&&fileEditTickets){
+            // A bounded, one-use in-memory ticket binds the executing edit to the authority that
+            // passed this very hook. A lost ticket refuses rather than attributing an edit to owner.
+            if(fileEditTickets.size>=1024){const oldest=fileEditTickets.keys().next().value;if(oldest!==undefined)fileEditTickets.delete(oldest);}
+            fileEditTickets.set(String(api.taskId),{tool:call.name,conversationId:String(api.conversationId),sessionId:sessionOf?.(String(api.conversationId))??String(api.conversationId),authority:JSON.stringify(authority),capabilityRevision});
+            if(call.name==='file_edit')await fileEditAuthorized?.();
+          }
+          return undefined;
+        }
         return { block: authority.emptyReason === null ? verdict.reason : verdict.reason + ' ' + authority.emptyReason };
       }
     })]
@@ -805,10 +964,13 @@ function privilegeExtension(project: Project, authorityOf: (sessionId: string) =
  * the project's connected worktree and nothing else — the size caps, the atomic write, and the mode,
  * which comes from the acceptance policy rather than being assumed.
  */
-function fileEditExtension(project: Project, capability: FileEditCapability, authorityOf: (sessionId: string) => Promise<DispatchAuthority>) {
+function fileEditExtension(project: Project, capability: FileEditCapability, authorityOf: (sessionId: string) => Promise<DispatchAuthority>, tickets: Map<string,EffectTicket>, allowedCapabilities?: () => Promise<{readonly codingTools:boolean;readonly shell:boolean;readonly fileEdit:boolean;readonly revision?:number}>, sessionOf?: (conversationId:string)=>string) {
   return defineExtension({
     name: 'file-edit',
-    sections: [section('file-edit-protocol', () => 'Use file_edit to propose or apply one bounded change to a file inside this project\u2019s connected worktree. The path is relative and must stay inside it. In propose-only mode the change and its diff are recorded and no file is written.', { tag: false })],
+    sections: [section('file-edit-protocol', async () => {
+      const mode = await capability.mode();
+      return 'Use file_edit for one bounded change inside the connected worktree. The current mode is ' + mode + (mode === 'auto-apply' ? ': changes are applied and recorded with a diff.' : ': changes and diffs are recorded, but no file is written.');
+    }, { tag: false })],
     tools: [defineTool({
       name: 'file_edit',
       description: 'Propose or apply one bounded edit to a file inside this project\u2019s connected repository worktree.',
@@ -818,9 +980,21 @@ function fileEditExtension(project: Project, capability: FileEditCapability, aut
       }),
       replay: 'unsafe',
       execute: async (args, api, context) => {
-        const authority = await authorityOf(String(api.conversationId));
+        const ticket=tickets.get(String(api.taskId));tickets.delete(String(api.taskId));
+        if(ticket===undefined||ticket.tool!=='file_edit'||ticket.conversationId!==String(api.conversationId))throw new HttpError(403,'The file-edit dispatch authority is unavailable; no edit was started.');
+        const authorize=async()=>{
+          if(allowedCapabilities!==undefined){let allowed=false;try{const snapshot=await allowedCapabilities();allowed=snapshot.fileEdit&&(ticket.capabilityRevision===undefined||snapshot.revision===ticket.capabilityRevision);}catch{}if(!allowed)throw new HttpError(403,'The file-edit capability changed or is no longer enabled.');}
+          const conversationId=String(api.conversationId);
+          if((sessionOf?.(conversationId)??conversationId)!==ticket.sessionId)throw new HttpError(403,'File-edit session authority changed.');
+          const current=await authorityOf(conversationId);
+          if(JSON.stringify(current)!==ticket.authority || (current.projects!==null&&!current.projects.includes(project.id)) || !authorizeToolUse({scopes:current.scopes,tool:'file_edit'}).permitted)
+            throw new HttpError(403,'File-edit authority changed or is unavailable.');
+          return current;
+        };
+        const authority=await authorize();
         const outcome = await capability.edit({
           signal: context.abortSignal,
+          authorize: async()=>{await authorize();},
           projectId: project.id,
           agentId: authority.agentId,
           path: args.path,
@@ -828,19 +1002,360 @@ function fileEditExtension(project: Project, capability: FileEditCapability, aut
           mode: null,
           actor: authority.agentId === null ? { kind: 'owner' as const, identity: 'owner' } : { kind: 'agent' as const, identity: authority.agentId }
         });
-        return {
-          output: [{
-            type: 'text' as const,
-            text: (outcome.written ? 'Applied ' : 'Proposed ') + outcome.record.path + ' in ' + outcome.record.mode + ' mode; the change and its diff are recorded as ' + outcome.record.id + '.'+(outcome.commit?' Git: '+JSON.stringify(outcome.commit):'')
-          }]
-        };
+        const state=outcome.written
+          ? outcome.record.applied===true?'The write returned and its confirmation was recorded.':'The write returned, but its durable confirmation is unavailable; inspect before retrying.'
+          : outcome.record.applied===null?'No new write occurred. This existing auto-apply intent has an unknown outcome; inspect the file before retrying.'
+          : outcome.record.applied===true?'No new write occurred. This intent has a previous write confirmation; the current file may have changed since then.'
+          :outcome.reused?'No new write occurred. This is an earlier proposal; its diff and existence metadata describe the earlier observation, not the current file.':'No file was written by this call; the proposal is recorded.';
+        return {output:[{type:'text' as const,text:state+' File '+outcome.record.path+'; intent '+outcome.record.id+'.'+(outcome.commit?' Git: '+JSON.stringify(outcome.commit):'')}]};
       }
     })]
   });
 }
 
-/** Add planning selections without changing the model, transcript, or existing names. */
-async function migratePlanningSelection(conversation: HostedAgent['conversation'], planning: Extension, authority: DispatchAuthority, projectId: string): Promise<void> {
+/** These tools require a bound agent even when legacy owner dispatch is unrestricted. */
+function reusableExtension(project:Project,port:NonNullable<HarnessHostOptions['reusableTools']>,authorityOf:(id:string)=>Promise<DispatchAuthority>,sessionOf:(id:string)=>string,tickets:Map<string,EffectTicket>):Extension {
+  const caller=async(id:string,tool:string)=>{
+    const authority=await authorityOf(id),sessionId=sessionOf(id);
+    if(!authority.agentId||authority.scopes===null||!authorizeToolUse({scopes:authority.scopes,tool}).permitted||(authority.projects!==null&&!authority.projects.includes(project.id)))throw new HttpError(403,'A bound agent with reusable_tools scope is required.');
+    return {projectId:project.id,sessionId,agentId:authority.agentId,expectedAuthority:JSON.stringify(authority)};
+  };
+  const output=(value:unknown)=>({output:[{type:'text' as const,text:JSON.stringify(value)}]});
+  return defineExtension({name:'reusable-tools',tools:[
+    defineTool({name:'reusable_list',description:'List your reusable JSON projection definitions in this project.',parameters:Type.Object({},{additionalProperties:false}),replay:'safe',execute:async(_args,api)=>output(port.list(await caller(String(api.conversationId),'reusable_list')))}),
+    defineTool({name:'reusable_define',description:'Create or revise a named JSON object field projection. Revision 0 creates. This durably mutates the project agent definition store; it never runs code.',parameters:Type.Object({name:Type.String({pattern:'^[a-z][a-z0-9_-]{0,31}$'}),revision:Type.Integer({minimum:0,maximum:31}),fields:Type.Array(Type.String({pattern:'^[A-Za-z][A-Za-z0-9_-]{0,63}$'}),{minItems:1,maxItems:16})},{additionalProperties:false}),replay:'unsafe',execute:async(args,api,context)=>{
+      const id=String(api.conversationId),ticket=tickets.get(String(api.taskId));tickets.delete(String(api.taskId));
+      context.abortSignal?.throwIfAborted();const identity=await caller(id,'reusable_define');
+      if(!ticket||ticket.tool!=='reusable_define'||ticket.conversationId!==id||ticket.sessionId!==identity.sessionId||ticket.authority!==identity.expectedAuthority)throw new HttpError(403,'Reusable definition authority changed.');
+      return output(port.write({...identity,...args,signal:context.abortSignal}));
+    }}),
+    defineTool({name:'reusable_invoke',description:'Run your named JSON field projection on a JSON object string (maximum 8192 bytes). No network or code execution.',parameters:Type.Object({name:Type.String({pattern:'^[a-z][a-z0-9_-]{0,31}$'}),json:Type.String({maxLength:8192})},{additionalProperties:false}),replay:'unsafe',execute:async(args,api)=>output(port.invoke({...await caller(String(api.conversationId),'reusable_invoke'),...args}))})
+  ]});
+}
+
+/** Agent-facing acceptance tools retain the store's policy, identity and artifact checks. */
+function acceptanceExtension(project:Project, port:NonNullable<HarnessHostOptions['acceptanceTools']>, authorityOf:(conversationId:string)=>Promise<DispatchAuthority>, sessionOf:(id:string)=>string, tickets:Map<string,EffectTicket>, sessionGate?: (projectId:string,sessionId:string)=>void):Extension {
+ const caller=async(conversationId:string)=>{const initial=await authorityOf(conversationId);if(!initial.agentId)throw new HttpError(403,'Bind a named agent before an agent can accept evidence.');const agentId=initial.agentId,sessionId=sessionOf(conversationId);const authorize=async()=>{sessionGate?.(project.id,sessionId);const current=await authorityOf(conversationId);if(current.agentId!==agentId||current.scopes===null||!authorizeToolUse({scopes:current.scopes,tool:'acceptance_accept'}).permitted||(current.projects!==null&&!current.projects.includes(project.id)))throw new HttpError(403,'Acceptance authority changed or is unavailable.');};await authorize();return {agentId,sessionId,authorize};};
+ return defineExtension({name:'acceptance-tools',tools:[
+  defineTool({name:'acceptance_read',description:'Read the acceptance policy and a bounded summary of your session’s evidence. Evidence is self-reported and is not proof that tests ran or that a diff matches an artifact.',parameters:Type.Object({offset:Type.Optional(Type.Integer({minimum:0,maximum:199}))}, {additionalProperties:false}),replay:'safe',execute:async(args,api)=>{
+   const {sessionId,authorize}=await caller(String(api.conversationId)),view=await port.read(project.id,sessionId),offset=args.offset??0;await authorize();
+   // Keep the session check at the harness boundary as well: older injected adapters may ignore
+   // the session argument and return a project-wide view.
+   const own=view.evidence.filter(item=>item.record.sessionId===sessionId);
+   const evidence=own.slice(offset,offset+10).map(item=>({id:item.record.id,subject:item.record.subject,artifact:item.record.artifact,tests:item.record.tests.slice(0,5).map(test=>({command:test.command.slice(0,200),outcome:test.outcome})),testsTruncated:item.record.tests.length>5,accepted:item.acceptance!==null}));
+   return {output:[{type:'text' as const,text:JSON.stringify({policy:view.policy,evidence,warning:'Evidence consists of claims; tests and diffs are not independently verified.',nextOffset:offset+evidence.length<own.length?offset+evidence.length:null,truncated:view.truncated})}]};
+  }}),
+  ...(port.record?[defineTool({name:'acceptance_record',description:'Record self-reported evidence for this session and exact artifact. Claims and test output are not independently verified. This neither accepts nor performs an action; never include secrets.',parameters:Type.Object({
+   artifact:Type.Object({revision:Type.String({minLength:1,maxLength:200}),commit:Type.Union([Type.String({minLength:1,maxLength:128}),Type.Null()])},{additionalProperties:false}),
+   commands:Type.Array(Type.String({minLength:1,maxLength:500}),{minItems:1,maxItems:50}),
+   diff:Type.Object({files:Type.Integer({minimum:0}),linesAdded:Type.Integer({minimum:0}),linesRemoved:Type.Integer({minimum:0}),text:Type.Union([Type.String({maxLength:16384}),Type.Null()]),reference:Type.Union([Type.String({maxLength:400}),Type.Null()])},{additionalProperties:false}),
+   tests:Type.Array(Type.Object({command:Type.String({minLength:1,maxLength:500}),outcome:Type.Union([Type.Literal('passed'),Type.Literal('failed'),Type.Literal('not-run')]),output:Type.Union([Type.String({maxLength:8192}),Type.Null()]),counts:Type.Union([Type.Object({passed:Type.Integer({minimum:0}),failed:Type.Integer({minimum:0}),skipped:Type.Integer({minimum:0})},{additionalProperties:false}),Type.Null()])},{additionalProperties:false}),{minItems:1,maxItems:20})
+  },{additionalProperties:false}),replay:'unsafe',execute:async(args,api,context)=>{
+   const conversationId=String(api.conversationId),taskId=String(api.taskId),ticket=tickets.get(taskId);tickets.delete(taskId);
+   context.abortSignal?.throwIfAborted();
+   if(!ticket||ticket.tool!=='acceptance_record'||ticket.conversationId!==conversationId||ticket.sessionId!==sessionOf(conversationId))throw new HttpError(403,'Evidence dispatch authority is unavailable.');
+   const {agentId,sessionId,authorize:check}=await caller(conversationId);
+   const authorize=async()=>{await check();if(sessionOf(conversationId)!==ticket.sessionId||JSON.stringify(await authorityOf(conversationId))!==ticket.authority)throw new HttpError(403,'Evidence authority changed or is unavailable.');};
+   await authorize();
+   const evidence:CompletionRecordRequest={sessionId,subject:{kind:'session',id:sessionId},artifact:args.artifact,commands:args.commands,diff:args.diff,tests:args.tests,review:null,producedAt:new Date().toISOString()};
+   context.abortSignal?.throwIfAborted();
+   const result=await port.record!({projectId:project.id,sessionId,agentId,evidence,expectedAuthority:ticket.authority,authorize,signal:context.abortSignal});
+   return {output:[{type:'text' as const,text:JSON.stringify({evidenceId:result.evidence.record.id,artifact:result.evidence.record.artifact,markdown:result.evidence.markdown,written:result.written,warning:'Self-reported claims; not independently verified.'})}]};
+  }})]:[]),
+  defineTool({name:'acceptance_accept',description:'Accept existing evidence for its exact artifact under the current acceptance policy. Claims are not independently verified. This records a decision and does not execute a commit, deployment or other action.',parameters:Type.Object({evidenceId:Type.String({minLength:1,maxLength:160}),artifact:Type.Object({revision:Type.String({minLength:1,maxLength:200}),commit:Type.Union([Type.String({minLength:1,maxLength:128}),Type.Null()])},{additionalProperties:false}),actionClass:Type.Union([Type.Literal('commit'),Type.Literal('push'),Type.Literal('deploy'),Type.Literal('spend'),Type.Literal('provision'),Type.Literal('publish')])},{additionalProperties:false}),replay:'unsafe',execute:async(args,api,context)=>{
+   const conversationId=String(api.conversationId),taskId=String(api.taskId),ticket=tickets.get(taskId);tickets.delete(taskId);
+   context.abortSignal?.throwIfAborted();
+   if(!ticket||ticket.tool!=='acceptance_accept'||ticket.conversationId!==conversationId||ticket.sessionId!==sessionOf(conversationId))throw new HttpError(403,'Acceptance dispatch authority is unavailable.');
+   const {agentId,sessionId,authorize:check}=await caller(conversationId);
+   const authorize=async()=>{await check();if(sessionOf(conversationId)!==ticket.sessionId||JSON.stringify(await authorityOf(conversationId))!==ticket.authority)throw new HttpError(403,'Acceptance authority changed or is unavailable.');};
+   await authorize();
+   context.abortSignal?.throwIfAborted();
+   const result=await port.accept({projectId:project.id,sessionId,evidenceId:args.evidenceId,artifact:args.artifact,actionClass:args.actionClass,agentId,expectedAuthority:ticket.authority,authorize,signal:context.abortSignal});
+   return {output:[{type:'text' as const,text:JSON.stringify({acceptance:result.acceptance})}]};
+  }})
+ ]});
+}
+
+/** An explicitly injected commit adapter; no target or command is chosen by the model. */
+function acceptedCommitExtension(project: Project, port: NonNullable<HarnessHostOptions['acceptedCommitTools']>, authorityOf: (id: string) => Promise<DispatchAuthority>, sessionOf: (id: string) => string, sessionGate?: (projectId: string, sessionId: string) => void): Extension {
+  const context = async (conversationId: string) => {
+    const sessionId = sessionOf(conversationId), initial = await authorityOf(conversationId);
+    if (!initial.agentId) throw new HttpError(403, 'Bind a named agent before committing.');
+    const agentId = initial.agentId;
+    const authorize = async () => {
+      sessionGate?.(project.id, sessionId);
+      const current = await authorityOf(conversationId);
+      if (current.agentId !== agentId || current.scopes === null || !authorizeToolUse({ scopes: current.scopes, tool: 'commit_accepted' }).permitted || (current.projects !== null && !current.projects.includes(project.id)))
+        throw new HttpError(403, 'Commit authority changed or is unavailable.');
+    };
+    return { projectId: project.id, sessionId, agentId, authorize };
+  };
+  return defineExtension({ name: 'accepted-commit', tools: [
+    defineTool({ name: 'commit_preview', description: 'Inspect the exact staged Git tree and parent for the owner-configured Pilot branch. No files are staged and no branch is changed.', parameters: Type.Object({}, { additionalProperties: false }), replay: 'unsafe', execute: async (_args, api) => {
+      const caller = await context(String(api.conversationId));
+      try { return { output: [{ type: 'text' as const, text: JSON.stringify(await port.preview(caller)) }] }; }
+      catch { return { output: [{ type: 'text' as const, text: 'The configured commit snapshot is unavailable or authority changed. No branch update was requested.' }] }; }
+    } }),
+    defineTool({ name: 'commit_accepted', description: 'Commit the already staged exact tree to the configured Pilot branch only after same-session evidence is accepted for commit. Never pushes. An uncertain result requires inspection, not retry.', parameters: Type.Object({ evidenceId: Type.String({ minLength: 1, maxLength: 160 }), acceptanceId: Type.String({ minLength: 1, maxLength: 160 }), artifact: Type.Object({ revision: Type.String({ minLength: 1, maxLength: 160 }), commit: Type.Union([Type.String({ minLength: 1, maxLength: 128 }), Type.Null()]) }, { additionalProperties: false }) }, { additionalProperties: false }), replay: 'unsafe', execute: async (args, api, execution) => {
+      const caller = await context(String(api.conversationId));
+      try { const result = await port.commit({ ...caller, ...args, signal: execution.abortSignal }); return { output: [{ type: 'text' as const, text: JSON.stringify(result) }] }; }
+      catch { return { output: [{ type: 'text' as const, text: 'The commit could not be confirmed. Inspect its acceptance, action intent and branch before any retry.' }] }; }
+    } })
+  ] });
+}
+
+function acceptedPushExtension(project: Project, port: NonNullable<HarnessHostOptions['acceptedPushTools']>, authorityOf: (id: string) => Promise<DispatchAuthority>, sessionOf: (id: string) => string, sessionGate?: (projectId: string, sessionId: string) => void): Extension {
+  const context = async (conversationId: string) => {
+    const sessionId = sessionOf(conversationId), initial = await authorityOf(conversationId);
+    if (!initial.agentId) throw new HttpError(403, 'Bind a named agent before pushing.');
+    const agentId = initial.agentId;
+    const authorize = async () => {
+      sessionGate?.(project.id, sessionId);
+      const current = await authorityOf(conversationId);
+      if (current.agentId !== agentId || current.scopes === null || !authorizeToolUse({ scopes: current.scopes, tool: 'push_accepted' }).permitted || (current.projects !== null && !current.projects.includes(project.id)))
+        throw new HttpError(403, 'Push authority changed or is unavailable.');
+    };
+    return { projectId: project.id, sessionId, agentId, authorize };
+  };
+  return defineExtension({ name: 'accepted-push', tools: [
+    defineTool({ name: 'push_preview', description: 'Inspect one commit and the owner-configured push target. No push occurs. The displayed remote head is an observation, not a reservation.', parameters: Type.Object({ commit: Type.String({ pattern: '^[a-f0-9]{40}$' }) }, { additionalProperties: false }), replay: 'unsafe', execute: async (args, api) => {
+      const caller = await context(String(api.conversationId));
+      try { return { output: [{ type: 'text' as const, text: JSON.stringify(await port.preview({ ...caller, commit: args.commit })) }] }; }
+      catch { return { output: [{ type: 'text' as const, text: 'The configured push target or commit is unavailable. No push was requested.' }] }; }
+    } }),
+    defineTool({ name: 'push_accepted', description: 'Push exactly the accepted commit to the configured target through a non-force transport. An uncertain result requires inspection, not retry.', parameters: Type.Object({ evidenceId: Type.String({ minLength: 1, maxLength: 160 }), acceptanceId: Type.String({ minLength: 1, maxLength: 160 }), artifact: Type.Object({ revision: Type.String({ minLength: 1, maxLength: 160 }), commit: Type.Union([Type.String({ minLength: 1, maxLength: 128 }), Type.Null()]) }, { additionalProperties: false }) }, { additionalProperties: false }), replay: 'unsafe', execute: async (args, api, execution) => {
+      const caller = await context(String(api.conversationId));
+      try { const result = await port.push({ ...caller, ...args, signal: execution.abortSignal }); return { output: [{ type: 'text' as const, text: JSON.stringify(result) }] }; }
+      catch { return { output: [{ type: 'text' as const, text: 'The push could not be confirmed. Inspect its acceptance, durable action intent and remote branch before any retry.' }] }; }
+    } })
+  ] });
+}
+
+function acceptedDeployExtension(project: Project, port: NonNullable<HarnessHostOptions['acceptedDeployTools']>, authorityOf: (id: string) => Promise<DispatchAuthority>, sessionOf: (id: string) => string, sessionGate?: (projectId: string, sessionId: string) => void): Extension {
+  const context = async (conversationId: string) => {
+    const sessionId = sessionOf(conversationId), initial = await authorityOf(conversationId);
+    if (!initial.agentId) throw new HttpError(403, 'Bind a named agent before deploying.');
+    const agentId = initial.agentId;
+    const authorize = async () => {
+      sessionGate?.(project.id, sessionId);
+      const current = await authorityOf(conversationId);
+      if (current.agentId !== agentId || current.scopes === null || !authorizeToolUse({ scopes: current.scopes, tool: 'deploy_accepted' }).permitted || (current.projects !== null && !current.projects.includes(project.id)))
+        throw new HttpError(403, 'Deploy authority changed or is unavailable.');
+    };
+    return { projectId: project.id, sessionId, agentId, authorize };
+  };
+  const version = Type.String({ pattern: '^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$' });
+  return defineExtension({ name: 'accepted-deploy', tools: [
+    defineTool({ name: 'deploy_preview', description: 'Inspect an existing Worker version at the owner-configured deployment target. This does not deploy it or prove the code is safe.', parameters: Type.Object({ versionId: version }, { additionalProperties: false }), replay: 'unsafe', execute: async (args, api) => {
+      const caller = await context(String(api.conversationId));
+      try { return { output: [{ type: 'text' as const, text: JSON.stringify(await port.preview({ ...caller, versionId: args.versionId })) }] }; }
+      catch { return { output: [{ type: 'text' as const, text: 'The configured deployment target or version is unavailable. No deployment was requested.' }] }; }
+    } }),
+    defineTool({ name: 'deploy_accepted', description: 'Deploy exactly the accepted existing Worker version to the configured target. The provider receipt is not a health check. Inspect uncertain outcomes; do not retry automatically.', parameters: Type.Object({ versionId: version, evidenceId: Type.String({ minLength: 1, maxLength: 160 }), acceptanceId: Type.String({ minLength: 1, maxLength: 160 }), artifact: Type.Object({ revision: Type.String({ minLength: 1, maxLength: 160 }), commit: Type.Union([Type.String({ minLength: 1, maxLength: 128 }), Type.Null()]) }, { additionalProperties: false }) }, { additionalProperties: false }), replay: 'unsafe', execute: async (args, api, execution) => {
+      const caller = await context(String(api.conversationId));
+      try { return { output: [{ type: 'text' as const, text: JSON.stringify(await port.deploy({ ...caller, ...args, signal: execution.abortSignal })) }] }; }
+      catch { return { output: [{ type: 'text' as const, text: 'The deployment could not be confirmed. Inspect the durable action intent and provider state before any retry.' }] }; }
+    } })
+  ] });
+}
+
+/** The installed local capability: a fixed recipe in the registered project root, never a command. */
+function localTestsExtension(project: Project, port: NonNullable<HarnessHostOptions['localTests']>, authorityOf: (id: string) => Promise<DispatchAuthority>, sessionOf: (id: string) => string, tickets: Map<string, EffectTicket>): Extension {
+  return defineExtension({ name: 'local-tests', tools: [defineTool({
+    name: 'run_tests',
+    description: 'Run this project\u2019s fixed `node --test` recipe (no arguments) in the registered project root. It runs as the application user and is NOT a sandbox: the tests can read stored credentials and every project and can modify the project. A timeout or cancellation is uncertain and is not retried automatically; inspect the returned job record before running again.',
+    parameters: Type.Object({}, { additionalProperties: false }), replay: 'unsafe',
+    execute: async (_args, api, context) => {
+      const conversationId = String(api.conversationId), sessionId = sessionOf(conversationId), taskId = String(api.taskId), ticket = tickets.get(taskId);
+      tickets.delete(taskId);
+      if (!ticket || ticket.tool !== 'run_tests' || ticket.conversationId !== conversationId || ticket.sessionId !== sessionId)
+        throw new HttpError(403, 'Test dispatch authority is unavailable.');
+      const initial = await authorityOf(conversationId);
+      // The owner has no agent allowlist, so the owner's own dispatch cannot run tests: the
+      // capability is granted to a named, bound agent and refuses everything else.
+      if (!initial.agentId) throw new HttpError(403, 'Bind a named agent with the run_tests scope before tests can run; no test job was started.');
+      if (JSON.stringify(initial) !== ticket.authority) throw new HttpError(403, 'Test-execution authority changed or is unavailable; no test job was started.');
+      const result = await port.run({ projectId: project.id, sessionId, conversationId, agentId: initial.agentId, taskId, expectedAuthority: ticket.authority, signal: context.abortSignal });
+      return { output: [{ type: 'text' as const, text: JSON.stringify(result) }] };
+    }
+  })] });
+}
+
+/**
+ * The installed local release tools. Each tool is governed by the same privilege hook as every other
+ * tool, and this extension adds a second, narrower check: the caller must be a bound named agent and
+ * its current authority must still permit the named tool and the project. The target itself is never
+ * a tool argument; the owner configured it and the service reads it again at execution.
+ */
+function localDeployExtension(project: Project, port: LocalDeployPort, authorityOf: (id: string) => Promise<DispatchAuthority>, sessionOf: (id: string) => string, sessionGate?: (projectId: string, sessionId: string) => void): Extension {
+  const context = async (conversationId: string) => {
+    const sessionId = sessionOf(conversationId), initial = await authorityOf(conversationId);
+    if (!initial.agentId) throw new HttpError(403, 'Bind a named agent before deploying.');
+    const agentId = initial.agentId;
+    const authorize = async () => {
+      sessionGate?.(project.id, sessionId);
+      const current = await authorityOf(conversationId);
+      if (current.agentId !== agentId || current.scopes === null || !authorizeToolUse({ scopes: current.scopes, tool: 'deploy_accepted' }).permitted || (current.projects !== null && !current.projects.includes(project.id)))
+        throw new HttpError(403, 'Deploy authority changed or is unavailable.');
+    };
+    return { projectId: project.id, sessionId, agentId, authorize };
+  };
+  const artifact = Type.Object({ revision: Type.String({ minLength: 1, maxLength: 200 }), commit: Type.Union([Type.String({ minLength: 1, maxLength: 128 }), Type.Null()]) }, { additionalProperties: false });
+  return defineExtension({ name: 'local-deploy', tools: [
+    defineTool({ name: 'deploy_preview', description: 'Read the project\u2019s configured built artifact and its digest beside the owner-configured local deployment target. It copies and promotes nothing; the same collected content is what a later deploy binds.', parameters: Type.Object({}, { additionalProperties: false }), replay: 'unsafe', execute: async (_args, api) => {
+      try { const caller = await context(String(api.conversationId)); return { output: [{ type: 'text' as const, text: JSON.stringify(await port.preview(caller)) }] }; }
+      catch { return { output: [{ type: 'text' as const, text: 'The configured deployment artifact or destination is unavailable. Nothing was collected or promoted.' }] }; }
+    } }),
+    defineTool({ name: 'deploy_accepted', description: 'Promote the exact artifact accepted for deploy into the owner-configured local directory: a staged copy, a read-back digest, and an atomic current-link swap. A previous generation is retained for manual rollback. An uncertain result requires inspection, never a retry.', parameters: Type.Object({ evidenceId: Type.String({ minLength: 1, maxLength: 160 }), acceptanceId: Type.String({ minLength: 1, maxLength: 160 }), artifact }, { additionalProperties: false }), replay: 'unsafe', execute: async (args, api, execution) => {
+      try { const caller = await context(String(api.conversationId)); return { output: [{ type: 'text' as const, text: JSON.stringify(await port.deploy({ ...caller, ...args, signal: execution.abortSignal })) }] }; }
+      catch { return { output: [{ type: 'text' as const, text: 'The deployment could not be confirmed. Inspect its acceptance, durable action intent and the target\u2019s current link before any retry.' }] }; }
+    } })
+  ] });
+}
+
+function localPublishExtension(project: Project, port: LocalPublishPort, authorityOf: (id: string) => Promise<DispatchAuthority>, sessionOf: (id: string) => string, sessionGate?: (projectId: string, sessionId: string) => void): Extension {
+  const context = async (conversationId: string) => {
+    const sessionId = sessionOf(conversationId), initial = await authorityOf(conversationId);
+    if (!initial.agentId) throw new HttpError(403, 'Bind a named agent before publishing.');
+    const agentId = initial.agentId;
+    const authorize = async () => {
+      sessionGate?.(project.id, sessionId);
+      const current = await authorityOf(conversationId);
+      if (current.agentId !== agentId || current.scopes === null || !authorizeToolUse({ scopes: current.scopes, tool: 'publish_accepted' }).permitted || (current.projects !== null && !current.projects.includes(project.id)))
+        throw new HttpError(403, 'Publish authority changed or is unavailable.');
+    };
+    return { projectId: project.id, sessionId, agentId, authorize };
+  };
+  const files = Type.Array(Type.String({ minLength: 1, maxLength: 240 }), { minItems: 1, maxItems: 500 });
+  const artifact = Type.Object({ revision: Type.String({ minLength: 1, maxLength: 200 }), commit: Type.Union([Type.String({ minLength: 1, maxLength: 128 }), Type.Null()]) }, { additionalProperties: false });
+  return defineExtension({ name: 'local-publish', tools: [
+    defineTool({ name: 'publish_preview', description: 'Read an exact, bounded set of reviewed files from the project worktree beside the owner-configured local publication root, with their digests. It copies and publishes nothing.', parameters: Type.Object({ files }, { additionalProperties: false }), replay: 'unsafe', execute: async (args, api) => {
+      try { const caller = await context(String(api.conversationId)); return { output: [{ type: 'text' as const, text: JSON.stringify(await port.preview({ ...caller, files: args.files })) }] }; }
+      catch { return { output: [{ type: 'text' as const, text: 'The named files or the configured publication root are unavailable. Nothing was read for publication.' }] }; }
+    } }),
+    defineTool({ name: 'publish_accepted', description: 'Copy exactly the accepted reviewed files into the owner-configured local publication root through a staged copy and one atomic rename, then read their digests back. A previous publication is never replaced. An uncertain result requires inspection, never a retry.', parameters: Type.Object({ files, evidenceId: Type.String({ minLength: 1, maxLength: 160 }), acceptanceId: Type.String({ minLength: 1, maxLength: 160 }), artifact }, { additionalProperties: false }), replay: 'unsafe', execute: async (args, api, execution) => {
+      try { const caller = await context(String(api.conversationId)); return { output: [{ type: 'text' as const, text: JSON.stringify(await port.publish({ ...caller, ...args, signal: execution.abortSignal })) }] }; }
+      catch { return { output: [{ type: 'text' as const, text: 'The publication could not be confirmed. Inspect its acceptance, durable action intent and the publication root before any retry.' }] }; }
+    } })
+  ] });
+}
+
+/**
+ * The installed provisioning tools. The bound agent's live scope, project grant and the owner's
+ * acceptance policy are rechecked around every step by the service; these tools only refuse an
+ * unbound session and map a refusal to a message a model can act on. The root, target id and path
+ * are the service's configuration and never a model argument.
+ */
+function acceptedProvisionExtension(project: Project, port: NonNullable<HarnessHostOptions['acceptedProvisionTools']>, authorityOf: (id: string) => Promise<DispatchAuthority>, sessionOf: (id: string) => string, sessionGate?: (projectId: string, sessionId: string) => void): Extension {
+  const context = async (conversationId: string, tool: 'provision_preview' | 'provision_accepted') => {
+    const sessionId = sessionOf(conversationId), initial = await authorityOf(conversationId);
+    if (!initial.agentId) throw new HttpError(403, 'Bind a named agent before provisioning.');
+    const agentId = initial.agentId;
+    const authorize = async () => {
+      sessionGate?.(project.id, sessionId);
+      const current = await authorityOf(conversationId);
+      if (current.agentId !== agentId || current.scopes === null || !authorizeToolUse({ scopes: current.scopes, tool }).permitted || (current.projects !== null && !current.projects.includes(project.id)))
+        throw new HttpError(403, 'Provisioning authority changed or is unavailable.');
+    };
+    return { projectId: project.id, sessionId, agentId, authorize };
+  };
+  const spec = {
+    resource: Type.String({ pattern: '^[a-z][a-z0-9-]{0,31}$', description: 'A lowercase resource slug, 1-32 characters' }),
+    version: Type.String({ pattern: '^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$', description: 'The resource version, 1-32 characters' }),
+    description: Type.Optional(Type.String({ maxLength: 200 }))
+  };
+  return defineExtension({ name: 'accepted-provision', tools: [
+    defineTool({ name: 'provision_preview', description: 'Read the exact owner-configured provisioning target and this resource identity. Creates nothing. The target is a Pilot-owned local directory with a small manifest, not infrastructure.', parameters: Type.Object(spec, { additionalProperties: false }), replay: 'unsafe', execute: async (args, api) => {
+      const caller = await context(String(api.conversationId), 'provision_preview');
+      try { return { output: [{ type: 'text' as const, text: JSON.stringify(await port.preview({ ...caller, ...args })) }] }; }
+      catch (error) { return { output: [{ type: 'text' as const, text: (error instanceof HttpError ? error.message : 'The configured provisioning target or this resource identity is unavailable. Nothing was created.') }] }; }
+    } }),
+    defineTool({ name: 'provision_accepted', description: 'Create exactly one Pilot-owned local resource (a directory with a bounded manifest) after same-session evidence is accepted for provision under the policy in force. Repeating identical content is idempotent; different content conflicts. An uncertain result requires inspection, not retry.', parameters: Type.Object({ ...spec, evidenceId: Type.String({ minLength: 1, maxLength: 160 }), acceptanceId: Type.String({ minLength: 1, maxLength: 160 }), artifact: Type.Object({ revision: Type.String({ minLength: 1, maxLength: 200 }), commit: Type.Union([Type.String({ minLength: 1, maxLength: 128 }), Type.Null()]) }, { additionalProperties: false }) }, { additionalProperties: false }), replay: 'unsafe', execute: async (args, api, execution) => {
+      const caller = await context(String(api.conversationId), 'provision_accepted');
+      try { return { output: [{ type: 'text' as const, text: JSON.stringify(await port.provision({ ...caller, ...args, signal: execution.abortSignal })) }] }; }
+      catch (error) { return { output: [{ type: 'text' as const, text: (error instanceof HttpError ? error.message : 'The provisioning request could not be confirmed. Inspect the target and its durable action intent before any retry.') }] }; }
+    } })
+  ] });
+}
+
+/**
+ * The installed spend tools. The amount is the only number a model supplies; the endpoint, bearer
+ * credential, account, currency and both caps belong to the service. A charge that is refused,
+ * uncertain or a repeat is reported as such and never silently re-sent.
+ */
+function acceptedSpendExtension(project: Project, port: NonNullable<HarnessHostOptions['acceptedSpendTools']>, authorityOf: (id: string) => Promise<DispatchAuthority>, sessionOf: (id: string) => string, sessionGate?: (projectId: string, sessionId: string) => void): Extension {
+  const context = async (conversationId: string, tool: 'spend_preview' | 'spend_accepted') => {
+    const sessionId = sessionOf(conversationId), initial = await authorityOf(conversationId);
+    if (!initial.agentId) throw new HttpError(403, 'Bind a named agent before spending.');
+    const agentId = initial.agentId;
+    const authorize = async () => {
+      sessionGate?.(project.id, sessionId);
+      const current = await authorityOf(conversationId);
+      if (current.agentId !== agentId || current.scopes === null || !authorizeToolUse({ scopes: current.scopes, tool }).permitted || (current.projects !== null && !current.projects.includes(project.id)))
+        throw new HttpError(403, 'Spend authority changed or is unavailable.');
+    };
+    return { projectId: project.id, sessionId, agentId, authorize };
+  };
+  const amount = Type.Integer({ minimum: 1, maximum: SPEND_MAX_AMOUNT_MINOR, description: 'The charge in the owner-fixed currency, in minor units' });
+  return defineExtension({ name: 'accepted-spend', tools: [
+    defineTool({ name: 'spend_preview', description: 'Read the exact accepted artifact for a charge at the owner-configured billing target, with the per-charge and per-project caps and what is already committed. Sends nothing and charges nothing.', parameters: Type.Object({ amountMinor: amount }, { additionalProperties: false }), replay: 'unsafe', execute: async (args, api) => {
+      const caller = await context(String(api.conversationId), 'spend_preview');
+      try { return { output: [{ type: 'text' as const, text: JSON.stringify(await port.preview({ ...caller, amountMinor: args.amountMinor })) }] }; }
+      catch (error) { return { output: [{ type: 'text' as const, text: (error instanceof HttpError ? error.message : 'The configured billing target or this amount is unavailable. Nothing was sent.') }] }; }
+    } }),
+    defineTool({ name: 'spend_accepted', description: 'Send exactly one metered charge to the owner-configured billing endpoint after same-session evidence is accepted for spend under the policy in force. Bounded by the owner caps; not provider-side exactly-once; an uncertain or repeated charge is never re-sent automatically.', parameters: Type.Object({ amountMinor: amount, evidenceId: Type.String({ minLength: 1, maxLength: 160 }), acceptanceId: Type.String({ minLength: 1, maxLength: 160 }), artifact: Type.Object({ revision: Type.String({ minLength: 1, maxLength: 200 }), commit: Type.Union([Type.String({ minLength: 1, maxLength: 128 }), Type.Null()]) }, { additionalProperties: false }) }, { additionalProperties: false }), replay: 'unsafe', execute: async (args, api, execution) => {
+      const caller = await context(String(api.conversationId), 'spend_accepted');
+      try { return { output: [{ type: 'text' as const, text: JSON.stringify(await port.spend({ ...caller, ...args, signal: execution.abortSignal })) }] }; }
+      catch (error) { return { output: [{ type: 'text' as const, text: (error instanceof HttpError ? error.message : 'The charge could not be confirmed. Inspect its durable action intent and the provider before any retry; it is never re-sent automatically.') }] }; }
+    } })
+  ] });
+}
+
+/** A fixed recipe, gated by the live named agent and a session-aware workspace check. */
+function runnerTestsExtension(project: Project, port: NonNullable<HarnessHostOptions['runnerTests']>, authorityOf: (id: string) => Promise<DispatchAuthority>, sessionOf: (id: string) => string, tickets:Map<string,EffectTicket>, sessionGate?: (projectId: string, sessionId: string) => void): Extension {
+  return defineExtension({ name: 'runner-tests', tools: [defineTool({
+    name: 'run_tests', description: 'Run the fixed Node test recipe in this project through the configured bounded runner. The tests can modify the mounted workspace. Inspect uncertain jobs before retrying.',
+    parameters: Type.Object({}, { additionalProperties: false }), replay: 'unsafe',
+    execute: async (_args, api, context) => {
+      const conversationId = String(api.conversationId), sessionId = sessionOf(conversationId), taskId=String(api.taskId),ticket=tickets.get(taskId);
+      tickets.delete(taskId);
+      if(!ticket||ticket.tool!=='run_tests'||ticket.conversationId!==conversationId||ticket.sessionId!==sessionId)throw new HttpError(403,'Test dispatch authority is unavailable.');
+      const initial = await authorityOf(conversationId);
+      if (!initial.agentId || JSON.stringify(initial)!==ticket.authority) throw new HttpError(403, 'Bind a named agent to run tests with current authority.');
+      const agentId = initial.agentId;
+      const authorize = async () => {
+        sessionGate?.(project.id, sessionId);
+        const current = await authorityOf(conversationId);
+        if (sessionOf(conversationId)!==ticket.sessionId || JSON.stringify(current)!==ticket.authority || current.agentId !== agentId || current.scopes === null || !authorizeToolUse({ scopes: current.scopes, tool: 'run_tests' }).permitted || (current.projects !== null && !current.projects.includes(project.id)))
+          throw new HttpError(403, 'Test execution authority changed or is unavailable.');
+        await port.checkSession(project.id, sessionId);
+        sessionGate?.(project.id,sessionId);
+        if(sessionOf(conversationId)!==ticket.sessionId||JSON.stringify(await authorityOf(conversationId))!==ticket.authority)throw new HttpError(403,'Test execution authority changed or is unavailable.');
+      };
+      const result = await runAgentTests({ broker: port.broker, projectId: project.id, conversationId, taskId: String(api.taskId), owner: 'agent-' + agentId, workspace: '.', authorize, reserveJob: () => port.reserveJob(project.id, sessionId, agentId), signal: context.abortSignal });
+      return { output: [{ type: 'text' as const, text: JSON.stringify(result) }] };
+    }
+  })] });
+}
+
+/** A fork branches only the caller's own transcript at an exact recorded entry. */
+function forkExtension(project:Project,port:NonNullable<HarnessHostOptions['forkTools']>,sessionOf:(id:string)=>string):Extension {
+ return defineExtension({name:'fork-tools',tools:[
+  defineTool({name:'fork_context',description:'Read recent entry IDs of this conversation to select a fork cutoff.',parameters:Type.Object({}, {additionalProperties:false}),replay:'safe',execute:async(_args,api)=>{
+   const entries=await port.context(project.id,sessionOf(String(api.conversationId)));return {output:[{type:'text' as const,text:JSON.stringify({entries:entries.slice(-30)})}]};
+  }}),
+  defineTool({name:'fork_create',description:'Create a paused child conversation and worktree from an exact commit and transcript entry. The child inherits no agent grants and must be bound and resumed separately.',parameters:Type.Object({baseCommit:Type.String({pattern:'^[0-9a-f]{40}$'}),cutoffEntryId:Type.Integer({minimum:1}),target:Type.Optional(Type.String({minLength:1,maxLength:80}))},{additionalProperties:false}),replay:'unsafe',execute:async(args,api)=>{
+   const result=await port.create({projectId:project.id,parentSessionId:sessionOf(String(api.conversationId)),...args});return {output:[{type:'text' as const,text:JSON.stringify({created:result.created,childSessionId:result.fork.childSessionId,state:result.fork.state})}]};
+  }}),
+  defineTool({name:'fork_dispatch',description:'Send one input to an active child conversation under a stable invocation identity. The durable lifecycle fence is held for the whole child submission. Reusing the identity with the same text returns the same request; changed text conflicts. An uncertain outcome must be inspected, never retried automatically.',parameters:Type.Object({childSessionId:Type.String({pattern:'^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$'}),invocationId:Type.String({pattern:'^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$'}),text:Type.String({minLength:1,maxLength:2000})},{additionalProperties:false}),replay:'unsafe',execute:async(args,api)=>{
+   const result=await port.dispatch({projectId:project.id,parentSessionId:sessionOf(String(api.conversationId)),childSessionId:args.childSessionId,invocationId:args.invocationId,text:args.text});
+   return {output:[{type:'text' as const,text:JSON.stringify({requestId:result.requestId})}]};
+  }})
+ ]});
+}
+
+/** Add granted selections without changing the model, transcript, or explicit removal filters. */
+async function migrateToolSelection(conversation: HostedAgent['conversation'], planning: Extension, authority: DispatchAuthority, projectId: string): Promise<void> {
   const view = await conversation.viewState(BACKGROUND_CONTEXT);
   let state: { extensions?: string[] | { add?: string[]; remove?: string[] }; tools?: string[] | { remove: string[] }; modelTools?: string[] | { add?: string[]; remove?: string[] } };
   try { state = structuredClone((view.value.docs['pi.agent'] ?? {}) as typeof state); } finally { view.dispose(); }
@@ -866,11 +1381,11 @@ async function migratePlanningSelection(conversation: HostedAgent['conversation'
     return;
   } else if (selectedExtensions) {
     if (missingGuards.some(name => selectedExtensions.remove?.includes(name)))
-      throw new HttpError(409, 'A conversation explicitly excludes a required security guard; planning tools were not enabled.');
+      throw new HttpError(409, 'A conversation explicitly excludes a required security guard; tools were not enabled.');
     const next = unique([...(selectedExtensions.add ?? []), ...missingGuards, planning.name]);
     if (next.length !== (selectedExtensions.add?.length ?? 0)) extensions = { ...selectedExtensions, add: next.map(ext), remove: selectedExtensions.remove?.map(ext) };
   } else if (missingGuards.length) {
-    throw new HttpError(409, 'The conversation security guards are unavailable; planning tools were not enabled.');
+    throw new HttpError(409, 'The conversation security guards are unavailable; tools were not enabled.');
   }
   let tools: Parameters<typeof conversation.configure>[0]['tools'];
   if (Array.isArray(state.tools)) {
@@ -977,6 +1492,10 @@ export class HarnessHost {
   constructor(private readonly options: HarnessHostOptions) {
     if (options.readNotesDelayMs !== undefined && (!Number.isInteger(options.readNotesDelayMs) || options.readNotesDelayMs < 0 || options.readNotesDelayMs > 60_000))
       throw new RangeError('readNotesDelayMs must be an integer from 0 to 60000');
+    // Two extensions would define the same `run_tests` tool; refuse the ambiguity instead of
+    // letting one silently shadow the other.
+    if (options.localTests !== undefined && options.runnerTests !== undefined)
+      throw new RangeError('A harness installs one run_tests capability: provide localTests or runnerTests, not both');
   }
   get enabled(): boolean { return this.options.enabled; }
   private assertEnabled() { if (!this.options.enabled) throw new HttpError(503, 'Agents are disabled on this instance'); }
@@ -991,6 +1510,7 @@ export class HarnessHost {
    * the project is still honoured (it is handed the project and the harness's own root session id).
    */
   private assertNotUncertain(projectId: string, sessionId: string): void {
+    this.options.sessionGate?.(projectId, sessionId);
     if (!this.options.recovery) return;
     let recovery: ReturnType<NonNullable<HarnessHostOptions['recovery']>['read']>;
     try { recovery = this.options.recovery.read(projectId, sessionId); }
@@ -1000,7 +1520,7 @@ export class HarnessHost {
   private async dispatchAuthority(project: Project, sessionId: string): Promise<DispatchAuthority> {
     if (!this.options.privileges) return Object.freeze({ agentId: null, model: null, scopes: null, projects: null, emptyReason: null });
     const authority = await this.options.privileges.authority({ projectId: project.id, sessionId });
-    return Object.freeze({ agentId: authority.agentId ?? null, model: authority.model ?? null, scopes: authority.scopes ?? null, projects: authority.projects ?? null, emptyReason: authority.emptyReason ?? null });
+    return Object.freeze({ agentId: authority.agentId ?? null, model: authority.model ?? null, scopes: authority.scopes ?? null, projects: authority.projects ?? null, emptyReason: authority.emptyReason ?? null, ...(authority.authorityVersion===undefined?{}:{authorityVersion:authority.authorityVersion}) });
   }
   /** Resolve numeric aliases back to the named authority, including after restart. */
   private sessionIdentity(project: Project, conversationId: ConversationId): string {
@@ -1076,26 +1596,34 @@ export class HarnessHost {
             const signal=options?.signal;
             signal?.throwIfAborted();
             const conversationId = signal ? conversationBySignal.get(signal) : undefined;
+            const runRequest = async () => {
             // The project-level gate, asked before any provider request. An owner-reviewed repository
             // update owns the project exclusively, so a generation that would start for it — including
             // one resumed from a checkpoint by opening the harness — is refused here instead of racing
             // a merge in the worktree. A refusal never reaches the provider.
             this.options.projectGate?.(project.id);
+            if (this.options.sessionGate) {
+              if (conversationId === undefined) throw new HttpError(409, 'The model request session cannot be verified; no provider request was sent.');
+              this.options.sessionGate(project.id, this.sessionIdentity(project, conversationId));
+            }
             if (this.options.recovery) {
               if (conversationId === undefined) throw new HttpError(409, 'The model request session cannot be verified; no provider request was sent.');
               const refusal = recoveryGuard.refusalFor(conversationId);
               if (refusal !== null) throw new HttpError(409, refusal);
             }
+            if(!supportsBoundedProviderApi(model.api))throw new HttpError(409,'This provider transport cannot verify the configured output-token bound; no model request was sent.');
+            if(options?.onPayload)throw new HttpError(409,'External provider payload transforms are not supported.');
             if(model.provider!==provider.provider.id){
               if(!this.options.providers)throw new HttpError(409,'Real providers are not configured');
               await this.options.providers.assertUsable({provider:model.provider,modelId:model.id});
               // One dispatch may make only so many model requests in a row before a person looks at
               // it: a runaway loop of tool calls is stopped rather than billed. The bound is the
-              // instance's (`DASHBOARD_MAX_MODEL_TURNS`), stated in the refusal, and it counts the
-              // assistant messages since the last input, so sending another message continues.
+              // current owner setting, and it counts assistant messages since the last input.
+              const fallback=this.options.maxModelTurns ?? MAX_MODEL_TURNS_DEFAULT;
+              const limit=this.options.currentMaxModelTurns===undefined ? fallback : await this.options.currentMaxModelTurns().catch(()=>fallback);
               let turns=0;
               for(const message of [...context.messages].reverse()){if(message.role==='user')break;if(message.role==='assistant')turns++;}
-              if(turns>=(this.options.maxModelTurns ?? MAX_MODEL_TURNS_DEFAULT))throw new HttpError(409,'Pilot stopped after '+(this.options.maxModelTurns ?? MAX_MODEL_TURNS_DEFAULT)+' model turns in a row for one message. Nothing is lost: the work so far is in the transcript, and sending another message continues from here. An operator can raise the bound with DASHBOARD_MAX_MODEL_TURNS.');
+              if(limit>0&&turns>=limit)throw new HttpError(409,'Pilot stopped after '+limit+' model turns in a row for one message. Nothing is lost: the work so far is in the transcript, and sending another message continues from here. An owner can change the limit in Harness settings.');
             }
             // How much output one request may produce. The bound is the instance's, read here so a
             // change applies at the next request; a caller that states its own smaller bound still
@@ -1104,11 +1632,23 @@ export class HarnessHost {
             const bound=this.options.maxOutputTokens===undefined
               ?MAX_OUTPUT_TOKENS_DEFAULT
               :await this.options.maxOutputTokens().catch(()=>MAX_OUTPUT_TOKENS_DEFAULT);
-            const maxTokens=Math.min(options?.maxTokens??bound,bound);
-            // The worker boundary. The role marker is in the worker system prompt; the guard is the
-            // durable run/worker/policy/revocation check. A refusal returns a terminal assistant error
+            const cachedWorker=conversationId===undefined?undefined:this.workerConversations.get(conversationId);
+            let durableRun:string|null=null;
+            try { if(conversationId!==undefined)durableRun=this.options.workerBinding?.runForConversation(project.id,conversationId)??null; }
+            catch { throw new HttpError(409,'The worker conversation binding could not be verified; no provider request was sent.'); }
+            const workerRun=workerRequestRun({conversationId,marker:workerRunIdOf(context.messages),cachedRun:cachedWorker?.projectId===project.id?cachedWorker.runId:null,durableRun,requireDurable:this.options.workerBinding!==undefined});
+            let agentBudget: { maxOutputTokens: number | null; check: () => void } | undefined;
+            if (workerRun === null && this.options.agentRequestBudget) {
+              if (conversationId === undefined) throw new HttpError(409, 'The agent request budget cannot be verified; no provider request was sent.');
+              signal?.throwIfAborted();
+              agentBudget = await this.options.agentRequestBudget(project.id, this.sessionIdentity(project, conversationId));
+              signal?.throwIfAborted();
+            }
+            const maxTokens=Math.min(options?.maxTokens??bound,bound,agentBudget?.maxOutputTokens??bound,workerRun===null?bound:WORKER_MAX_OUTPUT_TOKENS_PER_TURN);
+            if(!Number.isSafeInteger(maxTokens)||maxTokens<1)throw new HttpError(409,'The output-token bound is invalid; no model request was sent.');
+            // The worker boundary. The prompt marker must match the run binding above; the guard is
+            // the durable run/worker/policy/revocation check. A refusal returns a terminal assistant error
             // and never calls the provider. The ninth request is refused here, before the call.
-            const workerRun = workerRunIdOf(context.messages);
             if (workerRun !== null) {
               let refusal: string | null;
               try { const verdict = this.options.workerRequestGuard?.({ projectId: project.id, runId: workerRun }); refusal = verdict === undefined ? 'The worker request could not be verified, so no model request was sent.' : verdict; }
@@ -1120,14 +1660,24 @@ export class HarnessHost {
               }
               if (refusal !== null) {
                 const message = { ...fauxAssistantMessage(refusal, { stopReason: 'error', errorMessage: refusal }), provider: model.provider, model: model.id, api: model.api };
-                (output.push as (event: unknown) => void)({ type: 'error', reason: 'error', error: message });
-                output.end(message);
-                return;
+                return { result: message, terminal: { type: 'error', reason: 'error', error: message } };
               }
             }
+            agentBudget?.check();
+            signal?.throwIfAborted();
             // A test-only observation at the provider boundary. It is never selected by a model.
             try { this.options.onModelRequest?.({ provider: model.provider, modelId: model.id, maxTokens }); } catch { /* observation never breaks a run */ }
-            const source=stream(model,context,{...options,maxTokens});
+            let source:ReturnType<typeof stream>,payloadSeen=false;
+            try{source=stream(model,context,{...options,maxTokens,maxRetries:0,...(model.api.startsWith('faux:')?{}:{onPayload:async(payload)=>{
+              // Locked adapters call this before each distinct payload, not each ordinary retry.
+              // Disable retries and reject a second payload (including strict-tool fallback).
+              if(payloadSeen)throw new Error('Repeated provider dispatch is not permitted.');
+              payloadSeen=true;
+              assertProviderOutputBound(model.api,payload,maxTokens);
+              signal?.throwIfAborted();agentBudget?.check();
+              if(workerRun!==null && this.options.workerRequestGuard?.({projectId:project.id,runId:workerRun})!==null)throw new Error('Worker authority is unavailable or changed.');
+              return payload;
+            }})});}catch{throw new ForkActivityUncertain();}
             const safeError='Model request failed. Check the provider connection, model access and quota.';
             // Provider/OAuth exceptions may embed raw response bodies. Never persist
             // those as UI errors; retain usage and partial model output only.
@@ -1139,25 +1689,41 @@ export class HarnessHost {
               if(signal.aborted)abortHandler();
               else signal.addEventListener('abort',abortHandler,{once:true});
             }):undefined;
-            const iter=source[Symbol.asyncIterator]();
+            if(abortPromise)void abortPromise.catch(()=>{});
+            let iter:ReturnType<typeof source[typeof Symbol.asyncIterator]>|undefined;
+            let terminal: unknown,providerError=false;
             try {
+              signal?.throwIfAborted();iter=source[Symbol.asyncIterator]();
               for(;;){
+                signal?.throwIfAborted();
                 const step=abortPromise?await Promise.race([iter.next(),abortPromise]):await iter.next();
                 if(step.done)break;
                 const event=step.value;
-                // The pushed events are the same shape the for-await loop produced; the type is an
-                // internal pi-ai type, so a cast to any is needed here at the call site.
                 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-                (output.push as (event:any)=>void)(event.type==='error'?{...event as any,error:{...event.error,errorMessage:safeError}}:event as any);
+                const safeEvent = event.type==='error'?{...event as any,error:{...event.error,errorMessage:safeError}}:event as any;
+                if(event.type==='error')providerError=true;
+                if (event.type === 'done' || event.type === 'error') terminal = safeEvent;
+                else (output.push as (event:any)=>void)(safeEvent);
               }
+              const result=abortPromise?await Promise.race([source.result(),abortPromise]):await source.result();
+              if(signal?.aborted||providerError||result.stopReason==='error'||result.stopReason==='aborted')throw new ForkActivityUncertain();
+              return { result, terminal };
+            } catch {
+              // Neither cancellation nor stream failure proves the provider stopped. A child fork's
+              // owning durable activity fence must remain held rather than admitting new work.
+              throw new ForkActivityUncertain();
             } finally {
               if(signal&&abortHandler)signal.removeEventListener('abort',abortHandler);
-              // Abort the provider iterator without waiting for its cleanup: a broken transport must not
-              // keep this generation or process shutdown pending after the signal has fired.
-              if(signal?.aborted&&iter.return)void Promise.resolve(iter.return()).catch(()=>{});
+              if(signal?.aborted&&iter?.return)try{void Promise.resolve(iter.return()).catch(()=>{});}catch{/* best effort only */}
             }
-            const result=await source.result();
-            output.end(result.stopReason==='error'?{...result,errorMessage:safeError}:result);
+            };
+            if (this.options.withSessionProvider && conversationId === undefined)
+              throw new HttpError(409, 'The model request session cannot be verified; no provider request was sent.');
+            const completed = this.options.withSessionProvider && conversationId !== undefined
+              ? await this.options.withSessionProvider(project.id, this.sessionIdentity(project, conversationId), runRequest)
+              : await runRequest();
+            if (completed.terminal) (output.push as (event: any) => void)(completed.terminal);
+            output.end(completed.result);
           }catch(error){
             const detail=error instanceof HttpError?error.message:'Provider request failed. Check the provider connection and try again.';
             const reason=options?.signal?.aborted?'aborted' as const:'error' as const;
@@ -1190,9 +1756,20 @@ export class HarnessHost {
           return {
             ...tool,
             execute: async (args, api, context) => {
-              const refusal = recoveryGuard.refusalFor(Number(api.conversationId));
-              if (refusal !== null) throw new HttpError(409, refusal);
-              return execute(args, api, context);
+              try {
+              const sessionId = this.sessionIdentity(project, Number(api.conversationId) as ConversationId);
+              const work = async () => {
+                this.options.sessionGate?.(project.id, sessionId);
+                const refusal = recoveryGuard.refusalFor(Number(api.conversationId));
+                if (refusal !== null) throw new HttpError(409, refusal);
+                if (this.options.coding?.isFork?.(project.id,sessionId) && ['file_edit', 'record_note', 'read_notes', 'list_docs', 'read_doc', 'read_board', 'write_board', 'acceptance_record', 'acceptance_accept', 'commit_preview', 'commit_accepted', 'push_preview', 'push_accepted', 'deploy_preview', 'deploy_accepted', 'publish_preview', 'publish_accepted', 'provision_preview', 'provision_accepted', 'spend_preview', 'spend_accepted'].includes(tool.name))
+                  throw new HttpError(409,'This tool targets the parent project workspace, not the fork worktree, and is unavailable in a fork. Use the fork-rooted coding tools where enabled.');
+                return execute(args, api, context);
+              };
+              return await (this.options.withSessionTool ? this.options.withSessionTool(project.id, sessionId, work) : work());
+              } finally {
+                if(['file_edit','record_note','write_board','acceptance_record','acceptance_accept','run_tests','reusable_define'].includes(tool.name))fileEditTickets.delete(String(api.taskId));
+              }
             }
           };
         })
@@ -1201,9 +1778,10 @@ export class HarnessHost {
       // describe the same instance: read and write are bounded to the worktree, bash is not contained
       // and exists only behind its own switch.
       const codingRoot = this.options.coding?.enabled === true ? this.options.coding.root(project.id) : undefined;
-      const coding = codingRoot === undefined ? null : codingTools({ root: codingRoot, shell: this.options.coding?.shell === true });
+      const coding = codingRoot === undefined ? null : codingTools({ root: codingRoot, shell: this.options.coding?.shell === true,
+        ...(this.options.coding?.sessionRoot ? {rootForConversation: (id:string) => this.options.coding!.sessionRoot!(project.id, this.sessionIdentity(project,Number(id) as ConversationId))} : {})
+      });
       const question = questionExtension();
-      const notes = notesExtension(project, { beforeWriteMs: this.options.recordNoteDelayMs, afterWriteMs: this.options.recordNoteAfterWriteMs, onExecute: this.options.recordNoteStarted }, { delayMs: this.options.readNotesDelayMs, onExecute: this.options.readNotesStarted },this.options.workspace);
       // The scopes in force are read once here, so the tools the model is offered are the permitted
       // ones, and again on every call by the privilege hook, which is the authority. Nothing about
       // the owner's own dispatch changes: with no privilege port the authority is null and every
@@ -1218,16 +1796,41 @@ export class HarnessHost {
         catch { return { agentId: null, model: null, scopes: [], projects: [], emptyReason: 'The conversation authority could not be verified.' }; }
       };
       const fileEditEnabled = this.options.fileEdit?.enabled === true;
+      const fileEditTickets=new Map<string,EffectTicket>();
+      const effectAuthority:EffectAuthority=(tool,taskId,conversationId)=>{
+        const ticket=fileEditTickets.get(taskId);fileEditTickets.delete(taskId);
+        if(ticket===undefined||ticket.tool!==tool||ticket.conversationId!==conversationId)throw new HttpError(403,'The tool dispatch authority is unavailable; no effect was started.');
+        return async()=>{
+          const sessionId=this.sessionIdentity(project,Number(conversationId) as ConversationId);
+          if(sessionId!==ticket.sessionId)throw new HttpError(403,'Tool session authority changed.');
+          this.options.sessionGate?.(project.id,sessionId);
+          if(this.options.coding?.isFork?.(project.id,sessionId))throw new HttpError(409,'This parent-workspace tool is unavailable in a fork.');
+          const current=await authorityOf(conversationId);
+          if(JSON.stringify(current)!==ticket.authority||(current.projects!==null&&!current.projects.includes(project.id))||!authorizeToolUse({scopes:current.scopes,tool}).permitted)
+            throw new HttpError(403,'Tool authority changed or is unavailable.');
+        };
+      };
+      const notes=notesExtension(project,{beforeWriteMs:this.options.recordNoteDelayMs,afterWriteMs:this.options.recordNoteAfterWriteMs,onExecute:this.options.recordNoteStarted},{delayMs:this.options.readNotesDelayMs,onExecute:this.options.readNotesStarted},this.options.workspace,effectAuthority);
       const privileges = privilegeExtension(project, authorityOf, {
+        reusableTools: this.options.reusableTools !== undefined,
         fileEdit: fileEditEnabled,
         fileRead: coding !== null,
         fileWrite: coding !== null,
-        shell: coding !== null && this.options.coding?.shell === true
-      }, this.options.allowedCapabilities);
+        shell: coding !== null && this.options.coding?.shell === true,
+        acceptance: this.options.acceptanceTools !== undefined,
+        fork: this.options.forkTools !== undefined,
+        runTests: this.options.localTests !== undefined || this.options.runnerTests !== undefined,
+        acceptedCommit: this.options.acceptedCommitTools !== undefined,
+        acceptedPush: this.options.acceptedPushTools !== undefined,
+        acceptedDeploy: this.options.acceptedDeployTools !== undefined || this.options.localDeployTools !== undefined,
+        localPublish: this.options.localPublishTools !== undefined,
+        acceptedProvision: this.options.acceptedProvisionTools !== undefined,
+        acceptedSpend: this.options.acceptedSpendTools !== undefined
+      }, this.options.allowedCapabilities, id => this.options.coding?.isFork?.(project.id, this.sessionIdentity(project, Number(id) as ConversationId)) ?? false, fileEditTickets, this.options.fileEditAuthorized,id=>this.sessionIdentity(project,Number(id) as ConversationId));
       // Installed once, statically, and selected by every conversation. Its durable marker decides
       // whether it applies, so no unregistered dynamic extension carries the worker role.
       const workerRole = workerRoleExtension(project, this.options);
-      const planning = planningExtension(project, this.options.docs ?? new DocStore(), this.options.boards ?? new BoardStore(this.options.dataRoot));
+      const planning = planningExtension(project, this.options.docs ?? new DocStore(), this.options.boards ?? new BoardStore(this.options.dataRoot),effectAuthority);
       const extensions: Extension[] = [question, notes, planning, privileges, recoveryGuard.extension, recoveryBoundary, workerRole].map(guardTools);
       const registry = createRegistry();
       for (const extension of extensions) registry.install(extension);
@@ -1238,9 +1841,56 @@ export class HarnessHost {
       }
       const fileEdit = this.options.fileEdit;
       if (fileEdit !== undefined && fileEdit.enabled) {
-        const edits = guardTools(fileEditExtension(project, fileEdit, authorityOf));
+        const edits = guardTools(fileEditExtension(project, fileEdit, authorityOf, fileEditTickets, this.options.allowedCapabilities,id=>this.sessionIdentity(project,Number(id) as ConversationId)));
         extensions.push(edits);
         registry.install(edits);
+      }
+      if (this.options.reusableTools !== undefined) {
+        const reusable=guardTools(reusableExtension(project,this.options.reusableTools,authorityOf,id=>this.sessionIdentity(project,Number(id) as ConversationId),fileEditTickets));
+        extensions.push(reusable);registry.install(reusable);
+      }
+      if (this.options.acceptanceTools !== undefined) {
+        const acceptance = guardTools(acceptanceExtension(project,this.options.acceptanceTools,authorityOf,id=>this.sessionIdentity(project,Number(id) as ConversationId),fileEditTickets,this.options.sessionGate));
+        extensions.push(acceptance);registry.install(acceptance);
+      }
+      if (this.options.forkTools !== undefined) {
+        const fork=guardTools(forkExtension(project,this.options.forkTools,id=>this.sessionIdentity(project,Number(id) as ConversationId)));
+        extensions.push(fork);registry.install(fork);
+      }
+      if (this.options.localTests !== undefined) {
+        const localTests = guardTools(localTestsExtension(project, this.options.localTests, authorityOf, id => this.sessionIdentity(project, Number(id) as ConversationId), fileEditTickets));
+        extensions.push(localTests); registry.install(localTests);
+      } else if (this.options.runnerTests !== undefined) {
+        const runnerTests = guardTools(runnerTestsExtension(project, this.options.runnerTests, authorityOf, id => this.sessionIdentity(project, Number(id) as ConversationId), fileEditTickets, this.options.sessionGate));
+        extensions.push(runnerTests); registry.install(runnerTests);
+      }
+      if (this.options.acceptedCommitTools !== undefined) {
+        const commit = guardTools(acceptedCommitExtension(project, this.options.acceptedCommitTools, authorityOf, id => this.sessionIdentity(project, Number(id) as ConversationId), this.options.sessionGate));
+        extensions.push(commit); registry.install(commit);
+      }
+      if (this.options.acceptedPushTools !== undefined) {
+        const push = guardTools(acceptedPushExtension(project, this.options.acceptedPushTools, authorityOf, id => this.sessionIdentity(project, Number(id) as ConversationId), this.options.sessionGate));
+        extensions.push(push); registry.install(push);
+      }
+      if (this.options.acceptedDeployTools !== undefined) {
+        const deploy = guardTools(acceptedDeployExtension(project, this.options.acceptedDeployTools, authorityOf, id => this.sessionIdentity(project, Number(id) as ConversationId), this.options.sessionGate));
+        extensions.push(deploy); registry.install(deploy);
+      }
+      if (this.options.localDeployTools !== undefined) {
+        const deploy = guardTools(localDeployExtension(project, this.options.localDeployTools, authorityOf, id => this.sessionIdentity(project, Number(id) as ConversationId), this.options.sessionGate));
+        extensions.push(deploy); registry.install(deploy);
+      }
+      if (this.options.localPublishTools !== undefined) {
+        const publish = guardTools(localPublishExtension(project, this.options.localPublishTools, authorityOf, id => this.sessionIdentity(project, Number(id) as ConversationId), this.options.sessionGate));
+        extensions.push(publish); registry.install(publish);
+      }
+      if (this.options.acceptedProvisionTools !== undefined) {
+        const provision = guardTools(acceptedProvisionExtension(project, this.options.acceptedProvisionTools, authorityOf, id => this.sessionIdentity(project, Number(id) as ConversationId), this.options.sessionGate));
+        extensions.push(provision); registry.install(provision);
+      }
+      if (this.options.acceptedSpendTools !== undefined) {
+        const spend = guardTools(acceptedSpendExtension(project, this.options.acceptedSpendTools, authorityOf, id => this.sessionIdentity(project, Number(id) as ConversationId), this.options.sessionGate));
+        extensions.push(spend); registry.install(spend);
       }
       const harness = await Harness.open(storage, { models, registry,settings:{retry:{enabled:false},stream:{maxRetries:0,timeoutMs:120000},compaction:{enabled:false}},...(coding === null ? {} : { env: coding.env as never }) }, BACKGROUND_CONTEXT);
       const initial=await this.options.providers?.defaultModel();
@@ -1317,14 +1967,16 @@ export class HarnessHost {
         });
       };
       await watch(conversation, rootSessionId);
-      await migratePlanningSelection(conversation, planning, authority, project.id);
+      for (const extension of extensions.filter(item=>['planning','coding-tools','file-edit','acceptance-tools','fork-tools','runner-tests','reusable-tools'].includes(item.name)))
+        await migrateToolSelection(conversation, extension, authority, project.id);
       // Restore identity and watchers before checkpoint recovery can execute tools.
       for (const binding of this.options.conversationBinding?.list?.(project.id) ?? []) {
         this.sessionConversations.set(project.id + ':' + binding.sessionId, binding.conversationId as ConversationId);
         const bound = await harness.conversation(binding.conversationId as ConversationId, BACKGROUND_CONTEXT);
         if (!bound) throw new HttpError(409, 'A durable conversation binding is unavailable');
         await watch(bound, binding.sessionId);
-        await migratePlanningSelection(bound, planning, await authorityOf(String(bound.id)), project.id);
+        for (const extension of extensions.filter(item=>['planning','coding-tools','file-edit','acceptance-tools','fork-tools','runner-tests','reusable-tools'].includes(item.name)))
+          await migrateToolSelection(bound, extension, await authorityOf(String(bound.id)), project.id);
       }
       harness.resume();
       const sessionExtensions = extensions;
@@ -1518,22 +2170,35 @@ export class HarnessHost {
    * rather than a second model request.
    */
   async dispatchToSession(project: Project, sessionId: string, input: { requestId: string; text: string }): Promise<{ submissionId: string }> {
-    this.assertEnabled();
-    this.options.projectGate?.(project.id);
-    const text = input.text.trim();
-    if (text === '') throw new HttpError(422, 'Enter a message');
-    if (text.length > 8000) throw new HttpError(413, 'This message is '+text.length+' characters. The limit for one message is 8000.');
-    return this.serial('agent:' + project.id, async () => {
-      const hosted = await this.open(project);
-      const id = conversationIdOf(sessionId);
-      if (id !== null && await this.isWorkerConversationDurable(hosted, project, id)) throw this.workerConversationRefusal();
-      const conversation = id === null ? undefined : await hosted.harness.conversation(id, BACKGROUND_CONTEXT);
-      if (conversation === undefined) throw new HttpError(404, 'This project holds no conversation for that session');
-      const actualSessionId = this.sessionIdentity(project, conversation.id);
-      this.assertNotUncertain(project.id, actualSessionId);
-      const submission = await conversation.submit({ type: 'input', content: text, requestId: input.requestId }, BACKGROUND_CONTEXT);
+    let submitInvoked = false;
+    try {
+      this.assertEnabled();
+      this.options.projectGate?.(project.id);
+      const text = input.text.trim();
+      if (text === '') throw new HttpError(422, 'Enter a message');
+      if (text.length > 8000) throw new HttpError(413, 'This message is '+text.length+' characters. The limit for one message is 8000.');
+      const submission = await this.serial('agent:' + project.id, async () => {
+        const hosted = await this.open(project);
+        const id = conversationIdOf(sessionId);
+        if (id !== null && await this.isWorkerConversationDurable(hosted, project, id)) throw this.workerConversationRefusal();
+        const conversation = id === null ? undefined : await hosted.harness.conversation(id, BACKGROUND_CONTEXT);
+        if (conversation === undefined) throw new HttpError(404, 'This project holds no conversation for that session');
+        const actualSessionId = this.sessionIdentity(project, conversation.id);
+        this.assertNotUncertain(project.id, actualSessionId);
+        // From this call onward, even a synchronous throw may follow partial durable admission.
+        submitInvoked = true;
+        return await conversation.submit({ type: 'input', content: text, requestId: input.requestId }, BACKGROUND_CONTEXT);
+      });
+      // Waiting under the project serial lock would block abort, answer and other serialized
+      // operations for every conversation in this project. dispatchChild owns its separate durable
+      // lifecycle fence through this wait, so release only the in-process admission lock here.
+      const settled = await submission.wait(BACKGROUND_CONTEXT);
+      if (settled.status !== 'done') throw new Error('The fork conversation did not settle successfully.');
       return { submissionId: String(submission.id) };
-    });
+    } catch (error) {
+      if (!submitInvoked) throw new ForkDispatchNotStarted();
+      throw error;
+    }
   }
 
   /**
@@ -1653,8 +2318,9 @@ export class HarnessHost {
       const sessionId = this.sessionIdentity(project, conversation.id);
       await hosted.watch(conversation, sessionId);
       this.assertNotUncertain(project.id, sessionId);
-      const planning = hosted.extensions.find(extension => extension.name === 'planning');
-      if (planning) await migratePlanningSelection(conversation, planning, await this.dispatchAuthority(project, sessionId), project.id);
+      const authority = await this.dispatchAuthority(project, sessionId);
+      for (const extension of hosted.extensions.filter(item=>['planning','coding-tools','file-edit','acceptance-tools','fork-tools','runner-tests','reusable-tools'].includes(item.name)))
+        await migrateToolSelection(conversation, extension, authority, project.id);
       const selected=(await conversation.agent(BACKGROUND_CONTEXT)).model;
       // The dispatch-time vision check. It reads the model this submission will actually run under, so
       // an image is refused outright — before anything is admitted — rather than dropped, or sent as

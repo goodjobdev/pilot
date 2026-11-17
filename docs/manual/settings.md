@@ -7,7 +7,7 @@ pilot:
   kind: reference
   doc_status: accepted
   feature_status: partial
-  verified_release: fd3fa6f
+  verified_release: null
 ---
 
 ## Adding a project
@@ -87,6 +87,8 @@ in the **Doc** view, so the session and the documentation it works from are one 
 Map, Milestone and Task are views of the same plan. Search, area, status (`todo`/`doing`/`done`/`blocked`) and scope filters change presentation, not the underlying task definitions. **Reset** clears the area/status/scope selections, not the search text. Hidden prerequisites still affect readiness. Layout/trace controls do not create prerequisites. Undo/redo are local board-edit conveniences, not Git reset; adopting a changed external board clears stale undo history. None of these controls fetches remote files or deploys a project.
 
 ## Harness settings (owner)
+
+The acceptance policy is available here with a separate save action. Choose owner-only for proposed `file_edit` changes, or agent-may-accept for automatic application. Set each acceptance class to ask or agent-decided, or use **Set all to full auto** to fill all controls before saving. This policy does not restrict direct `write`, `edit`, or `bash` tools; their instance switches and agent grants do. The policy is revision checked, so a conflicting save preserves the newer policy.
 
 **Harness** in the header holds what an owner changes in Pilot rather than in a container's
 environment:

@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp,readFile,rm,stat } from 'node:fs/promises';
+import { mkdir,mkdtemp,readFile,rm,stat,symlink,writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -10,6 +10,7 @@ import { ControlStore } from '../../src/server/state/control-store';
 import { DeliveryLedger } from '../../src/server/state/delivery';
 import type { AlertPayload } from '../../src/server/alerts';
 import { MAX_STREAM_FRAME_BYTES } from '../../src/shared/stream';
+import { fauxAssistantMessage, fauxProvider } from '@earendil-works/pi-ai/providers/faux';
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 async function waitFor<T>(check: () => Promise<T | undefined>, timeoutMs = 10000): Promise<T> {
@@ -118,12 +119,34 @@ test('the agent harness is off unless the instance enables it',async()=>{
 test('a durable agent answers, steers, aborts, de-duplicates and survives a restart',async()=>{
   const root=await mkdtemp(join(tmpdir(),'dashboard-agents-on-'));
   const app=await instance('on',root,300);
+  const faux=fauxProvider({provider:'steering-faux',models:[{id:'fixture'}]});
+  let releaseProviderGate!:()=>void, providerReached=false;
+  const providerGate=new Promise<void>(resolve=>{releaseProviderGate=resolve;});
+  faux.setResponses([
+    () => fauxAssistantMessage('Scripted test reply — no model was called.\n\nYou said: hello from the test'),
+    () => fauxAssistantMessage('deduplicated response'),
+    async (_context,options) => {
+      providerReached=true;
+      await new Promise<void>((resolve,reject)=>{
+        const signal=options?.signal;
+        const cleanup=()=>signal?.removeEventListener('abort',onAbort);
+        const onAbort=()=>{cleanup();resolve();};
+        if(signal?.aborted){reject(new Error('provider request aborted'));return;}
+        signal?.addEventListener('abort',onAbort,{once:true});
+        void providerGate.then(()=>{cleanup();resolve();});
+      });
+      options?.signal?.throwIfAborted();
+      return fauxAssistantMessage('the paused response must not be delivered');
+    }
+  ]);
   const send=async(body:unknown)=>fetch(app.base+'/input',{method:'POST',headers:app.writes,body:JSON.stringify(body)});
   try{
+    app.created.providers.models.setProvider(faux.provider);
+    await app.created.providers.savePreferences({defaultModel:{provider:'steering-faux',modelId:'fixture'},favourites:[],allowRealModels:true});
     const empty=await app.view();
     assert.equal(empty.enabled,true);
     assert.deepEqual(empty.view.entries,[]);
-    assert.deepEqual(empty.view.model,{provider:'faux',modelId:'faux-1'});
+    assert.deepEqual(empty.view.model,{provider:'steering-faux',modelId:'fixture'});
     assert.equal(empty.view.working,false);
 
     // A scripted answer, committed to the transcript.
@@ -139,12 +162,15 @@ test('a durable agent answers, steers, aborts, de-duplicates and survives a rest
     const one=await (await send({text:'deduplicated',mode:'followUp',requestId:'same-request'})).json();
     const two=await (await send({text:'deduplicated',mode:'followUp',requestId:'same-request'})).json();
     assert.equal(one.submissionId,two.submissionId);
-    await waitFor(async()=>{const v=await app.view();return v.view.entries.filter((e:any)=>e.kind==='user'&&e.text==='deduplicated').length===1?v:undefined;});
+    const deduplicated=await waitFor(async()=>{const v=await app.view();return v.view.entries.some((e:any)=>e.kind==='assistant'&&e.text==='deduplicated response')?v:undefined;});
+    assert.equal(deduplicated.view.entries.filter((e:any)=>e.kind==='user'&&e.text==='deduplicated').length,1);
 
-    // Steering joins a busy run, and the queued item is visible while it waits.
-    assert.equal((await send({text:'[pause] hold the run open',mode:'followUp'})).status,200);
+    // The faux provider signals that it received the pause turn, then holds its response behind an
+    // explicit gate. Steering is admitted while that real provider request remains in flight.
+    assert.equal((await send({text:'hold the run open',mode:'followUp'})).status,200);
+    await waitFor(async()=>providerReached?true:undefined);
     assert.equal((await send({text:'steer: prefer pnpm',mode:'steer'})).status,200);
-    const busy=await waitFor(async()=>{const v=await app.view();return v.view.working?v:undefined;});
+    const busy=await waitFor(async()=>{const v=await app.view();return v.view.working&&v.view.inbox.some((item:any)=>item.mode==='steer'&&item.text.includes('prefer pnpm'))?v:undefined;});
     assert.equal(busy.view.working,true);
     assert.ok(busy.view.inbox.some((item:any)=>item.mode==='steer'&&item.text.includes('prefer pnpm')));
 
@@ -152,6 +178,7 @@ test('a durable agent answers, steers, aborts, de-duplicates and survives a rest
     assert.equal((await fetch(app.base+'/abort',{method:'POST',headers:app.writes,body:'{}'})).status,200);
     const stopped=await waitFor(async()=>{const v=await app.view();return v.view.working?undefined:v;});
     assert.deepEqual(stopped.view.inbox,[]);
+    assert.equal(stopped.view.entries.filter((e:any)=>e.kind==='assistant'&&e.text.includes('the paused response must not be delivered')).length,0);
 
     // Authentication and validation still apply to the agent routes.
     assert.equal((await fetch(app.base)).status,401);
@@ -161,11 +188,12 @@ test('a durable agent answers, steers, aborts, de-duplicates and survives a rest
     const oversized=await send({text:'x'.repeat(9000)});
     assert.equal(oversized.status,413);
     assert.match(JSON.stringify(await oversized.json()),/The limit for one message is 8000/);
-  }finally{await app.created.close();}
+  }finally{releaseProviderGate();await app.created.close();}
 
   // The transcript is in SQLite, so a new process opens the same conversation.
   const reopened=await instance('on',root,300);
   try{
+    reopened.created.providers.models.setProvider(faux.provider);
     const persisted=await waitFor(async()=>{const v=await reopened.view();return v.view.entries.length? v:undefined;});
     assert.ok(persisted.view.entries.some((e:any)=>e.kind==='assistant'&&/hello from the test/.test(e.text)));
     const file=join(root,'agents',reopened.project.id,'session.sqlite');
@@ -375,10 +403,10 @@ test('a notification that reached no device is not a delivery, and the next star
  * the scopes forbid is refused with a precise reason and writes nothing, and the refusal is the
  * scope's rather than the tool's, because granting the scope makes the very same call succeed.
  */
-async function privilegeInstance(root:string,scopes:readonly string[]){
+async function privilegeInstance(root:string,scopes:readonly string[],seam:{delay?:number;started?:()=>void}={}){
  const security=localConfig('http://127.0.0.1:0');
  const store=new ControlStore(root);
- const created=await createApp({dataRoot:root,browseRoots:[],security,agents:'on',agentPauseMs:150,control:store});
+ const created=await createApp({dataRoot:root,browseRoots:[],security,agents:'on',agentPauseMs:150,control:store,recordNoteDelayMs:seam.delay,recordNoteStarted:seam.started});
  await new Promise<void>(ok=>created.server.listen(0,'127.0.0.1',ok));
  security.origin='http://127.0.0.1:'+(created.server.address() as {port:number}).port;
  const token={'x-dashboard-token':security.token};
@@ -421,6 +449,45 @@ test('a tool the scopes forbid is refused at dispatch with a precise reason and 
    assert.match(refusedText,/The record_note scope is not in this agent\u2019s allowlist/,'the refusal names the scope that was missing');
    assert.match(refusedText,/Append one line/,'the refusal says what granting it would allow');
    assert.equal(await stat(app.notesFile).then(()=>true).catch(()=>false),false,'a refused tool call wrote nothing at all');
+ }finally{await app.created.close();app.store.close();}
+});
+
+test('disabling the last legacy agent does not restore unrestricted tools to its session',async()=>{
+ const root=await mkdtemp(join(tmpdir(),'dashboard-disabled-legacy-'));
+ const app=await privilegeInstance(root,['read_notes','record_note']);
+ try{
+   await app.view();
+   app.created.agentStore!.update({agentId:app.agent.id,revision:app.agent.revision,patch:{enabled:false},actor:{kind:'owner',identity:'local'}});
+   assert.equal((await app.send({text:'[note must not become owner]',mode:'followUp'})).status,200);
+   assert.match(await transcriptText(app),/no active governing agent; no provider request was sent/i);
+   assert.equal(await stat(app.notesFile).then(()=>true).catch(()=>false),false);
+ }finally{await app.created.close();app.store.close();}
+});
+
+test('a revoked note scope stops an already queued append',async()=>{
+ const root=await mkdtemp(join(tmpdir(),'dashboard-revoked-note-'));
+ let entered=false;const app=await privilegeInstance(root,['read_notes','record_note'],{delay:300,started:()=>{entered=true;}});
+ try{
+   await app.view();
+   assert.equal((await app.send({text:'[note revoked while waiting]',mode:'followUp'})).status,200);
+   await waitFor(async()=>entered?true:undefined);
+   app.created.agentStore!.update({agentId:app.agent.id,revision:app.agent.revision,patch:{scopes:['read_notes']},actor:{kind:'owner',identity:'local'}});
+   assert.match(await transcriptText(app),/authority changed or is unavailable/i);
+   assert.equal(await stat(app.notesFile).then(()=>true).catch(()=>false),false);
+ }finally{await app.created.close();app.store.close();}
+});
+
+test('revoking and restoring a note scope does not revive an in-flight call',async()=>{
+ const root=await mkdtemp(join(tmpdir(),'dashboard-note-aba-'));
+ let entered=false;const app=await privilegeInstance(root,['read_notes','record_note'],{delay:300,started:()=>{entered=true;}});
+ try{
+   await app.view();assert.equal((await app.send({text:'[note must not revive]',mode:'followUp'})).status,200);
+   await waitFor(async()=>entered?true:undefined);
+   const actor={kind:'owner',identity:'local'};
+   const revoked=app.created.agentStore!.update({agentId:app.agent.id,revision:app.agent.revision,patch:{scopes:['read_notes']},actor});
+   app.created.agentStore!.update({agentId:app.agent.id,revision:revoked.revision,patch:{scopes:['read_notes','record_note']},actor});
+   assert.match(await transcriptText(app),/authority changed or is unavailable/i);
+   assert.equal(await stat(app.notesFile).then(()=>true).catch(()=>false),false);
  }finally{await app.created.close();app.store.close();}
 });
 
@@ -469,6 +536,17 @@ test('an agent is offered only the tools its scopes name, and a call to a tool i
  * reason and no side effect, a rebind takes effect at the next dispatch without a restart, and the
  * binding is durable across a restart. No model is called: the scripted provider drives the calls.
  */
+test('read_notes reports an unsafe path as unknown rather than as absent',async()=>{
+ const root=await mkdtemp(join(tmpdir(),'dashboard-unsafe-notes-'));
+ const app=await privilegeInstance(root,['read_notes']);
+ try{
+   await mkdir(join(app.project.path,'docs'),{recursive:true});
+   const outside=join(root,'outside-notes');await writeFile(outside,'private');await symlink(outside,app.notesFile);
+   await app.view();assert.equal((await app.send({text:'[read-notes]',mode:'followUp'})).status,200);
+   const text=await transcriptText(app);assert.match(text,/Notes could not be read safely/);assert.doesNotMatch(text,/No notes yet\.|private/);
+ }finally{await app.created.close();app.store.close();}
+});
+
 test('a session bound to an agent uses its scopes, the same session unbound refuses with a reason and writes nothing, and the rebind takes effect at the next dispatch',async()=>{
   const root=await mkdtemp(join(tmpdir(),'dashboard-agents-binding-'));
   const app=await privilegeInstance(root,['read_notes','record_note']);
@@ -482,15 +560,12 @@ test('a session bound to an agent uses its scopes, the same session unbound refu
     await waitFor(async()=>{const ok=await stat(app.notesFile).then(()=>true).catch(()=>false);return ok?true:undefined;});
     assert.match(await readFile(app.notesFile,'utf8'),/the bound session may write this/,'a bound session really used its agent\u2019s scope');
 
-    // Unbind the very same session: it now has no agent, so a tool call is refused with the reason.
-    // The tool differs (read_notes) only because the scripted provider never repeats a call it has
-    // already made in one conversation; the point proven is the authority, not the tool.
+    // Unbind the same session: dispatch is refused before any provider request or tool call.
     bind(1,null);
     const before=await readFile(app.notesFile,'utf8');
     assert.equal((await app.send({text:'[read-notes]',mode:'followUp'})).status,200);
     const refused=await transcriptText(app);
-    assert.match(refused,/blocked/i,'the refusal is reported in the transcript');
-    assert.match(refused,/No agent is bound to this session/,'the refusal names why there are no privileges');
+    assert.match(refused,/no active governing agent; no provider request was sent/i,'the refusal is reported before provider dispatch');
     assert.equal(await readFile(app.notesFile,'utf8'),before,'an unbound session wrote nothing');
   }finally{await app.created.close();app.store.close();}
 });
@@ -813,18 +888,20 @@ test('DEFECT2a: the scope vocabulary reports which scopes have an installed tool
   assert.ok(uninstalled.includes('spend'), 'spend is uninstalled');
   assert.ok(uninstalled.includes('provision'), 'provision is uninstalled');
   assert.ok(uninstalled.includes('publish'), 'publish is uninstalled');
-  // Verify the total count: 18 scopes, 3 always installed, and 4 behind the instance switches
-  // (file_edit, and the coding tools read/write plus the shell).
-  assert.equal(vocab.length, 18, 'there are exactly 18 scopes');
+  assert.ok(uninstalled.includes('reusable_tools'), 'reusable_tools is uninstalled by default');
+  // Verify the total count: 19 scopes, 5 always installed (planning, documentation and question
+  // tools), and 5 behind the instance switches (file_edit, the coding tools read/write plus the
+  // shell, and the reusable JSON projection tools).
+  assert.equal(vocab.length, 19, 'there are exactly 19 scopes');
   // Every switched capability has NO installed tool by default.
-  for (const scope of ['file_edit', 'file_read', 'file_write', 'shell'] as const)
+  for (const scope of ['file_edit', 'file_read', 'file_write', 'shell', 'reusable_tools'] as const)
     assert.ok(uninstalled.includes(scope), scope + ' is uninstalled by default (its switch is off)');
-  // With the switches on, exactly those four become installed, and nothing else changes.
-  const withCoding = agentScopeVocabulary({ fileEdit: true, fileRead: true, fileWrite: true, shell: true });
+  // With the switches on, exactly those five become installed, and nothing else changes.
+  const withCoding = agentScopeVocabulary({ fileEdit: true, fileRead: true, fileWrite: true, shell: true, reusableTools: true });
   const nowInstalled = withCoding.filter(s => s.installed).map(s => s.scope);
-  for (const scope of ['file_edit', 'file_read', 'file_write', 'shell'] as const)
+  for (const scope of ['file_edit', 'file_read', 'file_write', 'shell', 'reusable_tools'] as const)
     assert.ok(nowInstalled.includes(scope), scope + ' is installed when its switch is on');
-  assert.equal(nowInstalled.length, installed.length + 4, 'the switches install exactly four tools and no more');
+  assert.equal(nowInstalled.length, installed.length + 5, 'the switches install exactly five tools and no more');
 });
 
 test('DEFECT2b: an agent whose scope is granted but whose tool is not installed gets a 503 from the agent registry endpoint', async () => {

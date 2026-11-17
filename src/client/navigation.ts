@@ -18,7 +18,7 @@
  * mode; a fullscreen desktop tab is not guarded.
  */
 
-export const VIEWS = ['Dependencies', 'Timeline', 'List', 'Wiki', 'Agents'] as const;
+export const VIEWS = ['Dependencies', 'Timeline', 'List', 'Wiki', 'Agents', 'Terminal'] as const;
 export type View = (typeof VIEWS)[number];
 
 export interface RouteSnapshot {

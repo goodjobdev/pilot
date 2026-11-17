@@ -4,7 +4,7 @@ import { mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from 'node:fs/
 import { tmpdir } from 'node:os';
 import { dirname,join } from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { ControlStore } from '../../src/server/state/control-store';
+import { ControlStore,operationDigest } from '../../src/server/state/control-store';
 import { FILE_EDIT_MAX_DIFF_BYTES, FILE_EDIT_MAX_FILE_BYTES, FileEditError, FileEditTool, unifiedDiff, type FileEditMode } from '../../src/server/state/file-edit-tool';
 
 /**
@@ -82,6 +82,43 @@ test('propose-only is the default: it records the change and its diff and writes
     assert.equal(again.record.id, outcome.record.id);
     assert.equal((await f.tool.view(f.projectId)).edits.length, 2);
   } finally { await f.cleanup(); }
+});
+
+test('concurrent edits through one tool instance serialize before observing the file',async()=>{
+ const f=await fixture('auto-apply');
+ try{
+  let enter!:()=>void,release!:()=>void;const entered=new Promise<void>(resolve=>{enter=resolve;});const gate=new Promise<void>(resolve=>{release=resolve;});let calls=0;
+  const tool=new FileEditTool(f.store,{enabled:true,projectRoot:()=>f.worktree,policy:{mode:()=> 'auto-apply'},beforeFileCommit:async()=>{calls++;if(calls===1){enter();await gate;}}});
+  const request={projectId:f.projectId,agentId:null,path:'src/index.ts',actor:OWNER};
+  const first=tool.edit({...request,content:'first\n'});await entered;
+  const second=tool.edit({...request,content:'second\n'});await new Promise(resolve=>setTimeout(resolve,20));assert.equal(calls,1);
+  release();const [a,b]=await Promise.all([first,second]);assert.equal(a.written,true);assert.equal(b.written,true);assert.match(b.record.diff,/-first/);
+  assert.equal(await readFile(join(f.worktree,'src/index.ts'),'utf8'),'second\n');
+ }finally{await f.cleanup();}
+});
+
+test('a policy revoke and restore does not revive an admitted edit',async()=>{
+ const f=await fixture('auto-apply');
+ try{
+  let revision=1;let mode:FileEditMode='auto-apply';
+  const tool=new FileEditTool(f.store,{enabled:true,projectRoot:()=>f.worktree,policy:{mode:()=>mode,snapshot:()=>({mode,revision})},beforeFileCommit:async()=>{mode='propose-only';revision++;mode='auto-apply';revision++;}});
+  await assert.rejects(tool.edit({projectId:f.projectId,agentId:null,path:'src/index.ts',content:'changed',actor:OWNER}),/policy changed/);
+  assert.match(await readFile(join(f.worktree,'src/index.ts'),'utf8'),/one = 1/);
+  assert.equal((await tool.view(f.projectId)).edits[0].applied,null);
+ }finally{await f.cleanup();}
+});
+
+test('an existing empty file is not reported as newly created',async()=>{
+  const f=await fixture();
+  try{
+    await writeFile(join(f.worktree,'src','empty.ts'),'');
+    const existing=await f.edit({path:'src/empty.ts',content:'hello'});
+    const missing=await f.edit({path:'src/missing.ts',content:'hello'});
+    assert.equal(existing.record.created,false);assert.equal(missing.record.created,true);
+    await writeFile(join(f.worktree,'src','missing.ts'),'external');
+    const duplicate=await f.edit({path:'src/missing.ts',content:'hello'});
+    assert.equal(duplicate.reused,true);assert.equal(duplicate.record.created,true,'metadata belongs to the original proposal, not the current file');
+  }finally{await f.cleanup();}
 });
 
 test('auto-apply writes the file atomically and records the same diff, and only a policy that permits it allows it', async () => {
@@ -218,6 +255,46 @@ test('the record names the agent when an agent made the change, and every edit i
     await refused(() => f.edit({ path: 'x'.repeat(401) }), 'INVALID');
     assert.equal((f.store.db.prepare("SELECT count(*) AS n FROM operations WHERE kind='agent.file-edit'").get() as { n: number }).n, 1);
   } finally { await f.cleanup(); }
+});
+
+test('a lost write confirmation remains unknown after reopen and never automatically replays',async()=>{
+ const f=await fixture('auto-apply');
+ try {
+  const admit=f.store.admit.bind(f.store);
+  f.store.admit=input=>{if(input.kind==='agent.file-edit-confirmed')throw Error('fixture receipt loss');return admit(input);};
+  const result=await f.edit();assert.equal(result.written,true);assert.equal(result.record.applied,null);
+  assert.equal((await f.tool.view(f.projectId)).edits[0].applied,null);
+  f.store.admit=admit;
+  // The historical admission record has applied=true in its input and outbox payload. Keep the
+  // current admission digest envelope internally consistent; this does not claim historic data compatibility.
+  const op=f.store.db.prepare("SELECT id,input_json FROM operations WHERE kind='agent.file-edit'").get() as {id:string;input_json:string};
+  const out=f.store.db.prepare('SELECT kind,payload_json FROM outboxes WHERE operation_id=?').get(op.id) as {kind:string;payload_json:string};
+  const legacyInput={...JSON.parse(op.input_json),applied:true};
+  const legacyPayload={...JSON.parse(out.payload_json),applied:true};
+  const digest=operationDigest('agent.file-edit',{input:legacyInput,outbox:{kind:out.kind,payload:legacyPayload}});
+  f.store.db.prepare('UPDATE operations SET input_json=?,input_digest=? WHERE id=?').run(JSON.stringify(legacyInput),digest,op.id);
+  f.store.db.prepare('UPDATE outboxes SET payload_json=? WHERE operation_id=?').run(JSON.stringify(legacyPayload),op.id);
+  assert.equal((await f.tool.view(f.projectId)).edits[0].applied,null);
+  f.store.close();const reopened=new ControlStore(f.dataRoot);
+  try {
+   const tool=new FileEditTool(reopened,{enabled:true,projectRoot:()=>f.worktree,policy:{mode:()=> 'auto-apply'}});
+   assert.equal((await tool.view(f.projectId)).edits[0].applied,null);
+   await writeFile(join(f.worktree,'src/index.ts'),'external change\n');
+   const again=await tool.edit({projectId:f.projectId,agentId:null,path:'src/index.ts',content:'export const one = 1;\nexport const two = 3;\n',actor:OWNER});
+   assert.equal(again.written,false);assert.equal(again.record.applied,null);
+   assert.equal(await readFile(join(f.worktree,'src/index.ts'),'utf8'),'external change\n');
+  } finally {reopened.close();}
+ } finally {await f.cleanup();}
+});
+
+test('a workspace callback that omits the write cannot produce a confirmation',async()=>{
+ const f=await fixture('auto-apply');
+ try {
+  const tool=new FileEditTool(f.store,{enabled:true,projectRoot:()=>f.worktree,policy:{mode:()=> 'auto-apply'},saveMarkdown:async()=>({status:'unchanged',message:'Fixture'})});
+  await assert.rejects(tool.edit({projectId:f.projectId,agentId:null,path:'src/missing.md',content:'# Proposed\n',actor:OWNER}),/write could not be confirmed/);
+  assert.equal((await tool.view(f.projectId)).edits[0].applied,null);
+  assert.equal(await exists(join(f.worktree,'src','missing.md')),false);
+ } finally {await f.cleanup();}
 });
 
 for(const change of ['cancel','external edit'] as const)test('queued Markdown apply respects '+change+' before its disk effect',async t=>{

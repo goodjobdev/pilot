@@ -24,6 +24,7 @@
   chevron:'m8 5 7 7-7 7',
   book:'M4 4h7v16H4z M13 4h7v16h-7z M11 4v16',
   agent:'M5 8h14v9H5z M9 11h.01 M15 11h.01 M9 14h6 M12 4v4 M8 20l-1-3 M16 20l1-3',
+  terminal:'M4 5h16v14H4z M7 9l3 3-3 3 M12 15h5',
   edit:'M4 20h4L20 8l-4-4L4 16z M14 6l4 4',
   save:'M5 4h11l3 3v13H5z M8 4v6h7V4 M8 20v-6h8v6',
   image:'M3 5h18v14H3z M8.5 10a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3 M4 17l5-5 4 4 3-3 4 4'

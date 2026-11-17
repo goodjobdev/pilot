@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp,mkdir,writeFile,readFile,rm,symlink,chmod } from 'node:fs/promises';
+import { mkdtemp,mkdir,open,writeFile,readFile,rm,symlink,chmod } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -20,9 +20,25 @@ async function fixture(t:{after:(fn:()=>Promise<void>)=>void},git=true){
  if(git)await command('init','-b','work/pilot-'+p.id.slice(0,8));
  const workspace=new WorkspaceStore(),boards=new BoardStore(root,workspace),docs=new DocStore({}, {boards,workspace});return {root,p,command,workspace,boards,docs};
 }
+test('workspace preview refuses an oversized file using the opened-file byte cap',async t=>{
+ const {p,workspace}=await fixture(t,false);await mkdir(join(p.path,'src'),{recursive:true});
+ const file=join(p.path,'src','large.ts'),handle=await open(file,'w');
+ try{await handle.truncate(2*1024*1024+1);}finally{await handle.close();}
+ await assert.rejects(workspace.read(p,'src/large.ts'),(error:unknown)=>error instanceof Error&&'status'in error&&(error as {status:number}).status===413);
+});
+
+test('board raw reads refuse an oversized opened board before parsing or export',async t=>{
+ const {p,boards}=await fixture(t,false);await mkdir(join(p.path,'docs','dashboard'),{recursive:true});
+ const file=join(p.path,'docs','dashboard','board.md'),handle=await open(file,'w');
+ try{await handle.truncate(8*1024*1024+1);}finally{await handle.close();}
+ await assert.rejects(boards.raw(p),(error:unknown)=>error instanceof Error&&error.message==='Board exceeds size limit');
+ await assert.rejects(boards.read(p),(error:unknown)=>error instanceof Error&&'status'in error&&(error as {status:number}).status===413);
+});
 test('document saves commit exactly their file and preserve unrelated staged changes',async t=>{
  const {p,docs,workspace,command}=await fixture(t);
+ for(const [key,value] of [['author.name','Imposter'],['author.email','imposter@example.invalid'],['committer.name','Imposter'],['committer.email','imposter@example.invalid']])await command('config',key,value);
  const first=await docs.create(p,'docs/spec.md','# Spec\n');assert.equal(first.commit?.status,'committed');
+ assert.equal((await command('show','-s','--format=%an <%ae>|%cn <%ce>','HEAD')).trim(),'Pilot <pilot@localhost>|Pilot <pilot@localhost>');
  assert.equal(await command('show','HEAD:docs/spec.md'),'# Spec\n');
  await writeFile(join(p.path,'unrelated.txt'),'staged elsewhere\n');await command('add','unrelated.txt');
  const saved=await docs.write(p,first.path,first.revision,'# Spec\n\nUpdated\n');assert.equal(saved.commit?.status,'committed');

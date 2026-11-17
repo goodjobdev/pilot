@@ -151,9 +151,11 @@ exactly once.
   but a project you register is a directory the agent may write to. Run it in a container,
   not on a workstation. The optional coding tools are off unless the instance enables them
   (`DASHBOARD_CODING_TOOLS=on`, and `DASHBOARD_SHELL=on` for commands) and an agent is granted
-  the matching scope. `read` and `write` stay inside the connected worktree; the shell is **not
-  contained** and can reach the whole data volume, including the stored credentials. See
-  [Coding tools](docs/specs/coding-tools.md).
+  the matching scope. `read` and `write` stay inside the connected worktree; the agent shell is **not
+  contained** and can reach the whole data volume, including stored credentials. A separate,
+  owner-facing interactive terminal is opt-in with `DASHBOARD_TERMINAL=on` and grants the same broad
+  service-user access; it does not install or change the agent shell. See
+  [Coding tools](docs/specs/coding-tools.md) and the [terminal guide](docs/manual/terminal.md).
 - **The backup script covers documentation and working state, not credentials.** The archive
   captures `catalog.json`, the agent session databases, the durable control store
   (`control.sqlite`), managed projects' boards and documents, media, and settings. For an

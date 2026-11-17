@@ -17,11 +17,19 @@ alongside the application checks when documentation changes. Only `docs-site/pag
 entries publish; generated output is disposable. Never publish project/runtime/private
 content by globbing the documentation tree.
 
-## Execution surface
+## Product direction and execution surface
 
-- **The agent harness is the execution surface for models.** No HTTP endpoint runs a command.
-  Agent tools run inside a registered project's own workspace and nowhere else. The default set is
-  questions/notes, contained documentation reads and revision-checked planning board updates.
+The owner has directed Pilot toward a full-auto mode. Record the change and remaining work in
+`docs/specs/autonomy-milestone.md`; it is a milestone, not evidence that all actions are implemented or
+released. Implement capabilities one at a time with truthful availability, server-enforced per-agent
+scope, an explicit owner-configured policy, durable receipts and recovery. A policy accepting an
+artifact is not by itself a tool that performs an action. Do not use the shell as proof that named
+commit, push, deploy, spend, provision or publish scopes are separately enforced.
+
+- **The agent harness is the execution surface for models.** No general-purpose HTTP endpoint runs a
+  command. The default set is questions/notes, contained documentation reads and revision-checked
+  planning board updates. Bounded tools are scoped to a registered project; the opt-in shell below is
+  an explicit exception to workspace containment and must be described as such.
 - **The coding tools are opt-in twice.** `read` and `write` are installed only when the instance
   sets `DASHBOARD_CODING_TOOLS=on`, `bash` only when `DASHBOARD_SHELL=on` as well, and each is
   offered to an agent only when that agent's allowlist grants `file_read`, `file_write` or `shell`.
@@ -41,7 +49,9 @@ content by globbing the documentation tree.
   incoming/result previews, and explicitly confirmed fast-forward or two-parent merge.
   Reviews expire and are lost on restart, never replayed. Preserve dirty/staged/ignored
   data, refuse active/uncertain work and invalid plans, and never push, stash, reset,
-  rebase, install, or grant an agent a Git tool. Read `docs/specs/repository-updates.md`.
+  rebase or install through this update workflow. Any future model-facing Git capability needs its
+  own scoped, policy-enforced design and verification; the reviewed update is not that capability.
+  Read `docs/specs/repository-updates.md`.
 - Provider and deploy-key secrets live outside project roots under `<data>/credentials/`;
   do not return them in views or logs. The coding tools, including the shell, run as that same
   user: granting the shell grants reach to those files, and no part of this code claims otherwise.
@@ -73,7 +83,8 @@ Check for hostnames, account identifiers, email addresses and tokens before any 
 
 Use disposable roots; never a live project or a real planning document. Git acceptance
 tests commit only inside disposable repositories. Never push, publish or synchronise
-between machines as part of a test.
+between machines as part of a test. The product milestone is not permission for this development
+session to perform an automatic commit, push, publication or live-data synchronisation.
 
 ## Bounded execution and progress
 

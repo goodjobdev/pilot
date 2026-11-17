@@ -46,9 +46,10 @@ test('compact console, persistent sidebar hiding and keyboard/popover controls p
  await page.getByRole('button',{name:'Filters',exact:true}).click();await page.getByRole('button',{name:'Reset',exact:true}).click();await page.keyboard.press('Escape');
  await page.getByRole('button',{name:'Hide project sidebar'}).click();
  await mkdir('/tmp/project-dashboard-ui-preview',{recursive:true,mode:0o700});
- await page.screenshot({path:'/tmp/project-dashboard-ui-preview/console-dark.png',animations:'disabled'});
- await page.getByRole('button',{name:'Toggle theme'}).click();await expect(page.locator('html')).toHaveAttribute('data-theme','light');
+ await expect(page.locator('html')).toHaveAttribute('data-theme','light');
  await expect(page.locator('.svelte-flow')).toHaveClass(/light/);await page.screenshot({path:'/tmp/project-dashboard-ui-preview/console-light.png',animations:'disabled'});
+ await page.getByRole('button',{name:'Toggle theme'}).click();await expect(page.locator('html')).toHaveAttribute('data-theme','dark');
+ await page.screenshot({path:'/tmp/project-dashboard-ui-preview/console-dark.png',animations:'disabled'});
  expect(await snapshot()).toEqual(before);expect(before.board.adoption).toBe('mirror');
  await page.setViewportSize({width:390,height:844});await page.reload();
  await expect(page.getByRole('button',{name:'Task',exact:true})).toHaveClass(/active/);
@@ -58,7 +59,28 @@ test('compact console, persistent sidebar hiding and keyboard/popover controls p
  const panel=(await page.locator('.filter-panel').boundingBox())!;expect(panel.x).toBeGreaterThanOrEqual(0);expect(panel.x+panel.width).toBeLessThanOrEqual(390);
  await page.keyboard.press('Escape');await page.getByRole('button',{name:'Show project sidebar'}).click();
  await expect(page.getByRole('navigation',{name:'Projects'})).toBeVisible();
+ // The drawer begins below the *whole* responsive header, including its wrapping toolbar.
+ const drawer=(await page.getByRole('complementary',{name:'Project sidebar'}).boundingBox())!;
+ const content=(await page.locator('.view-area').boundingBox())!;
+ expect(Math.abs(drawer.y-content.y)).toBeLessThanOrEqual(1);
+ await page.getByLabel('Search projects').fill('not a project');
+ await expect(page.getByText('No projects match your search.')).toBeVisible();
+ await page.getByLabel('Search projects').fill(' Orbital ');
+ await expect(page.getByRole('navigation',{name:'Projects'}).getByRole('button',{name:/Orbital/})).toBeVisible();
  await page.getByRole('button',{name:'Hide project sidebar'}).click();
  await page.screenshot({path:'/tmp/project-dashboard-ui-preview/console-mobile.png',animations:'disabled'});
  expect(await snapshot()).toEqual(before);expect(errors).toEqual([]);
+});
+
+test('theme preferences and reduced motion are respected',async({page})=>{
+ await page.emulateMedia({reducedMotion:'reduce'});
+ await page.addInitScript(()=>localStorage.setItem('dashboard.theme','dark'));
+ await page.goto('/');
+ await expect(page.locator('html')).toHaveAttribute('data-theme','dark');
+ await expect(page.getByRole('button',{name:'Toggle theme'})).toBeVisible();
+ const transition=await page.getByRole('button',{name:'Toggle theme'}).evaluate(el=>getComputedStyle(el).transitionDuration);
+ expect(transition).toBe('0s');
+ await page.getByRole('button',{name:'Toggle theme'}).click();
+ await expect(page.locator('html')).toHaveAttribute('data-theme','light');
+ expect(await page.evaluate(()=>localStorage.getItem('dashboard.theme'))).toBe('light');
 });

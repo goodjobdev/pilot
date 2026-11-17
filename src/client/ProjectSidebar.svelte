@@ -9,8 +9,10 @@
  <label class="search"><Icon name="search" size={14}/><input aria-label="Search projects" placeholder="Find a project…" bind:value={search}></label>
  <div class="eyebrow sidebar-label">PROJECTS <span>{String(projects.length).padStart(2,'0')}</span></div>
  <nav aria-label="Projects">
- {#each projects.filter(p=>p.name.toLowerCase().includes(search.toLowerCase())) as project}
+ {#each projects.filter(p=>p.name.toLowerCase().includes(search.trim().toLowerCase())) as project (project.id)}
  <button class:current={selected===project.id} aria-current={selected===project.id?'page':undefined} onclick={()=>onselect(project)}><span class="project-icon">{project.name.slice(0,1).toUpperCase()}</span><span>{project.name}<small>{project.state==='available'?'Planning workspace':project.state}</small></span></button>
+ {:else}
+ <p class="sidebar-empty">{search.trim() ? 'No projects match your search.' : 'No projects yet.'}</p>
  {/each}
  </nav>
  <button class="add-project" disabled={!ready} onclick={onadd} aria-label="＋ Add project"><Icon name="plus" size={15}/>Add project</button>

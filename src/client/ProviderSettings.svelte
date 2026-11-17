@@ -1,5 +1,6 @@
 <script lang="ts">
  import {onMount} from 'svelte';
+ import {showModalWithFocusReturn} from './modal-focus';
  import {request,ApiError} from './api';
  import {modelKey,type ProviderSettings,type ModelPreferences,type LoginView,type ModelChoice} from '../shared/settings';
  import type {WorkerModelPolicyView} from '../shared/model-policy';
@@ -14,9 +15,9 @@
  const selected=$derived(settings?.providers.find(p=>p.id===provider));
  const filtered=$derived((settings?.models??[]).filter(m=>m.configured&&(!query||(m.name+' '+modelKey(m)).toLowerCase().includes(query.toLowerCase()))));
  onMount(()=>{
-  dialog.showModal();void load();
+  const close=showModalWithFocusReturn(dialog);void load();
   const timer=setInterval(()=>{if(login?.status==='pending')void poll(login.id);},1000);
-  return ()=>{clearInterval(timer);key='';if(login?.status==='pending')void request('/settings/logins/'+login.id,'DELETE',{}).catch(()=>{});};
+  return ()=>{close();clearInterval(timer);key='';if(login?.status==='pending')void request('/settings/logins/'+login.id,'DELETE',{}).catch(()=>{});};
  });
  async function load(){try{settings=await request('/settings/providers');}catch(e){problem=(e as Error).message;return;}if(policyView===null)await loadPolicy();}
  async function loadPolicy(){policyProblem='';policyReloadOffered=false;policyRebase=null;try{applyPolicy(await request<WorkerModelPolicyView>('/settings/model-policy'));}catch(e){policyProblem=(e as Error).message;}}
@@ -80,13 +81,15 @@
   }finally{busy=false;}
  }
 </script>
-<dialog bind:this={dialog} oncancel={onclose} class="provider-settings">
- <header class="modal-head"><div><span class="eyebrow">PILOT SETTINGS</span><h2>Providers &amp; models</h2></div><button aria-label="Close provider settings" onclick={onclose}>×</button></header>
+<dialog bind:this={dialog} oncancel={onclose} class="provider-settings" aria-labelledby="provider-settings-title">
+ <header class="modal-head"><div><span class="eyebrow">PILOT SETTINGS</span><h2 id="provider-settings-title">Providers &amp; models</h2></div><button aria-label="Close provider settings" onclick={onclose}>×</button></header>
  <p class="muted">Credentials stay on this server, outside projects and ordinary backups. They are never returned to this form. Use provider-side spending limits.</p>
  <fieldset disabled={busy}>
   <legend>Connect a provider</legend>
   <label>Provider<select aria-label="Provider" bind:value={provider} onchange={()=>{key='';message='';}}>{#each settings?.providers??[] as p}<option value={p.id}>{p.name}{p.configured?' · connected':''}</option>{/each}</select></label>
   {#if selected?.configured}<p role="status">Connected via {selected.credentialType==='oauth'?'sign-in':'API key'}.</p>{/if}
+  {#if provider==='openai-codex'||(provider==='openai'&&selected?.credentialType==='oauth')}<p role="note">This sign-in can be stored, but model generation is currently unavailable: its transport does not expose a verifiable output-token bound. Use a supported API-key model instead.</p>{/if}
+  {#if provider==='openai'&&selected?.credentialType!=='oauth'}<small>ChatGPT sign-in can be connected, but its generation transport currently cannot verify the output-token bound and will be refused.</small>{/if}
   {#if selected?.apiKey}
    <form onsubmit={e=>{e.preventDefault();void saveKey();}}>
     <label>Provider API key<input type="password" autocomplete="new-password" bind:value={key} spellcheck="false" required></label>
@@ -114,7 +117,7 @@
       <button type="submit" disabled={busy||!answer}>Continue sign-in</button>
      </form>
     {/if}
-    <small>On a phone or remote host, prefer Codex's device-code method. For browser login, paste the final localhost callback URL back here; do not share it in chat.</small>
+    <small>On a phone or remote host, paste the final localhost callback URL back here for browser login; do not share it in chat. Signing in does not establish that this transport can run models.</small>
     <button onclick={()=>void cancelLogin()} disabled={busy}>Cancel sign-in</button>
    {/if}
   </section>
@@ -123,7 +126,7 @@
  <fieldset disabled={busy}>
   <legend>Model defaults</legend>
   <label class="row"><input type="checkbox" checked={settings.preferences.allowRealModels} onchange={e=>void preference({allowRealModels:e.currentTarget.checked})}>Allow real model calls (may incur charges or use subscription quota)</label>
-  <small>Off by default. Saving a key, signing in, choosing a default or starring a model does not call a model. Calls are capped at 4,096 output tokens per request and eight model turns between user inputs, with automatic retries and compaction disabled. These are not a dollar spending cap.</small>
+  <small>Off by default. Saving a key, signing in, choosing a default or starring a model does not call a model. Ordinary sessions use the instance's configurable turn and output limits; workers have separate lower limits. Some transports and settings are refused when their output bound cannot be verified. These are not a dollar spending cap.</small>
   <p>Default for <strong>new sessions</strong>: <strong>{settings.preferences.defaultModel?modelKey(settings.preferences.defaultModel):'Scripted test provider (free)'}</strong></p>
   <button onclick={()=>void preference({defaultModel:null})}>Use scripted default</button>
   <label>Search models<input type="search" bind:value={query} placeholder="Connected providers · favourites first"></label>

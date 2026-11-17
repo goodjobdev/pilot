@@ -15,12 +15,14 @@
  import DocView from './DocView.svelte';
  import DocEditor from './DocEditor.svelte';
  import AgentsView from './AgentsView.svelte';
+ import Terminal from './Terminal.svelte';
  import ActionPalette from './ActionPalette.svelte';
  import ProviderSettings from './ProviderSettings.svelte';
  import ProjectConnection from './ProjectConnection.svelte';
  import AgentManager from './AgentManager.svelte';
  import WorkersPanel from './WorkersPanel.svelte';
  import WorkspaceSidebar from './WorkspaceSidebar.svelte';
+ import { InboxRequestController } from './inbox-request-controller';
 import HarnessSettings from './HarnessSettings.svelte';
  import { PLAN_PATH,commitMessage } from '../shared/workspace';
  import { api,session,ApiError,download,whenSessionExpires } from './api';
@@ -44,7 +46,7 @@ import HarnessSettings from './HarnessSettings.svelte';
  let booted=$state(false);
  let stack:HistoryStack|null=null;
  let saving=$state(false),saveState=$state('Saved'),failed=$state(false),inspectorDirty=$state(false),undoStack=$state<Board[]>([]),redoStack=$state<Board[]>([]);
- let theme=$state<'dark'|'light'>(localStorage.getItem('dashboard.theme')==='light'?'light':'dark');
+ let theme=$state<'dark'|'light'>(localStorage.getItem('dashboard.theme')==='dark'?'dark':'light');
  let sidebarHidden=$state(localStorage.getItem('dashboard.sidebar.hidden')==='true'||(localStorage.getItem('dashboard.sidebar.hidden')===null&&window.innerWidth<900));
  let actionsMenu=$state<HTMLDivElement>(),filtersMenu=$state<HTMLDivElement>();
  let workspaceUpdating=$state(false);
@@ -54,7 +56,7 @@ import HarnessSettings from './HarnessSettings.svelte';
  let requestedDoc=$state<string|null>(null);
  let docLoadGeneration=0,docSaveGeneration=0;
  let actionsOpen=$state(false),filtersOpen=$state(false),inboxOpen=$state(false),paletteOpen=$state(false);
- let inbox=$state<{path:string;line:number;text:string;anchor:string|null;id:string}[]>([]),focusAnchor=$state<string|null>(null),inboxMenu=$state<HTMLDivElement>();
+ let inbox=$state<{path:string;line:number;text:string;anchor:string|null;id:string}[]>([]),inboxError=$state(false),inboxRequests=new InboxRequestController(),focusAnchor=$state<string|null>(null),inboxMenu=$state<HTMLDivElement>();
  let attentionCount=$state<number|null>(null),attentionCountComplete=$state(false),attentionChecked=$state(false),inboxRefresh=$state(0),attentionFocus=$state<string|null>(null),questionFocus=$state('');
  let alertState=$state<AlertState>('off'),alertBusy=$state(false),alertMessage=$state('');
  let sessionExpired=$state(false),providersOpen=$state(false),harnessOpen=$state(false),workersOpen=$state(false),connectionOpen=$state(false),agentManagerOpen=$state(false),agentsVersion=$state(0);
@@ -75,12 +77,12 @@ import HarnessSettings from './HarnessSettings.svelte';
   * a dialog and the palette on top, which is the order these can really be open in.
   */
  const LAYER_ORDER=['drawer:projects','drawer:docs','panel:inbox','menu:actions','menu:filters','panel:sessions','panel:workspace','dialog:settings','dialog:import','dialog:add','dialog:providers','dialog:agentManager','dialog:workers','dialog:connection','dialog:palette'] as const;
- const VIEW_MODES:View[]=['Dependencies','Timeline','List','Wiki','Agents'];
+ const VIEW_MODES:View[]=['Dependencies','Timeline','List','Wiki','Agents','Terminal'];
  /**
   * The words the tabs show, which are not the internal names: the stored view, the route and the
   * filters keep the original identifiers, so a rename is a label and never a migration.
   */
- const VIEW_LABELS:Record<View,string>={Dependencies:'Map',Timeline:'Milestone',List:'Task',Wiki:'Doc',Agents:'Session'};
+ const VIEW_LABELS:Record<View,string>={Dependencies:'Map',Timeline:'Milestone',List:'Task',Wiki:'Doc',Agents:'Session',Terminal:'Terminal'};
  function currentLayers():string[]{
    const open:Record<string,boolean>={
      'drawer:projects':!sidebarHidden&&narrowProjects,
@@ -289,7 +291,7 @@ import HarnessSettings from './HarnessSettings.svelte';
      error='';
    }catch{/* a malformed alert link is ignored */}
  }
- function command(action:()=>void){actionsOpen=false;action();}
+ function command(action:()=>void){actionsMenu?.querySelector('button')?.focus();actionsOpen=false;action();}
  function outside(e:MouseEvent){if(!(e.target instanceof Node))return;if(actionsOpen&&!actionsMenu?.contains(e.target))actionsOpen=false;if(filtersOpen&&!filtersMenu?.contains(e.target))filtersOpen=false;if(inboxOpen&&!inboxMenu?.contains(e.target))inboxOpen=false;}
  function keys(e:KeyboardEvent){
    if(e.key==='Escape'){if(paletteOpen){paletteOpen=false;e.preventDefault();return;}if(actionsOpen){actionsOpen=false;actionsMenu?.querySelector('button')?.focus();e.preventDefault();}if(filtersOpen){filtersOpen=false;filtersMenu?.querySelector('button')?.focus();e.preventDefault();}if(inboxOpen){inboxOpen=false;inboxMenu?.querySelector('button')?.focus();e.preventDefault();}return;}
@@ -331,7 +333,7 @@ import HarnessSettings from './HarnessSettings.svelte';
    }
  }
  async function select(p:Project,opts:SelectOptions={}){
-   if(!opts.confirmed&&!leave())return;project=p;docLoadGeneration++;docSaveGeneration++;docSaving=false;snapshot=null;error='';missingBoard=false;loading=true;selected='';failed=false;inspectorDirty=false;saveState='Saved';undoStack=[];redoStack=[];doc=null;docDraft='';docEditing=false;docDirty=false;docConflict=false;docMessage='';docsError='';docs=[];requestedDoc=null;inbox=[];attentionCount=null;attentionCountComplete=false;attentionChecked=false;attentionFocus=null;questionFocus='';inboxRefresh+=1;if(!opts.fromRoute){treeOpen=false;sessionListOpen=false;}localStorage.setItem('dashboard.project',p.id);
+   if(!opts.confirmed&&!leave())return;project=p;docLoadGeneration++;docSaveGeneration++;docSaving=false;snapshot=null;error='';missingBoard=false;loading=true;selected='';failed=false;inspectorDirty=false;saveState='Saved';undoStack=[];redoStack=[];doc=null;docDraft='';docEditing=false;docDirty=false;docConflict=false;docMessage='';docsError='';docs=[];requestedDoc=null;inboxRequests.invalidate();inbox=[];inboxError=false;attentionCount=null;attentionCountComplete=false;attentionChecked=false;attentionFocus=null;questionFocus='';inboxRefresh+=1;if(!opts.fromRoute){treeOpen=false;sessionListOpen=false;}localStorage.setItem('dashboard.project',p.id);
    let remembered:View|undefined;
    try{const filters=JSON.parse(localStorage.getItem('dashboard.filters.'+p.id)??'null');if(filters){search=filters.search??'';domain=filters.domain??'all';status=filters.status??'all';scope=filters.scope??'all';if(isView(filters.view))remembered=filters.view;}else{search='';domain='all';status='all';scope='all';}}catch{/* defaults */}
    const narrow=window.innerWidth<750;
@@ -430,7 +432,11 @@ import HarnessSettings from './HarnessSettings.svelte';
    // A response for the project this page has since left is discarded, so a switch cannot show one
    // project's count for another.
    const id=project.id;
-   try{const loaded=(await api.inbox(id)).questions;if(project?.id===id)inbox=loaded;}catch{if(project?.id===id)inbox=[];}
+   await inboxRequests.load(()=>api.inbox(id),{
+     start:()=>{if(project?.id===id)inboxError=false;},
+     success:loaded=>{if(project?.id===id){inbox=loaded.questions;inboxError=false;}},
+     failure:()=>{if(project?.id===id){inbox=[];inboxError=true;}}
+   });
  }
  async function loadAttentionCount(){
    if(!project)return;
@@ -551,7 +557,7 @@ import HarnessSettings from './HarnessSettings.svelte';
    {#if project}
    <div class="popover" bind:this={inboxMenu}>
     <button class="icon-button" aria-label={inboxCount===null?'Needs me (count incomplete)':inboxCount?'Needs me ('+inboxCount+')':'Needs me'} title={inboxCount===null?'Open questions and missing specifications. The attention count is incomplete because a source is unavailable.':'Open questions and missing specifications'} aria-expanded={inboxOpen} onclick={()=>{inboxOpen=!inboxOpen;actionsOpen=false;filtersOpen=false;if(inboxOpen){attentionFocus=null;void loadDocInbox();void loadDocs();}else{attentionFocus=null;}}}><Icon name="book"/> {#if inboxCount}<span class="inbox-count">{inboxCount}</span>{:else if attentionChecked&&!attentionCountComplete}<span class="inbox-count" aria-hidden="true">?</span>{/if}</button>
-    {#if inboxOpen}{#key project.id}<AttentionPanel projectId={project.id} questions={inbox} {unlinked} {alertState} {alertBusy} {alertMessage} refreshKey={inboxRefresh} focusId={attentionFocus} onopen={openQuestion} onopenquestion={(session,questionId)=>{inboxOpen=false;attentionFocus=null;questionFocus=questionId;setView('Agents');sessionId=session??'';if(project)writeSelectedSession(localStorage,project.id,session??'');}} oncount={(loaded)=>{attentionCount=loaded.open;attentionCountComplete=loaded.complete;attentionChecked=true;}} onchanged={()=>{void loadDocInbox();}} onenable={()=>void enablePhoneAlerts()} ondisable={()=>void disablePhoneAlerts()} ontest={()=>void testPhoneAlert()} onclose={()=>{inboxOpen=false;attentionFocus=null;}}/>{/key}{/if}
+    {#if inboxOpen}{#key project.id}{#if inboxError}<div class="error inbox-load-error" role="alert"><span>Open questions are temporarily unavailable. Try again.</span><button class="small-button" onclick={()=>void loadDocInbox()}>Retry</button></div>{/if}<AttentionPanel projectId={project.id} questions={inbox} questionsUnavailable={inboxError} {unlinked} {alertState} {alertBusy} {alertMessage} refreshKey={inboxRefresh} focusId={attentionFocus} onopen={openQuestion} onopenquestion={(session,questionId)=>{inboxOpen=false;attentionFocus=null;questionFocus=questionId;setView('Agents');sessionId=session??'';if(project)writeSelectedSession(localStorage,project.id,session??'');}} oncount={(loaded)=>{attentionCount=loaded.open;attentionCountComplete=loaded.complete;attentionChecked=true;}} onchanged={()=>{void loadDocInbox();}} onenable={()=>void enablePhoneAlerts()} ondisable={()=>void disablePhoneAlerts()} ontest={()=>void testPhoneAlert()} onclose={()=>{inboxOpen=false;attentionFocus=null;}}/>{/key}{/if}
    </div>
    <button class="icon-button" aria-label="Files and changes" title="Project files and changes" aria-expanded={workspaceOpen} onclick={()=>{workspaceOpen=!workspaceOpen;if(workspaceOpen&&innerWidth<=1100)sidebarHidden=true;}}><Icon name="sidebar"/></button>
    {/if}
@@ -567,14 +573,14 @@ import HarnessSettings from './HarnessSettings.svelte';
   <div class="view-row">
   <div class="view-switch" aria-label="Workspace views">
    {#each VIEW_MODES as mode}
-   <button class:active={view===mode} aria-pressed={view===mode} aria-label={VIEW_LABELS[mode]} title={VIEW_LABELS[mode]} onclick={()=>setView(mode)}><Icon name={mode==='Dependencies'?'graph':mode==='Timeline'?'timeline':mode==='List'?'list':mode==='Wiki'?'book':'agent'} size={14}/><span class="view-label">{VIEW_LABELS[mode]}</span></button>
+   <button class:active={view===mode} aria-pressed={view===mode} aria-label={VIEW_LABELS[mode]} title={VIEW_LABELS[mode]} onclick={()=>setView(mode)}><Icon name={mode==='Dependencies'?'graph':mode==='Timeline'?'timeline':mode==='List'?'list':mode==='Wiki'?'book':mode==='Terminal'?'terminal':'agent'} size={14}/><span class="view-label">{VIEW_LABELS[mode]}</span></button>
    {/each}
   </div>
-  <p class="view-tagline">Documentation is the source of work: write the intent, then link the work to it.</p>
+  <p class="view-tagline">{view==='Terminal'?'Interactive shell · commands run as Pilot’s service user.':'Documentation is the source of work: write the intent, then link the work to it.'}</p>
   </div>
   <!-- Row two: the tools for the view in force. -->
   <div class="tool-row">
-  {#if view!=='Wiki'&&view!=='Agents'}
+  {#if view!=='Wiki'&&view!=='Agents'&&view!=='Terminal'}
   <span class="command-divider"></span>
   <label class="search task-search"><Icon name="search" size={14}/><input aria-label="Search tasks" placeholder="Search tasks" bind:value={search}></label>
   <div class="popover filters-popover" bind:this={filtersMenu}>
@@ -598,6 +604,8 @@ import HarnessSettings from './HarnessSettings.svelte';
   {:else if view==='Wiki'}
   <span class="wiki-hint">{doc?doc.path:'No document selected'} · {docs.length} documents</span>
   <div class="commandbar-end"><button class="compact-button wiki-tree-toggle" aria-label="Show documents" onclick={()=>treeOpen=true}><Icon name="book" size={14}/><span>Documents</span></button></div>
+  {:else if view==='Terminal'}
+  <span class="wiki-hint">Commands start in the selected project; this is not a sandbox.</span>
   {/if}
   </div>
  </div>
@@ -618,6 +626,8 @@ import HarnessSettings from './HarnessSettings.svelte';
  </section>
  {:else if view==='Agents'}
  <AgentsView projectId={project.id} {agentsVersion} sessionId={sessionId} chips={sessionChips} onopenchip={(path)=>openWorkspaceDoc(path)} onsessionchange={sessionChanged} sessionListOpen={sessionListOpen} onsessionlistchange={(open)=>sessionListOpen=open} onmissing={sessionUnavailable} onerror={(message)=>error=message} focusQuestion={questionFocus} onopenproviders={()=>providersOpen=true} onquestions={()=>{void loadInbox();inboxRefresh+=1;}}/>
+ {:else if view==='Terminal'}
+ {#key project.id}<Terminal projectId={project.id} onerror={(message)=>error=message}/>{/key}
  {:else}
  <div class="view-content">
  {#if loading}<div class="empty"><p>Loading board…</p></div>
@@ -631,7 +641,7 @@ import HarnessSettings from './HarnessSettings.svelte';
  {/if}
  {#if project&&workspaceOpen}{#key project.id}<WorkspaceSidebar projectId={project.id} pendingEdits={docUnsaved()||inspectorDirty||failed||saving||docSaving} onbusy={(value)=>workspaceUpdating=value} onupdated={workspaceUpdated} onclose={()=>workspaceOpen=false} onopendoc={openWorkspaceDoc}/>{/key}{/if}
  </div>
- {#if view!=='Agents'}
+ {#if view!=='Agents'&&view!=='Terminal'}
  <footer class="statusbar">
  {#if view==='Wiki'}
   <span class="file-state">{doc?doc.path:'No document selected'} · {docs.length} documents</span>

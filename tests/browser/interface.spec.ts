@@ -127,6 +127,31 @@ test('the harness settings are the owner’s, apply without a restart, and canno
  const shell=dialog.getByLabel('Shell (bash)');
  await expect(shell).toBeDisabled();
  await expect(dialog.locator('[data-capability-state="shell"]')).toContainText('Not offered by this deployment');
- const coding=dialog.getByLabel('Coding tools (read, write)');
+ const coding=dialog.getByLabel('Coding tools (read, write, edit)');
  await expect(coding).toBeDisabled();
+});
+
+test('the owner can set and persist the acceptance policy from harness settings',async({page})=>{
+ await fixture(page,'Acceptance controls fixture');
+ await page.getByRole('button',{name:'Harness settings',exact:true}).click();
+ const dialog=page.getByRole('dialog');
+ await dialog.getByRole('button',{name:'Set all to full auto'}).click();
+ await dialog.getByLabel('Acceptance for push').selectOption('ask');
+ await dialog.getByRole('button',{name:'Save acceptance policy'}).click();
+ await expect(dialog.getByText('Acceptance policy saved.')).toBeVisible();
+ await expect.poll(async()=>page.evaluate(async()=>{const token=document.querySelector('meta[name="dashboard-token"]')?.getAttribute('content')??'';const response=await fetch('/api/acceptance/policy',{headers:{'x-dashboard-token':token}});const {policy}=await response.json();return [policy.mode,policy.actionClasses.commit,policy.actionClasses.push].join(',');})).toBe('agent-may-accept,full-auto,ask');
+});
+
+test('a stale acceptance policy keeps the owner’s unsaved selections',async({page})=>{
+ await fixture(page,'Acceptance conflict fixture');
+ await page.getByRole('button',{name:'Harness settings',exact:true}).click();
+ const dialog=page.getByRole('dialog');
+ await dialog.getByLabel('Acceptance mode').selectOption('agent-may-accept');
+ await page.route('**/api/acceptance/policy',async route=>{
+  if(route.request().method()==='POST') return route.fulfill({status:409,contentType:'application/json',body:JSON.stringify({error:'Policy changed'})});
+  return route.continue();
+ });
+ await dialog.getByRole('button',{name:'Save acceptance policy'}).click();
+ await expect(dialog.getByLabel('Acceptance mode')).toHaveValue('agent-may-accept');
+ await expect(dialog.getByText(/Your selections are still here/)).toBeVisible();
 });

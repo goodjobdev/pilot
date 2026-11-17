@@ -25,3 +25,9 @@ For each flow, specify the user, entry point, successful outcome and alternative
 Keep artifact source in the repository. Give each important screen/state a stable identifier. Link the design to the feature specification and its acceptance criteria; record what changed and why. Screenshots alone are insufficient to define interaction or data rules.
 
 Use the [feature template](../templates/feature.md) and [design template](../templates/design.md). The plan points to these documents instead of duplicating them in task descriptions.
+
+## Workspace visual direction
+
+The workspace uses quiet neutral surfaces, readable typography and blue selected states. New browsers start in the light theme; an existing light or dark preference remains in force. Conversation messages use a readable proportional typeface, while tool output retains monospace formatting. The project navigator reports when a search has no matches. On phones it opens below the entire responsive header, without covering the view controls. The same controls and views remain available at phone and desktop widths, with visible keyboard focus and reduced-motion support.
+
+These refinements are implemented locally; they are not a claim that a particular deployment includes them.

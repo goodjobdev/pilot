@@ -5,10 +5,10 @@ No shell or environment-file edit is needed.
 
 ## Supported connections
 
-- OpenAI API key, or **Sign in with ChatGPT**.
-- **OpenAI Codex (legacy)** subscription sign-in, including the library's headless
-  device-code method.
-- Anthropic, Google and OpenRouter API keys.
+- OpenAI, Anthropic, Google and OpenRouter API-key connections.
+- **Sign in with ChatGPT** and **OpenAI Codex (legacy)** can store credentials, but their current
+  generation transports omit the output bound and are refused. A successful sign-in does not mean
+  these models can run. Use a supported API-key transport instead.
 
 These use the pinned Pi AI 1.3.0 adapters and bundled chat-model catalog. Custom
 provider endpoints and arbitrary provider plugins are not supported by this UI.
@@ -17,10 +17,8 @@ Availability in the bundled catalog does not guarantee account entitlement.
 
 ## Sign in from a phone
 
-For legacy Codex, choose **Device code login (headless)**, open the provider link
-and enter the code there. The backend polls using the pinned provider flow.
-
-The OpenAI provider uses a different browser/PKCE flow. Complete sign-in in a new
+These sign-in flows are retained for credential management, but currently cannot be used for model
+generation because their transport does not provide a verifiable output cap. The OpenAI provider uses a browser/PKCE flow. Complete sign-in in a new
 tab. Its final callback is a localhost URL; on a phone it will not reach the
 server. Copy that full URL from the address bar into Pilot's waiting sign-in
 prompt. The library validates the callback and exchanges the code on the server.
@@ -74,9 +72,13 @@ authorizes calls submitted by the owner and continuation of unfinished runs.
 Model dispatch checks that switch and provider availability on every request,
 including queued work and resumed checkpoints. Current limits:
 
-- at most 4,096 output tokens per request;
-- at most eight model requests after the latest user input;
-- no automatic generation/provider retries or automatic compaction.
+- Ordinary sessions use the configurable instance output and turn limits (defaults: 32,000 output
+  tokens per request and 40 turns after the latest input). A zero turn limit is unlimited.
+- Owner-created workers have separate limits of at most 4,096 requested output tokens per request and
+  eight model requests per run; lower instance limits still apply.
+- Supported locked adapters' outgoing payloads must carry a verifiable output bound. Missing or inflated
+  bounds and uncheckable transports are refused; providers must honor the requested value.
+- Adapter retries and a second fallback payload are disabled; automatic compaction is disabled.
 
 These are **not a monetary cap**. Input tokens, provider pricing, failed calls
 and subscription rules still matter; provider-side budgets are recommended.
@@ -93,7 +95,7 @@ No promise is made that third-party harness use is included in a subscription.
 Automated tests use disposable roots, fake credentials and synthetic providers:
 credential persistence/permissions, concurrent refresh and logout, one-use login
 prompts/cancellation, default/favourite sorting, actual harness model dispatch,
-dispatch opt-in and the eight-turn limit. Browser tests exercise key entry and
+dispatch opt-in and the configured turn limit. Browser tests exercise key entry and
 persisted model preferences without contacting a model.
 
 These tests are **not** a live provider sign-in or billed generation acceptance.

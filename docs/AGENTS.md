@@ -43,36 +43,49 @@ exactly one description, which is the description the interface shows beside its
 | `write_docs` | Create or update planning tasks, dependencies and milestones. |
 | `file_read` | Read a file inside the project's connected repository worktree. |
 | `file_edit` | Propose or apply one bounded edit to a file inside the project's connected repository worktree. |
-| `run_tests` | Submit a bounded coding job from the fixed recipe allowlist. |
-| `fork` | Branch a transcript and create a child worktree. |
+| `file_write` | Directly write or edit files through the coding tools. |
+| `shell` | Run commands as the application user through the coding shell. |
+| `run_tests` | Run this project's fixed `node --test` recipe as the application user. It is not a sandbox: the tests can read stored credentials and every project and can modify this project. |
+| `fork` | Branch a transcript, create a paused child worktree, and send one input into an active child that this conversation parented. |
 | `accept` | Accept a completion record under the acceptance policy in force. |
-| `commit` | Commit work in the project's repository. |
-| `push` | Push a commit to a remote. |
-| `deploy` | Deploy a release. |
-| `spend` | Incur a cost through a provider or a paid service. |
-| `provision` | Create infrastructure or another resource. |
-| `publish` | Publish an artifact to a channel. |
+| `commit` | Commit the exact staged tree to the project's fixed Pilot branch, under the acceptance policy. Never pushes. |
+| `push` | Push one accepted commit to the project's owner-configured local remote, without force. |
+| `deploy` | Promote the project's built artifact into the owner-configured local deployment directory, retaining the previous generation. |
+| `spend` | Charge one metered amount against the owner-configured billing endpoint, within its caps. This build has no live billing target configured. |
+| `provision` | Create one Pilot-owned local resource directory with a bounded manifest under the owner-approved root. This build provisions no infrastructure. |
+| `publish` | Copy reviewed files into the owner-configured local publication root. |
 
-The scopes that govern a tool this build exposes to a model are declared in `AGENT_TOOL_SCOPES`
-(`ask_question`, `record_note`, `read_notes`, `list_docs`, `read_doc`, `read_board`,
-`write_board`, `file_read`, `file_edit`, `run_tests`). The rest are capabilities the command surface and
-the acceptance record name; nothing in the vocabulary is a label with nothing behind it.
+The authoritative tool-to-scope mapping is `AGENT_TOOL_SCOPES`. A scope can be granted only for
+an installed capability; a declaration alone does not install an action. Installation also depends
+on the instance switches and control store.
 
 ## Tool installation status
 
-Not every scope with a declared tool-scope mapping actually has a running tool in all builds.
-Only the following scopes correspond to a tool this instance installs:
-
-| Scope | Tool installed | Default |
+| Scope | Model-facing tools | Availability |
 |---|---|---|
-| `ask_question` | Yes, always | On |
-| `record_note` | Yes, always | On |
-| `read_notes` | Yes, always | On |
-| `file_edit` | Conditional — see below | Off (behind switch) |
-| `read_docs` | `list_docs`, `read_doc`, `read_board` | Available; requires a grant |
-| `write_docs` | `write_board` | Available; requires a grant |
-| `file_read` | **No** — not installed | N/A |
-| `run_tests` | **No** — not installed | N/A |
+| `ask_question`, `record_note`, `read_notes` | Question and note tools | Installed |
+| `read_docs`, `write_docs` | Planning and board tools | Installed |
+| `file_read`, `file_write` | `read`, `write`, `edit` | When coding tools are enabled |
+| `shell` | `bash` | When the coding shell is enabled |
+| `file_edit` | `file_edit` | When bounded file editing is enabled |
+| `accept` | `acceptance_read`, `acceptance_accept`; optionally `acceptance_record` | With a control store; requires a named bound agent. Evidence recording requires the default-off deployment switch. |
+
+| `fork` | `fork_context`, `fork_create`, `fork_dispatch` | With a control store and enabled agent harness |
+| `run_tests` | `run_tests` | When the local test runner is enabled (`DASHBOARD_TEST_RUNNER=on`). Requires a named agent bound to the session, the `run_tests` scope and the project in its project grant. |
+| `deploy` | `deploy_preview`, `deploy_accepted` | Default off (`DASHBOARD_DEPLOY=on`). Promotes the project's configured built artifact into the owner-configured local directory; requires a bound named agent, the `deploy` grant and evidence accepted for `deploy` under `full-auto`. |
+| `publish` | `publish_preview`, `publish_accepted` | Default off (`DASHBOARD_PUBLISH=on`). Copies reviewed files into the owner-configured publication root; same authority and policy requirements. |
+| `provision` | `provision_preview`, `provision_accepted` | Default off. Installed only with a control store, `DASHBOARD_PROVISION_ACTIONS=on` and an owner-approved root; requires a bound named agent, the `provision` grant, and evidence accepted for `provision` under `full-auto`. |
+| `spend` | `spend_preview`, `spend_accepted` | Default off. Installed only with a control store, `DASHBOARD_SPEND_ACTIONS=on`, an owner-configured billing endpoint and credential, one fixed currency and both caps; requires a bound named agent, the `spend` grant, and evidence accepted for `spend` under `full-auto`. |
+| `commit` | `commit_preview`, `commit_accepted` | Default off (`DASHBOARD_AGENT_COMMIT=on`). Commits the exact staged tree to the project's fixed Pilot branch after evidence accepted for `commit` under `full-auto`; never stages or pushes. |
+| `push` | `push_preview`, `push_accepted` | Default off (`DASHBOARD_AGENT_PUSH=on`). Pushes one accepted commit, without force, to the owner-configured local remote; no hosted credential integration. |
+
+
+The shell runs as the application user without a per-agent sandbox; it can reach same-user
+credentials and may perform actions outside these separately named scopes. Grant it only when that
+access is intended. The `run_tests` tool runs the fixed recipe the same way: a child process of the
+application with no container, no cgroup memory or PID limit, and a best-effort process-group stop.
+It can read `<data>/credentials/`, the durable store and every project. Grant it only where that is
+intended. The acceptance tools record decisions; they do not perform the accepted action.
 
 A scope whose tool is not installed remains in the vocabulary, but the agent cannot call it.
 Settings disable new unavailable grants and preserve existing ones unless the owner removes them.
@@ -102,9 +115,32 @@ Enforcement happens in the **authoritative dispatch path**, never in the interfa
    harness's own tool task reads the **session's** authority **again on every call** — model-issued and
    nested — and refuses, with a precise reason, *before the call's intent is recorded*: first a tool the
    scopes forbid, then a call that would act on a project outside the authority's own project set. A
-   forbidden call therefore produces **no side effect at all**, however it was crafted: a scope revoked,
-   a binding changed, or a project removed from the set after the offered list was built is still
-   refused, because the re-check is the authority and the offered list is a courtesy.
+   call refused at this hook produces no tool effect. The offered list is a courtesy, not the authority.
+   A later revocation cannot retract an effect already in flight: asynchronous checks and filesystem
+   mutations are not one atomic transaction.
+
+A session with no active governing agent is refused before a provider request, rather than sent to
+an unrestricted owner context. For bounded `file_edit`, the current binding, scope and capability
+are checked again during execution and immediately before rename; an admitted auto-apply without a
+durable write confirmation has an **unknown** outcome and is never automatically replayed. These
+checks include production agent/binding revisions, acceptance-policy revisions and the live harness
+settings revision, so a revoke-and-restore during a call is not treated as unchanged. File edits
+through one tool instance are serialized by resolved target; this is not a lock across processes,
+separate tool instances, path aliases or external writers. These checks do not make revocation atomic
+with a filesystem write, prevent same-user path replacement, or stop detached processes. The same ticket-and-recheck approach covers `record_note`
+and `write_board` before their effects; it does not stop an append or rename already in flight. Board
+revision hashes are rechecked immediately before rename, but the check and rename are not atomic
+against independent external writers: concurrent filesystem edits can still be overwritten. Inspect
+uncertain outcomes before taking further action.
+Authenticated owner HTTP routes derive their audit actor from the owner session, not a submitted agent
+label; they cannot create agent-attributed decisions or file edits. The Agent Manager's project-scoped
+**Action history** pages through durable accepted-action intents, 50 at a time, and reports uncertain,
+not-started or receipt-recorded states. It does not verify a remote target, expose arbitrary external
+receipt IDs, clear a barrier or retry an action. An owner can record a revision-bound observation
+using fixed choices; it is an unverified statement of what the owner saw, not a reconciliation, a
+confirmation that an effect stopped or authority to retry. Observations do not release any barrier.
+An empty list does not establish that no external activity occurred; older releases, other stores and
+external writers are outside this view.
 
 The **project set** is enforced against the project the harness acts on, so a session bound to a
 multi-project agent works in any project the agent allows and is refused — server-side, with no side
@@ -124,14 +160,17 @@ a durable **session binding**:
 
 The semantics are explicit and fail closed:
 
-- **No binding record at all** — the session is unmanaged, and the project-level rule that predates the
-  binding still applies: the scopes of the enabled agents whose project scope allows the project.
+- **No binding record at all** — the project-level legacy rule applies: the intersection of enabled
+  agents whose project scope allows the project. A project with no agent history has owner dispatch;
+  once any agent has governed the project, disabling, archiving or moving the last one away instead
+  leaves an empty allowlist. Bind or enable an agent rather than silently restoring owner privileges.
 - **A binding naming no agent (an unbind)** — an empty allowlist, so **every tool is refused**, with the
   named reason. This is deliberate, never the result of an accident.
 - **A binding naming a disabled or archived agent** — the same refusal, naming that agent.
 - **A binding naming a live agent** — exactly that agent's scopes and project set are in force.
 
-The binding is read **per session, on every tool call**, so a binding or a scope change takes effect at
+Only the owner can change a session binding; only the owner-controlled harness records conversation
+bindings. The binding is read **per session, on every tool call**, so a binding or a scope change takes effect at
 the next dispatch with **no restart**. It is written through `POST /api/sessions/:id/agent` and read
 through the matching `GET`; the session bar in the Agents view is the owner's way to choose or change
 the agent, and it shows the agent and the scopes actually in effect, including the empty case, rather
@@ -148,7 +187,7 @@ refusal beside the field the server named.
 | Who | May do |
 |---|---|
 | The **owner** (the authenticated session) | Change any scope, create any agent, change or archive any agent. |
-| An **agent** | Nothing at all on its own record; nothing that creates an agent; and only a change that stays **inside the scopes it holds itself**. |
+| An **agent** | Nothing on its own record and no creation. It may change another agent's scopes only within its own scopes, or archive a permitted agent. Workspace, budgets, model, enabled state and other fields remain owner-only. |
 
 Three refusals are explicit, and none of them is merely a hidden button:
 
@@ -157,7 +196,8 @@ Three refusals are explicit, and none of them is merely a hidden button:
 - an agent **may not create another agent**;
 - an agent **may not give another agent a scope it does not hold itself**. The rule is checked against
   the allowlist the change would *leave in force*, not against the request alone, so widening in two
-  steps is refused at the step that widens.
+  steps is refused at the step that widens. A disabled or archived agent cannot govern another agent;
+  actor authority and target revision are checked again inside the durable write transaction.
 
 Every change is recorded durably, with the actor, the action and the instant, in the audit row beside
 the record; `agent.read` serves that trail and the view renders it.
@@ -220,6 +260,152 @@ Two modes, and **the mode in force is read from the acceptance policy rather tha
   policy: set it to `agent-may-accept` to permit auto-apply, and it returns to propose-only when
   that policy is restored.
 
+
+## The local deploy and publish capabilities
+
+`deploy` and `publish` now each install one real, model-facing pair of tools, and both are **disabled
+by default**. The switch decides whether the tools exist at all; the agent scope of the same name
+decides who may call them; a bound named agent and the acceptance policy decide whether an effect is
+authorized. A scope granted without its switch is reported to the model as granted but unavailable.
+
+| Tool | Scope | Instance switch |
+| --- | --- | --- |
+| `deploy_preview`, `deploy_accepted` | `deploy` | `DASHBOARD_DEPLOY=on` |
+| `publish_preview`, `publish_accepted` | `publish` | `DASHBOARD_PUBLISH=on` |
+
+These are **local filesystem targets**, not Cloudflare, a CDN, a CI pipeline or any other provider.
+Nothing here makes a network request or handles a provider credential.
+
+### Configuring the destination (owner only)
+
+The exact destination is the owner's, never the model's:
+
+- `POST /api/projects/:id/action-destinations/deploy` with
+  `{ revision, enabled, artifactPath, targetDirectory }`, where `artifactPath` is a relative path
+  inside the project's connected worktree (for example `dist`) and `targetDirectory` is an existing
+  **real** directory under the instance's configured browse roots.
+- `POST /api/projects/:id/action-destinations/publish` with
+  `{ revision, enabled, publicationRoot }`, where `publicationRoot` is also an existing real
+  directory under the configured browse roots.
+
+Both writes are owner-only, revision-checked and audited like the other action targets. They execute
+nothing; a configured destination is not a performed action. The route refuses a directory reached
+through a link, a directory outside the approved roots and a relative or escaping artifact path.
+
+### What a deploy really does
+
+`deploy_preview` reads the configured artifact directory, refuses anything that is not a regular
+file, and returns a sorted SHA-256 manifest digest, the file count and the bound artifact identity.
+`deploy_accepted` then requires that the session holds an acceptance for exactly that target-bound
+artifact, under `agent-may-accept` with the `deploy` class set to `full-auto`. With the authority and
+policy in force it:
+
+1. copies the artifact into an owned staging directory inside the configured target and reads the
+   staged digest back;
+2. renames the staging directory to an immutable `generations/gen-<digest-prefix>` directory;
+3. replaces the stable `current` link atomically by renaming a temporary link over it;
+4. reads the served content back through `current` and requires the same digest;
+5. records the generation and the **previous generation** in a durable outcome.
+
+The previous generation directory is retained, never removed. To roll back, an operator points the
+`current` link at the retained previous generation; Pilot never rolls back automatically and never
+deletes a generation. If the artifact digest changed after the preview, the target revision changed,
+the target is not a real directory under the approved roots, or `current` exists but is not a link
+this tool created, the deploy is refused before any copy.
+
+### What a publish really does
+
+`publish_preview` accepts 1–500 paths relative to the project's connected worktree and returns each
+file's digest beside the target-bound artifact identity. `publish_accepted` requires the same
+acceptance form and then copies exactly those files into a staging directory inside the configured
+publication root, reads the staged digests back, and renames the staging directory to
+`publish-<digest-prefix>` with one atomic rename. It reads the published digests back once more. An
+earlier publication is never replaced or removed, so a publish is additive and has no rollback
+pointer; rolling publication back is an operator decision about what the server reads.
+
+A path that escapes the worktree, a symlink at any component, a non-regular file, a file over 2 MiB
+or a total over 16 MiB is refused before any copy. The same caps apply to a deploy artifact (500
+files, 2 MiB each, 16 MiB total).
+
+### Uncertainty, duplication and concurrency
+
+Both effects run through the existing accepted-action executor: a durable intent is written before
+the effect, a confirmed effect records a receipt, and an interruption or an unreadable result is
+reported as **uncertain** with the intent and its barrier retained. That intent is never replayed
+automatically; inspect the target and the durable intent first. A duplicate invocation is refused
+rather than performed twice.
+
+The durable resource key binds the configured directory **and** the promoted content. A later
+generation of the same target is therefore admissible, while replaying the same accepted content is
+refused. It does **not** serialize two different contents targeting one directory at the same time:
+concurrent deployments to the same target can interleave, and the last swap wins. This is a local,
+same-UID design; it is not a transactional deployment system or a lease.
+
+### Honest limits
+
+- These tools do not serve anything. A separate web server or process must read the configured
+  target directory; Pilot neither starts it nor checks that it is healthy.
+- A digest proves the bytes this process read and copied, not who produced them or that serving them
+  is safe. Evidence and acceptance remain claims about the artifact.
+- A staging directory is briefly visible under the configured target (dot-prefixed
+  `.pilot-staging-…`). Old staging directories left by a hard crash are not removed automatically.
+- The same-UID shell can read and write the same directories, so enabling `shell` is not contained
+  by these tools.
+- Both tools are refused in a fork session, because they would write a parent-owned target.
+
+## The bounded commit and push capability
+
+`commit` and `push` govern four tools, and each is **disabled by default behind its own deployment
+switch**. While `DASHBOARD_AGENT_COMMIT` is not `on`, `commit_preview` and `commit_accepted` do not
+exist at all; the same is true of `push_preview` and `push_accepted` and `DASHBOARD_AGENT_PUSH`. A
+scope grant alone installs nothing, and configuring a target grants nothing. Both need the durable
+control store.
+
+To enable them:
+
+1. Set `DASHBOARD_AGENT_COMMIT=on` and/or `DASHBOARD_AGENT_PUSH=on` in the environment and restart.
+2. Configure the target for each project through the authenticated owner interface:
+   `/api/projects/:id/action-targets/commit` (a fixed target; the request carries only a revision and
+   an enabled flag) and `/api/projects/:id/action-targets/push` (a revision, an enabled flag and the
+   name of one remote already configured in the project's Git repository). The server derives the
+   branch, repository and — for push — the digest of the remote's canonical local path. No model and
+   no client supplies a path, remote URL, branch or command.
+3. Set the acceptance policy to `agent-may-accept` with the `commit`/`push` class decision
+   `full-auto`, and grant the scope to a bound named agent. A class decision other than `full-auto`
+   refuses the action even when evidence was already accepted.
+
+What the tools do, and what they do not:
+
+- `commit_preview` inspects the exact staged tree and its parent on the project's fixed Pilot branch
+  (`refs/heads/work/pilot-<id prefix>`) and returns the artifact the evidence must bind. It stages
+  nothing, and a preview writes Git tree objects even though it updates no branch.
+- `commit_accepted` re-verifies the staged tree, parent, branch, target revision, acceptance, policy
+  and session, then creates one immutable commit object for **exactly** that tree and moves only that
+  branch with a compare-and-swap. It runs no hooks or filters, sets its own author and committer, and
+  **never pushes**.
+- `push_preview` inspects one commit and the configured push target, reporting the remote branch head.
+  That observation is not a reservation: the remote can change afterwards.
+- `push_accepted` pushes exactly the accepted commit to exactly the configured branch of the
+  configured remote, **without force**. It refuses when the remote branch is not at that commit's
+  parent (so it cannot be a fast-forward), re-checks the remote identity immediately before the write,
+  and reads the branch back afterwards. The transport can reach only a local filesystem repository;
+  there is no hosted credential integration and no network transport in this build.
+
+Limits, stated plainly:
+
+- **Staging is not secret scanning.** Refused paths and symlinks are checked, and the change is
+  bounded in size, but nothing decides that the committed content is safe or free of secrets.
+- **These checks are not external-writer compare-and-swap.** The branch and remote are verified
+  around the write, not atomically with it, so another process or writer can still change either
+  between the last check and the update. A detected substitution is refused; an undetected one is not.
+- **Outcomes are durable and single-use.** One acceptance reserves one action intent. A pending or
+  uncertain intent is inspectable and never replayed automatically: inspect the branch, the remote
+  and the action history before doing anything else. The push adapter's post-push read-back is an
+  observation, not independent proof.
+- **The commit target is per project, not per agent.** The target fixes the repository and branch;
+  the agent's project scope decides which projects it can act in, and the branch is never `main`.
+
+
 ## Honest limits
 
 - **Conversation selections are durable.** Planning tools are added to existing root and named
@@ -232,15 +418,110 @@ Two modes, and **the mode in force is read from the acceptance policy rather tha
   a widening.
 - **The project scope is a set of project ids, or every project.** A tool call against a project outside
   the authority's set is refused at dispatch; the refusal names the project's id, never a filesystem
-  path.
+  path. The recorded workspace subpath is not enforced by the direct coding tools. Shell access is not
+  confined to the project or the subpath and can reach other files and same-user credentials.
 - **The mode switch is the acceptance policy's mode.** This build reuses that one owner-set switch rather
   than adding a second, dedicated file-edit class; a dedicated class is follow-up work.
-- **The budgets are declarations.** They are validated and recorded, and the interface shows them, but
-  nothing in this round enforces a per-agent request, token or job count at dispatch; the harness's own
-  4,096-token and eight-turn ceilings are what actually bound a run. Enforcing a per-agent budget is
-  follow-up work, and it is stated here rather than implied.
+- **Agent budget enforcement is partial.** For an attributable named-agent session, each direct provider request
+  reserves a durable request slot before sending, shared across projects; owner-created worker runs
+  are separate, are not attributable to that agent, and are not counted in its ledger; `maxRequests` caps the slots
+  recorded since accounting was installed, not historical requests from earlier releases. The owner may
+  revise that threshold, including raising it after exhaustion; doing so does not reset the count, and
+  lowering it below the count refuses further requests. Agents cannot change budget fields. Failed or
+  uncertain attempts are not refunded. The application checks the final output-token field produced by
+  the locked, supported provider adapters against the instance, agent and worker limits before a model
+  request. Transports whose payload cannot be checked (including OpenAI Codex), missing fields, and
+  adapter-expanded limits are refused; some models or thinking settings may therefore be unavailable.
+  Automatic adapter retries and a second payload fallback are disabled. This is a requested bound, not
+  proof the provider honored it or a spending limit. Authentication can refresh credentials separately,
+  before a model request is admitted, and a started refresh cannot necessarily be cancelled. A session governed by several agents refuses a request
+  if any of them has a configured budget, until a single agent is bound. `maxJobsPerHour` is enforced
+  for the installed `run_tests` capability only: each invocation reserves one rolling-hour job through
+  the durable ledger before its intent is written, the reservation is never refunded, and the limit
+  is not a spending limit. No other application job path is wired to it. Instance-wide harness settings and
+  the separate worker limits still apply; a zero instance turn limit is unlimited. A rollback to an
+  older build bypasses this ledger; release and rollback review must explicitly preserve budget
+  enforcement and must not assume older binaries understand these reservations. Changes after the
+  last authority check cannot retract an already-issued provider request.
 - **A refusal carries no path.** Every message the registry and the tool produce is path-free, so a
   refusal shown in the interface or written to a log names a field or a scope and never a filesystem
   location.
 - **The registry is working state, not documentation.** Markdown in the project stays canonical, so
   losing the registry costs convenience and never a planning fact.
+
+
+## The installed `run_tests` capability
+
+When the instance sets `DASHBOARD_TEST_RUNNER=on` (default off), a named agent bound to a session can
+call `run_tests`. The tool runs one constant command — `node --test` with no arguments — in the
+registered project root, as a child process of this application.
+
+It is enabled only together with a durable control store and the agent registry, and every call is
+checked on the installed path:
+
+1. The privilege hook issues a one-use ticket for the exact call; the owner's own dispatch (no bound
+   agent) is refused.
+2. The session must be bound to that agent, the agent must hold `run_tests`, the project must be in its
+   project grant, and the versioned authority snapshot must still match. A change refuses the call
+   before anything is reserved or started.
+3. One rolling-hour job is reserved through the durable agent budget ledger before the intent is
+   written; a second invocation beyond the limit is refused.
+4. The durable intent is keyed by a stable job id derived from the project, the conversation and the
+   task identity. A duplicate invocation returns the existing record and cannot start a second job.
+5. The authority is re-read in the intent's write transaction and once more immediately before the
+   process starts. A revocation in that window records `not-started`, so the record says nothing ran.
+6. A fork is refused: the fixed recipe's working directory is the registered project root.
+
+The receipt records the exit code, a bounded prefix of stdout and stderr with truncation flags and
+counted bytes, the duration and the exact command. A timeout or cancellation is recorded `unknown` or
+`interrupted`, never as success, and is never retried automatically. After a restart, an intent left
+pending becomes `unknown` once and is not re-run. The tool is **not a sandbox**: see
+[the runner page](RUNNER.md) for exactly what it can reach.
+
+## Installed `spend` and `provision` tools
+
+These two are the first model-facing tools that really perform a consequential class. Each is
+**default off** and needs all of the following, in this order: the deployment switch, a durable
+control store, a bound named agent holding the scope, a project inside that agent's project scope,
+self-reported evidence for the exact artifact, an acceptance by that agent for the class, and an
+`agent-may-accept` policy whose decision for the class is `full-auto`. The tool rechecks the live
+scope, project and policy around the effect; a refusal before the effect leaves nothing done.
+
+- `spend_preview` and `spend_accepted` charge one metered amount (minor units, owner-fixed currency)
+  against one owner-configured billing endpoint. The endpoint, the bearer credential (a private file
+  under `<data>/credentials/`, never a project root), the account, the currency and the caps are
+  deployment configuration, never model arguments and never returned to the model. The amount is
+  bounded by a per-charge cap and by a durable per-project cap; both are checked before any request.
+  A reservation is never refunded: an admitted amount keeps counting even if the charge is later
+  refused, fails or stays unknown, so releasing it is the owner's decision, not an automatic retry.
+  The charge identity is the project, the target and the amount, so **one charge per amount per
+  project** is admitted for the life of the durable store: a second accepted charge of the same
+  amount is refused rather than sent. There is no release path for a reservation in this build — an
+  amount that was reserved keeps counting even after a refusal or an unknown outcome — so an owner
+  who needs the same amount again must use a different amount or a reviewed change to the ledger.
+  An unusable credential is refused at startup and again before any reservation, but a credential
+  that becomes unusable after startup leaves an uncertain outcome with the cap consumed.
+  The `Idempotency-Key` is derived from the accepted artifact. A repeat of the same accepted charge is
+  refused from its durable intent rather than sent again. Redirects are refused, the JSON media type
+  and a provider charge id are required, and the response is bounded. A non-2xx status, redirect,
+  timeout, lost response or unverifiable body is an **unknown** outcome: the durable intent and the
+  cap reservation remain and nothing replays automatically. This is **not provider-side
+  exactly-once** — the provider decides whether it honours the key — and **not a global spending
+  cap**: it bounds only Pilot's own charges through this one target. Revocation cannot cancel a
+  request that is already in flight.
+- `provision_preview` and `provision_accepted` create exactly one **Pilot-owned local directory** with
+  one bounded `manifest.json` at `<approved root>/<projectId>/<targetId>`, written in a staging
+  directory and published with one atomic `rename`. That is the whole capability: no infrastructure,
+  no template, no credential and no provider call. A repeat of the same content is idempotent and
+  returns the recorded receipt; different content is a conflict and leaves the existing resource
+  untouched. Path escapes, symlinked roots, parents, targets or manifests, an existing target that no
+  Pilot manifest owns, and oversized input are refused before anything is published. The approved root
+  must be a real directory that overlaps neither the data root nor a registered project. Check-then-use
+  on a filesystem is not atomic, so a same-user process can still substitute a path between calls.
+
+Both classes are excluded from forks, like the other parent-project action tools.
+
+
+## Agent-facing acceptance tools
+
+A named agent with the `accept` scope can call `acceptance_read` to inspect its session's paged summaries, `acceptance_record` to record its own session's self-reported evidence only when `DASHBOARD_AGENT_EVIDENCE_RECORDING=on` is explicitly set at deployment, and `acceptance_accept` to accept a specific evidence record and exact artifact. The server supplies the bound agent identity; a model cannot assert an owner identity. Evidence is a claim, not independent proof of tests or diffs. The control store enforces the instance acceptance policy, scope, artifact revision and single-use rule. These tools do not execute the action class named by the record. With no control store, they are not installed. `commit_accepted` and `push_accepted` are separate tools that do perform the named class, and only where their own deployment switch, target, scope and `full-auto` class decision are all in force (see above).
