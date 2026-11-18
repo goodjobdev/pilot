@@ -12,11 +12,13 @@ pilot:
 
 # Status and review gate
 
-**Pending design only; not implemented, available, or deployed.** This records the user's request for an
-isolated preview of an **already-running dev server started from an owner terminal session**. It is
-not a request to preview a disposable package-manager/server manager, and does not authorize adding a
-preview route, port forward, tunnel, process launcher, shell command, or live deployment change. This
-proposal needs a separate security/design advisor review before implementation.
+**The optional owner-terminal link is implemented; isolated preview remains experimental and is not
+implemented, available, or deployed by Pilot.** `DASHBOARD_PREVIEW_CONTROL_ORIGIN` can expose a link
+from the authenticated terminal UI to a separately authenticated preview control site. The link
+opens no preview route in Pilot and does not create mappings, start processes, or send commands. The
+experimental gateway source under `deploy/experimental/preview-gateway-poc/` is not wired into Pilot
+or standard deployment. Its security, packaging and operational conditions remain subject to review
+before use.
 
 ## Design intent
 
@@ -29,8 +31,8 @@ be presented as one.
 ## Scope and explicit non-goals
 
 - Preview only a server that the owner has already started in an existing terminal session.
-- A future design may specify a narrowly bound preview transport, but this document does not select
-  a proxy, port, host, tunnel, process supervisor, or authentication mechanism.
+- The experimental POC is not a selected production architecture. This document does not authorize
+  enabling its proxy, port, host, tunnel, process supervisor, or authentication mechanism.
 - Do not launch or supervise dev servers, run package manager commands, create a disposable manager,
   or change terminal command semantics as part of preview work.
 - Do not expose arbitrary host ports, arbitrary URLs, files, shell output, or the Pilot control API.
@@ -140,9 +142,10 @@ security architecture is approved. Do not mock these states as if they exist in 
 
 ## Unresolved decisions
 
-No transport, authentication flow, UI, tab-versus-iframe choice, session/process identity mechanism,
-timeout, or exposure path has been chosen. A separate advisor/security review must resolve TP-1
-through TP-8 and approve a concrete design before implementation. Exact process isolation against
-hostile same-UID code requires a separately reviewed OS identity or equivalent containment; absent
-that, the threat must remain an explicit limitation. Until then Pilot continues not to serve active
-terminal preview content; ordinary terminal use is unchanged.
+The UI is only an external control-site link; it does not serve active terminal preview content.
+The POC's concrete deployment architecture, site selection, enrollment, node identity, key/certificate
+provisioning, operational recovery, and hostile-content boundaries still require independent review.
+Exact process isolation against hostile same-UID terminal code is not provided: terminal commands run
+as Pilot's service user and can reach whatever that identity can reach. Do not enable or deploy either
+experimental gateway from this repository without separate owner/security review. Ordinary terminal
+behavior is unchanged.

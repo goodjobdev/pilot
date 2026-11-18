@@ -6,17 +6,18 @@
  import {api,type TerminalInfo} from './api';
  import Icon from './Icon.svelte';
  let {projectId,onerror}:{projectId:string;onerror:(message:string)=>void}=$props();
- let host=$state<HTMLDivElement>(),sessions=$state<TerminalInfo[]>([]),active=$state<TerminalInfo|null>(null),busy=$state(false),message=$state(''),problem=$state('');
+ let host=$state<HTMLDivElement>(),sessions=$state<TerminalInfo[]>([]),active=$state<TerminalInfo|null>(null),busy=$state(false),message=$state(''),problem=$state(''),previewControlOrigin=$state<string|null>(null);
  let xterm:XTerm|null=null,fit:FitAddon|null=null,socket:WebSocket|null=null,resizeObserver:ResizeObserver|null=null,inputDisposable:{dispose:()=>void}|null=null;
  let disposed=false,lifecycleGeneration=0,attachmentGeneration=0;
  const pendingCreated=new Set<string>();
 
- onMount(()=>{xterm=new XTerm({cursorBlink:true,convertEol:false,scrollback:5000, fontFamily:'ui-monospace, SFMono-Regular, Menlo, monospace',fontSize:13,theme:{background:'#101318',foreground:'#e5e9f0',cursor:'#b9c9ff'}});fit=new FitAddon();xterm.loadAddon(fit);if(host)xterm.open(host);inputDisposable=xterm.onData(data=>{if(socket?.readyState===WebSocket.OPEN)socket.send(JSON.stringify({type:'input',data}));});resizeObserver=new ResizeObserver(()=>resize());if(host)resizeObserver.observe(host);void refresh();});
+ onMount(()=>{xterm=new XTerm({cursorBlink:true,convertEol:false,scrollback:5000, fontFamily:'ui-monospace, SFMono-Regular, Menlo, monospace',fontSize:13,theme:{background:'#101318',foreground:'#e5e9f0',cursor:'#b9c9ff'}});fit=new FitAddon();xterm.loadAddon(fit);if(host)xterm.open(host);inputDisposable=xterm.onData(data=>{if(socket?.readyState===WebSocket.OPEN)socket.send(JSON.stringify({type:'input',data}));});resizeObserver=new ResizeObserver(()=>resize());if(host)resizeObserver.observe(host);void refresh();void loadPreviewControl();});
  onDestroy(destroy);
  function isLive(generation:number){return !disposed&&generation===lifecycleGeneration;}
  function closePendingCreated(id:string){if(!pendingCreated.delete(id))return;void api.closeTerminal(projectId,id).catch(()=>{});}
  function destroy(){if(disposed)return;disposed=true;lifecycleGeneration++;attachmentGeneration++;for(const id of [...pendingCreated])closePendingCreated(id);resizeObserver?.disconnect();inputDisposable?.dispose();inputDisposable=null;detachSocket();xterm?.dispose();xterm=null;}
  async function refresh(){const generation=lifecycleGeneration;try{const result=await api.terminals(projectId);if(isLive(generation))sessions=result.terminals;}catch(e){if(isLive(generation))problem=(e as Error).message;}}
+ async function loadPreviewControl(){try{const config=await api.terminalPreview();if(!disposed)previewControlOrigin=config.controlOrigin;}catch{/* preview control is optional; terminal remains available */}}
  function resize(){if(!xterm||!fit)return;try{fit.fit();if(socket?.readyState===WebSocket.OPEN)socket.send(JSON.stringify({type:'resize',cols:xterm.cols,rows:xterm.rows}));}catch{/* terminal may be between mounts */}}
  async function open(){if(busy||disposed)return;const generation=lifecycleGeneration;busy=true;problem='';message='';try{const created=await api.openTerminal(projectId,{cols:xterm?.cols??80,rows:xterm?.rows??24});if(!isLive(generation)){void api.closeTerminal(projectId,created.terminal.id).catch(()=>{});return;}pendingCreated.add(created.terminal.id);sessions=[created.terminal,...sessions];await attach(created.terminal);if(isLive(generation))pendingCreated.delete(created.terminal.id);}catch(e){if(isLive(generation))problem=(e as Error).message;}finally{if(isLive(generation))busy=false;}}
  async function attach(info:TerminalInfo){if(disposed)return;if(info.connected){problem='This terminal already has a browser attached.';return;}const generation=lifecycleGeneration,attempt=++attachmentGeneration,isCurrent=()=>isLive(generation)&&attempt===attachmentGeneration;detachSocket();active=info;message='Connecting…';try{const {ticket}=await api.terminalTicket(projectId,info.id);if(!isCurrent())return;const url=new URL('/api/terminals/'+encodeURIComponent(info.id)+'/stream',location.href);url.protocol=location.protocol==='https:'?'wss:':'ws:';if(!isCurrent())return;const ws=new WebSocket(url,['pilot-terminal',ticket]);if(!isCurrent()){ws.close();return;}socket=ws;ws.onopen=()=>{if(!isCurrent()||socket!==ws){ws.close();return;}message='Connected · '+info.cwd;resize();xterm?.focus();};ws.onmessage=event=>{if(!isCurrent()||socket!==ws)return;try{const frame=JSON.parse(String(event.data)) as {type?:string;data?:string};if(frame.type==='output'&&typeof frame.data==='string')xterm?.write(frame.data);}catch{/* invalid frames are ignored */}};ws.onerror=()=>{if(isCurrent()&&socket===ws)message='Terminal connection failed.';};ws.onclose=()=>{if(!isCurrent()||socket!==ws)return;socket=null;message='Disconnected';void refresh();};}catch(e){if(isCurrent()){active=null;problem=(e as Error).message;}}}
@@ -34,9 +35,11 @@
    </select>
    <button class="primary compact-button" disabled={busy} onclick={()=>void open()}><Icon name="plus" size={14}/><span>New terminal</span></button>
    {#if active}<button class="compact-button" disabled={busy} onclick={()=>void closeActive()}>Stop session</button>{/if}
+   {#if previewControlOrigin}<a class="compact-button" href={previewControlOrigin} target="_blank" rel="noopener noreferrer">Manage preview</a>{/if}
   </div>
  </header>
  <p class="terminal-warning"><strong>Broad access:</strong> commands run as Pilot’s service user with its environment and filesystem permissions. The project is only the starting directory. Commands may access other files, credentials and services available to that user.</p>
+ {#if previewControlOrigin}<p class="terminal-status">Manage preview opens an external control site. Its owner authentication is separate from Pilot; this link does not start processes, send commands, or create a preview mapping.</p>{/if}
  {#if problem}<p class="error" role="alert">{problem}</p>{/if}
  <div class="terminal-status" role="status">{message||'Open a terminal to start a shell in this project.'}</div>
  <div class="terminal-frame" bind:this={host} aria-label="Terminal output and input"></div>

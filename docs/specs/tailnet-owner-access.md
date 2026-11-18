@@ -12,9 +12,12 @@ pilot:
 
 # Status
 
-**Planned design only.** This is not implemented, available, deployed, or authorization to alter a
-live service. Cloudflare Access remains the existing hosted identity path. A tailnet connection or
-Tailscale membership is not proof that a request is the owner.
+**Experimental verifier and proxy source only; not production-ready or deployed.** Pilot now has an
+explicit `DASHBOARD_IDENTITY_PROVIDER=tailnet-gateway` verifier option and source-only Go proxy code
+under `deploy/experimental/tailnet-dashboard-proxy-poc/`. This is not authorization to alter a live
+service. Cloudflare Access remains the default/current hosted identity path. A tailnet connection or
+Tailscale membership alone is not proof that a request is the owner. Independent review and the
+acceptance/deployment work below remain outstanding.
 
 ## Problem and outcome
 
@@ -76,13 +79,16 @@ identity proxy, but neither is selected or approved by this document. The design
   multiple identities, missing fields, stale identity, daemon restart, or API failure.
 - Whether identity is checked at each request or bound to a bounded Pilot session, and how logout,
   session expiry, revocation and WebSocket disconnect work.
-- What explicit provider selection and configuration shape prevent Cloudflare and tailnet modes
-  from being confused. Exact variable names are intentionally not specified yet.
+- Whether the explicit `DASHBOARD_IDENTITY_PROVIDER` and `TAILNET_GATEWAY_*` configuration, replay
+  semantics and gateway-to-app boundary meet full deployment requirements.
 - How the listener remains private and how direct access that bypasses the identity-verifying
   component is refused.
 
-Until those decisions are reviewed, do not implement an auth bypass, trust an assertion header, or
-call a network-membership check owner authentication.
+The verifier accepts only the signed, dedicated `x-pilot-gateway-assertion` when its provider is
+explicitly selected; it rejects Cloudflare assertions in that mode. Configuration alone does not
+authenticate a caller: the separately operated proxy must validate owner/node identity, strip incoming
+identity headers, protect the signer key and connect to Pilot only over a reviewed private boundary.
+Do not enable this mode until that boundary is independently reviewed and tested.
 
 ## Acceptance criteria for a future implementation
 
@@ -119,5 +125,7 @@ call a network-membership check owner authentication.
   separately secured proxy required?
 - How should setup and break-glass recovery work without a fail-open fallback?
 
-A security/design review must resolve these before implementation. Cloudflare remains the supported
-hosted identity path in the meantime.
+A security/design review must resolve these before production use. Cloudflare remains the default
+and supported hosted identity path; this verifier and proxy source do not establish that the tailnet
+path is ready. Keep the status experimental until acceptance and owner-approved deployment proof are
+independently satisfied.

@@ -27,6 +27,16 @@ assumes, and what it does not protect, so you can decide whether that fits.
 | Credentials | Provider credentials and project deploy keys live outside project roots in 0600 files/0700 folders, excluded from ordinary backups; settings reads return status/public keys only. Login and Git failures do not echo raw credential response bodies or command output. The opt-in Cloudflare connection credential is stored unencrypted at `credentials/cloudflare-connections.sqlite` (0600 file, 0700 folder); its route returns only the project and connection ids, the revision, the enabled and credential-presence flags, a target digest and the fixed authority — never the token, account id or script name — and removing it revokes nothing at Cloudflare. The opt-in spend tool reads one bearer token from `credentials/spend-billing.json` (0600 file, 0700 folder); it is never returned to a model or written to a log, and removing the file stops future charges only, not a request already in flight |
 | Host escape | The container drops all capabilities, runs non-root with a read-only root filesystem, has no Docker socket and no host mounts |
 
+Hosted verification defaults to Cloudflare Access. The separately selected `tailnet-gateway` mode is
+experimental and requires explicit issuer, audience and Ed25519 public-key configuration. It accepts
+only its dedicated assertion header, validates owner/subject/time claims and rejects duplicate or
+replayed assertions. The Go dashboard-proxy source in `deploy/experimental/tailnet-dashboard-proxy-poc/`
+is not wired into standard deployment and still needs independent review. Tailnet mode does not bypass
+exact Host, owner, origin, session-cookie or CSRF checks; Cloudflare mode's verifier remains unchanged.
+The in-memory replay cache resets on restart. The separate terminal preview gateway POC has a different
+site/auth role and is not the Pilot dashboard verifier. Its optional terminal control link does not
+serve preview content. Terminal processes remain same-UID and are not contained by either gateway.
+
 ## What is not protected
 
 - **A compromised host.** Anything with root or the data directory can read every project and

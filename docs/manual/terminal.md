@@ -45,7 +45,12 @@ interactive shell, as it would in a same-user process environment.
   version needs registry access; if it fails, check container network access and that the mounted
   `/data` volume is writable by UID 10001. The root filesystem remains read-only.
 
-Pilot does not serve active terminal preview content. A pending design covers only an already-running
-dev server started from an owner terminal session—not a disposable manager—and still requires a
-separate security/advisor review before implementation. Any future preview must use a separately
-reviewed, owner-authenticated origin; preview behavior is not available in Pilot today.
+Pilot does not serve active terminal preview content. An operator may configure the optional
+`DASHBOARD_PREVIEW_CONTROL_ORIGIN` exact HTTPS origin; when set, the authenticated terminal view shows
+a **Manage preview** link to an external control site. Pilot's endpoint that supplies the link is
+read-only and owner-authenticated; Pilot does not validate the other site's authentication. Configure
+only a separately reviewed owner-authenticated control site. This link does not start processes, send
+commands, select a port or create a preview mapping. The Go + Node preview gateway source in `deploy/experimental/` is disabled
+and not connected to Pilot's runtime. Actual preview behavior is unavailable until its separate
+security/owner review and production-like verification are complete. Regardless of preview behavior,
+terminal commands retain their broad same-service-user access.

@@ -106,6 +106,8 @@ message naming the problem; nothing is created and nothing listens.
 | `DASHBOARD_ALLOWED_HOSTS` | Optional. If set it must be exactly the canonical origin host. The accepted Host set is never widened beyond that host. |
 | `DASHBOARD_RELEASE` | Optional release identity recorded in the lock, bounded to 1-120 characters of `A-Za-z0-9._:-`. Defaults to `unreleased-local`; a release manifest overrides it. |
 | `DASHBOARD_RELEASE_MANIFEST` | Optional path to the immutable release manifest. Defaults to `release.json` beside the built server. See [Release identity and readiness](#release-identity-and-readiness). |
+| `DASHBOARD_PREVIEW_CONTROL_ORIGIN` | Optional exact HTTPS origin for an external preview control site link in the owner terminal UI. Unset by default; Pilot serves no preview proxy or mapping through this option. |
+| `DASHBOARD_IDENTITY_PROVIDER` | Hosted identity verifier selection. Defaults to `cloudflare`; `tailnet-gateway` is an explicit experimental integration requiring separately reviewed gateway deployment. |
 | `DASHBOARD_ROOT_ID` | Optional logical root id recorded in the lock, bounded the same way. Defaults to the first 16 hex characters of sha256 of the canonical data root path. |
 | `DASHBOARD_SHUTDOWN_DEADLINE_MS` | Optional. How long one drain may take, 1-60000; 10000 by default. Reaching it retains the lock. |
 | `DASHBOARD_ACCEPTANCE_FAUX_WORKER_DELAY_MS` | Optional acceptance aid for W1 workers. Strict integer 0-15000 milliseconds; unset or 0 adds no delay. It applies only to Faux `faux-1` workers, never real workers or ordinary sessions. Invalid values refuse startup. See [Workers](WORKERS.md#acceptance-only-faux-pre-submit-delay). |
@@ -117,7 +119,11 @@ before it touches the data root: both lock identity values are durable evidence 
 therefore restricted to that opaque-token alphabet instead of being recorded verbatim.
 
 Local mode rejects the hosted identity variables (`DASHBOARD_ORIGIN`, `CF_ACCESS_TEAM`,
-`CF_ACCESS_AUD`, `DASHBOARD_OWNER`) instead of ignoring them. The process validates the
+`CF_ACCESS_AUD`, `DASHBOARD_OWNER`, `DASHBOARD_IDENTITY_PROVIDER` and tailnet gateway trust
+settings) instead of ignoring them. Cloudflare remains the hosted default. Tailnet gateway mode
+requires an explicitly selected verifier and its own trusted Ed25519 key/issuer/audience settings; it
+is not enabled by membership or a forwarded identity header. The independent proxy and preview
+packaging POCs in `deploy/experimental/` are not wired into normal startup or Compose deployment. The process validates the
 listener literal, the canonical origin and the accepted Host; whether the surrounding network
 actually restricts access stays an **operator-attested** fact, not something inferred from
 the listener or from the proxy in front of it.

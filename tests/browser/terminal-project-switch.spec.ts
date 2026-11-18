@@ -46,6 +46,24 @@ async function selectProject(page:Page,name:string):Promise<void> {
 function listFor(projectId:string,id:string,name:string){return {terminals:[{id,projectId,projectName:name,cwd:'/tmp/'+name,createdAt:'2026-11-16T00:00:00.000Z',connected:false}]};}
 function socketCount(page:Page){return page.evaluate(()=>((window as WindowWithTerminalSockets).__terminalTestSockets??[]).length);}
 
+test('preview manager link is absent when disabled and opens the configured origin safely',async({page})=>{
+ await setupProjects(page);
+ await page.route('**/api/terminal-preview',route=>route.fulfill({json:{controlOrigin:null}}));
+ await selectProject(page,'Terminal project A');
+ await page.getByRole('button',{name:'Terminal',exact:true}).click();
+ await expect(page.getByRole('link',{name:'Manage preview'})).toHaveCount(0);
+ await page.unroute('**/api/terminal-preview');
+ await page.route('**/api/terminal-preview',route=>route.fulfill({json:{controlOrigin:'https://preview.invalid'}}));
+ await page.reload();
+ await selectProject(page,'Terminal project A');
+ await page.getByRole('button',{name:'Terminal',exact:true}).click();
+ const link=page.getByRole('link',{name:'Manage preview'});
+ await expect(link).toHaveAttribute('href','https://preview.invalid');
+ await expect(link).toHaveAttribute('target','_blank');
+ await expect(link).toHaveAttribute('rel','noopener noreferrer');
+ await expect(page.getByText(/external control site/)).toBeVisible();
+});
+
 test('switching projects while Terminal is selected detaches the old project session',async({page})=>{
  await installSocketSpy(page);
  const {projectA,projectB}=await setupProjects(page);

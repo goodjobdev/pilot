@@ -1,0 +1,7 @@
+**/node_modules
+**/peercred-linux.node
+state
+certificates
+.env
+.env.*
+.git

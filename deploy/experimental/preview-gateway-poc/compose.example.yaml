@@ -1,0 +1,53 @@
+# EXAMPLE ONLY: merge the gateway service into a reviewed copy of the Pilot stack.
+# Do not run this file by itself: the dashboard entry is intentionally external.
+services:
+  preview-gateway:
+    image: pilot-preview-gateway:test-only
+    build:
+      context: .
+      dockerfile: Dockerfile
+      platforms: [linux/arm64]
+      args:
+        GO_BUILD_IMAGE: ${GO_BUILD_IMAGE:?immutable @sha256 digest required}
+        NODE_BUILD_IMAGE: ${NODE_BUILD_IMAGE:?immutable @sha256 digest required}
+        NODE_RUNTIME_IMAGE: ${NODE_RUNTIME_IMAGE:?immutable @sha256 digest required}
+    init: true
+    network_mode: service:dashboard
+    user: "10002:10002"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 128
+    cpus: 1.0
+    mem_limit: 512m
+    restart: "no"
+    stop_grace_period: 30s
+    environment:
+      GATEWAY_SERVICE_UID: "10002"
+      PILOT_SERVICE_UID: ${PILOT_SERVICE_UID:?required distinct Pilot UID}
+      TSNET_STATE_DIR: /var/lib/tsnet
+      TSNET_HOSTNAME: ${TSNET_HOSTNAME:?reviewed node name required}
+      TAILNET_OWNER_LOGIN: ${TAILNET_OWNER_LOGIN:?reviewed identity required}
+      TAILNET_GATEWAY_NODE_ID: ${TAILNET_GATEWAY_NODE_ID:?reviewed gateway ID required}
+      TAILNET_HOST_NODE_ID: ${TAILNET_HOST_NODE_ID:?reviewed Pilot node ID required}
+      TAILNET_ALLOWED_REMOTE_NODE_IDS: ${TAILNET_ALLOWED_REMOTE_NODE_IDS:?explicit reviewed node allowlist required}
+      INGRESS_ASSERTION_KEY_FILE: /run/preview/keys/assertion.key
+      INGRESS_ASSERTION_PUBLIC_KEY_FILE: /run/preview/keys/assertion.pub
+      PREVIEW_CORE_SOCKET: /run/preview/socket/core.sock
+      PREVIEW_DOMAIN: ${PREVIEW_DOMAIN:?reviewed domain required}
+      PREVIEW_TLS_CERT_FILE: /run/preview/certs/preview.crt
+      PREVIEW_TLS_KEY_FILE: /run/preview/certs/preview.key
+      PREVIEW_CONTROL_HOST: ${PREVIEW_CONTROL_HOST:?reviewed control host required}
+      DASHBOARD_ORIGIN: ${DASHBOARD_ORIGIN:?reviewed HTTPS dashboard origin required}
+      PREVIEW_PRIVATE_IPV4: ${PREVIEW_PRIVATE_IPV4:?dashboard namespace IPv4 required}
+      PREVIEW_ALLOWED_PORTS: ${PREVIEW_ALLOWED_PORTS:?explicit per-project port allowlist required}
+      PREVIEW_SITE_REVIEWED: ${PREVIEW_SITE_REVIEWED:?must be true after independent certification}
+      PREVIEW_PORTS_REVIEWED: ${PREVIEW_PORTS_REVIEWED:?must be true after independent port review}
+    volumes:
+      - ./state/tsnet:/var/lib/tsnet
+      - ./state/keys:/run/preview/keys:ro
+      - ./certificates:/run/preview/certs:ro
+    tmpfs:
+      - /run/preview/socket:rw,noexec,nosuid,nodev,size=4m,mode=0700,uid=10002,gid=10002
+      - /tmp:rw,noexec,nosuid,nodev,size=16m,mode=0700,uid=10002,gid=10002
+    # No ports, host networking, Docker/Tailscale sockets, host privileges, or Funnel.

@@ -18,6 +18,8 @@ test('terminal API is off by default and creates no shell service',async()=>{
     const port=await new Promise<number>(resolve=>app.server.listen(0,'127.0.0.1',()=>resolve((app.server.address() as {port:number}).port)));
     security.origin='http://127.0.0.1:'+port;
     const token={'x-dashboard-token':security.token};
+    assert.equal((await fetch(security.origin+'/api/terminal-preview')).status,401);
+    assert.deepEqual(await (await fetch(security.origin+'/api/terminal-preview',{headers:token})).json(),{controlOrigin:null});
     const list=await fetch(security.origin+'/api/projects',{headers:{'x-dashboard-token':security.token}});
     const projects=await list.json() as {id:string}[];
     assert.equal(projects.length,0);

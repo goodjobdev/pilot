@@ -19,6 +19,7 @@ import { PLAN_PATH } from '../shared/workspace';
 import { isMarkdownPath } from '../shared/docs';
 import { HarnessHost,type AgentDeliveryPort,type AgentImage,type SessionLifecycleHooks } from './agents/harness-host';
 import { TerminalService } from './agents/terminal-service';
+import { terminalPreviewControlOrigin } from './terminal-preview-config';
 import { acceptAgentEvidence, verifyAgentAcceptanceDispatch } from './agents/accept-evidence';
 import { MEDIA_CONTAINER_CODE, MediaContainerError, MediaReadUnavailableError, MediaStore } from './media-store';
 import { AlertStore,type AlertPayload,type AlertTransport } from './alerts';
@@ -496,6 +497,7 @@ function questionNotification(questionId:string,projectId:string,sessionId:strin
   return {title:'An agent needs an answer',body:body.slice(0,240),url:agentQuestionLink(projectId,sessionId,questionId),tag:questionTag(questionId)};
 }
 export async function createApp(options:AppOptions){
+  const previewControlOrigin=terminalPreviewControlOrigin(process.env.DASHBOARD_PREVIEW_CONTROL_ORIGIN);
   // The same test-only seam validator the entrypoint uses before it creates the data root. A host
   // option is accepted directly; the environment form additionally requires the explicit switch.
   const { recordNoteDelayMs, recordNoteAfterWriteMs } = resolveNoteDelaySeams(options, process.env);
@@ -1515,6 +1517,7 @@ export async function createApp(options:AppOptions){
           }
         }
         if(path==='/api/session' && req.method==='GET'){json(establishSession(req,res,options.security,subject));return;}
+        if(path==='/api/terminal-preview' && req.method==='GET'){json({controlOrigin:previewControlOrigin});return;}
         if(path==='/api/roots' && req.method==='GET'){json(options.browseRoots);return;}
         const projectTerminals=path.match(/^\/api\/projects\/([a-f0-9-]{36})\/terminals$/);
         if(projectTerminals){
@@ -2902,6 +2905,7 @@ async function main(){
   // store opens. Loopback is the default exposure; a container that must bind its own
   // interface says so explicitly, while the published port stays 127.0.0.1 on the host.
   const env=process.env,config=effectiveConfig(env);
+  terminalPreviewControlOrigin(env.DASHBOARD_PREVIEW_CONTROL_ORIGIN);
   // Resolve the immutable release identity before the data root is touched. Hosted mode refuses a
   // missing or invalid manifest; local mode may run as the explicit 'unreleased-local' identity.
   const release=await resolveRelease(env,config.mode);
