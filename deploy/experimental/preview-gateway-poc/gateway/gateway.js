@@ -24,6 +24,7 @@ function dashboardRegistrableSite(origin) {
   return registrableSite(parsedOrigin.hostname.toLowerCase());
 }
 
+const ASSERTION_HEADER = 'x-pilot-ingress-assertion';
 const MAX_BODY = 4096;
 const MAX_HEADER_BYTES = 16 * 1024;
 
@@ -65,7 +66,7 @@ export function createGateway({
   // Previews are selected by port on the gateway node's own tailnet name, so the
   // listener set is explicit, unprivileged and bounded.
   if (!Array.isArray(previewPorts) || !previewPorts.length || previewPorts.length > 32 ||
-      previewPorts.some((p) => !Number.isInteger(p) || p < 1024 || p > 65535 || p === 443) ||
+      previewPorts.some((p) => !Number.isInteger(p) || p < 1024 || p > 65535 || [22, 443, 4319].includes(p)) ||
       new Set(previewPorts).size !== previewPorts.length) throw new Error('previewPorts must be distinct unprivileged listener ports');
   const controlSite = registrableSite(controlHost.toLowerCase());
   const previewSite = registrableSite(previewDomain.toLowerCase());
@@ -141,12 +142,18 @@ export function createGateway({
 
   const server = http.createServer({ maxHeaderSize: MAX_HEADER_BYTES, headersTimeout: 10_000, requestTimeout: 30_000 }, async (req, res) => {
     try {
-      const identity = await peer(req);
-      if (!ownerAllowed(identity)) return fail(res, 403, 'tailnet owner required');
       const pathname = new URL(req.url, 'http://gateway.invalid').pathname;
       const controlPath = pathname.startsWith('/__gateway/');
       const managementAssetPath = pathname === '/' || pathname === '/management.js' || pathname === '/management.css';
       const isManagement = req.headers.host?.toLowerCase() === controlHostname && (controlPath || managementAssetPath);
+      // A local owner action over the mode-0600 private socket (same service UID,
+      // verified by SO_PEERCRED) authenticates management only; it never grants
+      // preview traffic, which always requires a signed ingress assertion.
+      const localOwner = isManagement && privateSocketOnly && req.socket.remoteAddress === undefined &&
+        typeof verifyPrivateSource === 'function' && verifyPrivateSource(req.socket) === true &&
+        !req.headers[ASSERTION_HEADER];
+      const identity = localOwner ? { name: owner, nodeId: ownerDeviceIds[0] } : await peer(req);
+      if (!ownerAllowed(identity)) return fail(res, 403, 'tailnet owner required');
       if (controlPath && !isManagement) return fail(res, 404, 'management route not found');
       let previewRoute = null;
       if (isManagement) {

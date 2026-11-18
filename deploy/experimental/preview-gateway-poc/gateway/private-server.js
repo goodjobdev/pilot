@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import { createGateway } from './gateway.js';
 import { createAssertionVerifier } from './assertion.js';
+import { buildGatewayConfig } from './config.js';
 import { validatePrivatePaths } from './boundary.js';
 import peerCredentials from './peercred-linux.node';
 
@@ -15,21 +16,14 @@ const publicKeyPath = required('INGRESS_ASSERTION_PUBLIC_KEY_FILE');
 const serviceUid = Number(required('GATEWAY_SERVICE_UID'));
 const pilotUid = Number(required('PILOT_SERVICE_UID'));
 const publicKey = validatePrivatePaths({ socketPath, publicKeyPath, serviceUid, pilotUid });
-const allowedPorts = required('PREVIEW_ALLOWED_PORTS').split(',').map((v) => Number(v.trim()));
+const config = buildGatewayConfig(process.env);
 const verifier = createAssertionVerifier({
   publicKey,
-  ownerLogin: required('TAILNET_OWNER_LOGIN'),
-  allowedNodeIds: required('TAILNET_ALLOWED_REMOTE_NODE_IDS').split(',').map((v) => v.trim()),
+  ownerLogin: config.owner,
+  allowedNodeIds: config.ownerDeviceIds,
 });
 const core = createGateway({
-  owner: required('TAILNET_OWNER_LOGIN'),
-  ownerDeviceIds: required('TAILNET_ALLOWED_REMOTE_NODE_IDS').split(',').map((v) => v.trim()),
-  excludedNodeIds: [required('TAILNET_GATEWAY_NODE_ID'), required('TAILNET_HOST_NODE_ID')],
-  controlHost: required('PREVIEW_CONTROL_HOST'),
-  previewDomain: required('PREVIEW_DOMAIN'),
-  dashboardOrigin: required('DASHBOARD_ORIGIN'),
-  containerAddress: required('PREVIEW_PRIVATE_IPV4'),
-  allowedPorts,
+  ...config,
   assertionVerifier: verifier,
   privateSocketOnly: true,
   verifyPrivateSource: (socket) => {

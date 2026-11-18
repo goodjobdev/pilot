@@ -48,10 +48,17 @@ test('private Unix socket enforces assertion and only exposes authenticated mana
   assert.equal(managementHtml.status, 200, 'owner can GET management UI without Origin on the private socket');
   assert.match(managementHtml.body, /Pilot preview management/);
   assert.equal((await call(socketPath, 'HEAD', '/management.js', 'control.example.com', assertion('HEAD', '/management.js', 'control.example.com', 'socket-ui-head-private-1'))).status, 200);
-  assert.equal((await call(socketPath, 'GET', '/', 'control.example.com', null)).status, 403, 'unauthenticated UI access is denied');
+  // Local management over the mode-0600 socket (service UID) is the owner action.
+  assert.equal((await call(socketPath, 'GET', '/', 'control.example.com', null)).status, 200, 'local owner may read management over the socket');
+  assert.notEqual((await call(socketPath, 'GET', '/', 'gateway.tailnet-example.ts.net:4301', null)).status, 200, 'preview traffic still requires an assertion');
   assert.equal((await call(socketPath, 'GET', '/', 'control.example.com', assertion('GET', '/', 'control.example.com', 'socket-ui-origin-private-1'), { origin: 'https://attacker.example' })).status, 403, 'mismatched Origin is denied');
   assert.equal((await call(socketPath, 'GET', '/', 'wrong.example.com', assertion('GET', '/', 'wrong.example.com', 'socket-ui-host-private-1'))).status, 404, 'management UI remains host-bound');
   const createPath = '/__gateway/routes';
+  // The owner CLI runs as the gateway UID and carries no ingress assertion; the
+  // mode-0600 socket plus Host/Origin/CSRF checks are the management boundary.
+  const cliCreated = await call(socketPath, 'POST', createPath, 'control.example.com', null, { 'content-type': 'application/json', 'x-gateway-csrf': 'same-origin', origin: 'https://control.example.com' }, JSON.stringify({ port }));
+  assert.equal(cliCreated.status, 201, 'management over the private socket does not require an ingress assertion');
+
   const created = await call(socketPath, 'POST', createPath, 'control.example.com', assertion('POST', createPath, 'control.example.com', 'socket-test-create-1'), { 'content-type': 'application/json', 'x-gateway-csrf': 'same-origin', origin: 'https://control.example.com' }, JSON.stringify({ port }));
   assert.equal(created.status, 201);
   const route = JSON.parse(created.body);

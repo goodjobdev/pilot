@@ -35,9 +35,9 @@ RUN test "$(node -p 'process.platform + "/" + process.arch')" = linux/arm64 \
  && node -e 'if (typeof require("/opt/preview/gateway/peercred-linux.node").peerUid !== "function") process.exit(1)' \
  && chmod 0555 /usr/local/bin/tsnet-ingress \
  && chmod -R go-w /opt/preview \
- && mkdir -p /var/lib/tsnet /run/preview/keys /run/preview/certs /run/preview/socket \
- && chown 10002:10002 /var/lib/tsnet /run/preview /run/preview/keys /run/preview/certs /run/preview/socket \
- && chmod 0700 /var/lib/tsnet /run/preview /run/preview/keys /run/preview/certs /run/preview/socket
+ && mkdir -p /var/lib/tsnet /run/preview/keys /run/preview/socket \
+ && chown 10002:10002 /var/lib/tsnet /run/preview /run/preview/keys /run/preview/socket \
+ && chmod 0700 /var/lib/tsnet /run/preview /run/preview/keys /run/preview/socket
 ENV HOME=/var/lib/tsnet NODE_ENV=production
 USER 10002:10002
 # The deployment must set Compose init: true to provide a PID 1 reaper.

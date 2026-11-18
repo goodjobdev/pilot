@@ -22,8 +22,13 @@ preview: `https://<gateway-node>.<tailnet>.ts.net:<port>/`.
   with the name reported by the tailnet status at startup and refuses a mismatch.
 - `PREVIEW_PORTS` is the reviewed listener-port set (unprivileged, at most 32, excluding
   443/22/4319). Each active preview takes one free port; `Host` must carry that exact port.
-- The preview host is a different browser site from both Pilot (`goodjob.dev`) and the
-  control UI, which stays on Pilot behind Cloudflare Access.
+- The preview host is a different browser site from Pilot (`goodjob.dev`). There is no
+  browser control site: routes are managed by the owner as the gateway service UID over
+  the private Unix socket (`gateway/manage.mjs`).
+- Because the node name is covered by a publicly trusted certificate, the exact
+  `<node>.<tailnet>.ts.net` string is observable in Certificate Transparency logs. That
+  discloses a tailnet identifier, not access: the name resolves only inside the tailnet and
+  every request is still owner-authenticated.
 
 ## Boundaries and limits
 
@@ -39,7 +44,7 @@ preview: `https://<gateway-node>.<tailnet>.ts.net:<port>/`.
 - Go: `go vet ./... && go test -count=1 ./...` passes offline in a network-disabled
   `golang:1.27.4-bookworm` container as UID 10001, including HTTP/WebSocket forwarding and
   the tsnet shutdown lifecycle tests.
-- Node: 31 tests pass offline in a network-disabled `node:24-bookworm-slim` container as a
+- Node: 35 tests pass offline in a network-disabled `node:24-bookworm-slim` container as a
   non-root UID (`gateway`, `gateway-ui`, `assertion`, `private-socket`, `boundary`,
   `preflight`).
 - These runs prove source behavior only. Live tailnet identity, certificate issuance,

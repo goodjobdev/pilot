@@ -95,39 +95,6 @@ func readPrivateKey(path string, serviceUID, pilotUID int) ([]byte, error) {
 	return key[:64], nil
 }
 
-func readProtectedPEM(path string, serviceUID, pilotUID int) ([]byte, error) {
-	if !filepath.IsAbs(path) || filepath.Clean(path) != path { return nil, fmt.Errorf("TLS material path must be absolute and canonical") }
-	if err := validatePrivateDirectory(path, serviceUID, pilotUID); err != nil { return nil, err }
-	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0)
-	if err != nil { return nil, err }
-	file := os.NewFile(uintptr(fd), path)
-	defer file.Close()
-	var stat unix.Stat_t
-	if err := unix.Fstat(fd, &stat); err != nil { return nil, err }
-	const maxPEMSize = 1 << 20
-	if stat.Mode&unix.S_IFMT != unix.S_IFREG || int(stat.Uid) != serviceUID || stat.Mode&0077 != 0 || stat.Size <= 0 || stat.Size > maxPEMSize {
-		return nil, fmt.Errorf("TLS material must be a service-owned private regular file no larger than 1 MiB")
-	}
-	data, err := io.ReadAll(io.LimitReader(file, maxPEMSize+1))
-	if err != nil { return nil, err }
-	if len(data) == 0 || len(data) > maxPEMSize { return nil, fmt.Errorf("invalid TLS material file size") }
-	return data, nil
-}
-
-// ReadOwnerTLSMaterial reads the owner certificate and private key only from
-// protected service-owned files; neither file may be reached through a symlink.
-func ReadOwnerTLSMaterial(certPath, keyPath string, serviceUID, pilotUID int) ([]byte, []byte, error) {
-	if certPath == keyPath { return nil, nil, fmt.Errorf("TLS certificate and key must be separate files") }
-	if os.Geteuid() != serviceUID || serviceUID <= 0 || pilotUID <= 0 || serviceUID == pilotUID {
-		return nil, nil, fmt.Errorf("invalid TLS material UID configuration")
-	}
-	certPEM, err := readProtectedPEM(certPath, serviceUID, pilotUID)
-	if err != nil { return nil, nil, err }
-	keyPEM, err := readProtectedPEM(keyPath, serviceUID, pilotUID)
-	if err != nil { return nil, nil, err }
-	return certPEM, keyPEM, nil
-}
-
 func validateSocketPath(path string, serviceUID, pilotUID int) error {
 	if err := validatePrivateDirectory(path, serviceUID, pilotUID); err != nil { return err }
 	info, err := os.Lstat(path)

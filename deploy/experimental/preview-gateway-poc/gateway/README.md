@@ -21,11 +21,27 @@ Previews are addressed by **port on the gateway node's own tailnet name**:
 - The preview site must still be a different PSL site from both the control host
   and the Pilot origin.
 
+## Managing routes
+
+There is no browser control site in this design. Previews are the only
+browser-facing surface; routes are created and revoked by the owner as the
+gateway service UID over the mode-0600 socket:
+
+```sh
+docker exec -u <gateway-uid> <gateway-container> node /app/manage.mjs create --port 5173
+docker exec -u <gateway-uid> <gateway-container> node /app/manage.mjs revoke --id <uuid>
+```
+
+The management request still carries the management `Host`, `Origin` and CSRF
+header, so the same host/origin/CSRF checks apply. Because the socket is 0600 and
+its peer UID is checked, a Pilot-UID process cannot use it.
+
 ## Verification
 
 `gateway.test.js`, `gateway-ui.test.js`, `assertion.test.js`,
-`private-socket.test.js` and `boundary.test.js` — **27 tests, 0 failures**, run
-offline in a network-disabled `node:24-bookworm-slim` container as a non-root UID.
+`private-socket.test.js`, `boundary.test.js` and `config.test.js` — **35 tests, 0
+failures**, run offline in a network-disabled `node:24-bookworm-slim` container as
+a non-root UID.
 
 The Go suite (`go vet ./... && go test -count=1 ./...`) also passes offline in a
 network-disabled `golang:1.27.4-bookworm` container as UID 10001, including

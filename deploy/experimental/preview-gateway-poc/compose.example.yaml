@@ -45,7 +45,6 @@ services:
     volumes:
       - ./state/tsnet:/var/lib/tsnet
       - ./state/keys:/run/preview/keys:ro
-      - ./certificates:/run/preview/certs:ro
     tmpfs:
       - /run/preview/socket:rw,noexec,nosuid,nodev,size=4m,mode=0700,uid=10002,gid=10002
       - /tmp:rw,noexec,nosuid,nodev,size=16m,mode=0700,uid=10002,gid=10002

@@ -153,6 +153,7 @@ func main() {
 		log.Printf("tailnet preview listener ready on https://%s:%d", nodeCertificate.Hostname(), port)
 	}
 
+	log.Printf("tsnet HTTPS ingress ready on %d preview listeners", len(servers))
 	errs := make(chan error, len(servers))
 	for i := range servers {
 		go func(server *http.Server, listener net.Listener) {
