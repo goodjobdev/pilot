@@ -140,6 +140,24 @@ security architecture is approved. Do not mock these states as if they exist in 
   and recovery behavior, and that preview does not sandbox terminal commands. Availability remains
   planned until verified release evidence exists.
 
+## Selected addressing (owner decision, 2026-11-18)
+
+Previews are served on the preview gateway node's own tailnet name, one listener
+port per preview (`https://<node>.<tailnet>.ts.net:<port>/`). This replaces the
+earlier public-wildcard design: no owner DNS record, no owner-supplied
+certificate, and no Funnel. Tailscale issues the node certificate, the ingress
+accepts only the exact node name as TLS SNI and re-validates it per handshake, and
+`Host` must carry the listener's own port so one preview cannot be redirected to
+another port on the same name. The node name is publicly visible in Certificate
+Transparency logs; it resolves only inside the tailnet and discloses no access.
+
+There is no browser control site in this mode. The owner creates and revokes
+preview routes as the gateway service UID over the mode-0600 private socket; the
+core treats that verified local UID as the owner for management paths only, and
+preview traffic still requires a signed ingress assertion minted by the ingress
+for each request. The dashboard's optional preview-control link therefore stays
+disabled for this deployment mode.
+
 ## Unresolved decisions
 
 The UI is only an external control-site link; it does not serve active terminal preview content.
