@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
+import { readFileSync } from 'node:fs';
 import { supervise } from './supervisor.mjs';
 
 function harness(t) {
@@ -61,4 +62,15 @@ test('forwards readiness only from explicit service markers', (t) => {
   const h = harness(t);
   h.children[0].child.stdout.emit('data', 'unrelated log\n');
   assert.equal(h.result.readyCount, 0);
+});
+
+test('readiness contract matches the ingress log line', () => {
+  // The supervisor counts a child ready only on this exact substring; a change on
+  // one side without the other would leave the container permanently unready.
+  const source = readFileSync(new URL('./supervisor.mjs', import.meta.url), 'utf8');
+  const ingress = readFileSync(new URL('./ingress/cmd/tsnet-ingress/lifecycle.go', import.meta.url), 'utf8');
+  const literal = /const readyLine = "([^"]+)"/.exec(ingress);
+  assert.ok(literal, 'ingress readyLine constant is missing');
+  assert.ok(source.includes(literal[1]), 'supervisor does not wait for the ingress ready line');
+  assert.ok(source.includes(`\${literal[1]}`) || source.includes(literal[1]));
 });

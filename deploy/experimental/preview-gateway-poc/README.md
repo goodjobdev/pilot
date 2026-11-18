@@ -44,9 +44,13 @@ preview: `https://<gateway-node>.<tailnet>.ts.net:<port>/`.
 - Go: `go vet ./... && go test -count=1 ./...` passes offline in a network-disabled
   `golang:1.27.4-bookworm` container as UID 10001, including HTTP/WebSocket forwarding and
   the tsnet shutdown lifecycle tests.
-- Node: 35 tests pass offline in a network-disabled `node:24-bookworm-slim` container as a
+- Node: 41 tests pass offline in a network-disabled `node:24-bookworm-slim` container as a
   non-root UID (`gateway`, `gateway-ui`, `assertion`, `private-socket`, `boundary`,
   `preflight`).
+- Container: the gateway image builds for linux/arm64 from digest-pinned Go/Node
+  bases and fails closed when started without configuration or without its
+  assertion key (supervisor starts both children, preflight refuses, container
+  exits 1).
 - These runs prove source behavior only. Live tailnet identity, certificate issuance,
   enrollment, DNS (none is required), and real browser flows remain unverified until the
   owner supplies an auth key and node IDs.

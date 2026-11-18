@@ -13,7 +13,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -120,16 +119,6 @@ func main() {
 	}
 	defer func() { _ = closeNode() }()
 
-	// The node is closed only after every listener has finished draining.
-	remaining := int32(len(ports))
-	var nodeOnce sync.Once
-	lastListenerDone := func() error {
-		if atomic.AddInt32(&remaining, -1) == 0 {
-			nodeOnce.Do(func() { _ = closeNode() })
-		}
-		return nil
-	}
-
 	servers := make([]*http.Server, 0, len(ports))
 	listeners := make([]net.Listener, 0, len(ports))
 	for _, port := range ports {
@@ -153,22 +142,9 @@ func main() {
 		log.Printf("tailnet preview listener ready on https://%s:%d", nodeCertificate.Hostname(), port)
 	}
 
-	log.Printf("tsnet HTTPS ingress ready on %d preview listeners", len(servers))
-	errs := make(chan error, len(servers))
-	for i := range servers {
-		go func(server *http.Server, listener net.Listener) {
-			errs <- serveHTTPS(ctx, server, listener, 25*time.Second, lastListenerDone)
-		}(servers[i], listeners[i])
-	}
-	var failed bool
-	for range servers {
-		if err := <-errs; err != nil {
-			log.Printf("tailnet preview listener stopped: %v", err)
-			failed = true
-			cancel()
-		}
-	}
-	if failed {
+	log.Printf("%s on %d preview listeners", readyLine, len(servers))
+	if err := serveAll(ctx, servers, listeners, 25*time.Second, closeNode); err != nil {
+		log.Printf("tailnet preview listener stopped: %v", err)
 		os.Exit(1)
 	}
 }

@@ -39,7 +39,7 @@ its peer UID is checked, a Pilot-UID process cannot use it.
 ## Verification
 
 `gateway.test.js`, `gateway-ui.test.js`, `assertion.test.js`,
-`private-socket.test.js`, `boundary.test.js` and `config.test.js` — **35 tests, 0
+`private-socket.test.js`, `boundary.test.js`, `config.test.js` and `supervisor.test.mjs` — **41 tests, 0
 failures**, run offline in a network-disabled `node:24-bookworm-slim` container as
 a non-root UID.
 

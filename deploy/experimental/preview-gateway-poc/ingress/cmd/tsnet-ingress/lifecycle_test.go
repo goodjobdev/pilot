@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -230,5 +231,63 @@ func TestServeHTTPSShutdownTimeoutClosesServerAndTransport(t *testing.T) {
 	case <-respDone:
 	case <-time.After(time.Second):
 		t.Fatal("HTTP client did not observe forced connection close")
+	}
+}
+
+// TestServeAllClosesNodeOnceAfterEveryListenerDrains covers the multi-listener
+// coordinator: two listeners, both drained, one node close, after the last.
+func TestServeAllClosesNodeOnceAfterEveryListenerDrains(t *testing.T) {
+	var bases []*fakeTsnetListener
+	var servers []*http.Server
+	var listeners []net.Listener
+	for index := 0; index < 2; index++ {
+		base, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil { t.Fatal(err) }
+		fake := &fakeTsnetListener{Listener: base}
+		bases = append(bases, fake)
+		servers = append(servers, &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusNoContent)
+		})})
+		listeners = append(listeners, fake)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	closed := make(chan int, 4)
+	var closeCount int32
+	done := make(chan error, 1)
+	go func() {
+		done <- serveAll(ctx, servers, listeners, time.Second, func() error {
+			atomic.AddInt32(&closeCount, 1)
+			closed <- int(atomic.LoadInt32(&closeCount))
+			return nil
+		})
+	}()
+	for _, fake := range bases {
+		resp, err := http.Get("http://" + fake.Addr().String() + "/")
+		if err != nil { t.Fatal(err) }
+		resp.Body.Close()
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil { t.Fatalf("serveAll returned %v", err) }
+	case <-time.After(5 * time.Second):
+		t.Fatal("serveAll did not return after cancellation")
+	}
+	if count := atomic.LoadInt32(&closeCount); count != 1 {
+		t.Fatalf("node closed %d times, want exactly once", count)
+	}
+	select {
+	case <-closed:
+	default:
+		t.Fatal("node close was not observed")
+	}
+}
+
+func TestServeAllRefusesEmptyOrMismatchedListeners(t *testing.T) {
+	if err := serveAll(context.Background(), nil, nil, time.Second, func() error { return nil }); err == nil {
+		t.Fatal("empty listener set accepted")
+	}
+	if err := serveAll(context.Background(), []*http.Server{{}}, nil, time.Second, func() error { return nil }); err == nil {
+		t.Fatal("mismatched listener set accepted")
 	}
 }

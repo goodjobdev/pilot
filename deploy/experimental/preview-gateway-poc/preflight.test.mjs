@@ -17,6 +17,10 @@ const stat = (target) => target === '/state'
 test('accepts reviewed static deployment configuration and protected dirs', () => {
   assert.equal(validateRuntimeConfig(base, { uid: 10002, stat }), true);
 });
+test('accepts the base image version markers but not arbitrary variables', () => {
+  assert.equal(validateRuntimeConfig({ ...base, NODE_VERSION: '24.22.3', YARN_VERSION: '1.22.22' }, { uid: 10002, stat }), true);
+  assert.throws(() => validateRuntimeConfig({ ...base, NODE_OPTIONS: '--require=/tmp/x' }, { uid: 10002, stat }), /not permitted/);
+});
 test('rejects loose environment values and unreviewed site configuration', () => {
   assert.throws(() => validateRuntimeConfig({ ...base, TAILSCALE_AUTH_KEY: 'not-allowed' }, { uid: 10002, stat }), /not permitted/);
   assert.throws(() => validateRuntimeConfig({ ...base, PREVIEW_SITE_REVIEWED: 'false' }, { uid: 10002, stat }), /certify/);
