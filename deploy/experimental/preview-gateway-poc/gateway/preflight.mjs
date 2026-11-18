@@ -8,7 +8,7 @@ const allowedEnvironment = new Set([
   'GATEWAY_SERVICE_UID', 'PILOT_SERVICE_UID', 'TSNET_STATE_DIR', 'TSNET_HOSTNAME',
   'TAILNET_OWNER_LOGIN', 'TAILNET_GATEWAY_NODE_ID', 'TAILNET_HOST_NODE_ID', 'TAILNET_ALLOWED_REMOTE_NODE_IDS',
   'INGRESS_ASSERTION_KEY_FILE', 'INGRESS_ASSERTION_PUBLIC_KEY_FILE', 'PREVIEW_CORE_SOCKET',
-  'PREVIEW_DOMAIN', 'PREVIEW_TLS_CERT_FILE', 'PREVIEW_TLS_KEY_FILE', 'PREVIEW_CONTROL_HOST',
+  'PREVIEW_DOMAIN', 'PREVIEW_PORTS', 'PREVIEW_CONTROL_HOST',
   'DASHBOARD_ORIGIN', 'PREVIEW_PRIVATE_IPV4', 'PREVIEW_ALLOWED_PORTS', 'PREVIEW_SITE_REVIEWED', 'PREVIEW_PORTS_REVIEWED',
 ]);
 function privateIPv4(address) {
@@ -21,7 +21,7 @@ const required = [
   'GATEWAY_SERVICE_UID', 'PILOT_SERVICE_UID', 'TSNET_STATE_DIR', 'TSNET_HOSTNAME',
   'TAILNET_OWNER_LOGIN', 'TAILNET_GATEWAY_NODE_ID', 'TAILNET_HOST_NODE_ID', 'TAILNET_ALLOWED_REMOTE_NODE_IDS',
   'INGRESS_ASSERTION_KEY_FILE', 'INGRESS_ASSERTION_PUBLIC_KEY_FILE', 'PREVIEW_CORE_SOCKET',
-  'PREVIEW_DOMAIN', 'PREVIEW_TLS_CERT_FILE', 'PREVIEW_TLS_KEY_FILE', 'PREVIEW_CONTROL_HOST',
+  'PREVIEW_DOMAIN', 'PREVIEW_PORTS', 'PREVIEW_CONTROL_HOST',
   'DASHBOARD_ORIGIN', 'PREVIEW_PRIVATE_IPV4', 'PREVIEW_ALLOWED_PORTS',
 ];
 
@@ -37,7 +37,13 @@ export function validateRuntimeConfig(env, { uid = process.getuid?.(), stat = fs
   if (!Number.isInteger(serviceUid) || serviceUid !== uid || serviceUid <= 0 || !Number.isInteger(pilotUid) || pilotUid <= 0 || pilotUid === serviceUid) throw new Error('gateway runtime UID must match configured non-root UID and differ from Pilot UID');
   if (env.PREVIEW_SITE_REVIEWED !== 'true') throw new Error('review and certify preview/control/dashboard site isolation before startup');
   if (env.PREVIEW_PORTS_REVIEWED !== 'true') throw new Error('review and certify the preview port allowlist before startup');
-  if ([env.PREVIEW_CONTROL_HOST, env.PREVIEW_DOMAIN].some((host) => host.includes(':') || /[\\s/]/.test(host))) throw new Error('control host and preview domain must be bare hostnames');
+  if ([env.PREVIEW_CONTROL_HOST, env.PREVIEW_DOMAIN].some((host) => host.includes(':') || /[\s/]/.test(host))) throw new Error('control host and preview node name must be bare hostnames');
+  // Previews are served on the gateway's own tailnet name, one port each.
+  if (!env.PREVIEW_DOMAIN.toLowerCase().endsWith('.ts.net')) throw new Error('PREVIEW_DOMAIN must be the gateway node tailnet name');
+  const listenerPorts = env.PREVIEW_PORTS.split(',').map((part) => part.trim());
+  if (!listenerPorts.length || listenerPorts.length > 32 ||
+      listenerPorts.some((port) => !/^[0-9]{4,5}$/.test(port) || Number(port) < 1024 || Number(port) > 65535 || ['443','4319','22'].includes(port)) ||
+      new Set(listenerPorts).size !== listenerPorts.length) throw new Error('PREVIEW_PORTS must be distinct unprivileged listener ports');
   const registrableSite = (host) => {
     const parsed = psl.parse(host);
     if (parsed.error || !parsed.listed || !parsed.domain || !parsed.tld) throw new Error('control, preview, and dashboard must use recognized public suffixes');
@@ -56,8 +62,6 @@ export function validateRuntimeConfig(env, { uid = process.getuid?.(), stat = fs
     ['tsnet state directory', env.TSNET_STATE_DIR, true],
     ['assertion private key', env.INGRESS_ASSERTION_KEY_FILE, false],
     ['preview core socket', env.PREVIEW_CORE_SOCKET, false],
-    ['TLS certificate', env.PREVIEW_TLS_CERT_FILE, false],
-    ['TLS private key', env.PREVIEW_TLS_KEY_FILE, false],
   ]) {
     if (!path.isAbsolute(input) || input.includes('\0')) throw new Error(`${label} path must be absolute`);
     const target = directory ? input : path.dirname(input);
@@ -66,6 +70,5 @@ export function validateRuntimeConfig(env, { uid = process.getuid?.(), stat = fs
     if (target === input && (info.uid !== serviceUid || (info.mode & 0o777) !== 0o700)) throw new Error('tsnet state directory must be service-owned mode 0700');
     if (target !== input && ((info.uid !== serviceUid) || (info.mode & 0o077) !== 0)) throw new Error(`${label} parent must be service-owned and inaccessible to group/other`);
   }
-  if (env.INGRESS_ASSERTION_KEY_FILE === env.PREVIEW_TLS_KEY_FILE) throw new Error('assertion and TLS private key paths must differ');
   return true;
 }

@@ -1,7 +1,34 @@
-# Preview gateway core source
+# Node preview core
 
-This Node core is part of the separate terminal preview gateway experiment. The private entrypoint is
-Linux-only and requires protected service-owned paths, a non-root gateway UID distinct from the Pilot
-UID, a mode-0600 Unix socket, and the Linux `SO_PEERCRED` addon. Missing credentials or unsupported
-platforms fail closed; trust is not inferred from an empty remote address. It remains disabled and
-unreviewed for production use. See the parent experimental POC README.
+This Node core is part of the isolated preview bridge. Its private entry point is
+Linux-only and requires protected service-UID-owned parent directories, a non-root
+gateway UID distinct from Pilot, a mode-0600 Unix socket, and the
+`peercred-linux.node` addon to enforce `SO_PEERCRED` on each accepted
+request/upgrade. Missing credentials or unsupported platforms fail closed; it never
+infers identity from an empty remote address.
+
+## Route model
+
+Previews are addressed by **port on the gateway node's own tailnet name**:
+
+- `previewDomain` is the exact node FQDN (for example
+  `pilot-preview.<tailnet>.ts.net`), not a wildcard domain.
+- `previewPorts` is the explicit, bounded set of listener ports; each route takes
+  one free port, so at most one preview per port and `Host` is always
+  `<node>:<port>`.
+- `allowedPorts` remains the set of *upstream* dev-server ports the owner may
+  choose; it is unrelated to the listener ports.
+- The preview site must still be a different PSL site from both the control host
+  and the Pilot origin.
+
+## Verification
+
+`gateway.test.js`, `gateway-ui.test.js`, `assertion.test.js`,
+`private-socket.test.js` and `boundary.test.js` — **27 tests, 0 failures**, run
+offline in a network-disabled `node:24-bookworm-slim` container as a non-root UID.
+
+The Go suite (`go vet ./... && go test -count=1 ./...`) also passes offline in a
+network-disabled `golang:1.27.4-bookworm` container as UID 10001, including
+cross-process Go-to-Node HTTP and WebSocket forwarding tests.
+
+No deployment, certificate, DNS, or live-tailnet claim is made.

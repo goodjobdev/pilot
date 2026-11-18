@@ -22,7 +22,7 @@ function request(port, { method = 'GET', path = '/', host = controlHost, origin 
 async function fixture({ peerName = owner, peerNodeId = 'owner-device-1', unauthenticated = false } = {}) {
   const upstream = http.createServer((_req, res) => res.end('preview'));
   const upstreamPort = await listen(upstream);
-  const core = createGateway({ owner, ownerDeviceIds: ['owner-device-1'], excludedNodeIds: ['oracle-node', 'gateway-node'], controlHost, previewDomain, dashboardOrigin, containerAddress: '127.0.0.1', allowedPorts: [upstreamPort, 4310], verifyPeer: async (address) => address && !unauthenticated ? { name: peerName, nodeId: peerNodeId } : null });
+  const core = createGateway({ owner, ownerDeviceIds: ['owner-device-1'], excludedNodeIds: ['oracle-node', 'gateway-node'], controlHost, previewDomain, previewPorts: [4301, 4302], dashboardOrigin, containerAddress: '127.0.0.1', allowedPorts: [upstreamPort, 4310], verifyPeer: async (address) => address && !unauthenticated ? { name: peerName, nodeId: peerNodeId } : null });
   const gatewayPort = await listen(core.server);
   return { upstream, core, gatewayPort, upstreamPort };
 }
@@ -63,17 +63,17 @@ test('forged and non-owner peers cannot read management HTML or JavaScript', asy
 test('preview uses recognized PSL sites distinct from gateway control and dashboard', async () => {
   const base = { owner, ownerDeviceIds: ['owner-device-1'], excludedNodeIds: ['oracle-node', 'gateway-node'], dashboardOrigin: 'https://dashboard.example.co.uk', containerAddress: '127.0.0.1', allowedPorts: [4310], verifyPeer: async () => ({ name: owner, nodeId: 'owner-device-1' }) };
   const { dashboardOrigin: _dashboardOrigin, ...withoutDashboardOrigin } = base;
-  assert.throws(() => createGateway({ ...withoutDashboardOrigin, controlHost: 'ui.example.co.uk', previewDomain: 'route.other.co.uk' }), /invalid controlHost, previewDomain, or dashboardOrigin/);
-  assert.throws(() => createGateway({ ...base, controlHost: 'ui.example.co.uk', previewDomain: 'route.example.co.uk' }), /different browser site/);
-  assert.doesNotThrow(() => createGateway({ ...base, controlHost: 'ui.example.co.uk', previewDomain: 'route.other.co.uk' }), 'control and dashboard may intentionally share a site');
-  assert.throws(() => createGateway({ ...base, controlHost: 'ui.control.example.com', previewDomain: 'route.owner.github.io', dashboardOrigin: 'https://dashboard.owner.github.io' }), /different browser site/);
-  assert.throws(() => createGateway({ ...base, controlHost: 'ui.owner.github.io', previewDomain: 'route.owner.github.io' }), /different browser site/);
-  assert.throws(() => createGateway({ ...base, controlHost: 'ui.tailnet.ts.net', previewDomain: 'route.tailnet.ts.net' }), /different browser site/);
-  assert.doesNotThrow(() => createGateway({ ...base, controlHost: 'ui.tailnet-one.ts.net', previewDomain: 'route.tailnet-two.ts.net' }));
-  assert.throws(() => createGateway({ ...base, controlHost: 'ui.example.unknownzz', previewDomain: 'route.other.com' }), /recognized public suffixes/);
-  assert.throws(() => createGateway({ ...base, controlHost: 'com', previewDomain: 'route.other.com' }), /recognized public suffixes/);
+  assert.throws(() => createGateway({ ...withoutDashboardOrigin, controlHost: 'ui.example.co.uk', previewDomain: 'route.other.co.uk', previewPorts: [4301, 4302] }), /invalid controlHost, previewDomain, or dashboardOrigin/);
+  assert.throws(() => createGateway({ ...base, controlHost: 'ui.example.co.uk', previewDomain: 'route.example.co.uk', previewPorts: [4301, 4302] }), /different browser site/);
+  assert.doesNotThrow(() => createGateway({ ...base, controlHost: 'ui.example.co.uk', previewDomain: 'route.other.co.uk', previewPorts: [4301, 4302] }), 'control and dashboard may intentionally share a site');
+  assert.throws(() => createGateway({ ...base, controlHost: 'ui.control.example.com', previewDomain: 'route.owner.github.io', previewPorts: [4301, 4302], dashboardOrigin: 'https://dashboard.owner.github.io' }), /different browser site/);
+  assert.throws(() => createGateway({ ...base, controlHost: 'ui.owner.github.io', previewDomain: 'route.owner.github.io', previewPorts: [4301, 4302] }), /different browser site/);
+  assert.throws(() => createGateway({ ...base, controlHost: 'ui.tailnet.ts.net', previewDomain: 'route.tailnet.ts.net', previewPorts: [4301, 4302] }), /different browser site/);
+  assert.doesNotThrow(() => createGateway({ ...base, controlHost: 'ui.tailnet-one.ts.net', previewDomain: 'route.tailnet-two.ts.net', previewPorts: [4301, 4302] }));
+  assert.throws(() => createGateway({ ...base, controlHost: 'ui.example.unknownzz', previewDomain: 'route.other.com', previewPorts: [4301, 4302] }), /recognized public suffixes/);
+  assert.throws(() => createGateway({ ...base, controlHost: 'com', previewDomain: 'route.other.com', previewPorts: [4301, 4302] }), /recognized public suffixes/);
   for (const dashboardOrigin of ['http://dashboard.example.org', 'https://dashboard.example.unknownzz', 'https://dashboard.example.org/path', 'https://dashboard.example.org/foo/..', 'https://dashboard.example.org?', 'https://dashboard.example.org#', 'not-an-origin']) {
-    assert.throws(() => createGateway({ ...base, controlHost: 'ui.control.example.com', previewDomain: 'route.preview.example.net', dashboardOrigin }), /DASHBOARD_ORIGIN|recognized public suffixes/);
+    assert.throws(() => createGateway({ ...base, controlHost: 'ui.control.example.com', previewDomain: 'route.preview.example.net', previewPorts: [4301, 4302], dashboardOrigin }), /DASHBOARD_ORIGIN|recognized public suffixes/);
   }
 });
 
@@ -87,7 +87,7 @@ test('route API rejects cross-site Origin, missing CSRF and unapproved ports; se
   const calls = [];
   const route = await submitPort(f.upstreamPort, async (path, options) => {
     calls.push({ path, options });
-    return { ok: true, json: async () => ({ id: '12345678-1234-1234-1234-123456789abc', port: f.upstreamPort, origin: `https://${previewDomain}`, path: '/' }) };
+    return { ok: true, json: async () => ({ id: '12345678-1234-1234-1234-123456789abc', port: f.upstreamPort, origin: 'https://preview-placeholder', path: '/' }) };
   });
   assert.deepEqual(JSON.parse(calls[0].options.body), { port: f.upstreamPort });
   assert.equal(calls[0].path, '/__gateway/routes'); assert.equal(route.port, f.upstreamPort);

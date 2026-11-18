@@ -16,7 +16,7 @@ function verifier(time = 10_500) {
 }
 
 test('private socket mode refuses to start without an exact peer credential verifier', () => {
-  assert.throws(() => createGateway({ owner: 'owner@example.test', ownerDeviceIds: ['approved-node'], excludedNodeIds: ['gateway', 'host'], controlHost: 'control.example.com', previewDomain: 'preview.example.net', dashboardOrigin: 'https://dashboard.example.org', containerAddress: '127.0.0.1', allowedPorts: [3000], assertionVerifier: verifier(), privateSocketOnly: true }), /exact peer credential verification/);
+  assert.throws(() => createGateway({ owner: 'owner@example.test', ownerDeviceIds: ['approved-node'], excludedNodeIds: ['gateway', 'host'], controlHost: 'control.example.com', previewDomain: 'preview.example.net', previewPorts: [4301, 4302], dashboardOrigin: 'https://dashboard.example.org', containerAddress: '127.0.0.1', allowedPorts: [3000], assertionVerifier: verifier(), privateSocketOnly: true }), /exact peer credential verification/);
 });
 
 test('accepts one fresh assertion only from private request source and binds all request attributes', () => {

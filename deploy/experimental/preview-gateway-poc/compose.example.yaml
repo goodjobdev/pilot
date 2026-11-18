@@ -34,9 +34,8 @@ services:
       INGRESS_ASSERTION_KEY_FILE: /run/preview/keys/assertion.key
       INGRESS_ASSERTION_PUBLIC_KEY_FILE: /run/preview/keys/assertion.pub
       PREVIEW_CORE_SOCKET: /run/preview/socket/core.sock
-      PREVIEW_DOMAIN: ${PREVIEW_DOMAIN:?reviewed domain required}
-      PREVIEW_TLS_CERT_FILE: /run/preview/certs/preview.crt
-      PREVIEW_TLS_KEY_FILE: /run/preview/certs/preview.key
+      PREVIEW_DOMAIN: ${PREVIEW_DOMAIN:?gateway tailnet node name required}
+      PREVIEW_PORTS: ${PREVIEW_PORTS:?reviewed listener ports required}
       PREVIEW_CONTROL_HOST: ${PREVIEW_CONTROL_HOST:?reviewed control host required}
       DASHBOARD_ORIGIN: ${DASHBOARD_ORIGIN:?reviewed HTTPS dashboard origin required}
       PREVIEW_PRIVATE_IPV4: ${PREVIEW_PRIVATE_IPV4:?dashboard namespace IPv4 required}

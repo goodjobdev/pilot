@@ -6,12 +6,14 @@ import (
 	"crypto/tls"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -48,20 +50,32 @@ func main() {
 		log.Fatal("invalid identity policy; gateway/host IDs must be distinct and excluded from approved remote IDs")
 	}
 	serviceUID, err := strconv.Atoi(required("GATEWAY_SERVICE_UID"))
-	if err != nil || serviceUID <= 0 || serviceUID != os.Geteuid() { log.Fatal("process must run as configured non-root gateway service UID") }
+	if err != nil || serviceUID <= 0 || serviceUID != os.Geteuid() {
+		log.Fatal("process must run as configured non-root gateway service UID")
+	}
 	pilotUID, err := strconv.Atoi(required("PILOT_SERVICE_UID"))
-	if err != nil || pilotUID <= 0 || pilotUID == serviceUID { log.Fatal("Pilot UID must be valid and distinct from gateway service UID") }
-	if err := ingress.ValidateTsnetStateDirectory(stateDir, serviceUID, pilotUID); err != nil { log.Fatalf("invalid tsnet state directory: %v", err) }
+	if err != nil || pilotUID <= 0 || pilotUID == serviceUID {
+		log.Fatal("Pilot UID must be valid and distinct from gateway service UID")
+	}
+	if err := ingress.ValidateTsnetStateDirectory(stateDir, serviceUID, pilotUID); err != nil {
+		log.Fatalf("invalid tsnet state directory: %v", err)
+	}
 	keyPath := required("INGRESS_ASSERTION_KEY_FILE")
 	socketPath := required("PREVIEW_CORE_SOCKET")
 	key, err := ingress.PrivateAssertionKey(keyPath, serviceUID, pilotUID)
-	if err != nil { log.Fatalf("invalid assertion key file: %v", err) }
-	if err := ingress.ValidatePrivateSocketPath(socketPath, serviceUID, pilotUID); err != nil { log.Fatalf("invalid preview-core socket: %v", err) }
-	previewDomain := required("PREVIEW_DOMAIN")
-	previewCertificates, err := ingress.NewPreviewCertificateStore(
-		required("PREVIEW_TLS_CERT_FILE"), required("PREVIEW_TLS_KEY_FILE"), serviceUID, pilotUID, previewDomain, nil,
-	)
-	if err != nil { log.Fatalf("invalid owner preview certificate configuration: %v", err) }
+	if err != nil {
+		log.Fatalf("invalid assertion key file: %v", err)
+	}
+	if err := ingress.ValidatePrivateSocketPath(socketPath, serviceUID, pilotUID); err != nil {
+		log.Fatalf("invalid preview-core socket: %v", err)
+	}
+	// Previews are selected by port on the gateway node's own tailnet name: no
+	// wildcard certificate, no owner DNS, no SNI dispatch beyond the exact name.
+	expectedNode := required("PREVIEW_DOMAIN")
+	ports, err := ingress.ParsePreviewPorts(required("PREVIEW_PORTS"), 0)
+	if err != nil {
+		log.Fatalf("invalid preview ports: %v", err)
+	}
 
 	ts := &tsnet.Server{Dir: stateDir, Hostname: hostname}
 	if err := ts.Start(); err != nil {
@@ -71,41 +85,33 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	status, err := client.Status(context.Background())
+	if err != nil || status.Self == nil || status.Self.DNSName == "" {
+		log.Fatal("cannot read the gateway's tailnet DNS name")
+	}
+	nodeName := strings.TrimSuffix(status.Self.DNSName, ".")
+	if !strings.EqualFold(nodeName, expectedNode) {
+		_ = ts.Close()
+		log.Fatalf("gateway tailnet name %q does not match the reviewed PREVIEW_DOMAIN", nodeName)
+	}
+	nodeCertificate, err := ingress.NewNodeCertificate(nodeName, client.GetCertificate)
+	if err != nil {
+		log.Fatalf("invalid gateway node certificate configuration: %v", err)
+	}
 	lookup, err := ingress.NewTsnetWhoIs(client)
 	if err != nil {
 		log.Fatal(err)
 	}
 	app, err := ingress.UnixForwarder(socketPath, key, serviceUID, pilotUID)
-	if err != nil { log.Fatalf("invalid preview core bridge: %v", err) }
-	handler := ingress.RequireHostMatchesSNI(app)
-	handler = ingress.Protect(handler, lookup, policy)
-	selector, err := ingress.NewCertificateSelector(ts.CertDomains(), previewDomain,
-		func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) { return client.GetCertificate(hello) },
-		previewCertificates.GetCertificate,
-	)
-	if err != nil { log.Fatalf("invalid TLS certificate selector configuration: %v", err) }
-	tailnetListener, err := ts.Listen("tcp", ":443")
-	if err != nil { log.Fatal(err) }
-	tlsListener := tls.NewListener(tailnetListener, &tls.Config{
-		MinVersion: tls.VersionTLS12,
-		GetCertificate: selector.GetCertificate,
-	})
-	server := &http.Server{Handler: handler, ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 32 << 10}
-	reload := make(chan os.Signal, 1)
-	signal.Notify(reload, syscall.SIGHUP)
-	defer signal.Stop(reload)
+	if err != nil {
+		log.Fatalf("invalid preview core bridge: %v", err)
+	}
+
 	shutdownCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
-	go func() {
-		for range reload {
-			if err := previewCertificates.Reload(); err != nil {
-				log.Printf("owner preview TLS reload failed; preview certificate is unavailable until a valid pair is loaded")
-			} else {
-				log.Printf("owner preview TLS certificate reloaded")
-			}
-		}
-	}()
-	log.Printf("tsnet HTTPS ingress ready on %s; preview forwarding uses protected Unix socket", fmt.Sprintf("https://%s", hostname))
+	ctx, cancel := context.WithCancel(shutdownCtx)
+	defer cancel()
+
 	var closeOnce sync.Once
 	var closeErr error
 	closeNode := func() error {
@@ -113,8 +119,55 @@ func main() {
 		return closeErr
 	}
 	defer func() { _ = closeNode() }()
-	if err := serveHTTPS(shutdownCtx, server, tlsListener, 25*time.Second, closeNode); err != nil {
-		log.Printf("tsnet HTTPS ingress stopped: %v", err)
+
+	// The node is closed only after every listener has finished draining.
+	remaining := int32(len(ports))
+	var nodeOnce sync.Once
+	lastListenerDone := func() error {
+		if atomic.AddInt32(&remaining, -1) == 0 {
+			nodeOnce.Do(func() { _ = closeNode() })
+		}
+		return nil
+	}
+
+	servers := make([]*http.Server, 0, len(ports))
+	listeners := make([]net.Listener, 0, len(ports))
+	for _, port := range ports {
+		handler := ingress.RequireHostMatchesNode(app, nodeCertificate.Hostname(), port)
+		handler = ingress.Protect(handler, lookup, policy)
+		tailnetListener, listenErr := ts.Listen("tcp", fmt.Sprintf(":%d", port))
+		if listenErr != nil {
+			cancel()
+			log.Fatalf("cannot listen on tailnet preview port %d: %v", port, listenErr)
+		}
+		servers = append(servers, &http.Server{
+			Handler:           handler,
+			ReadHeaderTimeout: 5 * time.Second,
+			IdleTimeout:       60 * time.Second,
+			MaxHeaderBytes:    32 << 10,
+		})
+		listeners = append(listeners, tls.NewListener(tailnetListener, &tls.Config{
+			MinVersion:     tls.VersionTLS12,
+			GetCertificate: nodeCertificate.GetCertificate,
+		}))
+		log.Printf("tailnet preview listener ready on https://%s:%d", nodeCertificate.Hostname(), port)
+	}
+
+	errs := make(chan error, len(servers))
+	for i := range servers {
+		go func(server *http.Server, listener net.Listener) {
+			errs <- serveHTTPS(ctx, server, listener, 25*time.Second, lastListenerDone)
+		}(servers[i], listeners[i])
+	}
+	var failed bool
+	for range servers {
+		if err := <-errs; err != nil {
+			log.Printf("tailnet preview listener stopped: %v", err)
+			failed = true
+			cancel()
+		}
+	}
+	if failed {
 		os.Exit(1)
 	}
 }

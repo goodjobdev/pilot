@@ -6,7 +6,7 @@ const base = {
   GATEWAY_SERVICE_UID: '10002', PILOT_SERVICE_UID: '10001', TSNET_STATE_DIR: '/state', TSNET_HOSTNAME: 'node',
   TAILNET_OWNER_LOGIN: 'owner', TAILNET_GATEWAY_NODE_ID: 'gateway', TAILNET_HOST_NODE_ID: 'pilot', TAILNET_ALLOWED_REMOTE_NODE_IDS: 'device-a,device-b',
   INGRESS_ASSERTION_KEY_FILE: '/run/preview/keys/assertion.key', INGRESS_ASSERTION_PUBLIC_KEY_FILE: '/run/preview/keys/assertion.pub', PREVIEW_CORE_SOCKET: '/run/preview/socket/core.sock',
-  PREVIEW_DOMAIN: 'preview.example.com', PREVIEW_TLS_CERT_FILE: '/run/preview/certs/site.crt', PREVIEW_TLS_KEY_FILE: '/run/preview/certs/site.key',
+  PREVIEW_DOMAIN: 'gateway.tailnet-example.ts.net', PREVIEW_PORTS: '4301,4302',
   PREVIEW_CONTROL_HOST: 'control.example.net', DASHBOARD_ORIGIN: 'https://dashboard.example.org', PREVIEW_PRIVATE_IPV4: '127.0.0.1',
   PREVIEW_ALLOWED_PORTS: '3000,8080', PREVIEW_SITE_REVIEWED: 'true', PREVIEW_PORTS_REVIEWED: 'true',
 };
@@ -22,7 +22,10 @@ test('rejects loose environment values and unreviewed site configuration', () =>
   assert.throws(() => validateRuntimeConfig({ ...base, PREVIEW_SITE_REVIEWED: 'false' }, { uid: 10002, stat }), /certify/);
 });
 test('rejects same-site preview, unreviewed ports, and a non-loopback target', () => {
-  assert.throws(() => validateRuntimeConfig({ ...base, PREVIEW_DOMAIN: 'preview.example.net' }, { uid: 10002, stat }), /registrable site/);
+  assert.throws(() => validateRuntimeConfig({ ...base, PREVIEW_CONTROL_HOST: 'gateway.tailnet-example.ts.net' }, { uid: 10002, stat }), /registrable site|different/);
+  assert.throws(() => validateRuntimeConfig({ ...base, PREVIEW_DOMAIN: 'preview.example.net' }, { uid: 10002, stat }), /tailnet name/);
+  assert.throws(() => validateRuntimeConfig({ ...base, PREVIEW_PORTS: '443,4319' }, { uid: 10002, stat }), /listener ports/);
+  assert.throws(() => validateRuntimeConfig({ ...base, PREVIEW_PORTS: '4301,4301' }, { uid: 10002, stat }), /listener ports/);
   assert.throws(() => validateRuntimeConfig({ ...base, PREVIEW_PORTS_REVIEWED: 'false' }, { uid: 10002, stat }), /port allowlist/);
   assert.throws(() => validateRuntimeConfig({ ...base, PREVIEW_PRIVATE_IPV4: '10.0.0.2' }, { uid: 10002, stat }), /127.0.0.1/);
 });

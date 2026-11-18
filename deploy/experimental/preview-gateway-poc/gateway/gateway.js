@@ -57,11 +57,16 @@ function trustedHeaders(incoming, upgrade = false) {
  * intentionally never consulted. This core does not itself implement Tailscale/tsnet.
  */
 export function createGateway({
-  owner, ownerDeviceIds, excludedNodeIds, controlHost, previewDomain, dashboardOrigin, containerAddress, allowedPorts, verifyPeer,
+  owner, ownerDeviceIds, excludedNodeIds, controlHost, previewDomain, previewPorts, dashboardOrigin, containerAddress, allowedPorts, verifyPeer,
   ttlMs = 10 * 60_000, maxRoutes = 64, wsHandshakeTimeoutMs = 10_000, now = Date.now,
   assertionVerifier = null, privateSocketOnly = false, verifyPrivateSource = null,
 }) {
   if (!owner || !controlHost || !previewDomain || !dashboardOrigin || controlHost.includes(':') || previewDomain.includes(':') || /[\s/]/.test(controlHost) || /[\s/]/.test(previewDomain)) throw new Error('invalid controlHost, previewDomain, or dashboardOrigin');
+  // Previews are selected by port on the gateway node's own tailnet name, so the
+  // listener set is explicit, unprivileged and bounded.
+  if (!Array.isArray(previewPorts) || !previewPorts.length || previewPorts.length > 32 ||
+      previewPorts.some((p) => !Number.isInteger(p) || p < 1024 || p > 65535 || p === 443) ||
+      new Set(previewPorts).size !== previewPorts.length) throw new Error('previewPorts must be distinct unprivileged listener ports');
   const controlSite = registrableSite(controlHost.toLowerCase());
   const previewSite = registrableSite(previewDomain.toLowerCase());
   const dashboardSite = dashboardRegistrableSite(dashboardOrigin);
@@ -78,7 +83,7 @@ export function createGateway({
 
   const routes = new Map();
   const controlHostname = controlHost.toLowerCase();
-  const previewsDomain = previewDomain.toLowerCase();
+  const previewHost = previewDomain.toLowerCase();
   const controlOrigin = `https://${controlHostname}`;
 
   async function peer(req) {
@@ -175,14 +180,17 @@ export function createGateway({
         if (routes.size >= maxRoutes) return fail(res, 429, 'route limit reached');
         const id = randomUUID();
         const expiresAt = now() + ttlMs;
-        const host = `${id}.${previewsDomain}`;
+        const used = new Set([...routes.values()].map((route) => route.previewPort));
+        const previewPort = previewPorts.find((candidate) => !used.has(candidate));
+        if (previewPort === undefined) return fail(res, 429, 'no preview port available');
+        const host = `${previewHost}:${previewPort}`;
         const origin = `https://${host}`;
-        const route = { id, port, expiresAt, host, origin, connections: new Set(), expiryTimer: null };
+        const route = { id, port, previewPort, expiresAt, host, origin, connections: new Set(), expiryTimer: null };
         route.expiryTimer = setTimeout(() => removeRoute(id), ttlMs);
         route.expiryTimer.unref();
         routes.set(id, route);
         res.writeHead(201, { 'content-type': 'application/json', 'cache-control': 'no-store' });
-        return res.end(JSON.stringify({ id, expiresAt, host, origin, path: '/' }));
+        return res.end(JSON.stringify({ id, expiresAt, host, origin, previewPort, path: '/' }));
       }
       const revoke = /^\/__gateway\/routes\/([0-9a-f-]{36})$/i.exec(pathname);
       if (revoke && req.method === 'DELETE') {

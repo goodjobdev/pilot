@@ -24,7 +24,7 @@ async function fixture({ peerName = owner, peerNodeId = 'owner-device-1', ttlMs 
   if (onUpgrade) upstream.on('upgrade', onUpgrade);
   const upstreamPort = await listen(upstream);
   let now = 1000;
-  const core = createGateway({ owner, ownerDeviceIds: ['owner-device-1'], excludedNodeIds: ['oracle-node', 'gateway-node'], controlHost, previewDomain, dashboardOrigin, containerAddress: '127.0.0.1', allowedPorts: [upstreamPort], ttlMs, wsHandshakeTimeoutMs,
+  const core = createGateway({ owner, ownerDeviceIds: ['owner-device-1'], excludedNodeIds: ['oracle-node', 'gateway-node'], controlHost, previewDomain, previewPorts: [4301, 4302], dashboardOrigin, containerAddress: '127.0.0.1', allowedPorts: [upstreamPort], ttlMs, wsHandshakeTimeoutMs,
     now: () => now, verifyPeer: async (address) => address ? { name: peerName, ...(peerNodeId ? { nodeId: peerNodeId } : {}) } : null });
   const gatewayPort = await listen(core.server);
   return { upstream, core, gatewayPort, upstreamPort, setNow: (v) => { now = v; } };
@@ -43,7 +43,9 @@ test('owner can create route; browser navigation/root-relative assets work and s
   f.upstream.removeAllListeners('request');
   f.upstream.on('request', (req, res) => { received = req.headers; res.setHeader('set-cookie', 'session=secret'); res.end(`path:${req.url}`); });
   const route = await createRoute(f);
-  assert.equal(route.host, `${route.id}.${previewDomain}`);
+  assert.equal(route.host, `${previewDomain}:${route.previewPort}`);
+  assert.equal(route.origin, `https://${route.host}`);
+  assert.ok([4301, 4302].includes(route.previewPort));
   const response = await request(f.gatewayPort, { path: '/src/main.js', host: route.host, origin: route.origin, headers: { authorization: 'Bearer secret', cookie: 'session=secret', 'x-tailscale-user-login': owner } });
   assert.equal(response.status, 200); assert.equal(response.body, 'path:/src/main.js');
   assert.equal(received.authorization, undefined); assert.equal(received.cookie, undefined); assert.equal(response.headers['set-cookie'], undefined);
@@ -90,7 +92,7 @@ test('websocket rejects bad origin and supports root-relative HMR path', async (
   const wsServer = http.createServer(); let receivedPath;
   wsServer.on('upgrade', (req, socket) => { receivedPath = req.url; socket.end('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: test\r\n\r\n'); });
   const wsPort = await listen(wsServer);
-  const gateway = createGateway({ owner, ownerDeviceIds: ['owner-device-1'], excludedNodeIds: ['oracle-node', 'gateway-node'], controlHost, previewDomain, dashboardOrigin, containerAddress: '127.0.0.1', allowedPorts: [wsPort], verifyPeer: async () => ({ name: owner, nodeId: 'owner-device-1' }) });
+  const gateway = createGateway({ owner, ownerDeviceIds: ['owner-device-1'], excludedNodeIds: ['oracle-node', 'gateway-node'], controlHost, previewDomain, previewPorts: [4301, 4302], dashboardOrigin, containerAddress: '127.0.0.1', allowedPorts: [wsPort], verifyPeer: async () => ({ name: owner, nodeId: 'owner-device-1' }) });
   const gatewayPort = await listen(gateway.server); t.after(async () => { await close(gateway.server); await close(wsServer); });
   const route = JSON.parse((await request(gatewayPort, { method: 'POST', path: '/__gateway/routes', headers: ownerHttpHeaders, body: JSON.stringify({ port: wsPort }) })).body);
   // Use a direct handshake helper to ensure a malicious Origin is actually sent.

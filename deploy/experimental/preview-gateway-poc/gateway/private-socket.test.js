@@ -37,7 +37,7 @@ test('private Unix socket enforces assertion and only exposes authenticated mana
   });
   await new Promise((resolve) => upstream.listen(0, '127.0.0.1', resolve));
   const port = upstream.address().port;
-  const core = createGateway({ owner, ownerDeviceIds: ['approved'], excludedNodeIds: ['gateway', 'host'], controlHost: 'control.example.com', previewDomain: 'preview.example.net', dashboardOrigin: 'https://dashboard.example.org', containerAddress: '127.0.0.1', allowedPorts: [port], assertionVerifier: createAssertionVerifier({ publicKey, ownerLogin: owner, allowedNodeIds: ['approved'] }), privateSocketOnly: true, verifyPrivateSource: (socket) => socket.remoteAddress === undefined });
+  const core = createGateway({ owner, ownerDeviceIds: ['approved'], excludedNodeIds: ['gateway', 'host'], controlHost: 'control.example.com', previewDomain: 'preview.example.net', previewPorts: [4301, 4302], dashboardOrigin: 'https://dashboard.example.org', containerAddress: '127.0.0.1', allowedPorts: [port], assertionVerifier: createAssertionVerifier({ publicKey, ownerLogin: owner, allowedNodeIds: ['approved'] }), privateSocketOnly: true, verifyPrivateSource: (socket) => socket.remoteAddress === undefined });
   await new Promise((resolve, reject) => { core.server.once('error', reject); core.server.listen(socketPath, resolve); });
   fs.chmodSync(socketPath, 0o600);
   assert.equal(fs.statSync(socketPath).mode & 0o777, 0o600);
@@ -77,7 +77,7 @@ test('private Unix socket enforces assertion and only exposes authenticated mana
 });
 
 test('TCP source cannot use a valid signed ingress assertion', async (t) => {
-  const core = createGateway({ owner, ownerDeviceIds: ['approved'], excludedNodeIds: ['gateway', 'host'], controlHost: 'control.example.com', previewDomain: 'preview.example.net', dashboardOrigin: 'https://dashboard.example.org', containerAddress: '127.0.0.1', allowedPorts: [1234], assertionVerifier: createAssertionVerifier({ publicKey, ownerLogin: owner, allowedNodeIds: ['approved'] }), privateSocketOnly: true, verifyPrivateSource: (socket) => socket.remoteAddress === undefined });
+  const core = createGateway({ owner, ownerDeviceIds: ['approved'], excludedNodeIds: ['gateway', 'host'], controlHost: 'control.example.com', previewDomain: 'preview.example.net', previewPorts: [4301, 4302], dashboardOrigin: 'https://dashboard.example.org', containerAddress: '127.0.0.1', allowedPorts: [1234], assertionVerifier: createAssertionVerifier({ publicKey, ownerLogin: owner, allowedNodeIds: ['approved'] }), privateSocketOnly: true, verifyPrivateSource: (socket) => socket.remoteAddress === undefined });
   await new Promise((resolve) => core.server.listen(0, '127.0.0.1', resolve));
   const port = core.server.address().port;
   t.after(() => new Promise((resolve) => core.server.close(resolve)));
