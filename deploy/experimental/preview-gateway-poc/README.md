@@ -44,6 +44,10 @@ preview: `https://<gateway-node>.<tailnet>.ts.net:<port>/`.
 - Go: `go vet ./... && go test -count=1 ./...` passes offline in a network-disabled
   `golang:1.27.4-bookworm` container as UID 10001, including HTTP/WebSocket forwarding and
   the tsnet shutdown lifecycle tests.
+- Cross-process lane: `TAILNET_BRIDGE_E2E=1` passes offline with the real
+  `SO_PEERCRED` addon in a network-disabled `node:24-bookworm` container as UID 10002 —
+  Go ingress ↔ Node core over the private socket, management route creation, HTTP and
+  WebSocket upgrade forwarding, and header stripping.
 - Node: 41 tests pass offline in a network-disabled `node:24-bookworm-slim` container as a
   non-root UID (`gateway`, `gateway-ui`, `assertion`, `private-socket`, `boundary`,
   `preflight`).

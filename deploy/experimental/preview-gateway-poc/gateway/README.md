@@ -44,7 +44,8 @@ failures**, run offline in a network-disabled `node:24-bookworm-slim` container 
 a non-root UID.
 
 The Go suite (`go vet ./... && go test -count=1 ./...`) also passes offline in a
-network-disabled `golang:1.27.4-bookworm` container as UID 10001, including
-cross-process Go-to-Node HTTP and WebSocket forwarding tests.
+network-disabled `golang:1.27.4-bookworm` container as UID 10001. The skip-gated
+cross-process lane (`TAILNET_BRIDGE_E2E=1`, real `SO_PEERCRED` addon) passes offline
+in a `node:24-bookworm` container as UID 10002.
 
 No deployment, certificate, DNS, or live-tailnet claim is made.

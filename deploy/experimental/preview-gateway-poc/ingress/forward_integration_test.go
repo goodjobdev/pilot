@@ -82,6 +82,7 @@ func TestGoProxyToNodeCoreHTTPAndWebSocket(t *testing.T) {
 		"TAILNET_HOST_NODE_ID=host-node",
 		"PREVIEW_CONTROL_HOST=control.example.com",
 		"PREVIEW_DOMAIN=preview.example.net",
+		"PREVIEW_PORTS="+strconv.Itoa(previewPort),
 		"DASHBOARD_ORIGIN=https://dashboard.example.org",
 		"PREVIEW_PRIVATE_IPV4=127.0.0.1",
 		"PREVIEW_ALLOWED_PORTS="+strconv.Itoa(previewPort),
