@@ -125,3 +125,22 @@ call a network-membership check owner authentication.
 
 A security/design review must resolve these before implementation. Cloudflare remains the supported
 hosted identity path in the meantime.
+
+# Verification
+
+Recorded from the disposable end-to-end run (Linux ARM64, no live tailnet): the real dashboard
+server in `tailnet-gateway` mode behind the real proxy handler, with an injected `WhoIs` and a
+freshly generated Ed25519 key pair. Sixteen checks passed:
+
+- the proxy forwards an owner request and the dashboard accepts its assertion (200);
+- a client-supplied `CF-Access-Jwt-Assertion` and a client-supplied `X-Pilot-Gateway-Assertion` are
+  both stripped before forwarding, and the request still succeeds;
+- the unauthenticated `/healthz` route stays public, and a foreign `Host` is refused (403) by the proxy;
+- direct to the dashboard: no assertion → 401, a Cloudflare assertion in this mode → 401, a valid
+  assertion → 200, a replay of that same assertion → 401, an assertion signed by another key → 401,
+  an expired assertion → 401, a wrong audience → 401, a non-owner subject → 403;
+- before the dashboard: an unapproved node, a tagged peer and a different tailnet login are each
+  refused with 403.
+
+Offline Go tests additionally cover the WebSocket upgrade path (101 from the backend, assertion
+attached, identity headers stripped) and configuration refusal for a non-private destination.
