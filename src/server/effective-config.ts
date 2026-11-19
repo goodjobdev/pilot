@@ -56,7 +56,7 @@ export function effectiveConfig(env: NodeJS.ProcessEnv): EffectiveConfig {
 
   let security: SecurityConfig;
   if (mode === 'local') {
-    const identityVariables = ['DASHBOARD_ORIGIN', 'CF_ACCESS_TEAM', 'CF_ACCESS_AUD', 'DASHBOARD_OWNER'];
+    const identityVariables = ['DASHBOARD_ORIGIN', 'CF_ACCESS_TEAM', 'CF_ACCESS_AUD', 'DASHBOARD_OWNER', 'DASHBOARD_IDENTITY_PROVIDER', 'TAILNET_GATEWAY_ISSUER', 'TAILNET_GATEWAY_AUD', 'TAILNET_GATEWAY_PUBLIC_KEY'];
     const contradictory = identityVariables.filter(name => env[name] !== undefined);
     if (contradictory.length) throw new Error('Hosted identity settings are not allowed in local mode');
     if (exposure !== 'host-loopback') throw new Error('Local mode requires host-loopback exposure');

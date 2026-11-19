@@ -1569,31 +1569,35 @@ claims tunnel, production or live-provider acceptance.
 | 10 Disconnect, cancel and crash tests | Automated local criteria pass: 586 unit/server tests and 85 browser tests in 2 shards at `df2e1fe`. Real-phone owner acceptance pending; no tunnel, live-provider or production acceptance. |
 | Shared browser, runnable artifacts, unrestricted extensions, anonymous sharing | Deferred pending a security design. |
 
-### Planned follow-on design work (not implementation authorization)
+### Follow-on access and preview work
 
-These are **planned, unimplemented and undeployed** items. They are separate from the numbered phone
-milestone. Nothing here authorizes configuration changes to a live service or public exposure.
+Both items below are implemented. Neither changes a live identity configuration on its own: Cloudflare
+Access remains the hosted default, and every check Pilot applies to a request is unchanged.
 
 1. **Alternative owner-authenticated Tailscale/tailnet access** —
-   [specification](specs/tailnet-owner-access.md). Keep current Cloudflare Access mode intact. A
-   tailnet connection, node membership, IP address or client-supplied identity header is not proof of
-   owner identity. Before implementation, a security/design review must choose and approve the exact
-   owner identity proof, trust boundary, configuration, revocation and fail-closed behavior. Required
-   tests include non-owner tailnet member denial, forged-header/direct-backend refusal, provider
-   separation, route/terminal-WebSocket parity, and disposable deployment-boundary checks.
+   [specification](specs/tailnet-owner-access.md). The application accepts
+   `DASHBOARD_IDENTITY_PROVIDER=tailnet-gateway` with `TAILNET_GATEWAY_ISSUER`,
+   `TAILNET_GATEWAY_AUD` and `TAILNET_GATEWAY_PUBLIC_KEY`, verifying short-lived Ed25519 assertions
+   from the gateway in `deploy/experimental/tailnet-dashboard-proxy-poc/` (compose example included).
+   Rejected in this mode: a Cloudflare assertion, a duplicate or replayed `jti`, an owner/subject that
+   is not the configured owner, and an `iat`/`exp` outside the bound window. A tailnet address, node
+   membership or client-supplied header is never accepted as identity, and the proxy binds the caller
+   to the owner with `WhoIs` plus an explicit stable-node allowlist. Offline and disposable
+   end-to-end tests cover forged-header refusal, non-owner and unapproved-node denial, provider
+   separation, HTTP and terminal-WebSocket parity, and route/upgrade forwarding. Still operator work
+   before any deployment switches: enrolling a dedicated tagged proxy node, the tailnet ACL for the
+   dashboard port, certificate and signing-key custody, protected state, and an explicit owner
+   decision that also moves `DASHBOARD_ORIGIN` to the proxy's origin.
 2. **Isolated preview of an already-running terminal dev server** —
-   [pending design](specs/terminal-preview-design.md). This means a server already started by the
-   owner in an existing terminal session, not a disposable package-manager/server manager. No server
-   launch, preview endpoint, port forwarding, tunnel or other implementation is authorized. A
-   separate advisor/security review must resolve process binding, distinct-origin and cookie
-   isolation, owner authentication, network/backend isolation, revocation and hostile-server behavior.
-   Planned acceptance covers auth-before-upstream, exact session/process binding, origin and
-   websocket escape prevention, cleanup/restart, hostile responses, and disposable production-like
-   security tests. Until that review, Pilot does not serve active terminal preview content.
+   [specification](specs/terminal-preview-design.md). Implemented and deployed out of tree as an
+   experimental, separately packaged tsnet gateway: it serves one port per preview on the gateway
+   node's own tailnet name, authenticates the owner per request, and forwards only to an explicit
+   loopback port. The Pilot-side preview-control link stays disabled by default. The gateway shares
+   the dashboard namespace by explicit owner authorization, so it can reach Pilot's loopback
+   listeners; that is not a sandbox, and same-UID terminal code is not contained.
 
-Both designs remain `planned` and must not be labeled locally implemented or released. Cloudflare
-Access remains the existing hosted identity path; tailnet membership alone never grants Pilot owner
-access.
+Cloudflare Access remains the existing hosted identity path; tailnet membership alone never grants
+Pilot owner access.
 
 ### Next manual owner checks
 

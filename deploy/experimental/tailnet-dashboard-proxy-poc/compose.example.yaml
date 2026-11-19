@@ -1,0 +1,53 @@
+# EXAMPLE ONLY: an opt-in alternative to Cloudflare Access for the dashboard.
+# Not part of Pilot's normal deployment, and not enabled by default.
+#
+# The proxy joins the tailnet as its own tagged node, terminates TLS on that node's
+# :443, verifies the calling node with WhoIs (owner login, approved stable node ID,
+# untagged), and forwards to one fixed private dashboard address with a short-lived
+# Ed25519 assertion. The dashboard must run with
+#   DASHBOARD_IDENTITY_PROVIDER=tailnet-gateway
+#   TAILNET_GATEWAY_ISSUER / TAILNET_GATEWAY_AUD / TAILNET_GATEWAY_PUBLIC_KEY
+# and its DASHBOARD_ORIGIN must be the proxy node's exact https origin.
+services:
+  tailnet-dashboard-proxy:
+    image: pilot-tailnet-dashboard-proxy:opt-in
+    build:
+      context: .
+      dockerfile: Dockerfile
+      platforms: [linux/arm64]
+      args:
+        GO_BUILD_IMAGE: ${GO_BUILD_IMAGE:?immutable @sha256 digest required}
+        RUNTIME_IMAGE: ${RUNTIME_IMAGE:?immutable @sha256 digest required}
+    init: true
+    # The dashboard binds loopback only; sharing its namespace is what makes that reachable.
+    network_mode: service:dashboard
+    user: "10002:10002"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 128
+    cpus: 1.0
+    mem_limit: 256m
+    restart: "no"
+    stop_grace_period: 15s
+    environment:
+      PILOT_TAILNET_DASHBOARD_PROXY: "1"
+      PILOT_SERVICE_UID: ${PILOT_SERVICE_UID:?required distinct Pilot UID}
+      TSNET_STATE_DIR: /var/lib/tsnet
+      TSNET_HOSTNAME: ${TSNET_HOSTNAME:?reviewed proxy node name required}
+      TAILNET_OWNER_LOGIN: ${TAILNET_OWNER_LOGIN:?reviewed owner login required}
+      TAILNET_GATEWAY_NODE_ID: ${TAILNET_GATEWAY_NODE_ID:?reviewed proxy node ID required}
+      TAILNET_HOST_NODE_ID: ${TAILNET_HOST_NODE_ID:?reviewed Pilot node ID required}
+      TAILNET_ALLOWED_REMOTE_NODE_IDS: ${TAILNET_ALLOWED_REMOTE_NODE_IDS:?explicit owner device allowlist required}
+      DASHBOARD_PRIVATE_ADDRPORT: ${DASHBOARD_PRIVATE_ADDRPORT:-127.0.0.1:4319}
+      DASHBOARD_PRIVATE_HOST: ${DASHBOARD_PRIVATE_HOST:?dashboard Host required}
+      DASHBOARD_ORIGIN: ${DASHBOARD_ORIGIN:?proxy https origin required}
+      TAILNET_GATEWAY_ISSUER: ${TAILNET_GATEWAY_ISSUER:?issuer required}
+      TAILNET_GATEWAY_AUD: ${TAILNET_GATEWAY_AUD:?audience required}
+      GATEWAY_ED25519_PRIVATE_KEY_FILE: /run/gateway/keys/assertion.key
+    volumes:
+      - ./state/tsnet:/var/lib/tsnet
+      - ./state/keys:/run/gateway/keys:ro
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m,mode=0700,uid=10002,gid=10002
+    # No published ports, host networking, Docker/Tailscale sockets, host privileges or Funnel.

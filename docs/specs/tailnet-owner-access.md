@@ -1,20 +1,24 @@
 ---
-title: "Planned design: owner-authenticated tailnet access"
-description: "Security and acceptance contract for a possible Tailscale access alternative to Cloudflare Access."
+title: "Owner-authenticated tailnet access"
+description: "Security and acceptance contract for Pilot's opt-in Tailscale alternative to Cloudflare Access."
 pilot:
   schema: 1
   id: tailnet-owner-access
   kind: specification
   doc_status: draft
-  feature_status: planned
+  feature_status: implemented
   verified_release: null
 ---
 
 # Status
 
-**Planned design only.** This is not implemented, available, deployed, or authorization to alter a
-live service. Cloudflare Access remains the existing hosted identity path. A tailnet connection or
-Tailscale membership is not proof that a request is the owner.
+**Implemented and shipped, opt-in, not enabled.** The application accepts
+`DASHBOARD_IDENTITY_PROVIDER=tailnet-gateway` with `TAILNET_GATEWAY_ISSUER`, `TAILNET_GATEWAY_AUD` and
+`TAILNET_GATEWAY_PUBLIC_KEY`, and `deploy/experimental/tailnet-dashboard-proxy-poc/` is the matching
+gateway source with an example Compose unit. No deployment of Pilot enables it: the live dashboard
+still runs `DASHBOARD_IDENTITY_PROVIDER=cloudflare` and Cloudflare Access remains the hosted default.
+A tailnet connection or Tailscale membership is not proof that a request is the owner; only a valid
+gateway assertion for the configured owner, verified by Pilot, is.
 
 ## Problem and outcome
 

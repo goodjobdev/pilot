@@ -1,4 +1,5 @@
 import {test} from 'node:test';
+import { generateKeyPairSync } from 'node:crypto';
 import {request as httpRequest} from 'node:http';
 const fetch=(url:string,init:{method?:string;headers?:Record<string,string>;body?:string}={})=>new Promise<Response>((resolve,reject)=>{const req=httpRequest(url,{method:init.method,headers:init.headers},res=>{let body='';res.on('data',chunk=>body+=chunk);res.on('end',()=>resolve(new Response(body,{status:res.statusCode,headers:res.headers as Record<string,string>})));});req.on('error',reject);req.end(init.body);});
 import assert from 'node:assert/strict';
@@ -8,7 +9,30 @@ import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {createApp} from '../../src/server/main';
 import {hostedConfig} from '../../src/server/security';
-test('hosted startup configuration fails closed',()=>{assert.throws(()=>hostedConfig({}));assert.throws(()=>hostedConfig({DASHBOARD_ORIGIN:'http://example.com',CF_ACCESS_TEAM:'https://test.cloudflareaccess.com',CF_ACCESS_AUD:'test',DASHBOARD_OWNER:'john@example.com'}));});
+test('hosted startup configuration fails closed and keeps Cloudflare as the default',()=>{assert.throws(()=>hostedConfig({}));assert.throws(()=>hostedConfig({DASHBOARD_ORIGIN:'http://example.com',CF_ACCESS_TEAM:'https://test.cloudflareaccess.com',CF_ACCESS_AUD:'test',DASHBOARD_OWNER:'john@example.com'}));assert.equal(hostedConfig({DASHBOARD_ORIGIN:'https://dashboard.example.com',CF_ACCESS_TEAM:'https://test.cloudflareaccess.com',CF_ACCESS_AUD:'dashboard',DASHBOARD_OWNER:'john@example.com'}).provider,'cloudflare');});
+test('tailnet gateway identity is explicit and validates its independent trust anchor',()=>{
+ const publicKey=generateKeyPairSync('ed25519').publicKey.export({type:'spki',format:'pem'}).toString();
+ const base={DASHBOARD_MODE:'hosted',DASHBOARD_ORIGIN:'https://dashboard.example.com',DASHBOARD_OWNER:'owner@example.com'};
+ assert.throws(()=>hostedConfig({...base,DASHBOARD_IDENTITY_PROVIDER:'tailnet-gateway'}),/TAILNET_GATEWAY_ISSUER/);
+ const config=hostedConfig({...base,DASHBOARD_IDENTITY_PROVIDER:'tailnet-gateway',TAILNET_GATEWAY_ISSUER:'pilot-gateway',TAILNET_GATEWAY_AUD:'pilot-dashboard',TAILNET_GATEWAY_PUBLIC_KEY:publicKey});
+ assert.equal(config.provider,'tailnet-gateway');assert.equal(config.team,undefined);assert.equal(config.audience,'pilot-dashboard');
+ assert.throws(()=>hostedConfig({...base,DASHBOARD_IDENTITY_PROVIDER:'tailnet-gateway',TAILNET_GATEWAY_ISSUER:'issuer',TAILNET_GATEWAY_AUD:'aud',TAILNET_GATEWAY_PUBLIC_KEY:'not-a-key'}),/valid Ed25519/);
+ assert.throws(()=>hostedConfig({...base,DASHBOARD_IDENTITY_PROVIDER:'tailnet-gateway',TAILNET_GATEWAY_ISSUER:'issuer',TAILNET_GATEWAY_AUD:'aud',TAILNET_GATEWAY_PUBLIC_KEY:publicKey,CF_ACCESS_TEAM:'https://test.cloudflareaccess.com'}),/Cloudflare settings/);
+});
+test('tailnet gateway assertions require an exact owner and are single-use without bypassing sessions',async()=>{
+ const {publicKey,privateKey}=generateKeyPairSync('ed25519');
+ const config=hostedConfig({DASHBOARD_ORIGIN:'https://dashboard.example.com',DASHBOARD_OWNER:'owner@example.com',DASHBOARD_IDENTITY_PROVIDER:'tailnet-gateway',TAILNET_GATEWAY_ISSUER:'https://gateway.example.test',TAILNET_GATEWAY_AUD:'pilot-dashboard',TAILNET_GATEWAY_PUBLIC_KEY:publicKey.export({type:'spki',format:'pem'}).toString()});
+ const app=await createApp({dataRoot:await mkdtemp(join(tmpdir(),'dashboard-tailnet-access-')),browseRoots:[],security:config});await new Promise<void>(ok=>app.server.listen(0,'127.0.0.1',ok));
+ const origin='http://127.0.0.1:'+(app.server.address() as any).port;
+ const assertion=(jti:string)=>new SignJWT({owner:'owner@example.com'}).setProtectedHeader({alg:'EdDSA'}).setIssuer(config.gatewayIssuer!).setAudience(config.audience!).setSubject('owner@example.com').setJti(jti).setIssuedAt().setExpirationTime('30s').sign(privateKey);
+ try{
+  const token=await assertion('one-time-assertion-01'),headers={host:'dashboard.example.com','x-pilot-gateway-assertion':token};
+  const sessionResponse=await fetch(origin+'/api/session',{headers});assert.equal(sessionResponse.status,200);
+  const session=await sessionResponse.json() as {csrf:string};assert.ok(session.csrf);
+  assert.equal((await fetch(origin+'/api/session',{headers})).status,401,'same assertion cannot be replayed');
+  assert.equal((await fetch(origin+'/api/session',{headers:{host:'dashboard.example.com','cf-access-jwt-assertion':token}})).status,401,'Cloudflare assertions are not accepted in tailnet mode');
+ }finally{await app.close();}
+});
 test('signed Access identity, expiry, audience, CSRF and untrusted requests',async()=>{
  const {publicKey,privateKey}=await generateKeyPair('RS256'),jwk=await exportJWK(publicKey);jwk.kid='test';const keys=createLocalJWKSet({keys:[jwk]});
  const security=hostedConfig({DASHBOARD_ORIGIN:'https://dashboard.example.com',CF_ACCESS_TEAM:'https://test.cloudflareaccess.com',CF_ACCESS_AUD:'dashboard',DASHBOARD_OWNER:'john@example.com'});

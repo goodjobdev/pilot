@@ -58,6 +58,9 @@ test('local mode rejects wildcard/nonloopback bindings and container or tunnel e
   assert.throws(() => effectiveConfig({
     DASHBOARD_MODE: 'local', DASHBOARD_ORIGIN: 'https://pilot.example.test'
   }), /Hosted identity settings/);
+  assert.throws(() => effectiveConfig({
+    DASHBOARD_MODE: 'local', TAILNET_GATEWAY_ISSUER: 'gateway'
+  }), /Hosted identity settings/);
 });
 
 test('hosted identity, mode and exposure profiles fail closed', () => {
