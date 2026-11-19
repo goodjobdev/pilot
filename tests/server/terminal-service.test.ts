@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { test } from 'node:test';
-import { TerminalService } from '../../src/server/agents/terminal-service';
+import { TerminalService, terminalEnvironment } from '../../src/server/agents/terminal-service';
 import type { Project } from '../../src/shared/model';
 
 async function root(){return await mkdtemp(join(tmpdir(),'pilot-terminal-'));}
@@ -47,4 +47,33 @@ test('interactive terminal rejects invalid dimensions and enforces session limit
     assert.throws(()=>service.open(projectRecord),/limit/);
     assert.equal(sessions.length,8);
   }finally{await service.close();await rm(path,{recursive:true,force:true});}
+});
+
+test('a terminal environment drops the service configuration and keeps the project environment',()=>{
+  const previous={origin:process.env.DASHBOARD_ORIGIN,team:process.env.CF_ACCESS_TEAM};
+  process.env.DASHBOARD_ORIGIN='https://dashboard.example';
+  process.env.CF_ACCESS_TEAM='https://team.cloudflareaccess.com';
+  try{
+    const env=terminalEnvironment();
+    assert.equal(env.DASHBOARD_ORIGIN,undefined,'the hosted dashboard origin must not reach a project command');
+    assert.equal(env.DASHBOARD_OWNER,undefined);
+    assert.equal(env.DASHBOARD_FILE_EDIT,undefined);
+    assert.equal(env.DASHBOARD_DATA,undefined);
+    assert.equal(env.CF_ACCESS_TEAM,undefined);
+    assert.equal(env.CF_ACCESS_AUD,undefined);
+    for(const key of ['PATH','HOME']) if(process.env[key]!==undefined) assert.equal(env[key],process.env[key],key+' must survive');
+    assert.equal(env.TERM,'xterm-256color');
+    assert.equal(env.COLORTERM,'truecolor');
+    assert.notEqual(env,process.env,'the service environment itself is never mutated or handed over');
+    assert.equal(process.env.DASHBOARD_ORIGIN,'https://dashboard.example');
+  }finally{
+    if(previous.origin===undefined)delete process.env.DASHBOARD_ORIGIN;else process.env.DASHBOARD_ORIGIN=previous.origin;
+    if(previous.team===undefined)delete process.env.CF_ACCESS_TEAM;else process.env.CF_ACCESS_TEAM=previous.team;
+  }
+});
+
+test('terminalEnvironment strips only the service prefixes and applies fixed terminal settings',()=>{
+  const env=terminalEnvironment({PATH:'/usr/bin',HOME:'/data',PNPM_HOME:'/data/pnpm',DASHBOARD_MODE:'hosted',DASHBOARD_TERMINAL:'on',DASHBOARD_:'',CF_ACCESS_AUD:'aud',TERM:'dumb',COLORTERM:'0',UNDEFINED_VALUE:undefined});
+  assert.deepEqual(Object.keys(env).sort(),['COLORTERM','HOME','PATH','PNPM_HOME','TERM']);
+  assert.equal(env.PNPM_HOME,'/data/pnpm');
 });

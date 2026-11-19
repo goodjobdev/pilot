@@ -9,6 +9,26 @@ export const TERMINAL_MAX_ROWS = 100;
 export const TERMINAL_SCROLLBACK_BYTES = 256 * 1024;
 export const TERMINAL_TICKET_TTL_MS = 30_000;
 
+/**
+ * Variables that describe how this Pilot service is deployed and authenticated. They belong to the
+ * service, not to the project a terminal belongs to, so a project command never receives them; a
+ * project suite that reads them would otherwise run in the deployment's hosted mode.
+ */
+const SERVICE_CONFIGURATION_PREFIXES = ['DASHBOARD_', 'CF_ACCESS_'] as const;
+
+/** The terminal child environment: the service environment without its own configuration. */
+export function terminalEnvironment(source: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {};
+  for (const [key, value] of Object.entries(source)) {
+    if (value === undefined) continue;
+    if (SERVICE_CONFIGURATION_PREFIXES.some((prefix) => key.startsWith(prefix))) continue;
+    env[key] = value;
+  }
+  env.TERM = 'xterm-256color';
+  env.COLORTERM = 'truecolor';
+  return env;
+}
+
 export type TerminalInfo = Readonly<{
   id: string;
   projectId: string;
@@ -49,7 +69,7 @@ export class TerminalService {
     const shell = configuredShell();
     const child = pty.spawn(shell, shellLoginArgs(shell), {
       name: 'xterm-256color', cols, rows, cwd: project.path,
-      env: { ...process.env, TERM: 'xterm-256color', COLORTERM: 'truecolor' }
+      env: terminalEnvironment()
     });
     let resolveExit!: () => void;
     const exited = new Promise<void>((resolve) => { resolveExit = resolve; });

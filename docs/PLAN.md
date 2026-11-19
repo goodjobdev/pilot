@@ -518,7 +518,7 @@ done until the owner accepts it on a phone.
   continuing to follow; a session switch resetting the count; two projects with equal-length
   conversations resetting between them; and a reload showing no phantom count.
 - Validation ran with this worktree's own binaries from
-  `[redacted local path]` (package `pilot` 0.1.0, Node
+  `/Users/john/dev/.archive/pilot-worktrees/integration-b23730b` (package `pilot` 0.1.0, Node
   26.8.1): `./node_modules/.bin/svelte-check --tsconfig ./tsconfig.json` and
   `./node_modules/.bin/tsc --noEmit` (0 errors, 0 warnings), `./node_modules/.bin/vite build` plus
   `./node_modules/.bin/esbuild …` (fresh build before the browser runs),
@@ -686,7 +686,7 @@ they are not docked over the transcript.
   controls and safe area; each session's draft across Back, Forward and reload; and a dirty
   document that refuses Back and then accepts it.
 - Validation ran with this worktree's own binaries from
-  `[redacted local path]` (package `pilot` 0.1.0, Node
+  `/Users/john/dev/.archive/pilot-worktrees/integration-b23730b` (package `pilot` 0.1.0, Node
   26.8.1): `./node_modules/.bin/svelte-check --tsconfig ./tsconfig.json` and
   `./node_modules/.bin/tsc --noEmit` (0 errors, 0 warnings), `./node_modules/.bin/vite build` plus
   `./node_modules/.bin/esbuild …` (fresh build before the browser runs),
@@ -952,7 +952,7 @@ deterministic delays are host-only test seams.
   the "between delay and append" boundary are the same durable `execute` checkpoint: both are
   before the append and both recover as interrupted, never repeated.
 - Validation ran with this worktree's own binaries from
-  `[redacted local path]` (package `pilot` 0.1.0, Node
+  `/Users/john/dev/.archive/pilot-worktrees/integration-b23730b` (package `pilot` 0.1.0, Node
   26.8.1): `./node_modules/.bin/tsc --noEmit`, `./node_modules/.bin/svelte-check --tsconfig
   ./tsconfig.json` (0 errors, 0 warnings), `./node_modules/.bin/vite build` plus
   `./node_modules/.bin/esbuild src/server/main.ts --bundle --platform=node --format=esm

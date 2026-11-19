@@ -15,7 +15,9 @@ pilot:
 The operator must set `DASHBOARD_TERMINAL=on` for the Pilot service and restart it. The default is
 off. This is separate from the agent coding-tool switches; it does not enable an agent shell.
 
-**Read this before enabling it:** the shell runs as the Pilot service user, inherits its environment,
+**Read this before enabling it:** the shell runs as the Pilot service user, inherits its environment
+(except `DASHBOARD_*` and `CF_ACCESS_*`, which describe the service's own deployment and
+authentication and are removed so a project command does not run in the dashboard's hosted mode),
 and may access every file, credential and service available to that user. The selected project is
 only its starting directory; this is not a sandbox. Do not enable the terminal on a service identity
 that should not have broad command access.
