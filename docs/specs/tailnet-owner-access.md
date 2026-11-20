@@ -5,9 +5,9 @@ pilot:
   schema: 1
   id: tailnet-owner-access
   kind: specification
-  doc_status: draft
+  doc_status: reviewed
   feature_status: implemented
-  verified_release: null
+  verified_release: "20261120T010000Z-r13"
 ---
 
 # Status
@@ -111,9 +111,11 @@ call a network-membership check owner authentication.
 - **TA-7 — Deployment boundary:** disposable production-like tests verify the listener and trusted
   identity endpoint are not exposed beyond the intended private boundary, with no privileged
   container, host networking expansion, or untrusted header trust.
-- **TA-8 — Documentation:** deployment and troubleshooting instructions describe exact owner setup,
-  revocation, failure behavior, and the fact that tailnet membership alone is insufficient. Status
-  remains planned until independently reviewed implementation and release evidence exist.
+- **TA-8 — Documentation:** deployment, configuration and failure behavior are documented, including
+  that tailnet membership alone is insufficient and that enabling the mode switches
+  `DASHBOARD_ORIGIN` away from the Cloudflare origin. The verifier ships in the dashboard image; the
+  gateway source, packaging and its disposable end-to-end harness live under
+  `deploy/experimental/tailnet-dashboard-proxy-poc/`. No deployment enables the mode.
 
 ## Open questions and review gate
 

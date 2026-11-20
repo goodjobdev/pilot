@@ -1,4 +1,4 @@
-// Package dashboardproxy provides a test-only, fixed-destination tailnet dashboard gateway.
+// Package dashboardproxy is Pilot's opt-in, fixed-destination tailnet dashboard gateway.
 package dashboardproxy
 
 import (
