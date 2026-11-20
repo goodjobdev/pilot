@@ -239,6 +239,7 @@ export const api={
   fileEdits:(projectId:string)=>request<FileEditLedgerView>('/projects/'+projectId+'/file-edits'),
   writeFileEdit:(projectId:string,body:{request:{agentId:string|null;path:string;content:string;mode?:'propose-only'|'auto-apply'};actor:AgentActorBody})=>request<{edit:FileEditRecordView;written:boolean}>('/projects/'+projectId+'/file-edits','POST',body),
   runAction:(id:string,body:{params?:Record<string,unknown>;scope?:ActionScope}={})=>request<ActionExecution>('/actions/execute','POST',{id,...body}),
+  terminalPreview:()=>request<{controlOrigin:string|null}>('/terminal-preview'),
   terminals:(projectId:string)=>request<{terminals:TerminalInfo[]}>('/projects/'+encodeURIComponent(projectId)+'/terminals'),
   openTerminal:(projectId:string,body:{cols:number;rows:number})=>request<{terminal:TerminalInfo}>('/projects/'+encodeURIComponent(projectId)+'/terminals','POST',body),
   terminalTicket:(projectId:string,terminalId:string)=>request<{ticket:string}>('/terminals/'+encodeURIComponent(terminalId)+'/ticket','POST',{projectId}),
