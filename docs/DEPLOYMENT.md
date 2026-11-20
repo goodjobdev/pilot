@@ -450,6 +450,12 @@ full-state backup into a new root and promote that (see
 never delete the previous release directory or image, and neither restarts the service: the restart is
 the deliberate step above.
 
+A rollback also depends on the host still having the previous container. A successful promotion
+replaces the running container (the Compose service keeps its name), so rolling the pointer back
+afterwards cannot start the old service; recreate that release's container from its pinned Compose
+model, or re-promote the running candidate. Stop the service and test the rollback before the
+candidate replaces the container when you need to prove that path.
+
 **Checking `service.lock` yourself is a fallback, not the mechanism.** The tool now refuses a held lock
 on its own; checking that the lock is gone before you switch, and clearing a stale one deliberately when
 it is not, is the runbook step for the *start*, not something the tool relies on you to remember. Never
