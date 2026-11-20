@@ -60,20 +60,24 @@ func main() {
 		"TAILNET_GATEWAY_PUBLIC_KEY="+string(pubPEM),
 	)
 	server.Stdout, server.Stderr = os.Stdout, os.Stderr
-	if err := server.Start(); err != nil { panic(err) }
+	if err := server.Start(); err != nil {
+		panic(err)
+	}
 	defer server.Process.Kill()
 	time.Sleep(2 * time.Second)
 
 	base := gateway.Config{
-		Lookup: who{ingress.Peer{Login: "owner@example.test", NodeID: "approved"}},
-		Policy: ingress.Policy{OwnerLogin: "owner@example.test", AllowedNodeIDs: map[string]struct{}{"approved": {}}, GatewayNodeID: "gateway", HostNodeID: "host"},
+		Lookup:      who{ingress.Peer{Login: "owner@example.test", NodeID: "approved"}},
+		Policy:      ingress.Policy{OwnerLogin: "owner@example.test", AllowedNodeIDs: map[string]struct{}{"approved": {}}, GatewayNodeID: "gateway", HostNodeID: "host"},
 		Destination: netip.MustParseAddrPort(*dashboard), DashboardHost: "dashboard.example.test",
 		DashboardOrigin: "https://dashboard.example.test", Issuer: "https://gateway.example.test",
 		Audience: "pilot-dashboard", Owner: "owner@example.test", SigningKey: key,
 	}
 	serve := func(addr string, cfg gateway.Config) *gateway.Gateway {
 		g, err := gateway.New(cfg)
-		if err != nil { panic(err) }
+		if err != nil {
+			panic(err)
+		}
 		s := &http.Server{Addr: addr, Handler: g.Handler}
 		go s.ListenAndServe()
 		time.Sleep(250 * time.Millisecond)
@@ -86,16 +90,23 @@ func main() {
 	hit := func(url, host string, headers map[string]string) int {
 		req, _ := http.NewRequest("GET", url, nil)
 		req.Host = host
-		for k, v := range headers { req.Header.Set(k, v) }
+		for k, v := range headers {
+			req.Header.Set(k, v)
+		}
 		res, err := client.Do(req)
-		if err != nil { return 0 }
+		if err != nil {
+			return 0
+		}
 		defer res.Body.Close()
 		return res.StatusCode
 	}
 	fail := 0
 	check := func(name string, got, want int) {
 		status := "PASS"
-		if got != want { status = "FAIL"; fail++ }
+		if got != want {
+			status = "FAIL"
+			fail++
+		}
 		fmt.Printf("%s %-58s got=%d want=%d\n", status, name, got, want)
 	}
 
@@ -124,17 +135,23 @@ func main() {
 
 	denied := base
 	denied.Lookup = who{ingress.Peer{Login: "owner@example.test", NodeID: "other"}}
-	dg := serve("127.0.0.1:4316", denied); defer dg.Close()
+	dg := serve("127.0.0.1:4316", denied)
+	defer dg.Close()
 	check("unapproved node refused before the dashboard", hit("http://127.0.0.1:4316/healthz", "dashboard.example.test", nil), 403)
 	tagged := base
 	tagged.Lookup = who{ingress.Peer{Login: "owner@example.test", NodeID: "approved", Tags: []string{"tag:server"}}}
-	tg := serve("127.0.0.1:4315", tagged); defer tg.Close()
+	tg := serve("127.0.0.1:4315", tagged)
+	defer tg.Close()
 	check("tagged peer refused before the dashboard", hit("http://127.0.0.1:4315/healthz", "dashboard.example.test", nil), 403)
 	wrongLogin := base
 	wrongLogin.Lookup = who{ingress.Peer{Login: "intruder@example.test", NodeID: "approved"}}
-	wg := serve("127.0.0.1:4314", wrongLogin); defer wg.Close()
+	wg := serve("127.0.0.1:4314", wrongLogin)
+	defer wg.Close()
 	check("different tailnet login refused", hit("http://127.0.0.1:4314/healthz", "dashboard.example.test", nil), 403)
 
-	if fail != 0 { fmt.Printf("e2e failures: %d\n", fail); os.Exit(1) }
+	if fail != 0 {
+		fmt.Printf("e2e failures: %d\n", fail)
+		os.Exit(1)
+	}
 	fmt.Println("e2e passed")
 }
