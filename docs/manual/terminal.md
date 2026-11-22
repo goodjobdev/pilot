@@ -47,7 +47,24 @@ interactive shell, as it would in a same-user process environment.
   version needs registry access; if it fails, check container network access and that the mounted
   `/data` volume is writable by UID 10001. The root filesystem remains read-only.
 
-Pilot does not serve active terminal preview content. A pending design covers only an already-running
-dev server started from an owner terminal session—not a disposable manager—and still requires a
-separate security/advisor review before implementation. Any future preview must use a separately
-reviewed, owner-authenticated origin; preview behavior is not available in Pilot today.
+# Preview a dev server from the terminal
+
+A preview shows a server you started yourself in this terminal. It is opt-in and separately packaged;
+nothing here launches, restarts or supervises your process.
+
+1. Start the server on loopback, for example `pnpm dev --host=127.0.0.1 --port=5173 --strictPort`.
+   Bind `127.0.0.1`, not all interfaces: the gateway reaches loopback through the container's network
+   namespace, and a wildcard bind would also expose the port to every container on Pilot's networks.
+2. Run the gateway from `deploy/experimental/preview-gateway-poc/` with its reviewed configuration: a
+   dedicated non-root UID, the dashboard's network namespace, its own enrolled tailnet node, and the
+   preview port allowlist.
+3. Create a route over the gateway's private socket as the gateway service UID, for example
+   `manage.mjs create --port 5173`. The gateway serves it as
+   `https://<gateway-node>.<tailnet>.ts.net:<port>/` and the route expires; create another when it does.
+4. Optionally set `DASHBOARD_PREVIEW_CONTROL_ORIGIN` to an exact HTTPS origin to show a **Manage
+   preview** link in the terminal. The link only opens that external control site; it starts nothing.
+
+Every preview request is owner-authenticated at the gateway (owner login, an explicit allowlist of
+stable node IDs, no tags, and not the gateway or host node) and every WebSocket upgrade is checked the
+same way. The preview is not a sandbox: the gateway shares Pilot's network namespace, can reach Pilot's
+loopback listeners, and same-UID terminal code is not contained.

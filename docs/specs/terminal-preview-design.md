@@ -141,15 +141,24 @@ security architecture is approved. Do not mock these states as if they exist in 
 - **TP-AC8 — Production-like boundary:** disposable container tests verify intended auth gate and
   network restrictions without privileged containers or host networking; manual owner review checks
   the real browser origin/cookie boundary before any release. No live deployment is part of the test.
-- **TP-AC9 — Honest docs:** user instructions explain prerequisites, exact selected architecture, stop
-  and recovery behavior, and that preview does not sandbox terminal commands. Availability remains
-  planned until verified release evidence exists.
+- **TP-AC9 — Honest docs:** user instructions explain prerequisites, the selected architecture, stop
+  and recovery behavior, and that preview does not sandbox terminal commands. They are shipped with the
+  release that provides the behaviour.
 
-## Unresolved decisions
+## Decisions taken
 
-No transport, authentication flow, UI, tab-versus-iframe choice, session/process identity mechanism,
-timeout, or exposure path has been chosen. A separate advisor/security review must resolve TP-1
-through TP-8 and approve a concrete design before implementation. Exact process isolation against
-hostile same-UID code requires a separately reviewed OS identity or equivalent containment; absent
-that, the threat must remain an explicit limitation. Until then Pilot continues not to serve active
-terminal preview content; ordinary terminal use is unchanged.
+- **Transport:** a dedicated Go tsnet gateway terminates TLS on its own tailnet node at `:443` and
+  forwards to one explicit loopback port per preview; the client speaks ordinary HTTPS and WebSocket to
+  `https://<gateway-node>.<tailnet>.ts.net:<port>/`. There is no DNS record, wildcard certificate,
+  Funnel or browser control site.
+- **Authentication:** per request, the gateway resolves the calling node with the local `WhoIs` API and
+  requires the configured owner login, an allowlist of stable node IDs, no tags, and an ID that is
+  neither the gateway nor the host node. Cloudflare assertions are not accepted in this path.
+- **Isolation:** the gateway runs as a separate non-root UID with a read-only root, dropped
+  capabilities, no published ports and no host sockets, and shares the dashboard's network namespace so
+  it can reach loopback. That sharing is a documented exposure, not a sandbox; same-UID terminal code
+  is not contained against hostile code, and that limitation is stated where the owner configures it.
+- **Lifecycle:** routes are created and revoked over a mode-`0600` Unix socket by the gateway service
+  UID, and a route expires; a held upgrade is closed on revoke.
+- **UI:** the terminal shows an optional link to a separately authenticated control site when
+  `DASHBOARD_PREVIEW_CONTROL_ORIGIN` is set; the link starts nothing and is unset by default.

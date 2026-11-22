@@ -68,25 +68,27 @@ silently replaced.
    ingress restrictions and the trusted component boundary. Tailnet reachability is not claimed to
    be an application firewall or a substitute for owner authentication.
 
-## Behavior and configuration decisions to resolve
+## Behaviour and configuration as implemented
 
-The implementation design must choose and document one concrete identity-verification mechanism.
-Candidates could include a locally authenticated Tailscale identity API or a dedicated trusted local
-identity proxy, but neither is selected or approved by this document. The design must answer:
-
-- How Pilot obtains identity data over a protected channel and proves it came from the expected local
-  Tailscale component or proxy, not a remote caller.
-- How the exact configured owner principal is matched, normalized and revoked; what happens for
-  multiple identities, missing fields, stale identity, daemon restart, or API failure.
-- Whether identity is checked at each request or bound to a bounded Pilot session, and how logout,
-  session expiry, revocation and WebSocket disconnect work.
-- What explicit provider selection and configuration shape prevent Cloudflare and tailnet modes
-  from being confused. Exact variable names are intentionally not specified yet.
-- How the listener remains private and how direct access that bypasses the identity-verifying
-  component is refused.
-
-Until those decisions are reviewed, do not implement an auth bypass, trust an assertion header, or
-call a network-membership check owner authentication.
+- **Mechanism:** a dedicated local gateway resolves the calling node with the Tailscale local identity
+  API (`WhoIs`) over the tailnet's own protected socket, and refuses anything that is not the configured
+  owner login, an allowlisted stable node ID, untagged, and neither the gateway nor the host node.
+- **Proof to Pilot:** the gateway mints a short-lived Ed25519 JWT assertion (`iss`, `aud`, `sub`,
+  `owner`, `iat`, `exp` at most 60 s, random `jti`) in `X-Pilot-Gateway-Assertion`. Pilot verifies it
+  against `TAILNET_GATEWAY_PUBLIC_KEY` and refuses a Cloudflare assertion in this mode, a duplicate
+  header, a replayed `jti`, an owner or subject that differs from `DASHBOARD_OWNER`, and any `iat`/`exp`
+  outside the bound window.
+- **Selection and shape:** `DASHBOARD_IDENTITY_PROVIDER=tailnet-gateway` (or `cloudflare`, the default)
+  with `TAILNET_GATEWAY_ISSUER`, `TAILNET_GATEWAY_AUD` and `TAILNET_GATEWAY_PUBLIC_KEY`. Setting a
+  tailnet variable in Cloudflare mode, or a Cloudflare variable in tailnet mode, is a startup error, so
+  the two can never be confused; the mode also moves `DASHBOARD_ORIGIN` to the gateway's origin.
+- **Revocation:** removing a node ID from the allowlist and from the tailnet, or rotating the gateway
+  signing key and its public key in Pilot, takes effect on the next request. Assertions live at most a
+  minute and are single-use; a WebSocket upgrade is authorised by the same check at connect time.
+- **Private listener:** the gateway listens only on its tailnet node, publishes no ports and exposes no
+  host socket; the dashboard itself still binds loopback. A caller that is not the allowlisted owner
+  node is refused before any request reaches Pilot, and direct access to the loopback listener is not
+  reachable from the tailnet.
 
 ## Acceptance criteria for a future implementation
 
