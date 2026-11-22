@@ -476,9 +476,11 @@ The terminal runs an interactive login shell as the Pilot service user. The proj
 initial directory, not a sandbox; its environment and filesystem permissions include anything the
 service user can reach, including credentials. It uses the ordinary owner authentication for its
 API, a short-lived single-use stream ticket and same-origin WebSocket checks. Sessions are in memory,
-limited to eight, stop on Pilot shutdown, and are not recovered. There is no active-content preview
-route: preview remains disabled until a distinct, owner-authenticated origin has been designed and
-approved. See [Terminal sessions](manual/terminal.md) and the [terminal contract](specs/terminal.md).
+limited to eight, stop on Pilot shutdown, and are not recovered. Active-content preview is served by a
+separate, opt-in gateway on its own tailnet origin (`deploy/experimental/preview-gateway-poc/`), never
+from Pilot's origin; it forwards only to an explicit loopback port and authenticates the owner on every
+request and upgrade. See [Terminal sessions](manual/terminal.md) and the
+[terminal contract](specs/terminal.md).
 
 ## Operational notes
 

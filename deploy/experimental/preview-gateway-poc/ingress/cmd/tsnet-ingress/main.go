@@ -4,6 +4,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -30,6 +31,18 @@ func required(name string) string {
 }
 
 func main() {
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	defer stop()
+	if err := run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+		log.Print(err)
+		os.Exit(1)
+	}
+}
+
+func run(ctx context.Context) error {
+	if err := validateKeylessEnvironment(os.Environ()); err != nil {
+		return err
+	}
 	stateDir := required("TSNET_STATE_DIR")
 	hostname := required("TSNET_HOSTNAME")
 	owner := required("TAILNET_OWNER_LOGIN")
@@ -59,6 +72,9 @@ func main() {
 	if err := ingress.ValidateTsnetStateDirectory(stateDir, serviceUID, pilotUID); err != nil {
 		log.Fatalf("invalid tsnet state directory: %v", err)
 	}
+	if err := validateEnrolledState(stateDir, serviceUID); err != nil {
+		return err
+	}
 	keyPath := required("INGRESS_ASSERTION_KEY_FILE")
 	socketPath := required("PREVIEW_CORE_SOCKET")
 	key, err := ingress.PrivateAssertionKey(keyPath, serviceUID, pilotUID)
@@ -76,41 +92,15 @@ func main() {
 		log.Fatalf("invalid preview ports: %v", err)
 	}
 
-	ts := &tsnet.Server{Dir: stateDir, Hostname: hostname}
-	if err := ts.Start(); err != nil {
-		log.Fatal(err)
+	readyCtx, cancelReady := context.WithTimeout(ctx, startupTimeout)
+	defer cancelReady()
+	if err := readyCtx.Err(); err != nil {
+		return err
 	}
-	client, err := ts.LocalClient()
-	if err != nil {
-		log.Fatal(err)
+	ts := &tsnet.Server{
+		Dir: stateDir, Hostname: hostname,
+		UserLogf: func(string, ...any) {}, // do not put potential login URLs in the service log
 	}
-	status, err := client.Status(context.Background())
-	if err != nil || status.Self == nil || status.Self.DNSName == "" {
-		log.Fatal("cannot read the gateway's tailnet DNS name")
-	}
-	nodeName := strings.TrimSuffix(status.Self.DNSName, ".")
-	if !strings.EqualFold(nodeName, expectedNode) {
-		_ = ts.Close()
-		log.Fatalf("gateway tailnet name %q does not match the reviewed PREVIEW_DOMAIN", nodeName)
-	}
-	nodeCertificate, err := ingress.NewNodeCertificate(nodeName, client.GetCertificate)
-	if err != nil {
-		log.Fatalf("invalid gateway node certificate configuration: %v", err)
-	}
-	lookup, err := ingress.NewTsnetWhoIs(client)
-	if err != nil {
-		log.Fatal(err)
-	}
-	app, err := ingress.UnixForwarder(socketPath, key, serviceUID, pilotUID)
-	if err != nil {
-		log.Fatalf("invalid preview core bridge: %v", err)
-	}
-
-	shutdownCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
-	defer stop()
-	ctx, cancel := context.WithCancel(shutdownCtx)
-	defer cancel()
-
 	var closeOnce sync.Once
 	var closeErr error
 	closeNode := func() error {
@@ -119,15 +109,46 @@ func main() {
 	}
 	defer func() { _ = closeNode() }()
 
+	// LocalClient starts tsnet synchronously; the outer supervisor also bounds
+	// startup so a stuck library initialization cannot hang the container.
+	client, err := ts.LocalClient()
+	if err != nil {
+		return errors.New("could not start pre-enrolled gateway node")
+	}
+	nodeName, err := waitForNode(readyCtx, client.StatusWithoutPeers, expectedNode, gatewayID, statusInterval)
+	cancelReady()
+	if err != nil {
+		return fmt.Errorf("gateway startup: %w", err)
+	}
+	nodeCertificate, err := ingress.NewNodeCertificate(nodeName, client.GetCertificate)
+	if err != nil {
+		return fmt.Errorf("invalid gateway node certificate configuration: %w", err)
+	}
+	lookup, err := ingress.NewTsnetWhoIs(client)
+	if err != nil {
+		return err
+	}
+	app, err := ingress.UnixForwarder(socketPath, key, serviceUID, pilotUID)
+	if err != nil {
+		return fmt.Errorf("invalid preview core bridge: %w", err)
+	}
+
 	servers := make([]*http.Server, 0, len(ports))
 	listeners := make([]net.Listener, 0, len(ports))
+	defer func() {
+		for _, listener := range listeners {
+			_ = listener.Close()
+		}
+	}()
 	for _, port := range ports {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		handler := ingress.RequireHostMatchesNode(app, nodeCertificate.Hostname(), port)
 		handler = ingress.Protect(handler, lookup, policy)
 		tailnetListener, listenErr := ts.Listen("tcp", fmt.Sprintf(":%d", port))
 		if listenErr != nil {
-			cancel()
-			log.Fatalf("cannot listen on tailnet preview port %d: %v", port, listenErr)
+			return fmt.Errorf("cannot listen on tailnet preview port %d: %w", port, listenErr)
 		}
 		servers = append(servers, &http.Server{
 			Handler:           handler,
@@ -142,11 +163,14 @@ func main() {
 		log.Printf("tailnet preview listener ready on https://%s:%d", nodeCertificate.Hostname(), port)
 	}
 
-	log.Printf("%s on %d preview listeners", readyLine, len(servers))
-	if err := serveAll(ctx, servers, listeners, 25*time.Second, closeNode); err != nil {
-		log.Printf("tailnet preview listener stopped: %v", err)
-		os.Exit(1)
+	if err := ctx.Err(); err != nil {
+		return err
 	}
+	fmt.Fprintln(os.Stdout, readyLine) // exact supervisor protocol; diagnostics stay on stderr
+	if err := serveAll(ctx, servers, listeners, 25*time.Second, closeNode); err != nil {
+		return fmt.Errorf("tailnet preview listener stopped: %w", err)
+	}
+	return nil
 }
 
 // Keep policy validation exposed only to this executable's startup path.

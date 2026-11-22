@@ -33,8 +33,10 @@ backpressure, and closes sessions on shutdown. Terminal sessions and output are 
 not durable or replayed after a restart.
 - Terminal command shortcuts are ordinary keystrokes sent to the shell, not constrained actions.
 They have the same broad privileges as commands typed by the owner.
-- No terminal preview route is installed. Preview remains disabled until a separately designed,
-owner-authenticated origin is reviewed and approved.
+- Preview is a separate, opt-in gateway on its own tailnet origin
+(`deploy/experimental/preview-gateway-poc/`), not a route on Pilot's origin. It forwards only to an
+explicit loopback port of a server the owner started, and authenticates the owner on every request and
+WebSocket upgrade. It is not a sandbox.
 
 # Acceptance criteria
 
@@ -45,7 +47,7 @@ owner-authenticated origin is reviewed and approved.
 | TERM-3 | Tickets are short-lived, single-use, bound to a terminal, and streams reject a foreign origin. |
 | TERM-4 | Sessions are bounded and terminate during application shutdown. |
 | TERM-5 | Existing agent `bash` installation and scope policy remain controlled only by `DASHBOARD_CODING_TOOLS`, `DASHBOARD_SHELL`, and the existing agent allowlist. |
-| TERM-6 | No active preview content is served from Pilot's origin. |
+| TERM-6 | No active preview content is served from Pilot's origin; the separate gateway serves it on its own tailnet origin with per-request owner authentication. |
 
-The owner guide is [Terminal sessions](../manual/terminal.md). This capability is implemented locally;
-it is not available in a deployed release until an approved deployment verifies it.
+The owner guide is [Terminal sessions](../manual/terminal.md). This capability is implemented and
+deployed; the preview runs on the separate gateway origin described above.

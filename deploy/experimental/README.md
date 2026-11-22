@@ -2,7 +2,8 @@
 
 Both directories here are opt-in components, not part of Pilot's standard image, Compose project,
 startup path, or service units. The dashboard-side verifier for `tailnet-gateway` mode is part of the
-application, but no identity provider is switched by this repository and no service here is enabled. Do not copy live hostnames, node identifiers, credentials, assertion keys, certificates,
+application, and this owner's deployment runs the preview gateway as a separate enrolled service; no
+identity provider is switched by this repository. Do not copy live hostnames, node identifiers, credentials, assertion keys, certificates,
 or prior operator evidence into tracked files.
 
 - `preview-gateway-poc/` is the Go + Node isolated terminal-dev-server preview gateway packaging
@@ -21,8 +22,10 @@ site; it does not activate either implementation. Their source and example entry
 for review and for an opt-in rollout. Offline and disposable end-to-end tests exist for both the
 application verifier and the proxy (forged headers, non-owner and unapproved nodes, replay, HTTP and
 WebSocket forwarding); the application verifier ships in the dashboard image and the proxy does not.
-No readiness claim is made for an enrolled production node, live ACL and egress policy, certificate
-or key custody, browser cookie isolation, or a switched deployment.
+The preview gateway is enrolled and serving in this owner's deployment (verified: HTTPS with a valid
+certificate, WebSocket upgrade, foreign Origin/Host refusal, an unapproved tailnet peer refused, and
+revocation closing a held upgrade). The tailnet identity proxy is not deployed, so no readiness claim
+is made for a switched dashboard provider, live ACL policy beyond the preview path, or key custody.
 Separate security and owner approval is required before building or running either in production.
 
 Both packages carry their lockfiles (the Go module has `go.sum`, the Node package its lockfile), have
