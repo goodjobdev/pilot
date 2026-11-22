@@ -16,7 +16,8 @@ pilot:
 `DASHBOARD_IDENTITY_PROVIDER=tailnet-gateway` with `TAILNET_GATEWAY_ISSUER`, `TAILNET_GATEWAY_AUD` and
 `TAILNET_GATEWAY_PUBLIC_KEY`, and `deploy/experimental/tailnet-dashboard-proxy-poc/` is the matching
 gateway source with an example Compose unit. No deployment of Pilot enables it: the live dashboard
-still runs `DASHBOARD_IDENTITY_PROVIDER=cloudflare` and Cloudflare Access remains the hosted default.
+does not set `DASHBOARD_IDENTITY_PROVIDER`, so the application uses its `cloudflare` default, and
+Cloudflare Access remains the hosted identity path.
 A tailnet connection or Tailscale membership is not proof that a request is the owner; only a valid
 gateway assertion for the configured owner, verified by Pilot, is.
 

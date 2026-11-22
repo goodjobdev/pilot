@@ -36,14 +36,15 @@ be presented as one.
 ## Scope and explicit non-goals
 
 - Preview only a server that the owner has already started in an existing terminal session.
-- A future design may specify a narrowly bound preview transport, but this document does not select
-  a proxy, port, host, tunnel, process supervisor, or authentication mechanism.
+- The selected transport is a dedicated tsnet gateway on its own tailnet node, one port per preview,
+  forwarding only to an explicit loopback port of a server the owner already runs. It selects no
+  process supervisor, launches nothing, and authenticates every request and upgrade itself.
 - Do not launch or supervise dev servers, run package manager commands, create a disposable manager,
   or change terminal command semantics as part of preview work.
 - Do not expose arbitrary host ports, arbitrary URLs, files, shell output, or the Pilot control API.
 - Do not treat tailnet membership, a private IP, an untrusted header, or knowledge of a preview URL as
-  owner authentication. Tailnet identity is separately planned in
-  [owner-authenticated tailnet access](tailnet-owner-access.md) and is not implemented by this design.
+  owner authentication. The gateway enforces the owner identity described in
+  [owner-authenticated tailnet access](tailnet-owner-access.md).
 - No live deployment, public tunnel, production project, credential, or non-disposable data is used
   for design validation.
 
