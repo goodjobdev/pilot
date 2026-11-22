@@ -117,16 +117,21 @@ call a network-membership check owner authentication.
   gateway source, packaging and its disposable end-to-end harness live under
   `deploy/experimental/tailnet-dashboard-proxy-poc/`. No deployment enables the mode.
 
-## Open questions and review gate
+## Decisions and remaining operator work
 
-- Which identity source and cryptographic/local trust boundary meet TA-2 through TA-4?
-- What principal identifier is owner-configured, and how is it rotated or revoked safely?
-- Does the production environment permit access to the Tailscale local identity API/socket, or is a
-  separately secured proxy required?
-- How should setup and break-glass recovery work without a fail-open fallback?
+The identity source and trust boundary are decided and implemented: the gateway resolves the calling
+node with the local `WhoIs` API, requires the configured owner login, an explicit stable-node
+allowlist, no tags, and neither the gateway nor the host node; it then signs a short-lived Ed25519
+assertion that Pilot verifies against a configured public key. The owner principal is
+`DASHBOARD_OWNER`; rotating the gateway key or the owner identity is a configuration change on both
+sides, and revoking a device is a stable-node allowlist edit plus removing it from the tailnet. There
+is no fail-open fallback: a missing key, a bad signature, a replay, an expired assertion or an
+unapproved node is refused. No deployment has switched to the mode.
 
-A security/design review must resolve these before implementation. Cloudflare remains the supported
-hosted identity path in the meantime.
+What still belongs to provisioning, not to the design: enrolling the gateway node, the tailnet ACL
+that limits the dashboard port to the owner device, certificate and signing-key custody, protected
+state directories, and the owner decision that also moves `DASHBOARD_ORIGIN`. Cloudflare remains the
+hosted default until that decision is made.
 
 # Verification
 

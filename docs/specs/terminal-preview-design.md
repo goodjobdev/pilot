@@ -1,22 +1,29 @@
 ---
-title: "Pending design: isolated terminal dev-server preview"
-description: "Security questions and design acceptance criteria for viewing an already-running terminal dev server."
+title: "Isolated terminal dev-server preview"
+description: "Design and acceptance criteria for the opt-in preview of an already-running terminal dev server."
 pilot:
   schema: 1
   id: terminal-preview-design
   kind: design
-  doc_status: draft
-  feature_status: planned
-  verified_release: null
+  doc_status: reviewed
+  feature_status: implemented
+  verified_release: "20261121T000000Z-r14"
 ---
 
-# Status and review gate
+# Status
 
-**Pending design only; not implemented, available, or deployed.** This records the user's request for an
-isolated preview of an **already-running dev server started from an owner terminal session**. It is
-not a request to preview a disposable package-manager/server manager, and does not authorize adding a
-preview route, port forward, tunnel, process launcher, shell command, or live deployment change. This
-proposal needs a separate security/design advisor review before implementation.
+**Implemented and deployed as an opt-in, separately packaged gateway.** A dedicated tsnet gateway
+serves one port per preview on its own tailnet name, authenticates the owner per request, and forwards
+only to an explicit loopback port on the dashboard's network namespace. The Pilot-side
+`DASHBOARD_PREVIEW_CONTROL_ORIGIN` link stays unset by default, so a deployment without that setting is
+unchanged. `deploy/experimental/preview-gateway-poc/` holds the gateway source and packaging; the
+owner-facing procedure is in `docs/manual/terminal.md`.
+
+The live acceptance run recorded HTTPS 200 with a valid certificate, byte-identical upstream content,
+a working WebSocket upgrade, refusal of foreign `Origin`/`Host`, refusal of an unapproved tailnet peer,
+and revocation closing a live upgrade. Honest limits: the gateway shares the dashboard's network
+namespace (it is not a sandbox), a same-UID terminal process is not contained, and the preview's
+upstream is whatever the owner started in their own terminal session.
 
 ## Design intent
 

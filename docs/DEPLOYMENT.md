@@ -3,10 +3,14 @@
 Pilot is a single-owner application. It assumes a private host you control, a hostname you
 own, and one person allowed through the door. Do not expose it directly to the internet:
 put an authenticating proxy in front of it (the current hosted example uses Cloudflare Access).
-A private network or tailnet is not owner authentication by itself. An alternative
-owner-authenticated Tailscale mode is only planned; see the
-[planned tailnet access design](specs/tailnet-owner-access.md). Until it is reviewed and implemented,
-Cloudflare Access remains the documented hosted identity path.
+A private network or tailnet is not owner authentication by itself. Pilot also implements an
+opt-in owner-authenticated Tailscale mode: set `DASHBOARD_IDENTITY_PROVIDER=tailnet-gateway` with
+`TAILNET_GATEWAY_ISSUER`, `TAILNET_GATEWAY_AUD` and `TAILNET_GATEWAY_PUBLIC_KEY`, and run the gateway
+in `deploy/experimental/tailnet-dashboard-proxy-poc/` in front of it. Switching that mode also moves
+`DASHBOARD_ORIGIN` to the gateway's own origin and stops the Cloudflare path for that deployment, so
+it is a deliberate owner choice; see the [tailnet access specification](specs/tailnet-owner-access.md).
+Cloudflare Access remains the default and the documented hosted identity path for every deployment
+that has not made that choice.
 
 ## Requirements
 

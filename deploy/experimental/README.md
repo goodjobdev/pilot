@@ -25,7 +25,8 @@ No readiness claim is made for an enrolled production node, live ACL and egress 
 or key custody, browser cookie isolation, or a switched deployment.
 Separate security and owner approval is required before building or running either in production.
 
-The source has not been built or tested in this integration worktree. The preview package includes
-its Node lockfile and pinned Go module files; the dashboard proxy POC lacks an independent Go checksum
-lockfile in its source checkout, which is a release blocker until reviewed and resolved. Do not run
-package installation or Go commands that download dependencies as an implicit step.
+Both packages carry their lockfiles (the Go module has `go.sum`, the Node package its lockfile), have
+been built from those lockfiles with dependency downloads disabled, and pass their offline tests:
+`go vet ./...` plus `go test ./...` for the proxy, `pnpm check` and the Node suite for the preview
+gateway. The proxy's disposable end-to-end harness lives in
+`tailnet-dashboard-proxy-poc/cmd/e2e` and is re-run against the real dashboard before each release.

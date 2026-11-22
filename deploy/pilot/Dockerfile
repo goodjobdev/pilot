@@ -36,6 +36,8 @@ RUN npm_config_build_from_source=true pnpm install --prod --frozen-lockfile \
  && chown -R pilot:pilot /app /data/pnpm
 
 COPY --chown=pilot:pilot dist ./dist
+# Ship the operator documentation with the release it describes.
+COPY --chown=pilot:pilot docs ./docs
 
 USER 10001:10001
 EXPOSE 4319
