@@ -60,7 +60,9 @@ nothing here launches, restarts or supervises your process.
    preview port allowlist.
 3. Create a route over the gateway's private socket as the gateway service UID, for example
    `manage.mjs create --port 5173`. The gateway serves it as
-   `https://<gateway-node>.<tailnet>.ts.net:<port>/` and the route expires; create another when it does.
+   `https://<gateway-node>.<tailnet>.ts.net:<port>/` and the route expires after ten minutes; create
+   another when it does, and revoke it early with `manage.mjs revoke --id <uuid>`, which also closes
+   any open WebSocket for that route.
 4. Optionally set `DASHBOARD_PREVIEW_CONTROL_ORIGIN` to an exact HTTPS origin to show a **Manage
    preview** link in the terminal. The link only opens that external control site; it starts nothing.
 
