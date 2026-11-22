@@ -47,7 +47,7 @@ WebSocket upgrade. It is not a sandbox.
 | TERM-3 | Tickets are short-lived, single-use, bound to a terminal, and streams reject a foreign origin. |
 | TERM-4 | Sessions are bounded and terminate during application shutdown. |
 | TERM-5 | Existing agent `bash` installation and scope policy remain controlled only by `DASHBOARD_CODING_TOOLS`, `DASHBOARD_SHELL`, and the existing agent allowlist. |
-| TERM-6 | No active preview content is served from Pilot's origin; the separate gateway serves it on its own tailnet origin with per-request owner authentication. |
+| TERM-6 | Preview content is never served from Pilot's origin; the separate gateway serves it on its own tailnet origin with per-request owner authentication. |
 
 The owner guide is [Terminal sessions](../manual/terminal.md). This capability is implemented and
 deployed; the preview runs on the separate gateway origin described above.
