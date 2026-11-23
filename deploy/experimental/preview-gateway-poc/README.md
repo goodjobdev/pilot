@@ -62,5 +62,48 @@ preview: `https://<gateway-node>.<tailnet>.ts.net:<port>/`.
   refused at the request gate, and route revocation closing a held upgrade. The dev server binds
   loopback only, so the preview is the sole authenticated path to it.
 
+## Recreating the gateway after a dashboard release
+
+The gateway shares the dashboard container's network namespace, so replacing the dashboard (every
+release) strands it: the old gateway container must be removed and rebuilt against the new one, and
+any routes it held are gone. `recreate-gateway.sh` does that in one step and verifies the result
+instead of trusting it.
+
+Every deployment-specific value comes from the environment, so the script carries no hostname, node
+id, owner login or image id. Keep those in a private file outside the repository, for example:
+
+```sh
+# ~/.config/pilot/preview-gateway.env  (0600, never committed)
+export DASHBOARD_CONTAINER=...        # the running dashboard container name or id
+export GATEWAY_IMAGE=sha256:...       # digest-pinned gateway image
+export TAILNET_GATEWAY_NODE_ID=n...   # stable node id the gateway enrolls as
+export TAILNET_HOST_NODE_ID=n...      # node id serving the preview
+export TAILNET_ALLOWED_REMOTE_NODE_IDS=n...
+export TAILNET_OWNER_LOGIN=owner@example.test
+export PREVIEW_DOMAIN=preview.<tailnet>.ts.net
+export DASHBOARD_ORIGIN=https://dashboard.example.test
+```
+
+Then, after a dashboard release:
+
+```sh
+set -a; . ~/.config/pilot/preview-gateway.env; set +a
+REPLACE=1 ./recreate-gateway.sh            # prints {"gateway": ..., "ready": true}
+docker exec --user 10002:10002 "$(docker ps -q --filter name=pi-workspace-pilot-preview)" \
+    node /opt/preview/gateway/manage.mjs create --port 5173
+```
+
+It refuses to run when the dashboard is not running and healthy, when `DASHBOARD_ORIGIN` disagrees
+with the dashboard's own environment, when the state or key directories are not `0700`/owned by the
+gateway uid or the key files are not `0600`, and when a container of that name already exists without
+`REPLACE=1`. After starting it checks the readiness marker, the shared network namespace, the
+read-only root filesystem, the absence of published ports, dropped capabilities and the `0600` private
+socket before printing the ids.
+
+The dev server itself is not restarted by this script: it belongs to the terminal session the owner
+started, and the release that replaced the container also ended that session. Start it again in the
+new container's terminal (`pnpm dev --host=127.0.0.1 --port=5173 --strictPort`) before expecting a
+preview response.
+
 See `docs/specs/terminal-preview-design.md` and `../README.md`; independent security review
 and owner approval are prerequisites to any use.
