@@ -4,10 +4,14 @@
  import { slug,type DocSnapshot } from '../shared/docs';
  import { assetBlobUrl,assetText } from './api';
  import Icon from './Icon.svelte';
+ import { PLAN_PATH } from '../shared/workspace';
+ import { parseBoard } from '../shared/markdown';
  let { doc, projectId, theme, focusAnchor=null, onedit, onopen }:{
    doc: DocSnapshot; projectId: string; theme: 'dark'|'light'; focusAnchor?: string|null;
    onedit:()=>void; onopen:(path:string)=>void;
  }=$props();
+ const plan=$derived.by(()=>{if(doc.path!==PLAN_PATH)return null;try{return parseBoard(doc.text);}catch{return null;}});
+ const planGroups=$derived(plan?[...[...plan.milestones].sort((a,b)=>a.order-b.order).map(m=>({name:m.name,tasks:plan!.tasks.slice(0,500).filter(task=>task.milestone===m.id)})),{name:'Independent',tasks:plan.tasks.slice(0,500).filter(task=>task.milestone===null)}]:[]);
  let html=$state(''),container=$state<HTMLDivElement>(),diagrams=$state(0),rendered=$state('');
  // Object URLs the DOM is currently using, the ones an in-flight render has created, and the
  // key of that render. URLs are revoked only once the newer render is in the DOM, so a live
@@ -49,7 +53,7 @@
   */
  async function build(key:string){
    pendingUrls=[];
-   const raw=marked.parse(doc.text,{gfm:true,async:false}) as string;
+   const raw=marked.parse(doc.path===PLAN_PATH?'':doc.text,{gfm:true,async:false}) as string;
    const clean=DOMPurify.sanitize(raw,{USE_PROFILES:{html:true},FORBID_TAGS:['style','form','iframe','object','embed','script','link','meta','base']});
    const parsed=new DOMParser().parseFromString(clean,'text/html');
    for(const image of Array.from(parsed.querySelectorAll('img'))){
@@ -148,5 +152,23 @@
   {/each}
  </section>
  {/if}
- <div class="doc-body markdown" bind:this={container}>{@html html}</div>
+ <div class="doc-body markdown" bind:this={container}>
+ {#if plan}
+ <p class="callout">Canonical project plan. Dependencies, Timeline and List read this exact document. Edit its source or use the board; saves update this file and create a local Git commit when available.</p>
+ {#if plan.summary}<pre class="plan-prose">{plan.summary}</pre>{/if}
+ {#if plan.tasks.length>500}<p class="callout">Showing the first 500 tasks. The YAML source contains all {plan.tasks.length} tasks.</p>{/if}
+ {#each planGroups as group}<h2>{group.name}</h2>
+ {#each group.tasks as task}
+ <article class="plan-task"><h3>{task.title}</h3><p><strong>{task.status}</strong> · {plan.domains.find(domain=>domain.id===task.domain)?.name??task.domain} · {plan.milestones.find(milestone=>milestone.id===task.milestone)?.name??'Independent'}{task.archived?' · archived':''}</p>
+ {#if task.description}<pre class="plan-prose">{task.description}</pre>{/if}{#if task.acceptance}<p>Acceptance: {task.acceptance}</p>{/if}
+ {#each plan.relationships.filter(edge=>edge.target===task.id&&edge.kind==='blocks') as edge}<p>Blocked by: {plan.tasks.find(other=>other.id===edge.source)?.title??edge.source}</p>{/each}
+ {#each task.specs as spec}<button class="text-button" onclick={()=>onopen(spec.path)}>{spec.path}{spec.anchor?'#'+spec.anchor:''}</button>{/each}
+ </article>
+ {/each}
+ {/each}
+ <details><summary>Canonical YAML source</summary><pre>{doc.text}</pre></details>
+ {:else if doc.path===PLAN_PATH}<p class="error" role="alert">The plan source is invalid. Board updates are blocked. Edit this document to repair its YAML and task references.</p><pre>{doc.text}</pre>
+ {:else}{@html html}{/if}
+ </div>
 </div>
+<style>.plan-task{border-bottom:1px solid var(--line);padding:12px 0}.plan-task h3{margin:8px 0}.plan-task .text-button{display:block;overflow-wrap:anywhere}.markdown .plan-prose{white-space:pre-wrap;overflow-wrap:anywhere;font-family:inherit;background:transparent;padding:0}</style>

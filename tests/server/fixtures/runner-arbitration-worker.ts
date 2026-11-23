@@ -1,0 +1,10 @@
+import {existsSync} from 'node:fs';
+import {RunnerDispatchArbitration} from '../../../src/server/state/runner-dispatch-arbitration';
+const [file,gate,action,json]=process.argv.slice(2);
+const journal=new RunnerDispatchArbitration(file);
+process.stdout.write('ready\n');
+while(!existsSync(gate))await new Promise(resolve=>setTimeout(resolve,2));
+if(action==='stall')await new Promise(()=>{setInterval(()=>{},1000);});
+const result=action==='dispatch'?journal.dispatch(JSON.parse(json)):journal.closeRequest(JSON.parse(json));
+journal.close();
+process.stdout.write(JSON.stringify(result));

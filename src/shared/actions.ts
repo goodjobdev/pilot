@@ -433,7 +433,7 @@ const forkForceParameter: ActionParameter = Object.freeze({
   name: 'force',
   type: 'flag' as const,
   required: false,
-  description: 'an explicit force, and the only way a child worktree holding uncommitted or untracked changes is ever removed; an absent or false value refuses that removal and reports the named operator-attention state instead'
+  description: 'reserved for future use; automatic removal of an existing worktree is unavailable even when force is true'
 });
 
 const agentIdParameter: ActionParameter = Object.freeze({
@@ -508,7 +508,7 @@ export const ACTION_DESCRIPTORS: readonly ActionDescriptor[] = Object.freeze([
   describe({
     id: 'session.lifecycle.resume' as const,
     label: 'Resume session',
-    description: 'Continue a paused or interrupted generation under its original request identity.',
+    description: 'Continue pending durable work under the original request identity. A terminal identity starts nothing and reports no additional work.',
     requires: sessionScope,
     parameters: lifecycleParameters(),
     preconditions: [
@@ -520,7 +520,7 @@ export const ACTION_DESCRIPTORS: readonly ActionDescriptor[] = Object.freeze([
     ],
     noops: Object.freeze([]),
     writes: true,
-    effect: 'writes the running transition and then dispatches the generation under the request identity the record already carries'
+    effect: 'writes the running transition and, only while the original identity is still pending, dispatches under that identity. When the identity is already terminal, it starts nothing, reports outcome terminal with dispatched false, and settles the record to idle or its existing failed; no fresh identity is minted and the terminal effect is never replayed'
   }),
   describe({
     id: 'session.lifecycle.retry' as const,
@@ -1111,7 +1111,7 @@ export const ACTION_DESCRIPTORS: readonly ActionDescriptor[] = Object.freeze([
   describe({
     id: 'fork.discard' as const,
     label: 'Discard a fork',
-    description: "Remove one fork's worktree and close the fork, refusing anything it did not create.",
+    description: "Close a non-active fork only after its worktree is already absent; active discard and automatic worktree removal are unavailable.",
     requires: sessionScope,
     parameters: sessionParameters([forkRevisionParameter, forkForceParameter]),
     preconditions: [
@@ -1119,12 +1119,12 @@ export const ACTION_DESCRIPTORS: readonly ActionDescriptor[] = Object.freeze([
       Object.freeze({ code: 'FORK_EXISTS' as const, description: 'the session scope names the child session of a fork this project really holds; an unknown one is refused as not found' }),
       Object.freeze({ code: 'REVISION_MATCHES' as const, description: 'the revision the caller read is the stored fork revision; a stale one is refused as a conflict and nothing is touched' }),
       Object.freeze({ code: 'TARGET_IN_FORK_ROOT' as const, description: 'the worktree path the record itself carries is still inside the designated fork root; a record that says otherwise is refused as an escape and nothing is removed' }),
-      Object.freeze({ code: 'WORKTREE_CLEAN' as const, description: 'the child worktree holds no uncommitted or untracked change, or the caller explicitly forces it. A dirty worktree is never removed implicitly: the fork becomes the named operator-attention state worktree-dirty and the worktree is left exactly where it is' }),
-      Object.freeze({ code: 'TRANSITION_LEGAL' as const, description: 'the fork can become discarded: a paused, active or failed fork can, and a discarded fork is terminal' })
+      Object.freeze({ code: 'WORKTREE_CLEAN' as const, description: 'automatic removal of an existing child worktree is unavailable, including when force is supplied; the worktree must already be absent before the fork can be closed' }),
+      Object.freeze({ code: 'TRANSITION_LEGAL' as const, description: 'only a paused or failed fork may be discarded; active discard is unavailable until concurrent admission can be controlled, and a discarded fork is terminal' })
     ],
     noops: Object.freeze(['discarding a fork whose worktree is already gone completes the discard and removes nothing']),
     writes: true,
-    effect: "reads the child worktree's own status, removes it by one git worktree remove — with an explicit force only where the caller forced it — and writes the discarded state; a worktree git will not remove or cannot report becomes the named operator-attention state worktree-remove-refused or worktree-unreadable instead, and nothing outside the designated fork root is ever touched"
+    effect: 'for a non-active fork whose worktree is already absent, writes the discarded state without removing a file; otherwise refuses because admission or path-based removal cannot be safely controlled'
   }),
   describe({
     id: 'agent.list' as const,
@@ -1265,10 +1265,16 @@ export function actionDescriptor(id: string): ActionDescriptor | undefined {
  *   and reports no state at all: an absent row is never presented as the fact `idle`. `revision` is
  *   then 0 because that is the revision a first write must claim, not because a write happened.
  * - A **call** and a **result** are two lists, never one paired list: the conversation view this
- *   build can read does not carry the call id, so pairing them would assert something the data does
+ *   build can read carries no reliable call id, so pairing them would assert something the data does
  *   not. Nothing here fabricates an entry to fill a view.
+ * - A recorded instant is the transcript's, or null with a named reason. A duration is only the
+ *   harness's own measured `durationMs`, or null with a named reason; two instants are never
+ *   subtracted, so clock skew cannot produce a negative elapsed time.
+ * - An outcome (`ok`, `warned`, `failed`, `interrupted`, `cancelled`) and its certainty are derived
+ *   only from the protocol's error flag and diagnostic codes. Interrupted and aborted calls are
+ *   uncertain; only an abandoned call, which never started execution, is a certain cancellation.
  * - No field carries a filesystem path, a token, a request identity or conversation text: a call is
- *   a name and an instant, a result is its diagnostic counts and the outcome they imply.
+ *   a name and an instant, a result is its own name, counts, outcome and measured duration.
  */
 export const LIVE_ACTIVITY_MAX_SESSIONS = 200;
 export const LIVE_ACTIVITY_MAX_TOOL_EVENTS = 50;
@@ -1283,11 +1289,38 @@ export const LIVE_TOOL_REASONS = Object.freeze({
 export const LIVE_TOOL_DETAILS = Object.freeze({
   agentsDisabled: 'The agent harness is disabled on this instance, so no tool activity is reported.',
   harnessReadFailed: 'The agent harness could not be read in this process, so no tool activity is reported.',
-  noToolActivity: 'The harness reports this project conversation with no tool invocation or result in its view yet.',
-  noConversation: 'The harness reports no conversation for this project, so there is nothing that could carry tool activity yet.'
+  noToolActivity: 'The harness reports the conversation in this scope with no tool invocation or result in its view yet.',
+  noConversation: 'The harness reports no conversation for the scope it was asked about, so there is nothing that could carry tool activity yet.'
 });
 /** The one source a reported tool projection comes from. */
 export const LIVE_TOOL_SOURCE = 'harness-conversation-view';
+/**
+ * The named reasons a missing tool instant or duration may carry. Stable strings, safe to assert on.
+ *
+ * An absent instant is null and names why it is null. A duration is only ever the harness's own
+ * measured `durationMs`: this build never subtracts two instants, because a recovered transcript can
+ * mix instants from more than one process and a clock skew would turn that subtraction negative.
+ */
+export const LIVE_TOOL_TIMING_REASONS = Object.freeze({
+  noInstant: 'no-instant-recorded-in-the-transcript',
+  noDuration: 'no-duration-reported-by-the-harness'
+});
+/** The closed set of tool outcomes this build can derive from the protocol. */
+export const LIVE_TOOL_OUTCOMES = ['ok', 'warned', 'failed', 'interrupted', 'cancelled'] as const;
+export type LiveToolOutcome = (typeof LIVE_TOOL_OUTCOMES)[number];
+/**
+ * Whether the outcome is proven (`certain`) or its effect cannot be proven (`uncertain`). An
+ * interruption is uncertain, and so is an abort: the harness emits `aborted` after a non-restart
+ * abort even in the execute phase. Only `abandoned` is a phase-proven cancellation with no execution.
+ */
+export const LIVE_TOOL_CERTAINTIES = ['certain', 'uncertain'] as const;
+export type LiveToolCertainty = (typeof LIVE_TOOL_CERTAINTIES)[number];
+/**
+ * The closed protocol class a result is derived from: the harness's own diagnostic codes, mapped to
+ * fixed names. An arbitrary diagnostic message or an unknown code is never carried into the payload.
+ */
+export const LIVE_TOOL_PROTOCOLS = ['completed', 'interrupted', 'aborted', 'abandoned', 'blocked', 'tool-unavailable', 'invalid-arguments', 'error', 'unknown'] as const;
+export type LiveToolProtocol = (typeof LIVE_TOOL_PROTOCOLS)[number];
 /** The named absence reasons a run-state projection may carry. Stable strings, safe to assert on. */
 export const LIVE_RUN_REASONS = Object.freeze({
   noRecord: 'no-durable-lifecycle-record-yet'
@@ -1318,15 +1351,34 @@ export type LiveRunState = {
   readonly activityAt: string | null;
   readonly updatedAt: string | null;
 };
-/** One tool call the harness recorded: its name and when it was recorded. Never its arguments. */
-export type LiveToolInvocation = { readonly name: string; readonly at: number | null };
-/** One tool result the harness recorded: the diagnostics it carries, as counts, and the outcome they imply. */
+/**
+ * One tool call the harness recorded: its name and when the assistant message that carried it was
+ * recorded. `at` is not a tool start; this view records no such start. Never its arguments.
+ */
+export type LiveToolInvocation = {
+  readonly name: string;
+  readonly at: number | null;
+  /** Set exactly when `at` is null: the named reason no instant is reported. */
+  readonly atReason: string | null;
+};
+/**
+ * One tool result the harness recorded: its own tool name, the diagnostics as counts, the outcome and
+ * certainty they imply, and the harness's own measured duration. It is never paired with a call.
+ */
 export type LiveToolResult = {
-  readonly outcome: 'failed' | 'warned' | 'ok';
+  readonly name: string | null;
+  readonly outcome: LiveToolOutcome;
+  readonly certainty: LiveToolCertainty;
+  readonly protocol: LiveToolProtocol;
   readonly errors: number;
   readonly warnings: number;
   readonly notices: number;
   readonly at: number | null;
+  /** Set exactly when `at` is null: the named reason no instant is reported. */
+  readonly atReason: string | null;
+  readonly durationMs: number | null;
+  /** Set exactly when `durationMs` is null: the named reason no duration is reported. */
+  readonly durationReason: string | null;
 };
 export type LiveToolProjection = {
   readonly state: LiveToolState;
@@ -1340,6 +1392,8 @@ export type LiveToolProjection = {
   readonly invocations: readonly LiveToolInvocation[];
   readonly results: readonly LiveToolResult[];
   readonly truncated: boolean;
+  /** How many older events the per-list cap withheld. Zero when the cap did not bite. */
+  readonly omitted: { readonly invocations: number; readonly results: number };
 };
 export type LiveSessionActivity = { readonly sessionId: string; readonly name: string; readonly run: LiveRunState };
 export type LiveActivity = {

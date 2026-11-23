@@ -5,13 +5,14 @@ import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promis
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ControlStore } from '../../src/server/state/control-store';
+import { agentTestJobId, runAgentTests } from '../../src/server/agents/run-tests';
 import {
   RunnerBroker, createProjectWorkspaceResolver, dockerRunnerPort, dockerRunArgv,
   type RunnerExecution, type RunnerExecutionRequest, type RunnerPort
 } from '../../src/server/state/runner-broker';
 import {
   RUNNER_DEFAULT_LEASE_MS, RUNNER_DEFAULT_LIMITS, RUNNER_MAX_JOBS, RUNNER_MAX_RECORD_BYTES, RunnerError,
-  runnerContainmentProblems, runnerJobRequest, runnerRecordBytes, submittedRunnerJob,
+  runnerJobRequest, runnerRecordBytes, runnerSettleVerdict, submittedRunnerJob, validateRunnerJobRecord,
   type RunnerContainment, type RunnerJobRecord
 } from '../../src/shared/runner';
 
@@ -23,6 +24,71 @@ import {
  * fail-closed rule through a port it controls; the one test that exercises the real port points it at a
  * fake binary that only records its own arguments. Nothing here reads or writes a live project.
  */
+
+test('an interrupted or repeated agent test invocation cannot submit a second durable job', async () => {
+  const f = await fixture();
+  try {
+    const input = { broker: f.broker, projectId: f.projectId, conversationId: 'conversation-1', taskId: 'task-1', owner: 'agent-1', workspace: '.', authorize: async () => {}, reserveJob: async () => {} }; // synthetic fixture
+    const first = await runAgentTests(input);
+    assert.equal(first.status, 'settled');
+    assert.equal(f.stub.executions, 1);
+    f.store.close();
+    const reopened = new ControlStore(f.data);
+    const reopenedBroker = new RunnerBroker(reopened, f.port, optionsFor(f));
+    const repeated = await runAgentTests({ ...input, broker: reopenedBroker });
+    assert.equal(repeated.status, 'needs-inspection');
+    if (repeated.status === 'needs-inspection') {
+      assert.equal(repeated.stage, 'submission');
+      assert.equal(repeated.jobId, agentTestJobId(f.projectId, input.conversationId, input.taskId));
+      assert.equal(reopenedBroker.readJob(f.projectId, repeated.jobId).state, 'settled');
+    }
+    assert.equal(f.stub.executions, 1);
+    assert.equal(reopenedBroker.read(f.projectId).jobs.length, 1);
+    reopened.close();
+  } finally { await f.cleanup(); }
+});
+
+test('synthetic runner output is not authenticated acceptance evidence', async () => {
+  const f = await fixture();
+  try {
+    // This test-controlled port returns a canned result; observing that the broker stores it does not
+    // establish that a real test process ran or that this output is trustworthy runtime evidence.
+    f.stub.behaviour = async () => execution({ stdout: 'synthetic output\n', stdoutBytes: 17 });
+    const run = await runAgentTests({ broker: f.broker, projectId: f.projectId, conversationId: 'provenance-characterization', taskId: 'task', owner: 'agent', workspace: '.', authorize: async () => {}, reserveJob: async () => {} });
+    assert.equal(run.status, 'settled');
+    assert.equal(f.stub.executions, 1);
+    const job = f.broker.read(f.projectId).jobs[0]!;
+    assert.equal(job.projectId, f.projectId);
+    assert.equal(job.state, 'settled');
+    assert.equal(job.result?.outcome, 'succeeded');
+    assert.equal(job.result?.stdout, 'synthetic output\n');
+    // Do not assert a permanently fixed record shape: this characterization only states what this
+    // synthetic port proves, and remains valid if a future trusted provenance bridge is added.
+  } finally { await f.cleanup(); }
+});
+
+test('a running record with a purported result is corrupt and cannot be settled', async () => {
+  const f = await fixture();
+  try {
+    const run = await runAgentTests({ broker: f.broker, projectId: f.projectId, conversationId: 'corrupt-test', taskId: 'task', owner: 'agent', workspace: '.', authorize: async () => {}, reserveJob: async () => {} });
+    assert.equal(run.status, 'settled');
+    const settled = f.broker.read(f.projectId).jobs[0]!;
+    const corrupt = { ...settled, state: 'running' as const };
+    assert.throws(() => validateRunnerJobRecord(corrupt, 'CORRUPT'), isRunnerError('CORRUPT', /must not carry a result/));
+    assert.throws(() => runnerSettleVerdict(corrupt), isRunnerError('CORRUPT', /cannot carry a result/));
+  } finally { await f.cleanup(); }
+});
+
+test('concurrent copies of the same agent test invocation admit at most one execution', async () => {
+  const f = await fixture();
+  try {
+    const input = { broker: f.broker, projectId: f.projectId, conversationId: 'conversation-1', taskId: 'task-1', owner: 'agent-1', workspace: '.', authorize: async () => {}, reserveJob: async () => {} }; // synthetic fixture
+    const results = await Promise.all([runAgentTests(input), runAgentTests(input)]);
+    assert.deepEqual(results.map(result => result.status).sort(), ['needs-inspection', 'settled']);
+    assert.equal(f.stub.executions, 1);
+    assert.equal(f.broker.read(f.projectId).jobs.length, 1);
+  } finally { await f.cleanup(); }
+});
 
 const RUNNER_AT = Date.parse('2025-01-01T00:00:00.000Z');
 
@@ -110,6 +176,21 @@ async function submitJob(f: Fixture, overrides: { recipe?: 'test-run' | 'noop-pr
 function isRunnerError(code: string, pattern?: RegExp) {
   return (error: unknown) => error instanceof RunnerError && error.code === code && (pattern === undefined || pattern.test(error.message));
 }
+
+test('an exact runner claim refuses a different queue head without claiming or executing it', async () => {
+  const f = await fixture();
+  try {
+    const first = await submitJob(f), second = await submitJob(f, { recipe: 'test-run' });
+    await assert.rejects(f.broker.claim({ projectId: f.projectId, owner: 'agent', expectedJobId: second.id }), isRunnerError('CONFLICT', /different coding job/));
+    assert.equal(f.broker.readJob(f.projectId, first.id).state, 'pending');
+    assert.equal(f.broker.readJob(f.projectId, second.id).state, 'pending');
+    assert.equal(f.stub.executions, 0);
+    assert.deepEqual(f.stub.calls, [], 'the refusal precedes even containment setup');
+    const claimed = await f.broker.claim({ projectId: f.projectId, owner: 'agent', expectedJobId: first.id });
+    assert.equal(claimed.id, first.id);
+    assert.equal(claimed.state, 'claimed');
+  } finally { await f.cleanup(); }
+});
 
 test('a coding job is a validated request: unknown fields, unknown recipes, out-of-root workspaces and oversized limits fail closed', async () => {
   const f = await fixture();
@@ -221,6 +302,42 @@ test('a run the port cannot report leaves the job running, and reconciliation na
   } finally { await f.cleanup(); }
 });
 
+test('runner rechecks delegated authority at both sides of durable admission', async () => {
+  for(const failAt of [1,2]){
+    const f=await fixture();
+    try{
+      const job=await submitJob(f);await f.broker.claim({projectId:f.projectId,owner:'dispatcher'});let checks=0;
+      await assert.rejects(f.broker.run({projectId:f.projectId,jobId:job.id,owner:'dispatcher',beforeExecute:async()=>{if(++checks===failAt)throw Error('revoked');}}),/revoked/);
+      assert.equal(f.stub.executions,0);assert.equal(f.broker.readJob(f.projectId,job.id).state,failAt===1?'claimed':'running');
+      if(failAt===2)assert.equal((await f.broker.settle({projectId:f.projectId,jobId:job.id})).record.attention?.reason,'job-interrupted');
+    }finally{await f.cleanup();}
+  }
+});
+
+test('runner cancellation refuses before execution and preserves uncertainty after admission', async () => {
+  const f = await fixture();
+  try {
+    const job = await submitJob(f);
+    await f.broker.claim({ projectId: f.projectId, owner: 'dispatcher' });
+    const before = new AbortController(); before.abort();
+    await assert.rejects(f.broker.run({ projectId: f.projectId, jobId: job.id, owner: 'dispatcher', signal: before.signal }), isRunnerError('ILLEGAL', /cancelled before/));
+    assert.equal(f.broker.readJob(f.projectId, job.id).state, 'claimed');
+    assert.equal(f.stub.executions, 0);
+    const during = new AbortController();
+    f.stub.behaviour = input => new Promise(resolve => {
+      input.signal.addEventListener('abort', () => resolve(execution()), { once: true });
+      during.abort();
+    });
+    await assert.rejects(f.broker.run({ projectId: f.projectId, jobId: job.id, owner: 'dispatcher', signal: during.signal }), isRunnerError('UNAVAILABLE', /effects are uncertain/));
+    assert.equal(f.stub.aborts, 1);
+    assert.equal(f.stub.executions, 1);
+    assert.equal(f.broker.readJob(f.projectId, job.id).state, 'running');
+    assert.deepEqual(await f.broker.reconcile(), { settled: 0, attention: 1, unchanged: 0 });
+    assert.equal(f.broker.readJob(f.projectId, job.id).attention?.reason, 'job-interrupted');
+    assert.equal(f.stub.executions, 1);
+  } finally { await f.cleanup(); }
+});
+
 test('a settled job is never run again, and a settle raced against a run executes nothing', async () => {
   const f = await fixture();
   try {
@@ -262,6 +379,50 @@ test('a settled job is never run again, and a settle raced against a run execute
   } finally { await f.cleanup(); }
 });
 
+test('characterization: settlement after running admission does not prevent later dispatch', { timeout: 5000 }, async () => {
+  const f = await fixture();
+  const otherStore = new ControlStore(f.data);
+  let release!: () => void;
+  const resumed = new Promise<void>((resolve) => { release = resolve; });
+  let admitted!: () => void;
+  const atAdmission = new Promise<void>((resolve) => { admitted = resolve; });
+  try {
+    const job = await submitJob(f);
+    await f.broker.claim({ projectId: f.projectId, owner: 'dispatcher' });
+    const other = new RunnerBroker(otherStore, f.port, optionsFor(f));
+    let checks = 0;
+    const run = f.broker.run({
+      projectId: f.projectId, jobId: job.id, owner: 'dispatcher',
+      beforeExecute: async () => {
+        if (++checks === 2) { admitted(); await resumed; }
+      }
+    });
+    // Observe through a separate SQLite connection after the running revision commits but before
+    // the execution port is invoked. This does not simulate or prove process death or containment.
+    let admissionTimer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        atAdmission,
+        run.then(
+          () => { throw new Error('run completed before admission'); },
+          (cause: unknown) => { throw new Error('run failed before admission', { cause }); }
+        ),
+        new Promise<never>((_, reject) => { admissionTimer = setTimeout(() => reject(new Error('timed out waiting for admission')), 2000); })
+      ]);
+    } finally { clearTimeout(admissionTimer); }
+    assert.equal(other.readJob(f.projectId, job.id).state, 'running');
+    const settlement = await other.settle({ projectId: f.projectId, jobId: job.id });
+    assert.equal(settlement.record.attention?.reason, 'job-interrupted');
+    assert.equal(f.stub.executions, 0);
+    release();
+    await assert.rejects(run, isRunnerError('CONFLICT'));
+    assert.equal(f.stub.executions, 1, 'the port can start after attention was recorded');
+    const final = other.readJob(f.projectId, job.id);
+    assert.equal(final.state, 'attention');
+    assert.equal(final.result, null, 'the successful synthetic report lost the revision race');
+  } finally { release(); otherStore.close(); await f.cleanup(); }
+});
+
 test('output is truncated at the byte cap, and a stored record stays inside the control store bound', async () => {
   const f = await fixture();
   try {
@@ -288,14 +449,14 @@ test('output is truncated at the byte cap, and a stored record stays inside the 
   } finally { await f.cleanup(); }
 });
 
-test('the broker enforces the wall clock, and a run it stopped keeps what the port reported', async () => {
+test('the broker settles a timed-out job only when the port confirms termination', async () => {
   const f = await fixture();
   try {
     const job = await submitJob(f, { limits: { timeoutMs: 100 } });
     await f.broker.claim({ projectId: f.projectId, owner: 'dispatcher' });
     // A port that honours the abort reports promptly with the output it had.
     f.stub.behaviour = (input) => new Promise<RunnerExecution>((done) => {
-      input.signal.addEventListener('abort', () => done(execution({ exitCode: null, stdout: 'partial\n', stdoutBytes: 8, timedOut: true, durationMs: 100 })), { once: true });
+      input.signal.addEventListener('abort', () => done(execution({ exitCode: null, stdout: 'partial\n', stdoutBytes: 8, timedOut: true, terminationConfirmed: true, durationMs: 100 })), { once: true });
     });
     const started = Date.now();
     const ran = await f.broker.run({ projectId: f.projectId, jobId: job.id, owner: 'dispatcher' });
@@ -306,18 +467,22 @@ test('the broker enforces the wall clock, and a run it stopped keeps what the po
     assert.ok(elapsed >= 100, 'the broker waited at least the job wall clock');
     assert.equal(f.stub.aborts, 1, 'the port was aborted exactly once');
 
-    // A port that ignores the abort cannot hold a job open: the bounded grace ends it anyway.
-    const second = await submitJob(f, { limits: { timeoutMs: 100 } });
-    await f.broker.claim({ projectId: f.projectId, owner: 'dispatcher' });
-    f.stub.behaviour = () => new Promise<RunnerExecution>(() => { /* never reports */ });
-    const stubbornStart = Date.now();
-    const stubborn = await f.broker.run({ projectId: f.projectId, jobId: second.id, owner: 'dispatcher' });
-    const stubbornElapsed = Date.now() - stubbornStart;
-    assert.deepEqual([stubborn.result!.outcome, stubborn.result!.exitCode, stubborn.result!.stdout], ['timed-out', null, '']);
-    assert.ok(stubbornElapsed < 2_000, 'the grace after an abort is bounded, not a second wait');
-    assert.ok(stubborn.result!.durationMs >= 100, 'a run the port never reported still records the wall clock this build waited');
-    assert.ok(Date.parse(stubborn.result!.endedAt) >= Date.parse(stubborn.result!.startedAt), 'the recorded instants are in order');
-    assert.equal(stubborn.state, 'settled');
+    // A hung, rejected or unverified port cannot prove the container stopped.
+    for (const behaviour of ['hung','rejected','unverified'] as const) {
+      const next = await submitJob(f, { limits: { timeoutMs: 100 } });
+      await f.broker.claim({ projectId: f.projectId, owner: 'dispatcher' });
+      f.stub.behaviour = input => new Promise<RunnerExecution>((resolve,reject) => {
+        if (behaviour==='hung') return;
+        input.signal.addEventListener('abort',()=>behaviour==='rejected'?reject(Error('lost stop')):resolve(execution({exitCode:null,timedOut:true})),{once:true});
+      });
+      const before=Date.now();
+      await assert.rejects(f.broker.run({projectId:f.projectId,jobId:next.id,owner:'dispatcher'}),/could not report|termination was not confirmed/i);
+      assert.ok(Date.now()-before<2_000,'the abort grace is bounded');
+      assert.equal(f.broker.readJob(f.projectId,next.id).state,'running');
+      const settled=await f.broker.settle({projectId:f.projectId,jobId:next.id});
+      assert.equal(settled.record.attention?.reason,'job-interrupted');
+      assert.equal(settled.record.result,null);
+    }
   } finally { await f.cleanup(); }
 });
 
@@ -389,9 +554,8 @@ test('jobs and their outcomes are durable across a reopen, and the per-project b
   } finally { await g.cleanup(); }
 });
 
-test('the real docker port builds the documented containment command line, and fails closed when it cannot contain a job', async () => {
-  // The command line *is* the containment: every required property is one flag, exactly one host path
-  // is mounted, and the image and the allowlist argv are the last words.
+test('the disabled Docker port never starts a CLI, even when called directly', async () => {
+  // The legacy command-line builder is retained only for inspection; flags alone do not prove containment.
   const argv = dockerRunArgv({
     image: 'pilot-runner:test', user: '10001:10001', tmpfsBytes: 16 * 1024 * 1024,
     workspace: '/tmp/ws', containerName: 'pilot-runner-job', limits: RUNNER_DEFAULT_LIMITS, recipe: 'noop-probe'
@@ -410,35 +574,26 @@ test('the real docker port builds the documented containment command line, and f
   }
   assert.ok(argv.includes('--read-only'), 'the root filesystem is read-only');
   assert.ok(argv.includes('--rm'), 'a finished container is removed');
+  assert.ok(argv.includes('--sig-proxy=false'), 'signals are not forwarded by the CLI');
   assert.equal(argv.filter((argument) => argument === '--volume').length, 1, 'exactly one host path is mounted');
   assert.deepEqual(argv.slice(-3), ['pilot-runner:test', '/bin/echo', 'pilot-runner-probe'], 'the image and the allowlist argv are the last words');
   assert.ok(!argv.some((argument) => /docker\.sock/.test(argument)), 'the runtime socket is never mounted');
   assert.ok(!argv.includes('-e') && !argv.includes('--env'), 'no environment is passed to a job');
   assert.ok(!argv.includes('-c') && !argv.includes('sh'), 'no shell is involved');
 
-  // A fake binary records the argv the port really spawns. No container is started anywhere: the script
-  // only logs its arguments and prints what the port parses.
+  // A fake binary would log any attempted CLI invocation; neither entry point may invoke it.
   const root = await mkdtemp(join(tmpdir(), 'pilot-docker-'));
   const log = join(root, 'calls.log');
   const fake = join(root, 'fake-docker');
   await writeFile(fake, '#!/bin/sh\nprintf "%s|" "$@" >> ' + JSON.stringify(log) + '\nprintf "\\n" >> ' + JSON.stringify(log) + '\ncase "$1" in\n  version) echo 27.0.0 ;;\n  image) case "$3" in pilot-runner:test) echo sha256:test ;; *) exit 1 ;; esac ;;\n  info) case "$3" in *MemTotal*) echo 8589934592 ;; *) echo 8 ;; esac ;;\n  run) echo "probe-output" ;;\nesac\nexit 0\n', { mode: 0o755 });
   try {
     const port = dockerRunnerPort({ image: 'pilot-runner:test', docker: fake });
-    const reported = await port.establish();
-    assert.deepEqual(runnerContainmentProblems(reported), [], 'the port reports every required property');
-    assert.deepEqual([reported.network, reported.rootFilesystem, reported.capabilities, reported.user, reported.mounts], ['none', 'read-only', 'none', '10001:10001', ['workspace']]);
+    await assert.rejects(port.establish(), isRunnerError('UNAVAILABLE', /wall-clock termination bound/));
     const job = submittedRunnerJob({ id: randomUUID(), projectId: 'pilot', request: runnerJobRequest({ recipe: 'noop-probe', workspace: '.' }), now: new Date(RUNNER_AT) });
-    const executed = await port.execute({ job, workspace: '/tmp/ws', containerName: 'pilot-runner-' + job.id, signal: new AbortController().signal });
-    assert.deepEqual([executed.exitCode, executed.stdout, executed.timedOut], [0, 'probe-output\n', false]);
-    const runLine = (await readFile(log, 'utf8')).split('\n').find((line) => line.startsWith('run|'));
-    assert.ok(runLine !== undefined, 'the port really spawned the container command line');
-    for (const fragment of ['--network|none|', '--read-only|', '--cap-drop|ALL|', '--security-opt|no-new-privileges|', '--volume|/tmp/ws:/workspace:rw|', '|pilot-runner:test|/bin/echo|pilot-runner-probe|']) {
-      assert.ok(runLine!.includes(fragment), 'the spawned command line carries ' + fragment);
-    }
-    // A binary that is not there, an image that is not loaded and no configured image at all each fail
-    // closed, and none of them runs anything on the host.
-    await assert.rejects(dockerRunnerPort({ image: 'pilot-runner:test', docker: join(root, 'missing-docker') }).establish(), isRunnerError('UNAVAILABLE', /did not answer/));
-    await assert.rejects(dockerRunnerPort({ image: 'pilot-runner:absent', docker: fake }).establish(), isRunnerError('UNAVAILABLE', /is not present in the container runtime/));
+    await assert.rejects(port.execute({ job, workspace: '/tmp/ws', containerName: 'pilot-runner-' + job.id, signal: new AbortController().signal }), isRunnerError('UNAVAILABLE', /wall-clock termination bound/));
+    assert.equal(await readFile(log, 'utf8').catch(()=>''), '', 'neither preflight nor direct execute spawns the CLI');
+    await assert.rejects(dockerRunnerPort({ image: 'pilot-runner:test', docker: join(root, 'missing-docker') }).establish(), isRunnerError('UNAVAILABLE', /wall-clock termination bound/));
+    await assert.rejects(dockerRunnerPort({ image: 'pilot-runner:absent', docker: fake }).establish(), isRunnerError('UNAVAILABLE', /wall-clock termination bound/));
     await assert.rejects(dockerRunnerPort({}).establish(), isRunnerError('UNAVAILABLE', /no runner image is configured/));
     await assert.rejects(dockerRunnerPort({ image: '--privileged', docker: fake }).establish(), isRunnerError('UNAVAILABLE', /not a plain image name/));
   } finally { await rm(root, { recursive: true, force: true }); }

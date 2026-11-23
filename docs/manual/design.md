@@ -1,0 +1,33 @@
+---
+title: "Design in the DDDD workflow"
+description: "Document design decisions today without claiming a design editor already exists."
+pilot:
+  schema: 1
+  id: design
+  kind: explanation
+  doc_status: draft
+  feature_status: planned
+  verified_release: null
+---
+
+## Available building blocks
+
+The Doc view can render Markdown, diagrams, supported images and static HTML/SVG mockups within its existing safety limits. Static mockups do not execute arbitrary scripts. Task specifications can link to these repository artifacts.
+
+## Planned design functionality
+
+An integrated design editor, component authoring, interactive prototyping and design-to-code tooling are not implemented. This page defines direction, not an available feature list.
+
+## Document a design now
+
+For each flow, specify the user, entry point, successful outcome and alternative paths. Include loading, empty, error, permission-denied, conflict and recovery states. Define keyboard operation, focus behaviour, accessible names, responsive layout and reduced motion where relevant.
+
+Keep artifact source in the repository. Give each important screen/state a stable identifier. Link the design to the feature specification and its acceptance criteria; record what changed and why. Screenshots alone are insufficient to define interaction or data rules.
+
+Use the [feature template](../templates/feature.md) and [design template](../templates/design.md). The plan points to these documents instead of duplicating them in task descriptions.
+
+## Workspace visual direction
+
+The workspace uses quiet neutral surfaces, readable typography and blue selected states. New browsers start in the light theme; an existing light or dark preference remains in force. Conversation messages use a readable proportional typeface, while tool output retains monospace formatting. The project navigator reports when a search has no matches. On phones it opens below the entire responsive header, without covering the view controls. The same controls and views remain available at phone and desktop widths, with visible keyboard focus and reduced-motion support.
+
+These refinements are implemented locally; they are not a claim that a particular deployment includes them.

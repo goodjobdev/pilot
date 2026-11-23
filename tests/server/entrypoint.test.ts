@@ -15,24 +15,43 @@ import { acquireServiceLock } from '../../src/server/service-lock';
 import { observeStorageSchema } from '../../src/server/release';
 import { doctorStartBlockers,restorePauseRefusal } from '../../src/server/main';
 import { PAUSED_MARKER,backup,promote,restore } from '../../scripts/data-tools.mjs';
-import { ControlStore } from '../../src/server/state/control-store';
+import { ControlStore,operationDigest } from '../../src/server/state/control-store';
 import { ReleaseStore } from '../../src/server/state/release-store';
 import { DeliveryLedger } from '../../src/server/state/delivery';
 import { SessionLifecycleStore } from '../../src/server/state/session-lifecycle';
 import { newTask } from '../../src/shared/model';
 
 /** The entrypoint validates the whole environment, so a test must not inherit deployment values. */
-const DEPLOYMENT_VARIABLES=['DASHBOARD_MODE','DASHBOARD_EXPOSURE','DASHBOARD_BIND','DASHBOARD_ALLOWED_HOSTS','DASHBOARD_RELEASE','DASHBOARD_RELEASE_MANIFEST','DASHBOARD_ROOT_ID','DASHBOARD_SHUTDOWN_DEADLINE_MS','DASHBOARD_ORIGIN','CF_ACCESS_TEAM','CF_ACCESS_AUD','DASHBOARD_OWNER','DASHBOARD_DATA','DASHBOARD_ROOTS','DASHBOARD_REGISTRY','PORT'];
+const DEPLOYMENT_VARIABLES=['DASHBOARD_MODE','DASHBOARD_EXPOSURE','DASHBOARD_BIND','DASHBOARD_ALLOWED_HOSTS','DASHBOARD_RELEASE','DASHBOARD_RELEASE_MANIFEST','DASHBOARD_ROOT_ID','DASHBOARD_SHUTDOWN_DEADLINE_MS','DASHBOARD_ORIGIN','CF_ACCESS_TEAM','CF_ACCESS_AUD','DASHBOARD_OWNER','DASHBOARD_DATA','DASHBOARD_ROOTS','DASHBOARD_REGISTRY','DASHBOARD_AGENT_TEST_SEAMS','DASHBOARD_AGENT_NOTE_DELAY_MS','DASHBOARD_AGENT_NOTE_AFTER_WRITE_MS','PORT'];
 function testEnv(overrides:NodeJS.ProcessEnv):NodeJS.ProcessEnv {
   const env:{[name:string]:string|undefined}={...process.env};
   for(const name of DEPLOYMENT_VARIABLES)delete env[name];
   return {...env,...overrides} as NodeJS.ProcessEnv;
 }
 /** The release layout the entrypoint is launched through, including the current symlink. */
-async function releaseRoot():Promise<string> {
+async function releaseRoot(fixture?:'reject-disposer'|'stuck-disposer'|'control-close'|'delayed-writer'):Promise<string> {
   const root=await mkdtemp(join(tmpdir(),'dashboard-entry-'));
   const release=join(root,'releases','v1');await mkdir(release,{recursive:true});
-  await build({entryPoints:[resolve('src/server/main.ts')],bundle:true,platform:'node',format:'esm',packages:'external',outfile:join(release,'server.mjs')});
+  // Synthetic test builds inject faults into the real entrypoint. No runtime flag or
+  // production endpoint can enable these hooks; ordinary builds contain none of them.
+  const fixtureCode=fixture==='control-close'
+    ? `store.close=()=>{throw new Error('synthetic control close failure');};`
+    : fixture==='reject-disposer'||fixture==='stuck-disposer'
+    ? `const subscribe=app.agents.subscribe.bind(app.agents);
+       app.agents.subscribe=async(...args)=>{await subscribe(...args);return async()=>{${fixture==='reject-disposer' ? "throw new Error('synthetic disposer failure');" : 'await new Promise(()=>{});'}};};`
+    : fixture==='delayed-writer'
+    ? `const create=app.docs.create.bind(app.docs);
+       app.docs.create=async(...args)=>{writeSync(2,'synthetic writer started\\n');await new Promise(ok=>setTimeout(ok,500));return create(...args);};`
+    : '';
+  await build({entryPoints:[resolve('src/server/main.ts')],bundle:true,platform:'node',format:'esm',packages:'external',outfile:join(release,'server.mjs'),plugins:fixture?[{
+    name:'synthetic-shutdown-fixture',setup(build){
+      build.onLoad({filter:/\/src\/server\/main\.ts$/},async args=>{
+        const source=await readFile(args.path,'utf8'),anchor='    let reason:NodeJS.Signals|null=null,failure:unknown=null;';
+        assert.equal(source.split(anchor).length,2,'the fixture must patch exactly one entrypoint location');
+        return {contents:source.replace(anchor,fixtureCode+'\n'+anchor),loader:'ts'};
+      });
+    },
+  }]:[]});
   // Production externals resolve from the app's installed dependencies, not this disposable root.
   await symlink(resolve('node_modules'),join(release,'node_modules'),'dir');
   // The local-mode session token is injected into the page it serves, so a test that needs an
@@ -57,7 +76,7 @@ async function waitFor<T>(check:()=>Promise<T|undefined>,timeoutMs=10000):Promis
  const until=Date.now()+timeoutMs;
  for(;;){
   const value=await check();
-  if(value!==undefined)return value;
+  if(value!==undefined&&value!==false)return value;
   if(Date.now()>until)throw Error('condition was not met in time');
   await sleep(100);
  }
@@ -69,6 +88,32 @@ async function sessionToken(port:number):Promise<string> {
   assert.ok(match,'the served page must carry the session token: '+html.slice(0,200));
   return match[1];
 }
+
+test('an invalid test-only note delay refuses before the data root is created', async () => {
+  const root=await releaseRoot();
+  const cases=[
+    { label: 'missing test switch', env: { DASHBOARD_AGENT_NOTE_DELAY_MS: '10' }, message: /test-only seam/ },
+    { label: 'out of range', env: { DASHBOARD_AGENT_TEST_SEAMS: 'on', DASHBOARD_AGENT_NOTE_DELAY_MS: '60001' }, message: /whole number/ },
+    { label: 'post-append seam without its switch', env: { DASHBOARD_AGENT_NOTE_AFTER_WRITE_MS: '10' }, message: /test-only seam/ },
+    { label: 'post-append seam out of range', env: { DASHBOARD_AGENT_TEST_SEAMS: 'on', DASHBOARD_AGENT_NOTE_AFTER_WRITE_MS: '-1' }, message: /whole number/ }
+  ];
+  try {
+    for (const [index, one] of cases.entries()) {
+      const data=join(root,'data-'+index);
+      const child=spawnServer(join(root,'current','server.mjs'), {
+        DASHBOARD_MODE:'local',DASHBOARD_DATA:data,PORT:String(4317+index),
+        DASHBOARD_ROOTS:'',DASHBOARD_REGISTRY:'',...one.env
+      });
+      const output=collect(child);
+      const [code]=await once(child,'exit') as [number, NodeJS.Signals|null];
+      assert.notEqual(code,0,one.label+': the start must fail closed');
+      assert.match(output.stderr(),one.message,one.label+': the refusal names the seam');
+      assert.equal(await stat(data).then(()=>true,()=>false),false,one.label+': the data root was not created');
+    }
+  } finally {
+    await rm(root,{recursive:true,force:true});
+  }
+});
 /**
  * One authenticated request that stops mid-body. Authentication has happened and the handler is
  * waiting for bytes that never arrive, so the server can neither answer nor finish closing.
@@ -287,6 +332,86 @@ test('the entrypoint starts through the current release symlink, holds the start
   await rm(root,{recursive:true,force:true});
  }
 });
+test('SIGTERM ends an uncancelled SSE client and releases the service lock', {timeout:15000}, async()=>{
+ const root=await releaseRoot(),data=join(root,'data'),port=await freePort();
+ const child=spawnServer(join(root,'current','server.mjs'),{DASHBOARD_MODE:'local',DASHBOARD_DATA:data,PORT:String(port),DASHBOARD_SHUTDOWN_DEADLINE_MS:'2000',DASHBOARD_AGENTS:'on',DASHBOARD_REGISTRY:'',DASHBOARD_ROOTS:''});
+ const logs=collect(child),exited=once(child,'exit');
+ try{
+  await waitForListening(child,logs.stderr);
+  const token=await sessionToken(port),base='http://127.0.0.1:'+port;
+  const created=await fetch(base+'/api/projects',{method:'POST',headers:{'x-dashboard-token':token,'content-type':'application/json',origin:base},body:JSON.stringify({name:'Shutdown stream',managed:true,confirm:true})});
+  assert.equal(created.status,201);
+  const project=await created.json() as {id:string};
+  const response=await fetch(base+'/api/projects/'+project.id+'/agents/stream',{headers:{'x-dashboard-token':token}});
+  assert.equal(response.status,200);
+  // Wait for a real subscription view, not just the initial retry frame.
+  const reader=response.body!.getReader();
+  let text='';
+  while(!text.includes('data: ')){
+   const chunk=await reader.read();assert.equal(chunk.done,false);
+   text+=new TextDecoder().decode(chunk.value);
+  }
+  child.kill('SIGTERM');
+  while(!(await reader.read()).done) { /* server-owned EOF; never cancel the client */ }
+  assert.equal(await waitForExit(child,exited,logs),0,logs.stderr());
+  await assert.rejects(stat(join(data,'service.lock')),{code:'ENOENT'});
+  assert.doesNotMatch(logs.stderr(),/intentionally retained/);
+ }finally{
+  await stop(child,exited,'SIGKILL');
+  await rm(root,{recursive:true,force:true});
+ }
+});
+
+for(const fixture of ['reject-disposer','stuck-disposer','control-close','delayed-writer'] as const) test(`production shutdown handles synthetic ${fixture}`, {timeout:15000}, async()=>{
+ const root=await releaseRoot(fixture),data=join(root,'data'),port=await freePort();
+ const child=spawnServer(join(root,'current','server.mjs'),{DASHBOARD_MODE:'local',DASHBOARD_DATA:data,PORT:String(port),DASHBOARD_SHUTDOWN_DEADLINE_MS:'1500',DASHBOARD_AGENTS:'on',DASHBOARD_REGISTRY:'',DASHBOARD_ROOTS:''});
+ const logs=collect(child),exited=once(child,'exit');
+ try{
+  await waitForListening(child,logs.stderr);
+  const token=await sessionToken(port),base='http://127.0.0.1:'+port;
+  const headers={'x-dashboard-token':token,'content-type':'application/json',origin:base};
+  const created=await fetch(base+'/api/projects',{method:'POST',headers,body:JSON.stringify({name:'Synthetic shutdown',managed:true,confirm:true})});
+  assert.equal(created.status,201);
+  const project=await created.json() as {id:string;path:string};
+  const response=await fetch(base+'/api/projects/'+project.id+'/agents/stream',{headers});
+  assert.equal(response.status,200);
+  const reader=response.body!.getReader();
+  let text='';
+  while(!text.includes('data: ')){
+   const chunk=await reader.read();assert.equal(chunk.done,false);
+   text+=new TextDecoder().decode(chunk.value);
+  }
+  let writerFinished=false;
+  const writer=fixture==='delayed-writer'
+   ? fetch(base+'/api/projects/'+project.id+'/docs/document',{method:'POST',headers,body:JSON.stringify({path:'shutdown-proof.md',text:'# Drained normally\n'})}).then(async res=>{const body=await res.text();writerFinished=true;return {status:res.status,body};})
+   : undefined;
+  if(writer)await waitFor(async()=>logs.stderr().includes('synthetic writer started')?true:undefined);
+  const lockEvidence=await readFile(join(data,'service.lock'),'utf8');
+  const start=Date.now();
+  child.kill('SIGTERM');
+  while(!(await reader.read()).done) { /* the server owns EOF */ }
+  if(writer){
+   assert.equal(writerFinished,false,'SSE ends before the ordinary writer finishes');
+   assert.equal((await writer).status,201);
+   assert.equal(await readFile(join(project.path,'shutdown-proof.md'),'utf8'),'# Drained normally\n');
+  }
+  const code=await waitForExit(child,exited,logs);
+  assert.ok(Date.now()-start<5000,'production shutdown must finish within a bounded interval');
+  if(writer){
+   assert.equal(code,0,logs.stderr());
+   await assert.rejects(stat(join(data,'service.lock')),{code:'ENOENT'});
+  }else{
+   assert.notEqual(code,0,logs.stderr());
+   assert.equal(await readFile(join(data,'service.lock'),'utf8'),lockEvidence,'failed cleanup preserves the exact ownership evidence');
+   assert.match(logs.stderr(),/intentionally retained/);
+   assert.match(logs.stderr(),fixture==='stuck-disposer'?/Shutdown did not finish within 1500ms/:fixture==='control-close'?/Could not close the control store: synthetic control close failure/:/Shutdown failed/);
+  }
+ }finally{
+  await stop(child,exited,'SIGKILL');
+  await rm(root,{recursive:true,force:true});
+ }
+});
+
 test('a drain that misses its deadline retains the lock and reports the timeout, and the root is usable once the operator clears it',async()=>{
  const root=await releaseRoot(),data=join(root,'data');
  const port=await freePort();
@@ -583,7 +708,11 @@ test('the running service reports its release identity, refuses a release the st
  const event=await brokenReleases.promote({candidateId:'cand-1',expectedRevision:0,actor:'owner'});
  brokenStore.close();
  const tamper=new DatabaseSync(join(await realpath(brokenData),'control.sqlite'));
- tamper.prepare("UPDATE operations SET input_json=? WHERE kind='release.promotion'").run(JSON.stringify({...event,actor:'someone-else'}));
+ const operation=tamper.prepare("SELECT id FROM operations WHERE kind='release.promotion'").get() as {id:string};
+ const outbox=tamper.prepare('SELECT kind,payload_json FROM outboxes WHERE operation_id=?').get(operation.id) as {kind:string;payload_json:string};
+ const altered={...event,actor:'someone-else'};
+ const digest=operationDigest('release.promotion',{input:altered,outbox:{kind:outbox.kind,payload:JSON.parse(outbox.payload_json)}});
+ tamper.prepare("UPDATE operations SET input_json=?,input_digest=? WHERE id=?").run(JSON.stringify(altered),digest,operation.id);
  tamper.close();
  const brokenPort=await freePort();
  const brokenChild=spawnServer(join(broken,'current','server.mjs'),{DASHBOARD_MODE:'local',DASHBOARD_DATA:brokenData,PORT:String(brokenPort),DASHBOARD_REGISTRY:'',DASHBOARD_ROOTS:''});
@@ -595,6 +724,21 @@ test('the running service reports its release identity, refuses a release the st
   await expectNothingListening(brokenPort);
  }finally{
   await stop(brokenChild,brokenExited,'SIGKILL');
+ }
+ // Digest tampering is a separate startup integrity failure, before release-history semantics run.
+ const stale=new DatabaseSync(join(await realpath(brokenData),'control.sqlite'));
+ stale.prepare("UPDATE operations SET input_digest=? WHERE kind='release.promotion'").run('0'.repeat(64));
+ stale.close();
+ const stalePort=await freePort();
+ const staleChild=spawnServer(join(broken,'current','server.mjs'),{DASHBOARD_MODE:'local',DASHBOARD_DATA:brokenData,PORT:String(stalePort),DASHBOARD_REGISTRY:'',DASHBOARD_ROOTS:''});
+ const staleLogs=collect(staleChild),staleExited=once(staleChild,'exit');
+ try{
+  const [code]=await staleExited as [number];
+  assert.notEqual(code,0,'a stale operation digest must fail closed on startup');
+  assert.match(staleLogs.stderr(),/Corrupt operation input digest/);
+  await expectNothingListening(stalePort);
+ }finally{
+  await stop(staleChild,staleExited,'SIGKILL');
   await rm(broken,{recursive:true,force:true});
  }
 });
@@ -685,7 +829,11 @@ test('a real start reconciles the delivery ledger it finds: it re-sends only wha
  const tampered=ledger.admitQuestion({...scope,questionId:'22222222-2222-4222-8222-222222222222',text:'Which provider?',askedAt:1700000000001});
  const outboxRows=(id:string)=>JSON.stringify(store.db.prepare('SELECT * FROM outboxes WHERE operation_id=?').all(id));
  const refusedWas=outboxRows(tampered.operation.id);
- store.db.prepare('UPDATE outboxes SET payload_json=? WHERE operation_id=?').run(JSON.stringify({version:1,delivery:'question',questionId:'22222222-2222-4222-8222-222222222222',tag:'question:someone-else',requestId:null}),tampered.operation.id);
+ const outbox=store.db.prepare('SELECT kind FROM outboxes WHERE operation_id=?').get(tampered.operation.id) as {kind:string};
+ const alteredPayload={version:1,delivery:'question',questionId:'22222222-2222-4222-8222-222222222222',tag:'question:someone-else',requestId:null};
+ store.db.prepare('UPDATE outboxes SET payload_json=? WHERE operation_id=?').run(JSON.stringify(alteredPayload),tampered.operation.id);
+ const digest=operationDigest(tampered.operation.kind,{input:tampered.operation.input,outbox:{kind:outbox.kind,payload:alteredPayload}});
+ store.db.prepare('UPDATE operations SET input_digest=? WHERE id=?').run(digest,tampered.operation.id);
  const refusedIs=outboxRows(tampered.operation.id);
  store.close();
  const port=await freePort();

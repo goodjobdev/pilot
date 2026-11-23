@@ -1,2 +1,6 @@
 allowBuilds:
+  # These registry packages ship their runtime files; their install hooks are no-ops.
+  '@google/genai': false
   esbuild: true
+  node-pty: true
+  protobufjs: false

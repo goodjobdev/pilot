@@ -1,0 +1,8 @@
+{
+  "name": "pilot-tailnet-gateway-poc",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": { "test": "node --test" },
+  "dependencies": { "psl": "1.15.0" }
+}

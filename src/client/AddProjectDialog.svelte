@@ -1,5 +1,6 @@
 <script lang="ts">
  import { onMount } from 'svelte';
+ import {showModalWithFocusReturn} from './modal-focus';
  import { api,request,isSessionExpired } from './api';
  import type { Project } from '../shared/model';
  let { onclose,oncreated }:{onclose:()=>void;oncreated:(p:Project)=>void}=$props();
@@ -8,7 +9,7 @@
  let preview=$state<{path:string;boardPath:string;detected:string[]}|null>(null);
  let folders=$state<{name:string;path:string}[]>([]),roots=$state<string[]>([]);
  let suggestions=$state<{name:string;path:string;remote:string}[]>([]);
- onMount(()=>{dialog.showModal();void request<string[]>('/roots').then(v=>roots=v);void request<typeof suggestions>('/suggestions').then(v=>suggestions=v).catch(()=>{});});
+ onMount(()=>{const close=showModalWithFocusReturn(dialog);void request<string[]>('/roots').then(v=>roots=v);void request<typeof suggestions>('/suggestions').then(v=>suggestions=v).catch(()=>{});return close;});
  async function browse(next:string){try{const v=await request<{path:string;entries:typeof folders}>('/browse?path='+encodeURIComponent(next));path=v.path;folders=v.entries;preview=null;}catch(e){error=(e as Error).message;}}
  async function inspect(){try{preview=await request('/preview','POST',{path});error='';}catch(e){error=(e as Error).message;}}
  async function submit(){
@@ -16,8 +17,8 @@
    catch(e){error=(e as Error).message;expired=isSessionExpired(e);}finally{busy=false;}
  }
 </script>
-<dialog bind:this={dialog} oncancel={onclose}>
- <header class="modal-head"><div><span class="eyebrow">NEW WORKSPACE</span><h2>Add a project</h2></div><button aria-label="Close dialog" onclick={onclose}>×</button></header>
+<dialog bind:this={dialog} oncancel={onclose} aria-labelledby="add-project-title">
+ <header class="modal-head"><div><span class="eyebrow">NEW WORKSPACE</span><h2 id="add-project-title">Add a project</h2></div><button aria-label="Close dialog" onclick={onclose}>×</button></header>
  <p class="muted">One dashboard, all your projects. Code checkouts are optional.</p>
  <form onsubmit={(e)=>{e.preventDefault();void submit();}}>
  <label>Project name<input required maxlength="100" bind:value={name} placeholder="e.g. Runway"></label>

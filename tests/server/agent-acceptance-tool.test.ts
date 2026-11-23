@@ -1,0 +1,143 @@
+import {test} from 'node:test';
+import assert from 'node:assert/strict';
+import {mkdtemp,mkdir,rm} from 'node:fs/promises';
+import {tmpdir} from 'node:os';
+import {join} from 'node:path';
+import {randomUUID} from 'node:crypto';
+import {fauxAssistantMessage,fauxProvider,fauxToolCall} from '@earendil-works/pi-ai/providers/faux';
+import {ROOT_CONVERSATION_ID} from '@earendil-works/pi-durable';
+import {acceptAgentEvidence,verifyAgentAcceptanceDispatch} from '../../src/server/agents/accept-evidence';
+import {AgentStore} from '../../src/server/state/agent-store';
+import {ControlStore} from '../../src/server/state/control-store';
+import {AcceptanceStore} from '../../src/server/state/acceptance-store';
+import {HarnessHost} from '../../src/server/agents/harness-host';
+import {ProviderStore} from '../../src/server/providers';
+import type {AgentScope} from '../../src/shared/agent-registry';
+
+const revision='a'.repeat(64),commit='b'.repeat(40),time='2026-01-01T00:00:00.000Z';
+const evidence={sessionId:String(ROOT_CONVERSATION_ID),subject:{kind:'session',id:String(ROOT_CONVERSATION_ID)},artifact:{revision,commit},commands:['node --test'],diff:{files:1,linesAdded:1,linesRemoved:0,text:'--- a/x\n+++ b/x\n+change\n',reference:null},tests:[{command:'node --test',outcome:'passed',output:'# tests 1\n# pass 1\n# fail 0\n# skipped 0',counts:{passed:1,failed:0,skipped:0}}],review:null,producedAt:time};
+async function waitFor(host:HarnessHost,project:Parameters<HarnessHost['view']>[0],text:string){const end=Date.now()+10000;while(!(await host.view(project)).entries.some(entry=>entry.text.includes(text))){if(Date.now()>end)throw Error('scripted run did not complete');await new Promise(resolve=>setTimeout(resolve,20));}}
+
+test('a bound agent records its own untrusted evidence, and an authority race records nothing',async t=>{
+ const root=await mkdtemp(join(tmpdir(),'pilot-agent-evidence-')),projectId=randomUUID(),path=join(root,'project');await mkdir(path);
+ const data=join(root,'data'),control=new ControlStore(data),other=new ControlStore(data),offered=[{provider:'evidence-faux',modelId:'fixture'}];
+ const options={models:()=>offered,projectKnown:(id:string)=>id===projectId},agents=new AgentStore(control,options),competitor=new AgentStore(other,options),actor={kind:'owner' as const,identity:'local'};
+ const agent=agents.create({actor,draft:{name:'Evidence agent',description:'',enabled:true,model:offered[0],workspace:{scope:{kind:'projects',projectIds:[projectId]},subpath:''},budgets:{maxRequests:null,maxOutputTokens:null,maxJobsPerHour:null},scopes:['accept']}});
+ agents.bindSession({projectId,sessionId:'1',revision:0,agentId:agent.id,actor});
+ const acceptance=new AcceptanceStore(control,{projectRoot:id=>id===projectId?path:undefined});
+ const fake=fauxProvider({provider:'evidence-faux',models:[{id:'fixture'}]}),providers=new ProviderStore(root,[fake.provider]);
+ await providers.savePreferences({defaultModel:{provider:'evidence-faux',modelId:'fixture'},favourites:[],allowRealModels:true});
+ const project={id:projectId,name:'Fixture',path,managed:true,repository:'',created:''};
+ const host=new HarnessHost({dataRoot:root,enabled:true,providers,privileges:{authority:async({projectId:id,sessionId})=>agents.versionedAuthorityForSession({projectId:id,sessionId:sessionId??''})},acceptanceTools:{read:(id,sessionId)=>acceptance.readProject({projectId:id,sessionId}),accept:input=>acceptAgentEvidence(acceptance,{...input,verifyAdmission:()=>verifyAgentAcceptanceDispatch(agents,input)}),record:async input=>{await input.authorize();return acceptance.recordEvidence({projectId:input.projectId,evidence:input.evidence,signal:input.signal,authorizeAdmission:()=>verifyAgentAcceptanceDispatch(agents,input)});}}});
+ t.after(async()=>{await host.close();await providers.close();other.close();control.close();await rm(root,{recursive:true,force:true});});
+ const admit=control.admit.bind(control);let raced=false;
+ control.admit=input=>{if(input.kind==='acceptance.evidence'&&!raced){raced=true;const b=competitor.bindSession({projectId,sessionId:'1',revision:1,agentId:null,actor});competitor.bindSession({projectId,sessionId:'1',revision:b.revision,agentId:agent.id,actor});}return admit(input);};
+ const claim={artifact:{revision,commit},commands:evidence.commands,diff:evidence.diff,tests:evidence.tests};
+ fake.setResponses([()=>fauxAssistantMessage([fauxToolCall('acceptance_record',claim)],{stopReason:'toolUse'}),()=>fauxAssistantMessage('Evidence race finished.')]);
+ await host.submit(project,{text:'Attempt evidence',mode:'followUp'});await waitFor(host,project,'Evidence race finished.');
+ assert.equal(raced,true);assert.equal((await acceptance.readProject({projectId})).evidence.length,0);
+ control.admit=admit;
+ fake.setResponses([()=>fauxAssistantMessage([fauxToolCall('acceptance_record',claim)],{stopReason:'toolUse'}),()=>fauxAssistantMessage('Fresh evidence finished.')]);
+ await host.submit(project,{text:'Record evidence',mode:'followUp'});await waitFor(host,project,'Fresh evidence finished.');
+ const records=(await acceptance.readProject({projectId})).evidence;
+ assert.equal(records.length,1);assert.equal(records[0].record.sessionId,'1');assert.deepEqual(records[0].record.subject,{kind:'session',id:'1'});assert.equal(records[0].acceptance,null);
+ assert.match(JSON.stringify((await host.view(project)).entries),/Self-reported claims; not independently verified/);
+});
+
+test('a harness abort reaches the evidence port before durable admission',async t=>{
+ const root=await mkdtemp(join(tmpdir(),'pilot-agent-evidence-abort-')),projectId=randomUUID(),path=join(root,'project');await mkdir(path);
+ const data=join(root,'data'),control=new ControlStore(data),offered=[{provider:'evidence-abort-faux',modelId:'fixture'}],actor={kind:'owner' as const,identity:'local'};
+ const agents=new AgentStore(control,{models:()=>offered,projectKnown:(id:string)=>id===projectId});
+ const agent=agents.create({actor,draft:{name:'Evidence agent',description:'',enabled:true,model:offered[0],workspace:{scope:{kind:'projects',projectIds:[projectId]},subpath:''},budgets:{maxRequests:null,maxOutputTokens:null,maxJobsPerHour:null},scopes:['accept']}});
+ agents.bindSession({projectId,sessionId:'1',revision:0,agentId:agent.id,actor});
+ const acceptance=new AcceptanceStore(control,{projectRoot:id=>id===projectId?path:undefined});
+ const fake=fauxProvider({provider:'evidence-abort-faux',models:[{id:'fixture'}]}),providers=new ProviderStore(root,[fake.provider]);
+ await providers.savePreferences({defaultModel:{provider:'evidence-abort-faux',modelId:'fixture'},favourites:[],allowRealModels:true});
+ const project={id:projectId,name:'Fixture',path,managed:true,repository:'',created:''};let entered!:()=>void,settled!:()=>void,aborted=false;
+ const inside=new Promise<void>(resolve=>{entered=resolve;}),done=new Promise<void>(resolve=>{settled=resolve;});
+ const host=new HarnessHost({dataRoot:root,enabled:true,providers,privileges:{authority:async({projectId:id,sessionId})=>agents.versionedAuthorityForSession({projectId:id,sessionId:sessionId??''})},acceptanceTools:{read:(id,sessionId)=>acceptance.readProject({projectId:id,sessionId}),accept:input=>acceptAgentEvidence(acceptance,{...input,verifyAdmission:()=>verifyAgentAcceptanceDispatch(agents,input)}),record:async input=>{
+  try{await input.authorize();assert.ok(input.signal);entered();await new Promise<void>(resolve=>{if(input.signal!.aborted)resolve();else input.signal!.addEventListener('abort',()=>resolve(),{once:true});});aborted=input.signal!.aborted;input.signal!.throwIfAborted();return await acceptance.recordEvidence({projectId:input.projectId,evidence:input.evidence,signal:input.signal,authorizeAdmission:()=>verifyAgentAcceptanceDispatch(agents,input)});}finally{settled();}
+ }}});
+ t.after(async()=>{await host.close();await providers.close();control.close();await rm(root,{recursive:true,force:true});});
+ const claim={artifact:{revision,commit},commands:evidence.commands,diff:evidence.diff,tests:evidence.tests};
+ fake.setResponses([()=>fauxAssistantMessage([fauxToolCall('acceptance_record',claim)],{stopReason:'toolUse'})]);
+ await host.submit(project,{text:'Record evidence',mode:'followUp'});await inside;await host.abort(project);await done;
+ assert.equal(aborted,true);assert.equal((await acceptance.readProject({projectId})).evidence.length,0);
+});
+
+test('model acceptance refuses binding ABA then accepts with a fresh dispatch',async t=>{
+ const root=await mkdtemp(join(tmpdir(),'pilot-accept-aba-')),projectId=randomUUID(),path=join(root,'project');await mkdir(path);
+ const data=join(root,'data'),control=new ControlStore(data),other=new ControlStore(data),offered=[{provider:'accept-aba-faux',modelId:'fixture'}];
+ const options={models:()=>offered,projectKnown:(id:string)=>id===projectId},agents=new AgentStore(control,options),competitor=new AgentStore(other,options),actor={kind:'owner' as const,identity:'local'};
+ const agent=agents.create({actor,draft:{name:'Acceptance agent',description:'',enabled:true,model:offered[0],workspace:{scope:{kind:'projects',projectIds:[projectId]},subpath:''},budgets:{maxRequests:null,maxOutputTokens:null,maxJobsPerHour:null},scopes:['accept']}});
+ agents.bindSession({projectId,sessionId:'1',revision:0,agentId:agent.id,actor});
+ const acceptance=new AcceptanceStore(control,{projectRoot:id=>id===projectId?path:undefined});
+ acceptance.updatePolicy({revision:0,policy:{mode:'agent-may-accept',actionClasses:{commit:'full-auto',push:'ask',deploy:'ask',spend:'ask',provision:'ask',publish:'ask'}},actor});
+ const evidenceId=(await acceptance.recordEvidence({projectId,evidence})).evidence.record.id;
+ const fake=fauxProvider({provider:'accept-aba-faux',models:[{id:'fixture'}]}),providers=new ProviderStore(root,[fake.provider]);
+ await providers.savePreferences({defaultModel:{provider:'accept-aba-faux',modelId:'fixture'},favourites:[],allowRealModels:true});
+ const project={id:projectId,name:'Fixture',path,managed:true,repository:'',created:''};
+ const host=new HarnessHost({dataRoot:root,enabled:true,providers,privileges:{authority:async({projectId:id,sessionId})=>agents.versionedAuthorityForSession({projectId:id,sessionId:sessionId??''})},acceptanceTools:{read:(id,sessionId)=>acceptance.readProject({projectId:id,sessionId}),accept:input=>acceptAgentEvidence(acceptance,{...input,verifyAdmission:()=>verifyAgentAcceptanceDispatch(agents,input)})}});
+ t.after(async()=>{await host.close();await providers.close();other.close();control.close();await rm(root,{recursive:true,force:true});});
+ const oldRead=acceptance.readEvidence.bind(acceptance);let raced=false;
+ acceptance.readEvidence=async input=>{const result=await oldRead(input);if(!raced){raced=true;const unbound=competitor.bindSession({projectId,sessionId:'1',revision:1,agentId:null,actor});competitor.bindSession({projectId,sessionId:'1',revision:unbound.revision,agentId:agent.id,actor});}return result;};
+ const attempt={evidenceId,artifact:{revision,commit},actionClass:'commit'};
+ fake.setResponses([()=>fauxAssistantMessage([fauxToolCall('acceptance_accept',attempt)],{stopReason:'toolUse'}),()=>fauxAssistantMessage('ABA refused.')]);
+ await host.submit(project,{text:'Attempt interrupted acceptance',mode:'followUp'});await waitFor(host,project,'ABA refused.');
+ assert.equal(raced,true);assert.equal((await oldRead({projectId,evidenceId})).acceptance,null);
+ acceptance.readEvidence=oldRead;
+ fake.setResponses([()=>fauxAssistantMessage([fauxToolCall('acceptance_accept',attempt)],{stopReason:'toolUse'}),()=>fauxAssistantMessage('Fresh acceptance completed.')]);
+ await host.submit(project,{text:'Accept after fresh dispatch',mode:'followUp'});await waitFor(host,project,'Fresh acceptance completed.');
+ assert.equal((await oldRead({projectId,evidenceId})).acceptance?.acceptedBy.identity,agent.id);
+});
+
+test('the model reads and accepts real project evidence only with its own agent identity and policy',async t=>{
+ const root=await mkdtemp(join(tmpdir(),'pilot-agent-acceptance-')),projectId=randomUUID(),path=join(root,'project');await mkdir(path);
+ const project={id:projectId,name:'Fixture',path,managed:true,repository:'',created:''};
+ const control=new ControlStore(join(root,'data'));
+ const acceptance=new AcceptanceStore(control,{projectRoot:id=>id===projectId?path:undefined});
+ const recorded=await acceptance.recordEvidence({projectId,evidence});const evidenceId=recorded.evidence.record.id;
+ const foreign=(await acceptance.recordEvidence({projectId,evidence:{...evidence,sessionId:'other-session',subject:{kind:'session',id:'other-session'}}})).evidence.record.id;
+ const fake=fauxProvider({provider:'accept-faux',models:[{id:'fixture'}]}),providers=new ProviderStore(root,[fake.provider]);
+ await providers.savePreferences({defaultModel:{provider:'accept-faux',modelId:'fixture'},favourites:[],allowRealModels:true});
+ let scopes:readonly AgentScope[]=['accept'],agentId:string|null='agent-fixture',projectScope:string[]=[projectId];
+ // A legacy project-wide adapter ignores the added session argument; the harness must filter defensively.
+ const host=new HarnessHost({dataRoot:root,enabled:true,providers,privileges:{authority:async()=>({agentId,model:null,scopes,projects:projectScope,emptyReason:null})},acceptanceTools:{read:id=>acceptance.readProject({projectId:id}),accept:input=>acceptAgentEvidence(acceptance,{...input,verifyAdmission:()=>{}})}});
+ t.after(async()=>{await host.close();await providers.close();control.close();await rm(root,{recursive:true,force:true});});
+ const attempt={evidenceId,artifact:{revision,commit},actionClass:'commit'};
+ fake.setResponses([()=>fauxAssistantMessage([fauxToolCall('acceptance_read',{})],{stopReason:'toolUse'}),()=>fauxAssistantMessage([fauxToolCall('acceptance_accept',attempt)],{stopReason:'toolUse'}),()=>fauxAssistantMessage('Policy refusal observed.')]);
+ await host.submit(project,{text:'Review and accept',mode:'followUp'});await waitFor(host,project,'Policy refusal observed.');
+ assert.equal((await acceptance.readEvidence({projectId,evidenceId})).acceptance,null);
+ assert.match(JSON.stringify((await host.view(project)).entries),/owner-only/);
+ assert.ok(JSON.stringify((await host.view(project)).entries).includes(evidenceId),'the model receives the recorded evidence identity');
+ assert.ok(!JSON.stringify((await host.view(project)).entries).includes(foreign),'another session’s evidence is not shown');
+ acceptance.updatePolicy({revision:0,policy:{mode:'agent-may-accept',actionClasses:{commit:'full-auto',push:'ask',deploy:'ask',spend:'ask',provision:'ask',publish:'ask'}},actor:{kind:'owner',identity:'owner'}});
+ fake.setResponses([()=>fauxAssistantMessage([fauxToolCall('acceptance_accept',{...attempt,evidenceId:foreign})],{stopReason:'toolUse'}),()=>fauxAssistantMessage('Foreign evidence refused.')]);
+ await host.submit(project,{text:'Try other session',mode:'followUp'});await waitFor(host,project,'Foreign evidence refused.');
+ assert.equal((await acceptance.readEvidence({projectId,evidenceId:foreign})).acceptance,null);
+ assert.match(JSON.stringify((await host.view(project)).entries),/own session/);
+ fake.setResponses([()=>fauxAssistantMessage([fauxToolCall('acceptance_accept',{...attempt,artifact:{revision:'c'.repeat(64),commit}})],{stopReason:'toolUse'}),()=>fauxAssistantMessage('Stale artifact refused.')]);
+ await host.submit(project,{text:'Try stale artifact',mode:'followUp'});await waitFor(host,project,'Stale artifact refused.');
+ assert.equal((await acceptance.readEvidence({projectId,evidenceId})).acceptance,null);
+ const originalRead=acceptance.readEvidence.bind(acceptance);
+ acceptance.readEvidence=async input=>{const view=await originalRead(input);scopes=[];return view;};
+ fake.setResponses([()=>fauxAssistantMessage([fauxToolCall('acceptance_accept',attempt)],{stopReason:'toolUse'}),()=>fauxAssistantMessage('Late revocation observed.')]);
+ await host.submit(project,{text:'Revoke during acceptance',mode:'followUp'});await waitFor(host,project,'Late revocation observed.');
+ acceptance.readEvidence=originalRead;assert.equal((await acceptance.readEvidence({projectId,evidenceId})).acceptance,null);scopes=['accept'];
+ fake.setResponses([()=>fauxAssistantMessage([fauxToolCall('acceptance_accept',attempt)],{stopReason:'toolUse'}),()=>fauxAssistantMessage('Acceptance recorded.')]);
+ await host.submit(project,{text:'Accept exact artifact',mode:'followUp'});await waitFor(host,project,'Acceptance recorded.');
+ const accepted=(await acceptance.readEvidence({projectId,evidenceId})).acceptance;
+ assert.equal(accepted?.acceptedBy.identity,'agent-fixture');assert.equal(accepted?.acceptedBy.kind,'agent');assert.equal(accepted?.policy.classDecision,'full-auto');
+ scopes=[];
+ fake.setResponses([()=>fauxAssistantMessage([fauxToolCall('acceptance_read',{})],{stopReason:'toolUse'}),()=>fauxAssistantMessage('Revocation observed.')]);
+ await host.submit(project,{text:'Try revoked capability',mode:'followUp'});await waitFor(host,project,'Revocation observed.');
+ assert.match(JSON.stringify((await host.view(project)).entries),/refused|not permitted/i);
+ scopes=['accept'];agentId=null;
+ fake.setResponses([()=>fauxAssistantMessage([fauxToolCall('acceptance_read',{})],{stopReason:'toolUse'}),()=>fauxAssistantMessage('Unbound agent observed.')]);
+ await host.submit(project,{text:'Try unbound acceptance',mode:'followUp'});await waitFor(host,project,'Unbound agent observed.');
+ assert.match(JSON.stringify((await host.view(project)).entries),/Bind a named agent/);
+ agentId='agent-fixture';projectScope=[];
+ fake.setResponses([()=>fauxAssistantMessage([fauxToolCall('acceptance_read',{})],{stopReason:'toolUse'}),()=>fauxAssistantMessage('Project scope refusal observed.')]);
+ await host.submit(project,{text:'Try outside the agent project scope',mode:'followUp'});await waitFor(host,project,'Project scope refusal observed.');
+ assert.match(JSON.stringify((await host.view(project)).entries),/outside this dispatch/);
+});

@@ -142,6 +142,19 @@ target**), the instant, the actor, and the immutable release pointer the port ac
   tool never restarts the service, so this happens before any start on a release nobody recorded.
 - **It does not restart anything.** After a promotion the operator restarts the service deliberately.
 
+### What a rollback can and cannot restart
+
+A rollback moves the pointer back to the recorded previous release. Starting that release is a
+separate host action, and it starts the **container that the host already has**: the previous
+container must still exist in a stopped state. A normal promotion replaces the running container
+because the Compose service keeps its name, so after a successful promotion and start there is no
+previous container left to start — the pointer can be moved back, but the old service will not come up
+from it. Two honest recoveries exist in that state: recreate the previous release's container from its
+pinned Compose model (the staged snapshot the release window used), or re-promote the candidate that
+is actually running, which restores the pointer and the record to what the host can serve. Test a
+rollback in the window where it is supported: after the service is stopped and before the candidate
+container replaces it.
+
 A **rollback** returns to the recorded previous release. It must be **compatible or it is refused**:
 the target release can be started only if it can read the storage schema actually on disk.
 

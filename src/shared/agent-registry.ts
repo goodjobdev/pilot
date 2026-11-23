@@ -35,20 +35,23 @@ export const AGENT_WORKSPACE_SUBPATH_MAX_LENGTH = 400;
 /** One instance cannot grow an unbounded registry. */
 export const AGENT_MAX_AGENTS = 200;
 /** One agent can never name more scopes than the closed vocabulary holds. */
-export const AGENT_MAX_SCOPES = 16;
+export const AGENT_MAX_SCOPES = 19;
 
 /**
  * The closed scope vocabulary. A scope is a capability, not a label: an agent has exactly the scopes
  * this list names in its allowlist, and everything else is refused at dispatch.
  */
 export const AGENT_SCOPES = [
+  'reusable_tools',
   'read_notes',
   'record_note',
   'ask_question',
   'read_docs',
   'write_docs',
   'file_read',
+  'file_write',
   'file_edit',
+  'shell',
   'run_tests',
   'fork',
   'accept',
@@ -63,22 +66,25 @@ export type AgentScope = (typeof AGENT_SCOPES)[number];
 
 /** One description per scope, in the interface's own words. Every scope has exactly one. */
 export const AGENT_SCOPE_DESCRIPTIONS: Readonly<Record<AgentScope, string>> = Object.freeze({
+  reusable_tools: 'Create and invoke bounded project-scoped JSON projections; definitions are durable and do not run code.',
   read_notes: 'Read this project\u2019s notes file back.',
   record_note: 'Append one line to this project\u2019s notes file.',
   ask_question: 'Ask the owner one question and end the turn until it is answered.',
-  read_docs: 'Read the project\u2019s documentation.',
-  write_docs: 'Write the project\u2019s documentation.',
+  read_docs: 'Browse project Markdown documents and read the planning board.',
+  write_docs: 'Create or update planning tasks, dependencies and milestones.',
   file_read: 'Read a file inside the project\u2019s connected repository worktree.',
+  file_write: 'Create or replace a file inside the project\u2019s connected repository worktree. This writes directly: the acceptance policy in force does not gate it.',
   file_edit: 'Propose or apply one bounded edit to a file inside the project\u2019s connected repository worktree.',
-  run_tests: 'Submit a bounded coding job from the fixed recipe allowlist.',
-  fork: 'Branch a transcript and create a child worktree.',
+  shell: 'Run a shell command inside the project\u2019s connected repository worktree. It runs as the application user and is not contained: it can reach every project, the durable control store and the stored credentials.',
+  run_tests: 'Run this project\u2019s fixed `node --test` recipe as the application user. It is not a sandbox: the tests can read stored credentials and every project and can modify this project.',
+  fork: 'Branch a transcript, create a paused child worktree and send one input into an active child of this same conversation.',
   accept: 'Accept a completion record under the acceptance policy in force.',
-  commit: 'Commit work in the project\u2019s repository.',
-  push: 'Push a commit to a remote.',
-  deploy: 'Deploy a release.',
-  spend: 'Incur a cost through a provider or a paid service.',
-  provision: 'Create infrastructure or another resource.',
-  publish: 'Publish an artifact to a channel.'
+  commit: 'Commit the exact staged tree to the project\u2019s fixed Pilot branch, under the acceptance policy. Never pushes.',
+  push: 'Push one accepted commit to the project\u2019s owner-configured local remote, without force.',
+  deploy: 'Promote the project\u2019s built artifact into the owner-configured local deployment directory, retaining the previous generation.',
+  spend: 'Charge one metered amount against the owner-configured billing endpoint, within its caps. This build has no live billing target configured.',
+  provision: 'Create one Pilot-owned local resource directory with a bounded manifest under the owner-approved root. This build provisions no infrastructure.',
+  publish: 'Copy reviewed files into the owner-configured local publication root.'
 });
 
 /**
@@ -94,7 +100,11 @@ export const AGENT_SCOPE_DESCRIPTIONS: Readonly<Record<AgentScope, string>> = Ob
  */ export const AGENT_DEFAULT_INSTALLED_TOOLS: Readonly<Record<string, AgentScope>> = Object.freeze({
   ask_question: 'ask_question',
   record_note: 'record_note',
-  read_notes: 'read_notes'
+  read_notes: 'read_notes',
+  list_docs: 'read_docs',
+  read_doc: 'read_docs',
+  read_board: 'read_docs',
+  write_board: 'write_docs'
 });
 /**
  * The scope that governs each tool this build exposes to a model. A tool this map does not name is
@@ -106,28 +116,105 @@ export const AGENT_SCOPE_DESCRIPTIONS: Readonly<Record<AgentScope, string>> = Ob
  * but unavailable on this instance, and the UI and the agent prompt report that.
  */
 export const AGENT_TOOL_SCOPES: Readonly<Record<string, AgentScope>> = Object.freeze({
+  reusable_define: 'reusable_tools',
+  reusable_list: 'reusable_tools',
+  reusable_invoke: 'reusable_tools',
   ask_question: 'ask_question',
   record_note: 'record_note',
   read_notes: 'read_notes',
-  read_docs: 'read_docs',
-  write_docs: 'write_docs',
+  list_docs: 'read_docs',
+  read_doc: 'read_docs',
+  read_board: 'read_docs',
+  write_board: 'write_docs',
+  // The tool a model actually calls, by name: the coding tools keep Pi's own names, so the scope
+  // that governs them is stated here under `read`, `write` and `bash`.
+  read: 'file_read',
+  write: 'file_write',
+  edit: 'file_write',
+  bash: 'shell',
   file_read: 'file_read',
   file_edit: 'file_edit',
-  run_tests: 'run_tests'
+  acceptance_read: 'accept',
+  acceptance_record: 'accept',
+  acceptance_accept: 'accept',
+  fork_context: 'fork',
+  fork_create: 'fork',
+  fork_dispatch: 'fork',
+  run_tests: 'run_tests',
+  commit_preview: 'commit',
+  commit_accepted: 'commit',
+  push_preview: 'push',
+  push_accepted: 'push',
+  deploy_preview: 'deploy',
+  deploy_accepted: 'deploy',
+  publish_preview: 'publish',
+  publish_accepted: 'publish',
+  provision_preview: 'provision',
+  provision_accepted: 'provision',
+  spend_preview: 'spend',
+  spend_accepted: 'spend'
 });
+/**
+ * The capability set a build may install tools for, as the interface, the harness and the worker
+ * validation all read it: the instance switches decided at startup. A capability that is off has
+ * no installed tool, whatever an agent's allowlist says, and the vocabulary reports that.
+ *
+ * `file_write` writes directly and `shell` runs arbitrary commands, so neither is gated by the
+ * acceptance policy: the policy governs the bounded `file_edit` tool only. Granting them is the
+ * deliberate act that makes the agent as capable as a person at a terminal in the container.
+ */
+export interface InstalledCapabilities {
+  readonly reusableTools?: boolean;
+  readonly fileEdit?: boolean;
+  readonly fileRead?: boolean;
+  readonly fileWrite?: boolean;
+  readonly shell?: boolean;
+  readonly acceptance?: boolean;
+  readonly fork?: boolean;
+  readonly runTests?: boolean;
+  /** The commit tools, installed only behind the default-off `DASHBOARD_AGENT_COMMIT` switch. */
+  readonly acceptedCommit?: boolean;
+  /** The push tools, installed only behind the default-off `DASHBOARD_AGENT_PUSH` switch. */
+  readonly acceptedPush?: boolean;
+  /** An accepted deploy adapter is installed: the experimental one, or the local one. */
+  readonly acceptedDeploy?: boolean;
+  /** The owner-configured local publication tool is installed on this instance. */
+  readonly localPublish?: boolean;
+  /** Installed only behind the default-off provisioning switch and an owner-approved root. */
+  readonly acceptedProvision?: boolean;
+  /** Installed only behind the default-off spend switch and a configured billing endpoint and cap. */
+  readonly acceptedSpend?: boolean;
+}
 /** Whether a scope whose tool this build declares is also one it actually installs. */
-export function scopeToolIsInstalled(scope: AgentScope): boolean {
+export function scopeToolIsInstalled(scope: AgentScope, capabilities: InstalledCapabilities | boolean = {}): boolean {
+  const caps: InstalledCapabilities = typeof capabilities === 'boolean' ? { fileEdit: capabilities } : capabilities;
   const installed = Object.values(AGENT_DEFAULT_INSTALLED_TOOLS) as readonly AgentScope[];
-  return installed.includes(scope);
+  if (installed.includes(scope)) return true;
+  // The read/write/shell tools come from the coding-tool extension: read and write together, and
+  // shell only behind its own switch, because a shell is not contained by anything this build does.
+  if (scope === 'reusable_tools') return caps.reusableTools === true;
+  if (scope === 'file_read') return caps.fileRead === true;
+  if (scope === 'file_write') return caps.fileWrite === true;
+  if (scope === 'shell') return caps.shell === true;
+  if (scope === 'accept') return caps.acceptance === true;
+  if (scope === 'fork') return caps.fork === true;
+  if (scope === 'run_tests') return caps.runTests === true;
+  if (scope === 'commit') return caps.acceptedCommit === true;
+  if (scope === 'push') return caps.acceptedPush === true;
+  if (scope === 'deploy') return caps.acceptedDeploy === true;
+  if (scope === 'publish') return caps.localPublish === true;
+  if (scope === 'provision') return caps.acceptedProvision === true;
+  if (scope === 'spend') return caps.acceptedSpend === true;
+  return scope === 'file_edit' && caps.fileEdit === true;
 }
 /** The scopes this build actually installs tools for, in vocabulary order. */
-export function installedAgentScopes(): readonly AgentScope[] {
-  return Object.freeze(AGENT_SCOPES.filter(scopeToolIsInstalled));
+export function installedAgentScopes(capabilities: InstalledCapabilities | boolean = {}): readonly AgentScope[] {
+  return Object.freeze(AGENT_SCOPES.filter((scope) => scopeToolIsInstalled(scope, capabilities)));
 }
 /** The scopes this build declares but does NOT install a tool for, in vocabulary order. */
-export function unavailableAgentScopes(): readonly { readonly scope: AgentScope; readonly description: string; readonly reason: string }[] {
+export function unavailableAgentScopes(capabilities: InstalledCapabilities | boolean = {}): readonly { readonly scope: AgentScope; readonly description: string; readonly reason: string }[] {
   return Object.freeze(AGENT_SCOPES
-    .filter((scope) => !scopeToolIsInstalled(scope))
+    .filter((scope) => !scopeToolIsInstalled(scope, capabilities))
     .map((scope) => Object.freeze({ scope, description: AGENT_SCOPE_DESCRIPTIONS[scope], reason: 'No tool is installed for this scope in this build' })));
 }
 
@@ -604,8 +691,8 @@ export function decideScopeChange(input: {
 }
 
 /** The closed vocabulary as the interface reads it: each scope beside the one line that describes it and whether a tool is installed for it. */
-export function agentScopeVocabulary(): readonly { readonly scope: AgentScope; readonly description: string; readonly installed: boolean }[] {
-  return Object.freeze(AGENT_SCOPES.map((scope) => Object.freeze({ scope, description: AGENT_SCOPE_DESCRIPTIONS[scope], installed: scopeToolIsInstalled(scope) })));
+export function agentScopeVocabulary(capabilities: InstalledCapabilities | boolean = {}): readonly { readonly scope: AgentScope; readonly description: string; readonly installed: boolean }[] {
+  return Object.freeze(AGENT_SCOPES.map((scope) => Object.freeze({ scope, description: AGENT_SCOPE_DESCRIPTIONS[scope], installed: scopeToolIsInstalled(scope, capabilities) })));
 }
 
 /** One entry of the durable audit trail: what changed, by whom, and when. */
@@ -675,11 +762,68 @@ export function validateAgentBinding(value: unknown, code: AgentErrorCode = 'INV
   return binding;
 }
 
+/**
+ * The durable conversation binder: which harness conversation a named session resolves to.
+ *
+ * Written once when a conversation is first forked for a session, and read on every access after a
+ * restart. The idempotency key is 'conversation.r' + revision, so the control store refuses a second
+ * creation with different content (CONFLICT) and returns the existing record for a repeat of the same
+ * content — the "exactly once" guarantee.
+ */
+export type ConversationBinding = {
+  readonly version: 1;
+  readonly projectId: string;
+  readonly sessionId: string;
+  readonly conversationId: number;
+  readonly revision: number;
+  readonly createdBy: AgentActor;
+  readonly createdAt: string;
+};
+
+export const AGENT_CONVERSATION_BINDING_VERSION = 1 as const;
+
+const conversationBindingSchema = z.strictObject({
+  version: z.literal(AGENT_CONVERSATION_BINDING_VERSION),
+  projectId: z.string().regex(AGENT_ID_PATTERN, 'a project id must be 1-160 characters from A-Za-z0-9._:-'),
+  sessionId: z.string().regex(AGENT_ID_PATTERN, 'a session id must be 1-160 characters from A-Za-z0-9._:-'),
+  conversationId: z.number().int().positive(),
+  revision: z.number().int().positive(),
+  createdBy: actorSchema,
+  createdAt: z.string().datetime()
+});
+
+/** Validates one stored conversation binding: strict fields, a positive revision and a readable instant. */
+export function validateConversationBinding(value: unknown, code: AgentErrorCode = 'INVALID'): ConversationBinding {
+  const parsed = parseStrict(conversationBindingSchema, value, 'conversation binding (requires version, projectId, sessionId, conversationId, revision, createdBy and createdAt)', code);
+  const binding: ConversationBinding = Object.freeze({
+    version: AGENT_CONVERSATION_BINDING_VERSION,
+    projectId: parsed.projectId,
+    sessionId: parsed.sessionId,
+    conversationId: parsed.conversationId,
+    revision: parsed.revision,
+    createdBy: Object.freeze({ kind: parsed.createdBy.kind, identity: parsed.createdBy.identity }) as AgentActor,
+    createdAt: parsed.createdAt
+  });
+  let encoded: string;
+  try { encoded = boundedJson(binding); }
+  catch (error) { throw new AgentError('The conversation binding is not bounded JSON data: ' + (error as Error).message, code); }
+  if (byteLength(encoded) > AGENT_MAX_RECORD_BYTES) throw new AgentError('The conversation binding exceeds ' + AGENT_MAX_RECORD_BYTES + ' bytes', code);
+  return binding;
+}
+
 /** What governs one session's dispatch: the agent bound to it, and the scopes in force. */
 export type DispatchAuthority = {
-  /** The agent whose scopes govern this dispatch, or null when the owner's own dispatch is in force. */
+  /** Trusted monotonic governance snapshot; absent only for legacy/injected privilege ports. */
+  readonly authorityVersion?: string;
+  /** The single governing agent, or null for owner, intersection, or a fail-closed unbound session. */
   readonly agentId: string | null;
-  /** The scopes in force: null means the owner (unrestricted), an empty list means an agent allowed nothing. */
+  /**
+   * The model the bound agent declares, or null when no agent is bound. It is applied to that
+   * agent's sessions **unless the owner chose a model for the session itself**, which is recorded
+   * with the session and wins over this.
+   */
+  readonly model: AgentModelChoice | null;
+  /** The scopes in force: null means owner dispatch; an empty list refuses every tool. */
   readonly scopes: readonly AgentScope[] | null;
   /**
    * The projects this authority may act in: null means every project (the owner, or an agent whose
@@ -688,9 +832,9 @@ export type DispatchAuthority = {
    */
   readonly projects: readonly string[] | null;
   /**
-   * A named explanation when the scopes are an explicit empty list — no agent is bound, or the bound
-   * agent is disabled or archived. Null when scopes are non-empty or the owner's own dispatch is in
-   * force. This is what makes "no privileges" a stated fact rather than a silent refusal.
+   * A named explanation for an explicit unbind, an inactive bound agent, or a previously governed
+   * project with no active agents. An empty intersection of active agents can also have no explanation.
+   * This makes common "no privileges" cases stated rather than silent.
    */
   readonly emptyReason: string | null;
 };

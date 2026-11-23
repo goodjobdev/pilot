@@ -122,17 +122,102 @@ parent's working tree, the child does not have it and never will without an expl
 
 ## The paused child, and inheritance
 
-A child is created **paused**, and `paused` means exactly one thing here: it refuses to dispatch
-anything. The refusal is read from the durable state before the transcript port is called at all, so a
-dispatch attempt on a paused child causes **no submission, no admission and no model request of any
-kind** — which is what makes a fork safe to create before deciding whether to use it. An explicit
+A child is created **paused**, and a dispatch that observes `paused` is refused before the transcript
+port is called. The application now exposes that fenced dispatch on two model/owner paths: the
+owner-authenticated route `POST /api/projects/<project>/forks/<childSessionId>/dispatch` and the
+`fork_dispatch` agent tool (governed by the `fork` scope), both carrying a caller-supplied invocation
+ID. `dispatchChild` requires a stable, caller-owned invocation ID, which the caller must reuse for
+retries and change for logically distinct work. Before submission, the store
+records a durable admission binding that ID to the child and exact text digest. The Pi request ID is
+derived from the invocation identity. An exact retry after a successful durable receipt returns that
+receipt without resubmitting; changed text under the same identity conflicts. A pending or unknown
+admission is never replayed, including after reopen, because the prior submission outcome may be
+uncertain. The action holds the durable per-child lifecycle fence while its transcript-dispatch promise
+is awaited. The controlled host marks only failures proven to occur before `conversation.submit` is
+invoked as a typed not-started refusal; those release the fence because this call submitted no input.
+Every other callback rejection or interruption remains uncertain and holds the fence for operator
+review. This is a limited application-level
+reservation around that one call, not an atomic handoff with Pi Durable's conversation admission. Pi
+Durable 1.3.0 may resume the scheduler before awaiting admission commit, and its public API does not
+expose an atomic lifecycle reservation and activation handoff. Provider-before-submit-return behavior
+and async-context propagation are not established as safe assumptions. The fence does not prove provider
+quiescence or termination. Ordinary harness submissions, question answer/dismissal/redelivery, and
+lifecycle replay remain unfenced across their full input-admission sequences; other processes/releases
+may bypass this process's reservation. Do not treat a state check or submission return as proof that
+provider work is quiescent. An explicit
 `fork.resume` lifts the pause; the resume itself dispatches nothing, makes no model request and grants
 nothing. A **repeat** of that call is a declared **no-op**: an already `active` fork answers
 `unchanged` **without re-checking the revision**, because it writes nothing at all — the revision is
 the token of the transitions that really write (the resume that lifts a pause, and the discard), so the
 `REVISION_MATCHES` the action descriptor declares and this one call accepting any revision are not in
 contradiction. Only an `active` fork may be dispatched into, and a `discarded` or `failed` one refuses
-with the reason.
+with the reason. The harness checks that state before each provider request and tool execution, as
+well as for ordinary session input, question delivery, lifecycle dispatch and the fork dispatch action;
+these remain check-then-submit paths, not admission reservations. A lifecycle refusal happens before
+its revision is changed. These checks cannot stop a provider request
+or tool already in progress. They are not process isolation: a same-UID shell can leave background
+processes even after its harness generation is no longer working.
+
+Before creating the transcript, the store records a durable per-project creation fence. While held, it
+refuses new dispatch checks for other sessions and competing fork creations; the known parent remains
+usable. A submission that passed its gate before acquisition can still be admitted while it is held. The
+fence is released only after a paused or failed fork record is durable. If the transcript call or its
+receipt is uncertain, the fence stays held across restart rather than guessing whether a child exists.
+The owner-only fork list reports a held fence's revision and parent. An owner can release it
+deliberately with `POST /api/projects/:id/forks/recover-creation` and the exact `{parentSessionId,
+revision}` the list showed; the release requires the parent session to be quiescent, creates nothing,
+replays nothing and removes nothing. Do not clear the record manually.
+
+An explicitly requested target is checked again against the filesystem and recorded fork targets
+while the creation fence is held, before the transcript is made. A successful new worktree receives a
+durable opaque ownership fingerprint. The experimental removal path checks for missing or conflicting
+ownership and compares the registered Git worktree and filesystem identity, but it is available only
+to disposable tests. A failed creation never acquires deletion authority over an occupied target. These
+checks are not a race-free OS handle: a same-UID process can still replace paths or Git metadata
+between verification and Git's removal. Consequently the application does not automatically remove
+existing fork worktrees, including legacy forks without an ownership record.
+
+Resume, discard, each awaited child provider request and each awaited child tool execution take the
+same durable per-child fence. Competing activity or lifecycle operations refuse while it is held; the
+activity itself can recheck its session under its private reservation. A provider's terminal event is
+forwarded only after release, allowing a subsequent tool to acquire its own fence. This closes the
+gate-to-body race with worktree removal for these awaited calls. Discard also checks the harness view for running or queued work after
+acquiring the fence; it refuses if that check is unavailable or the child is busy. If the process dies
+with the fence held, or removal starts and no durable result is recorded, the fence remains held across
+restart. The owner-only fork list reports held fences for listed children, but it cannot distinguish a
+currently running tool from an interrupted operation, so recovery is an owner decision, not an
+automatic one: `POST /api/projects/:id/forks/:childSessionId/recover` with the exact `{revision}` the
+list showed releases the fence only after the child is proven quiescent. It dispatches nothing,
+replays nothing and removes nothing; the owner must still inspect any interrupted effect and decide
+what to do next. A fork whose worktree was left behind still needs a separate operator decision
+because this build does not remove an existing worktree automatically.
+
+Fence reads verify the latest two revisions, their transition and linked durable outboxes. A malformed
+or mismatched recent record fails closed rather than being treated as released. This bounded check is
+not a full-history audit and cannot protect the store from a same-UID writer that can alter or delete
+records; it also does not establish whether interrupted work is still running. The owner recovery
+routes above release a fence deliberately, but they cannot distinguish a live operation from an
+interrupted one and do not prove provider quiescence: the release records the owner's decision, not a
+fact about the interrupted effect.
+
+A provider stream failure, cancellation or unconfirmed final result retains its child fence rather
+than assuming termination. An ordinary settled tool failure releases its fence, and a normal provider
+result is still only the provider's report—not independent evidence of remote termination. The fence
+is not an operating-system lease and cannot prove that an uncontained shell or a remote job has left
+no detached effects. It does
+not stop a same-UID process in another session from accessing the fork. It also does not cancel an
+effect already started. Inspect such processes before discarding. Older builds do not understand these
+fence records, so rolling back to one can bypass a held fence; a release needs a reviewed rollback
+procedure that preserves the block, not an assumption that the old build enforces it.
+
+Project documentation and note tools, acceptance writes, and the bounded `file_edit` tool resolve to the parent workspace
+rather than this child; they are refused in a fork instead of reading or changing the wrong tree. When
+explicitly enabled, the direct coding tools resolve the child worktree. This routing does not establish
+successful execution beyond this guarded path: ordinary submissions, question delivery and lifecycle
+replay remain unfenced, and this dispatch is not atomic admission or proof of provider quiescence.
+Action-driven dispatch waits for the child submission result under the lifecycle fence, but does not
+contain detached processes. The optional shell remains
+uncontained and can still reach the parent, other projects and credentials.
 
 A fork **inherits nothing**:
 
@@ -152,23 +237,24 @@ never collide.
 
 ## Discard
 
-`fork.discard` is **target-bound**: it acts on the `worktreePath` the durable record itself carries,
-re-checked against the designated fork root, and it never reads a path from a caller. It is
-**revision-checked**: a stale revision is a conflict that mutates nothing and touches no file. And it is
-never implicitly forced:
+`fork.discard` is revision-checked and never accepts a caller-supplied path. **Discard of an active
+fork is unavailable**, even if its worktree appears absent or the session looks idle: a submission can
+be admitted asynchronously after a quiescence check. There is currently no safe transition from active
+back to paused, so an active fork remains active pending a reviewed admission and recovery design.
+This restriction prevents that lifecycle transition; it does not make admission atomic or establish
+that detached processes have stopped. Older binaries or other writers can bypass it.
 
-| The worktree is… | what a discard does |
-|---|---|
-| already gone | completes the discard, removes nothing, and says so (`removed: false`) |
-| clean | one `git worktree remove` — no force — and the fork becomes `discarded` |
-| dirty (uncommitted or untracked changes) | **refuses** without an explicit `force`: the fork becomes the named operator-attention state `worktree-dirty` and the worktree is left exactly where it is |
-| dirty, with `force: true` | removed by one `git worktree remove --force`, and the fork becomes `discarded` |
-| not removable, or unreadable | nothing is forced: the fork becomes `worktree-remove-refused` or `worktree-unreadable`, and the worktree stays where it is |
+**Automatic removal of an existing worktree is also unavailable**, even with `force: true`: the application returns 503
+and leaves the fork and worktree unchanged. Independent review found that pathname-based Git removal
+cannot pin the verified directory against concurrent replacement. The owner must stop and inspect the
+workspace and use an appropriately safe, separately controlled procedure outside Pilot; do not assume
+that a force flag makes the target safe. If a non-active fork's recorded path is already absent, Pilot
+can close it with `removed: false`; an already discarded fork is a no-op. There is no automatic cleanup,
+`git clean`, or `git worktree prune`.
 
-A fork that needs an operator cannot be resumed (only discarded), a discarded fork is terminal, and
-nothing outside the designated fork root is ever touched — not even when a stored record claims a path
-there. `git` removes the worktree; this build never deletes a directory itself, never runs
-`git clean`, and never runs `git worktree prune`.
+The ownership fingerprints and path rechecks are defense in depth, not proof against a hostile
+same-UID process. The removal implementation is exercised only through an explicit disposable-test
+seam, not enabled by the application. Legacy forks without fingerprints also require operator review.
 
 ## Routes and actions
 
@@ -180,7 +266,10 @@ Every fork route is behind the same owner-only authentication as every other rou
 | `/api/projects/:id/forks` | GET | the project's forks, with the three rules and the bounds in force |
 | `/api/projects/:id/forks` | POST | `{ parentSessionId, baseCommit, cutoffEntryId, target? }`; 201 when the fork exists, 200 with `created: false` when it is recorded as a named operator-attention state |
 | `/api/projects/:id/forks/:childSessionId/resume` | POST | `{ revision }` — lifts the pause; dispatches nothing |
-| `/api/projects/:id/forks/:childSessionId/discard` | POST | `{ revision, force? }` — removes the worktree the record carries, or reports the named attention state |
+| `/api/projects/:id/forks/:childSessionId/discard` | POST | `{ revision, force? }` — closes a non-active fork only if its recorded worktree is already absent; otherwise returns 503 |
+| `/api/projects/:id/forks/:childSessionId/dispatch` | POST | `{ parentSessionId, invocationId, text }` — sends one input to an **active** child under the fenced, durably bound submission; an exact repeat returns the same `requestId`, changed text conflicts, and an uncertain outcome holds the fence |
+| `/api/projects/:id/forks/:childSessionId/recover` | POST | `{ revision }` — owner recovery for a **held lifecycle fence**: releases it only after the child is proven quiescent; dispatches, replays and removes nothing (404 when no fence is held, 409 when the revision is stale, 503 when quiescence cannot be verified) |
+| `/api/projects/:id/forks/recover-creation` | POST | `{ parentSessionId, revision }` — owner recovery for a **held creation fence** for that parent; same guarantees and statuses, and it creates nothing |
 
 The same four capabilities are the actions `fork.create`, `fork.list`, `fork.resume` and
 `fork.discard` (`docs/ACTIONS.md`), which is what the palette writes through. Both surfaces call the
@@ -203,13 +292,14 @@ those are logged on the server and never stored in a record or returned to a cal
 
 ## Honest limits
 
-- **Dispatching into an active child is not an owner route in this build.** `fork.resume` makes a child
-  dispatchable; the guarded dispatch itself (`ForkStore.dispatchChild`, which refuses anything that is
-  not `active` before it reaches the harness) is the path a server-side dispatcher would use, and
-  `tests/server/fork-store.test.ts` drives it. This project's **queue** dispatcher submits into the
-  project's *root* conversation, so the queue's claim and submit routes **refuse a fork child** (409)
-  rather than misdirect its input into the wrong transcript — a child's queue is empty by construction,
-  and it stays un-dispatchable through that path on purpose.
+- **Dispatching into an active child is one guarded path, and the queue is not it.** `fork.resume`
+  makes a child dispatchable; both the owner route above and the `fork_dispatch` tool call
+  `ForkStore.dispatchChild`, which refuses anything that is not `active` before it reaches the harness,
+  refuses a caller whose own session is not the fork's recorded parent, and binds the invocation
+  identity to the exact text. This project's **queue** dispatcher submits into the project's *root*
+  conversation, so the queue's claim and submit routes **refuse a fork child** (409) rather than
+  misdirect its input into the wrong transcript — a child's queue is empty by construction, and it
+  stays un-dispatchable through that path on purpose.
 - **Reading a fork attaches a conversation.** Creating a fork reads the parent's transcript, which opens
   the project's harness exactly as the Agents view does, and opening a harness resumes unfinished work
   the previous process left behind. That is the same exposure every other agent read in this build has;
@@ -227,8 +317,10 @@ those are logged on the server and never stored in a record or returned to a cal
   that, and this build deliberately runs no prune, because prune would also drop the registration of a
   worktree that is broken for another reason. An operator decides.
 - **The child worktree is a detached checkout, not a branch.** It is at the recorded commit and on no
-  branch, so continuing work there is an explicit operator step. Nothing in this build commits, pushes,
-  deploys, spends, provisions or publishes, for a fork or for anything else.
+  branch, so continuing work there is an explicit operator step. The action tools that are installed
+  in this build (`commit`, `push`, `deploy`, `publish`, `provision`, `spend`, `run_tests`) are all
+  refused in a fork: they act on the parent project, its configured targets or its repository. A fork
+  can still reach the same effects through the uncontained shell if that is granted.
 - **`forks/` is an explicit, documented backup exclusion — and a restored root keeps the fork records
   but none of their worktrees.** The child worktrees live in `<data>/forks/<projectId>/<childSessionId>`;
   `docs/BACKUP.md` and `docs/DEPLOYMENT.md` name that directory as an exclusion with its reason. It is
@@ -240,3 +332,37 @@ those are logged on the server and never stored in a record or returned to a cal
   and re-checks that it is inside the root in force **now**, so this build refuses to touch those paths
   (`OUTSIDE_ROOT`) rather than following them out of the restored root. Such a fork is therefore left
   as a deliberate operator decision, and this build has no path that clears one yet.
+
+## Agent tools and worktree routing
+
+An agent with the `fork` scope can call `fork_context` for recent entry IDs and `fork_create` for
+its own conversation, providing an exact commit and cutoff. The existing 2,000-entry cutoff scan
+still applies. The child is paused, receives no inherited agent grants, and requires separate binding
+and resume. Creation makes no model call in the child.
+
+For an active fork, direct coding tools use that fork’s worktree for file operations and the shell’s
+initial working directory. The shell itself remains uncontained. Calls are refused if the fork is
+not active or its worktree cannot be verified. The bounded `file_edit` tool is refused in forked
+sessions because it targets the parent project; planning tools still use the project’s canonical
+planning documents.
+
+**A model-facing child dispatch is installed, and it is narrower than the fork grant.** `HarnessHost`
+installs `fork_context`, `fork_create` and `fork_dispatch` through `forkExtension`. `fork_dispatch`
+passes the calling conversation's own session identity to `ForkStore.dispatchChild`, which refuses any
+child whose recorded parent is not that session — project membership alone is not authority to send
+into someone else's fork. The store binds the caller-supplied invocation identity to the child and the
+exact text digest at durable admission, so an exact repeat returns its receipt without resubmitting and
+changed text conflicts; a pending or unknown admission is never replayed. Duplicate admission and the
+held lifecycle fence are enforced in the same store transaction.
+
+The fence around the dispatch is not a fence around everything. `HarnessHost.submit` checks
+`assertNotUncertain`/`sessionGate` before `conversation.submit`, but it does not reserve the fork
+lifecycle fence across that check-to-submit interval. A deterministic test in
+`tests/server/fork-store.test.ts` installs a production-equivalent `sessionGate`, starts the ordinary
+`HarnessHost.submit` path, and pauses the real `conversation.submit` call after the gate has passed; it
+then acquires the child fence and confirms the ordinary submission reaches that paused call while the
+fence is held. Pi Durable exposes no atomic reservation-and-activation handoff for that admission, so
+ordinary submissions, question delivery and lifecycle work can still race admission. Neither the fence
+nor submission completion proves provider quiescence or termination, and the child's worktree is not a
+process sandbox. The installed action therefore binds identity, text and receipt; it does **not** claim
+exactly-once execution or containment, and an uncertain outcome is for the owner to reconcile.

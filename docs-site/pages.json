@@ -1,0 +1,90 @@
+[
+  {
+    "source": "docs/manual/index.md",
+    "slug": "index"
+  },
+  {
+    "source": "docs/manual/vision.md",
+    "slug": "start/vision"
+  },
+  {
+    "source": "docs/specs/reusable-json-tools.md",
+    "slug": "specs/reusable-json-tools"
+  },
+  {
+    "source": "docs/specs/autonomy-milestone.md",
+    "slug": "specs/autonomy-milestone"
+  },
+  {
+    "source": "docs/specs/cloudflare-targets.md",
+    "slug": "specs/cloudflare-targets"
+  },
+  {
+    "source": "docs/specs/ci-deployment-contract.md",
+    "slug": "specs/ci-deployment-contract"
+  },
+  {
+    "source": "docs/specs/local-release-targets.md",
+    "slug": "specs/local-release-targets"
+  },
+  {
+    "source": "docs/manual/first-project.md",
+    "slug": "start/first-project"
+  },
+  {
+    "source": "docs/manual/settings.md",
+    "slug": "guides/settings"
+  },
+  {
+    "source": "docs/manual/planning.md",
+    "slug": "guides/planning"
+  },
+  {
+    "source": "docs/manual/files-history.md",
+    "slug": "guides/files-history"
+  },
+  {
+    "source": "docs/manual/remote-updates.md",
+    "slug": "guides/remote-updates"
+  },
+  {
+    "source": "docs/manual/agents.md",
+    "slug": "guides/agents"
+  },
+  {
+    "source": "docs/manual/design.md",
+    "slug": "guides/design"
+  },
+  {
+    "source": "docs/DOCUMENTATION.md",
+    "slug": "handbook/documentation"
+  },
+  {
+    "source": "docs/templates/feature.md",
+    "slug": "handbook/feature-template"
+  },
+  {
+    "source": "docs/templates/design.md",
+    "slug": "handbook/design-template"
+  },
+  {
+    "source": "docs/specs/repository-updates.md",
+    "slug": "specs/repository-updates"
+  },
+  {
+    "source": "docs/specs/coding-tools.md",
+    "slug": "specs/coding-tools"
+  },
+  {
+    "source": "docs/specs/composer.md",
+    "slug": "specs/composer"
+  },
+  {
+    "source": "docs/manual/terminal.md",
+    "slug": "guides/terminal"
+  },
+  {
+    "source": "docs/specs/terminal.md",
+    "slug": "specs/terminal"
+  }
+]

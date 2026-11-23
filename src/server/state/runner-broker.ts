@@ -1,12 +1,11 @@
-import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { realpath, stat } from 'node:fs/promises';
 import { safePath, within } from '../paths';
 import { ControlStore, ControlStoreError } from './control-store';
 import type { ControlScope, OperationRecord, OutboxRecord } from '../../shared/control-state';
 import {
-  RUNNER_ATTENTION_DETAILS, RUNNER_CONTAINER_WORKSPACE_PATH, RUNNER_DEFAULT_LEASE_MS, RUNNER_LIMIT_BOUNDS, RUNNER_MAX_JOBS,
-  RUNNER_MAX_LEASE_MS, RUNNER_MAX_OUTPUT_BYTES, RUNNER_RECIPE_COMMANDS, RUNNER_WORKSPACE_MOUNT, RunnerError,
+  RUNNER_ATTENTION_DETAILS, RUNNER_CONTAINER_WORKSPACE_PATH, RUNNER_DEFAULT_LEASE_MS, RUNNER_MAX_JOBS,
+  RUNNER_MAX_LEASE_MS, RUNNER_RECIPE_COMMANDS, RunnerError,
   assertRunnerContainment, assertRunnerLimits, nextRunnerJob, parseRunnerIdentifier, parseRunnerJobId, parseRunnerOwner,
   runnerClaimVerdict, runnerJobRequest, runnerRunVerdict, runnerSettleVerdict, runnerView, submittedRunnerJob,
   truncateRunnerOutput, validateRunnerJobRecord,
@@ -31,8 +30,9 @@ import {
  *
  * 1. **A run is written durably before a container starts, and only then.** 'claimed' means nothing has
  *    run (which is why a reclaim and an explicit settlement of a claimed job cannot repeat an
- *    execution), and 'running' means an execution may have happened. The run-versus-settle race is
- *    decided by the store's compare-and-swap: whoever loses writes nothing and executes nothing.
+ *    execution), and 'running' means an execution may have happened. Compare-and-swap resolves a
+ *    run and settlement competing for the claimed revision only. After 'running' is committed,
+ *    settlement can record attention before the port starts; it does not fence that later dispatch.
  * 2. **Nothing runs without containment, and there is no fallback.** Every operation that could start a
  *    container asks the port to establish the container's properties first and refuses unless every
  *    required property is present and the runtime can enforce the job's limits. There is deliberately
@@ -66,6 +66,8 @@ export type RunnerExecution = {
   readonly stdoutTruncated: boolean;
   readonly stderrTruncated: boolean;
   readonly timedOut: boolean;
+  /** An independently observed termination, required to settle an aborted timeout. */
+  readonly terminationConfirmed?: boolean;
   readonly durationMs: number;
   readonly startedAt: string;
   readonly endedAt: string;
@@ -185,7 +187,7 @@ export class RunnerBroker {
    * anything is written, and the workspace is resolved against the project's own root here — so an
    * uncontained reference is refused before a record exists — and again when it is mounted.
    */
-  async submit(input: { projectId: unknown; recipe: unknown; workspace: unknown; limits?: unknown }): Promise<RunnerJobRecord> {
+  async submit(input: { projectId: unknown; recipe: unknown; workspace: unknown; limits?: unknown; jobId?: unknown }): Promise<RunnerJobRecord> {
     const project = this.known(input.projectId);
     const request = runnerJobRequest({ recipe: input.recipe, workspace: input.workspace, limits: input.limits });
     await this.workspace.resolve({ projectId: project, workspace: request.workspace });
@@ -194,7 +196,8 @@ export class RunnerBroker {
         'Project ' + project + ' already holds its documented maximum of ' + this.maxJobs + ' coding jobs; settle and inspect them before submitting another; the record is unchanged',
         'BOUNDED'
       );
-    return this.writeNew(submittedRunnerJob({ id: randomUUID(), projectId: project, request, now: this.clock() }));
+    const id = input.jobId === undefined ? randomUUID() : parseRunnerJobId(input.jobId);
+    return this.writeNew(submittedRunnerJob({ id, projectId: project, request, now: this.clock() }));
   }
 
   /**
@@ -203,12 +206,17 @@ export class RunnerBroker {
    * is never claimed. Containment is established **before** the claim is written, so an instance that
    * cannot contain a job leaves it unclaimed rather than claiming work it cannot run.
    */
-  async claim(input: { projectId: unknown; owner: unknown }): Promise<RunnerJobRecord> {
+  async claim(input: { projectId: unknown; owner: unknown; expectedJobId?: unknown }): Promise<RunnerJobRecord> {
     const project = this.known(input.projectId);
     const owner = parseRunnerOwner(input.owner);
+    const expected = input.expectedJobId === undefined ? undefined : parseRunnerJobId(input.expectedJobId);
     const now = this.clock();
     const verdict = runnerClaimVerdict(this.jobs(project), { owner, now });
     if (verdict.kind === 'refused') throw new RunnerError(verdict.reason, verdict.code);
+    // A model-facing caller must not accidentally claim an earlier person's pending job.
+    // The ordinary FIFO choice still decides which job is eligible; this is a refusal, not a skip.
+    if (expected !== undefined && verdict.job.id !== expected)
+      throw new RunnerError('A different coding job is at the head of the queue; the requested job was not claimed', 'CONFLICT');
     assertRunnerContainment(await this.port.establish());
     const head = verdict.job;
     const claim: RunnerClaim = Object.freeze({
@@ -225,11 +233,11 @@ export class RunnerBroker {
    *
    * The order is the whole of the safety argument: containment is established first, then the durable
    * 'running' record is written, and only then does a container start. A conflict on that write — a
-   * settle or another claim that got there first — means nothing executes. A port that cannot report
-   * leaves the job 'running' with no result rather than inventing an outcome, and an operator settles
-   * it from there.
+   * settle or another claim that got there first — means nothing executes. Once 'running' is written,
+   * a concurrent settlement does not prevent a later port invocation. A port that cannot report leaves
+   * no result; settlement records operator attention without proving termination or preventing dispatch.
    */
-  async run(input: { projectId: unknown; jobId: unknown; owner: unknown }): Promise<RunnerJobRecord> {
+  async run(input: { projectId: unknown; jobId: unknown; owner: unknown; signal?: AbortSignal; beforeExecute?:()=>Promise<void> }): Promise<RunnerJobRecord> {
     const project = this.known(input.projectId);
     const jobId = parseRunnerJobId(input.jobId);
     const owner = parseRunnerOwner(input.owner);
@@ -240,8 +248,16 @@ export class RunnerBroker {
     const containment = await this.port.establish();
     assertRunnerContainment(containment);
     assertRunnerLimits(current.limits, containment);
+    await input.beforeExecute?.();
+    const liveVerdict=runnerRunVerdict(current,{owner,now:this.clock()});
+    if(liveVerdict.kind==='refused')throw new RunnerError(liveVerdict.reason,liveVerdict.code);
+    if (input.signal?.aborted) throw new RunnerError('The run was cancelled before it started; the job remains claimed and nothing executed', 'ILLEGAL');
     const running = await this.write(current, nextRunnerJob(current, { state: 'running', claim: current.claim, result: null, attention: null, now: this.clock() }));
-    const execution = await this.execute(running, workspace);
+    await input.beforeExecute?.();
+    const finalVerdict=runnerRunVerdict(current,{owner,now:this.clock()});
+    if(finalVerdict.kind==='refused')throw new RunnerError('The claim expired after admission; reconcile the durable job before retrying.', 'UNAVAILABLE');
+    if (input.signal?.aborted) throw new RunnerError('The run was cancelled after admission; reconcile its durable state before trying again.', 'UNAVAILABLE');
+    const execution = await this.execute(running, workspace, input.signal);
     const result = this.resultOf(running, execution);
     return this.write(running, nextRunnerJob(running, { state: 'settled', claim: running.claim, result, attention: null, now: this.clock() }));
   }
@@ -249,7 +265,7 @@ export class RunnerBroker {
   /**
    * Settle one job from what the durable record proves:
    *
-   * - a run that reported a result becomes 'settled' with that result;
+   * - a valid running record has no result; a running record with a result is corrupt and refused;
    * - a run that began and reported nothing becomes the named operator-attention state
    *   'job-interrupted' — whether it executed cannot be established, and it is never re-run;
    * - a job that was claimed and never started becomes 'job-not-run', which the record proves because a
@@ -283,8 +299,7 @@ export class RunnerBroker {
   /**
    * Reconcile every job a previous process left behind, deterministically and idempotently:
    *
-   * - a job that is running and carries a result is settled on that result, so the outcome a crash
-   *   interrupted before the settlement write is completed rather than lost;
+   * - a valid running record carries no result; a running record with a result fails validation;
    * - a job that is running without a result becomes 'job-interrupted', the named operator-attention
    *   state: whether it executed cannot be established, and it is never re-run;
    * - anything else is left exactly as it is. A claimed job is not touched: its lease is the whole of
@@ -322,16 +337,18 @@ export class RunnerBroker {
    * Run one job under the port, with the wall clock enforced here rather than by the port alone.
    *
    * The broker aborts at the job's own timeout and then waits a bounded grace for the port to report
-   * what it had: a port that honours the abort reports promptly, and a port that does not cannot hold
-   * the job open. A timeout is a known outcome — this build stopped the run — so it is recorded as
-   * 'timed-out' with no exit code. A port that could not report at all leaves the outcome unknown and
-   * nothing is recorded.
+   * what it had. A port that does not report cannot hold the job open. A timeout is settled only
+   * when the port confirms termination; aborting a request is not proof that the job stopped. Otherwise
+   * the durable running job remains uncertain and requires inspection.
    */
-  private async execute(job: RunnerJobRecord, workspace: string): Promise<RunnerOutcomeReport> {
+  private async execute(job: RunnerJobRecord, workspace: string, signal?: AbortSignal): Promise<RunnerOutcomeReport> {
     const controller = new AbortController();
     const started = Date.now(), startedAt = new Date(started).toISOString();
-    let timedOut = false;
-    const timer = setTimeout(() => { timedOut = true; controller.abort(); }, job.limits.timeoutMs);
+    let timedOut = false, cancelled = false;
+    const cancel = () => { cancelled = true; controller.abort(); };
+    if (signal?.aborted) cancel();
+    else signal?.addEventListener('abort', cancel, { once: true });
+    const timer = setTimeout(() => { if (!cancelled) { timedOut = true; controller.abort(); } }, job.limits.timeoutMs);
     const attempt: Promise<Attempt> = this.port
       .execute({ job, workspace, containerName: 'pilot-runner-' + job.id, signal: controller.signal })
       .then(
@@ -344,22 +361,22 @@ export class RunnerBroker {
       reported = await Promise.race([attempt, afterAbort(controller.signal, graceMs)]);
     } finally {
       clearTimeout(timer);
+      signal?.removeEventListener('abort', cancel);
     }
+    // A cancellation can race the container's exit or stop operation. Do not assert that the test
+    // succeeded or that its effects were undone; leave the durable running record for reconciliation.
+    if (cancelled) throw new RunnerError('The job was cancelled after admission; its effects are uncertain. Inspect and settle it; it is never re-run automatically.', 'UNAVAILABLE');
     if (reported === null || !reported.ok) {
-      // The port reported nothing. If this build aborted the run, the outcome is known: it was stopped
-      // at its wall clock, and the broker still knows when it started and how long it waited. Otherwise
-      // the outcome cannot be established, and nothing is recorded.
-      if (!timedOut) {
-        const detail = reported === null ? 'it did not report within the bounded grace after the run was stopped' : reported.error.message;
-        console.error('The execution port could not report the outcome of coding job ' + job.id + ': ' + detail);
-        throw new RunnerError(
-          'The execution port could not report the outcome of job ' + job.id + ', so no result was recorded. The job stays running and needs an operator to settle it; it is never re-run automatically. The port\'s own error was logged on the server and is not repeated here.',
-          'UNAVAILABLE'
-        );
-      }
-      return Object.freeze({ execution: null, startedAt, durationMs: Date.now() - started });
+      const detail = reported === null ? 'it did not report within the bounded grace after abort' : reported.error.message;
+      console.error('The execution port could not report the outcome of coding job ' + job.id + ': ' + detail);
+      throw new RunnerError(
+        'The execution port could not report the outcome of job ' + job.id + ', so no result was recorded. The job stays running and needs an operator to settle it; it is never re-run automatically. The port\'s own error was logged on the server and is not repeated here.',
+        'UNAVAILABLE'
+      );
     }
     const execution = reported.execution;
+    if ((timedOut || execution.timedOut) && execution.terminationConfirmed !== true)
+      throw new RunnerError('Timeout termination was not confirmed; the job may still be running. Inspect and settle it; do not retry automatically.', 'UNAVAILABLE');
     return Object.freeze({
       execution: Object.freeze({
         ...execution,
@@ -377,25 +394,23 @@ export class RunnerBroker {
   /** The bounded result one execution produced, with each stream cut to the job's own cap. */
   private resultOf(job: RunnerJobRecord, report: RunnerOutcomeReport): RunnerJobResult {
     const execution = report.execution;
-    const stdout = truncateRunnerOutput(execution?.stdout ?? '', job.limits.outputBytes);
-    const stderr = truncateRunnerOutput(execution?.stderr ?? '', job.limits.outputBytes);
-    const timedOut = execution === null || execution.timedOut;
+    const stdout = truncateRunnerOutput(execution.stdout, job.limits.outputBytes);
+    const stderr = truncateRunnerOutput(execution.stderr, job.limits.outputBytes);
+    const timedOut = execution.timedOut;
     const outcome = timedOut ? 'timed-out' as const : execution.exitCode === 0 ? 'succeeded' as const : 'failed' as const;
-    const endedAt = execution?.endedAt ?? iso(this.clock());
-    const startedAt = execution?.startedAt ?? report.startedAt;
+    const endedAt = execution.endedAt;
+    const startedAt = execution.startedAt;
     return Object.freeze({
       recipe: job.recipe,
       outcome,
       exitCode: timedOut ? null : execution.exitCode,
       stdout: stdout.text,
       stderr: stderr.text,
-      stdoutBytes: execution?.stdoutBytes ?? 0,
-      stderrBytes: execution?.stderrBytes ?? 0,
-      truncated: stdout.truncated || stderr.truncated || execution?.stdoutTruncated === true || execution?.stderrTruncated === true,
+      stdoutBytes: execution.stdoutBytes,
+      stderrBytes: execution.stderrBytes,
+      truncated: stdout.truncated || stderr.truncated || execution.stdoutTruncated === true || execution.stderrTruncated === true,
       capBytes: job.limits.outputBytes,
-      // A port that reported nothing still leaves the broker's own observation: when the run started and
-      // how long it waited are facts this build has, so they are recorded rather than zeroed.
-      durationMs: execution?.durationMs ?? report.durationMs,
+      durationMs: execution.durationMs,
       startedAt,
       endedAt: Date.parse(endedAt) < Date.parse(startedAt) ? startedAt : endedAt,
       commands: Object.freeze([Object.freeze({ recipe: job.recipe, argv: RUNNER_RECIPE_COMMANDS[job.recipe] })])
@@ -516,12 +531,10 @@ export class RunnerBroker {
 type Attempt = { readonly ok: true; readonly execution: RunnerExecution } | { readonly ok: false; readonly error: Error };
 
 /**
- * What one run reported to the broker: the port's own report when there was one, and — always — when
- * this build started the run and how long it waited. A run stopped at its wall clock therefore still
- * records a real duration and start instant, even when the port could say nothing.
+ * What one run reported to the broker. A missing port report remains uncertain and is never a result.
  */
 type RunnerOutcomeReport = {
-  readonly execution: RunnerExecution | null;
+  readonly execution: RunnerExecution;
   readonly startedAt: string;
   readonly durationMs: number;
 };
@@ -580,15 +593,6 @@ export function createProjectWorkspaceResolver(input: { readonly projectRoot: (p
   };
 }
 
-/** The docker CLI is a bounded subprocess like any other: every call has a timeout and a captured bound. */
-const DOCKER_CLI_TIMEOUT_MS = 20_000;
-/** How long a stopped container is given to disappear before its client process is killed outright. */
-const DOCKER_KILL_GRACE_MS = 1_000;
-/** The writable tmpfs a read-only root filesystem needs, bounded so it cannot fill the host. */
-const DOCKER_TMPFS_BYTES = 16 * 1024 * 1024;
-/** The non-root user the runner image is built with, passed explicitly so the property is never implicit. */
-const DOCKER_RUNNER_USER = '10001:10001';
-
 export type DockerRunnerOptions = {
   /** The image built from deploy/runner/Dockerfile. An absent or unusable one refuses every job. */
   readonly image?: string;
@@ -597,40 +601,6 @@ export type DockerRunnerOptions = {
   readonly user?: string;
   readonly tmpfsBytes?: number;
 };
-
-/** One CLI invocation's bounded result. It never throws: a missing binary is a result like any other. */
-type CliResult = { readonly code: number | null; readonly stdout: string; readonly stderr: string; readonly error: Error | null };
-function runCli(binary: string, args: readonly string[], timeoutMs: number): Promise<CliResult> {
-  return new Promise<CliResult>((done) => {
-    let settled = false;
-    const finish = (result: CliResult) => { if (settled) return; settled = true; clearTimeout(timer); done(result); };
-    const child = spawn(binary, [...args], { stdio: ['ignore', 'pipe', 'pipe'] });
-    const out = captureStream(child.stdout, 4_096), err = captureStream(child.stderr, 4_096);
-    const timer = setTimeout(() => { child.kill('SIGKILL'); finish({ code: null, stdout: out.text, stderr: err.text, error: new Error('the container CLI did not answer within ' + timeoutMs + 'ms') }); }, timeoutMs);
-    child.on('error', (error) => finish({ code: null, stdout: out.text, stderr: err.text, error }));
-    child.on('close', (code) => finish({ code, stdout: out.text, stderr: err.text, error: null }));
-  });
-}
-
-type Capture = { text: string; bytes: number; truncated: boolean };
-/** Capture one stream, counting every byte and storing at most the cap. */
-function captureStream(stream: NodeJS.ReadableStream, cap: number): Capture {
-  const capture: Capture = { text: '', bytes: 0, truncated: false };
-  stream.on('data', (chunk: Buffer) => {
-    capture.bytes += chunk.byteLength;
-    if (capture.truncated) return;
-    const cut = truncateRunnerOutput(capture.text + chunk.toString('utf8'), cap);
-    capture.text = cut.text;
-    if (cut.truncated) capture.truncated = true;
-  });
-  return capture;
-}
-function wholeNumber(text: string): number | null {
-  const trimmed = text.trim();
-  if (!/^[0-9]+$/.test(trimmed)) return null;
-  const value = Number(trimmed);
-  return Number.isSafeInteger(value) && value > 0 ? value : null;
-}
 
 /**
  * The command line one job runs under. It is built here, from the recipe allowlist and the job's own
@@ -663,6 +633,7 @@ export function dockerRunArgv(input: {
   return Object.freeze([
     'run',
     '--rm',
+    '--sig-proxy=false',
     '--name', input.containerName,
     '--network', 'none',
     '--read-only',
@@ -682,20 +653,13 @@ export function dockerRunArgv(input: {
 }
 
 /**
- * The real execution port: a container created from the configured image, with the documented
- * properties, one mount and hard limits.
- *
- * \`establish\` verifies the runtime answers and the image is present, and reports the properties the
- * next run will enforce together with the largest limits the runtime says it can enforce. \`execute\`
- * starts the container, captures its bounded output and stops it by name when this build aborts the
- * run. A missing binary, an unreachable runtime or a missing image refuses every job with a clear,
- * path-free reason — nothing is ever run on the host instead.
+ * The legacy Docker execution port is unavailable. It cannot authenticate a container's identity
+ * during cancellation or prove a wall-clock termination bound; neither establish nor execute starts
+ * a process. Tests can inject a separate synthetic port. The command-line builder is retained for
+ * inspection, not as evidence of containment.
  */
 export function dockerRunnerPort(options: DockerRunnerOptions = {}): RunnerPort {
-  const docker = (options.docker ?? '').trim() === '' ? 'docker' : (options.docker as string).trim();
   const image = (options.image ?? '').trim();
-  const user = (options.user ?? '').trim() === '' ? DOCKER_RUNNER_USER : (options.user as string).trim();
-  const tmpfsBytes = options.tmpfsBytes ?? DOCKER_TMPFS_BYTES;
   // A configuration value is validated once, here: an image reference that could be read as a flag or
   // that carries whitespace is refused rather than passed to a command line.
   const usable = image !== '' && image.length <= 200 && !/\s/.test(image) && !image.startsWith('-') && !/[\u0000-\u001f\u007f]/.test(image);
@@ -710,91 +674,13 @@ export function dockerRunnerPort(options: DockerRunnerOptions = {}): RunnerPort 
             '. Build deploy/runner/Dockerfile and set DASHBOARD_RUNNER_IMAGE to it. Nothing was run, and nothing will be run on the host instead.',
           'UNAVAILABLE'
         );
-      const version = await runCli(docker, ['version', '--format', '{{.Server.Version}}'], DOCKER_CLI_TIMEOUT_MS);
-      if (version.code !== 0) {
-        if (version.error !== null || version.stderr.trim() !== '') console.error('The container CLI ' + docker + ' did not answer: ' + (version.error?.message ?? version.stderr.trim().slice(0, 400)));
-        throw new RunnerError(
-          'The container runtime did not answer, so no job can be contained. Nothing was run, and nothing will be run on the host instead. The runtime\'s own error was logged on the server and is not repeated here.',
-          'UNAVAILABLE'
-        );
-      }
-      const inspected = await runCli(docker, ['image', 'inspect', image, '--format', '{{.Id}}'], DOCKER_CLI_TIMEOUT_MS);
-      if (inspected.code !== 0 || inspected.stdout.trim() === '')
-        throw new RunnerError(
-          'The runner image ' + image + ' is not present in the container runtime, so no job can be contained. Build deploy/runner/Dockerfile and load it, or correct DASHBOARD_RUNNER_IMAGE. Nothing was run.',
-          'UNAVAILABLE'
-        );
-      const memory = await runCli(docker, ['info', '--format', '{{.MemTotal}}'], DOCKER_CLI_TIMEOUT_MS);
-      const cpus = await runCli(docker, ['info', '--format', '{{.NCPU}}'], DOCKER_CLI_TIMEOUT_MS);
-      const maxMemoryBytes = wholeNumber(memory.stdout), maxCpus = wholeNumber(cpus.stdout);
-      if (maxMemoryBytes === null || maxCpus === null)
-        throw new RunnerError(
-          'The container runtime did not report the memory and CPU limits it can enforce, so this build cannot promise a job is bounded and will not run one. Nothing was run.',
-          'UNAVAILABLE'
-        );
-      return Object.freeze({
-        runtime: 'docker',
-        image,
-        network: 'none',
-        rootFilesystem: 'read-only' as const,
-        user,
-        capabilities: 'none',
-        noNewPrivileges: true,
-        dockerSocket: false,
-        mounts: Object.freeze([RUNNER_WORKSPACE_MOUNT]),
-        // The runtime's own ceiling, and never more than this build documents: a job asking for more
-        // than either is refused rather than quietly given less.
-        maxMemoryBytes: Math.min(maxMemoryBytes, RUNNER_LIMIT_BOUNDS.memoryBytes.max),
-        maxCpus: Math.min(maxCpus, RUNNER_LIMIT_BOUNDS.cpus.max),
-        maxPids: RUNNER_LIMIT_BOUNDS.pids.max,
-        maxWallClockMs: RUNNER_LIMIT_BOUNDS.timeoutMs.max
-      });
+      // Stopping this CLI cannot establish that its container stopped. Do not claim a wall-clock
+      // containment limit, write a claim, or invoke Docker until an identity-bound termination and
+      // recovery mechanism is available. The explicit test-only port remains injectable separately.
+      throw new RunnerError('The Docker runner cannot verify a wall-clock termination bound; no job was claimed or run.', 'UNAVAILABLE');
     },
-    async execute(input: RunnerExecutionRequest): Promise<RunnerExecution> {
-      const started = Date.now(), startedAt = new Date(started).toISOString();
-      const argv = dockerRunArgv({
-        image,
-        user,
-        tmpfsBytes,
-        workspace: input.workspace,
-        containerName: input.containerName,
-        limits: input.job.limits,
-        recipe: input.job.recipe
-      });
-      const child = spawn(docker, [...argv], { stdio: ['ignore', 'pipe', 'pipe'] });
-      const out = captureStream(child.stdout, RUNNER_MAX_OUTPUT_BYTES), err = captureStream(child.stderr, RUNNER_MAX_OUTPUT_BYTES);
-      let aborted = false;
-      const stop = () => {
-        aborted = true;
-        // The container is stopped by name and then removed, so a run this build aborted cannot keep
-        // running: killing the CLI alone would leave the container alive on the runtime.
-        void runCli(docker, ['kill', input.containerName], DOCKER_CLI_TIMEOUT_MS)
-          .then(() => runCli(docker, ['rm', '-f', input.containerName], DOCKER_CLI_TIMEOUT_MS))
-          .catch(() => { /* the container may already be gone */ });
-        const hard = setTimeout(() => { if (child.exitCode === null) child.kill('SIGKILL'); }, DOCKER_KILL_GRACE_MS);
-        if (typeof hard.unref === 'function') hard.unref();
-      };
-      if (input.signal.aborted) stop();
-      else input.signal.addEventListener('abort', stop, { once: true });
-      const outcome = await new Promise<{ code: number | null; error: Error | null }>((done) => {
-        child.on('error', (error) => done({ code: null, error }));
-        child.on('close', (code) => done({ code, error: null }));
-      });
-      input.signal.removeEventListener('abort', stop);
-      if (outcome.error !== null && !aborted) throw outcome.error;
-      return Object.freeze({
-        exitCode: aborted ? null : outcome.code,
-        stdout: out.text,
-        stderr: err.text,
-        stdoutBytes: out.bytes,
-        stderrBytes: err.bytes,
-        stdoutTruncated: out.truncated,
-        stderrTruncated: err.truncated,
-        timedOut: aborted,
-        durationMs: Date.now() - started,
-        startedAt,
-        endedAt: new Date().toISOString()
-      });
+    async execute(_input: RunnerExecutionRequest): Promise<RunnerExecution> {
+      throw new RunnerError('The Docker runner cannot verify a wall-clock termination bound; no job was run.', 'UNAVAILABLE');
     }
   };
 }

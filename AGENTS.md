@@ -3,27 +3,61 @@
 Read `README.md` first, then `docs/ARCHITECTURE.md` for the invariants and
 `docs/DEPLOYMENT.md` for running it. Run `pnpm` commands here, never at a parent root.
 
+## Documentation-driven delivery
+
+Read `docs/manual/vision.md` before product-shaped work and `docs/DOCUMENTATION.md`
+before adding/changing a feature. Update its user instructions and behaviour/design
+contract in the same change. Use `docs/templates/feature.md` and `docs/templates/design.md`.
+Do not label planned or locally implemented behaviour as released. The runtime board has
+its own schema: never add editorial Starlight fields to it.
+
+The Starlight app in `docs-site/` has a separate lockfile and dependency tree. Run
+`pnpm --dir docs-site check`, `pnpm --dir docs-site test`, and `pnpm --dir docs-site build`
+alongside the application checks when documentation changes. Only `docs-site/pages.json`
+entries publish; generated output is disposable. Never publish project/runtime/private
+content by globbing the documentation tree.
+
 ## Product direction and execution surface
 
-The owner has directed Pilot toward opt-in, policy-controlled full-auto operation. The active
-integration worktree records this milestone and its incomplete capabilities in
-`docs/specs/autonomy-milestone.md`. This is a change of product direction, not proof that any action is
-implemented, safe to replay, or deployed. Implement separate capabilities only with explicit owner
-configuration, scoped authority, durable evidence and honest failure and recovery semantics.
+The owner has directed Pilot toward opt-in, policy-controlled full-auto operation. Record the change and
+remaining work in `docs/specs/autonomy-milestone.md`; it is a milestone, not proof that any action is
+implemented, safe to replay, or deployed. Implement capabilities one at a time with truthful
+availability, server-enforced per-agent scope, an explicit owner-configured policy, durable receipts and
+recovery. A policy accepting an artifact is not by itself a tool that performs an action. Do not use the
+shell as proof that named commit, push, deploy, spend, provision or publish scopes are separately
+enforced.
 
-- **The agent harness is the model execution surface.** Do not add a general-purpose HTTP command
-  or file API. The main-branch harness currently provides question/note tools, not a general coding
-  suite. Work on optional coding and shell tools belongs in the integration worktree and must be
-  opt-in, accurately disclosed, and independently tested. A same-UID shell is not contained to a
-  project and can reach credentials; never represent a scope, working directory or acceptance policy
-  as sandboxing it.
+- **The agent harness is the execution surface for models.** No general-purpose HTTP endpoint runs a
+  command. The default set is questions/notes, contained documentation reads and revision-checked
+  planning board updates. Bounded tools are scoped to a registered project; the opt-in shell below is
+  an explicit exception to workspace containment and must be described as such.
+- **The coding tools are opt-in twice.** `read` and `write` are installed only when the instance
+  sets `DASHBOARD_CODING_TOOLS=on`, `bash` only when `DASHBOARD_SHELL=on` as well, and each is
+  offered to an agent only when that agent's allowlist grants `file_read`, `file_write` or `shell`.
+  `read` and `write` resolve every path against the project's **connected repository worktree** and
+  refuse anything outside it; a symlink that leaves the worktree cannot be read through them. The
+  shell is **not contained**: it runs as the application user, so it can reach every project, the
+  durable control store and the unencrypted credentials. Never describe it as sandboxed, and never
+  add a command-pattern list that implies a guarantee this code cannot keep. Read
+  `docs/specs/coding-tools.md` before changing any of it.
 - Repository connection is a narrow provisioning exception: fixed Git/SSH-keygen operations,
   explicit owner action, one managed worktree, no hooks/install/commit/push. There is still no
   arbitrary command endpoint. See `docs/PROJECT-CONNECTIONS.md` before changing it.
+- Documentation saves have a separate, narrow local-history exception: fixed, path-scoped
+  commits on the project Pilot branch, with hooks/filters/network disabled. Never push, merge,
+  switch branches or sweep unrelated staged files. See `docs/PLAN-SYNC.md`.
+- Owner-reviewed remote updates are a separate narrow exception: fixed fetch, pinned
+  incoming/result previews, and explicitly confirmed fast-forward or two-parent merge.
+  Reviews expire and are lost on restart, never replayed. Preserve dirty/staged/ignored
+  data, refuse active/uncertain work and invalid plans, and never push, stash, reset,
+  rebase or install through this update workflow. Any future model-facing Git capability needs its
+  own scoped, policy-enforced design and verification; the reviewed update is not that capability.
+  Read `docs/specs/repository-updates.md`.
 - Provider and deploy-key secrets live outside project roots under `<data>/credentials/`;
-  do not return them in views or logs. Same-UID shell execution can read them: do not claim this
-  is per-agent isolation or enable coding tools by accident. A separate action scope is not enforced
-  against arbitrary shell commands; do not advertise it as such.
+  do not return them in views or logs. The coding tools, including the shell, run as that same
+  user: granting the shell grants reach to those files, and no part of this code claims otherwise.
+  A separate action scope is not enforced against arbitrary shell commands; do not advertise it as
+  such.
 - Documentation assets are read-only and limited to images and static HTML/SVG mockups,
   served with `nosniff` and, for HTML/SVG, a sandboxing Content-Security-Policy with no
   script source. Never add a route that serves arbitrary file types.
@@ -35,8 +69,10 @@ configuration, scoped authority, durable evidence and honest failure and recover
 
 - Markdown in the project is canonical. Board and document edits are revision-checked:
   a conflict preserves the draft instead of overwriting it.
-- Symlinks are never followed. Generated folders and app-managed paths are never served or
-  edited, and reads and writes are size-capped.
+- Symlinks are never followed. Generated folders and app-managed paths are not ordinary
+  document/file-viewer paths. The canonical plan is a validated Wiki exception; source
+  snapshots remain read-only through the existing source-reference route. All reads and
+  writes are size-capped.
 - Agent session databases are derived working state, not a source of truth for the
   documentation itself.
 
@@ -48,5 +84,21 @@ Check for hostnames, account identifiers, email addresses and tokens before any 
 
 ## Tests
 
-Use disposable roots; never a live project or a real planning document. No automatic
-commits, pushes or publication, and no synchronisation between machines.
+Use disposable roots; never a live project or a real planning document. Git acceptance
+tests commit only inside disposable repositories. Never push, publish or synchronise
+between machines as part of a test. The product milestone is not permission for this development
+session to perform an automatic commit, push, publication or live-data synchronisation.
+
+## Bounded execution and progress
+
+- The Bash tool's `timeout` is in **seconds**. Use 60–120 seconds for test commands,
+  never `timeout: 30000`. Node's `--test-timeout=30000` is in milliseconds and is a
+  separate limit; it does not reliably bound process shutdown.
+- If assertions pass but Node does not exit, investigate open streams, sockets,
+  servers, timers, and teardown. Do not repeat the same hanging command unchanged.
+- After a timeout, report the blocker and change the diagnostic approach before retrying.
+- Run long checks in a background subagent and keep the owner informed. Do not leave
+  the conversation silently waiting on a foreground tool for extended periods.
+- Pilot's stopped session incurred at least 3 waits of about 8 hours 20 minutes
+  because `timeout: 30000` was used for a test process that did not exit. Preserve
+  this regression lesson when changing the test harness.

@@ -169,6 +169,17 @@ export class ApprovalStore {
   }
 
   /**
+   * Every stored approval, in a deterministic order, read-only.
+   *
+   * The attention projection needs one pass over every scope so an approval is never hidden by the
+   * exact-scope rule that governs reads and consumption. This exposes no route by itself and the
+   * caller must still drop the nonce from anything owner-visible: the listing rule is unchanged.
+   */
+  records(): readonly ApprovalRecord[] {
+    return Object.freeze(this.all().map((operation) => this.record(operation, this.outboxFor(operation.id))));
+  }
+
+  /**
    * Lists the approvals in scope that can still be consumed, oldest first by id. An expired record
    * is not listed because it can never be consumed; it stays readable by id so an operator can see
    * and revoke it.

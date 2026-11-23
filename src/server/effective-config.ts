@@ -16,6 +16,7 @@ export interface EffectiveConfig {
   readonly dataRoot: string;
   readonly browseRoots: readonly string[];
   readonly security: Readonly<SecurityConfig>;
+  readonly agentEvidenceRecording: boolean;
 }
 
 export interface EffectiveConfigDiagnostics {
@@ -55,7 +56,7 @@ export function effectiveConfig(env: NodeJS.ProcessEnv): EffectiveConfig {
 
   let security: SecurityConfig;
   if (mode === 'local') {
-    const identityVariables = ['DASHBOARD_ORIGIN', 'CF_ACCESS_TEAM', 'CF_ACCESS_AUD', 'DASHBOARD_OWNER'];
+    const identityVariables = ['DASHBOARD_ORIGIN', 'CF_ACCESS_TEAM', 'CF_ACCESS_AUD', 'DASHBOARD_OWNER', 'DASHBOARD_IDENTITY_PROVIDER', 'TAILNET_GATEWAY_ISSUER', 'TAILNET_GATEWAY_AUD', 'TAILNET_GATEWAY_PUBLIC_KEY'];
     const contradictory = identityVariables.filter(name => env[name] !== undefined);
     if (contradictory.length) throw new Error('Hosted identity settings are not allowed in local mode');
     if (exposure !== 'host-loopback') throw new Error('Local mode requires host-loopback exposure');
@@ -98,6 +99,8 @@ export function effectiveConfig(env: NodeJS.ProcessEnv): EffectiveConfig {
     return resolve(path);
   });
 
+  const evidenceSetting=env.DASHBOARD_AGENT_EVIDENCE_RECORDING??'off';
+  if(evidenceSetting!=='on'&&evidenceSetting!=='off')throw new Error('DASHBOARD_AGENT_EVIDENCE_RECORDING must be on or off');
   const immutableSecurity = Object.freeze({ ...security });
   return Object.freeze({
     mode,
@@ -108,7 +111,8 @@ export function effectiveConfig(env: NodeJS.ProcessEnv): EffectiveConfig {
     bindHost: bindValue as EffectiveConfig['bindHost'],
     dataRoot,
     browseRoots: Object.freeze(browseRoots),
-    security: immutableSecurity
+    security: immutableSecurity,
+    agentEvidenceRecording: evidenceSetting==='on'
   });
 }
 

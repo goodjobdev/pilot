@@ -17,17 +17,43 @@ Three surfaces over one project's own files, plus derived state that can be rebu
    The SQLite index, the canvas layout, the alert subscriptions, the agent sessions and the
    named-session registry are derived or working state. Deleting them loses convenience, never
    documentation.
-2. **Writes are revision-checked.** A client sends the revision it read; a mismatch is a
-   conflict that preserves the draft. The application never overwrites a newer file.
-3. **Paths are contained.** Every read and write resolves through one containment helper that
-   refuses absolute paths, `..`, and symlinks. Generated folders (`node_modules`, `dist`, …)
-   and app-managed paths are never served or edited. Reads and writes are size-capped.
-4. **The agent harness is the only execution surface.** There is no shell endpoint and no
-   general file API. Agent tools resolve their paths through the same containment helper, so a
-   registered project root is the boundary for the current question/note tools. Repository
+2. **Writes use revision checks, not filesystem compare-and-swap.** A client sends the
+   revision it read; a detected mismatch is a conflict that preserves the draft. An external
+   writer can still change a file after the final check and before replacement, so these checks
+   do not guarantee that a newer external edit cannot be overwritten.
+3. **Filesystem access is path-specific, not globally contained.** Generated folders (`node_modules`, `dist`, …)
+   and app-managed paths are excluded from ordinary browsing. The canonical plan has an
+   explicit, schema-validated Wiki bridge; source snapshots retain their existing read-only
+   source-reference route. Ordinary Wiki document body and allowlisted image/static-mockup asset
+   reads use a Linux `/proc` descriptor-relative bounded reader and fail closed when that backend
+   is unavailable; those reads have no pathname fallback. The canonical plan's board-backed Wiki
+   bridge uses a separate pathname-based read. Linux document listing uses descriptor-pinned
+   procfs traversal with no pathname fallback, streamed enumeration and explicit depth/work budgets;
+   budget exhaustion fails unavailable rather than returning a partial list. Ordinary exclusive
+   document creation also pins directories, with no pathname fallback; failures after opening a new
+   file report an uncertain outcome for manual reconciliation, not automatic retry or deletion.
+   Subsequent history operations, board, write/revision-recheck, workspace, source-snapshot, import
+   and other paths remain unresolved and may use pathname operations. These narrow backends do not
+   establish trusted root identity, immutable files, mount or hardlink enforcement, or same-UID
+   isolation; pinned parents may be renamed. This is not whole-app containment.
+4. **Model execution stays in the agent harness.** There is no general-purpose HTTP command
+   endpoint or general file API. An optional owner-facing interactive terminal is a separate,
+   owner-authenticated WebSocket session; it is off unless `DASHBOARD_TERMINAL=on`, and its shell is
+   not contained. A model reaches a file only through a tool, and every tool resolves
+   its paths through project path checks. Those checks are not atomic with subsequent file operations
+   and do not isolate concurrent processes. The coding tools are installed only when the instance
+   switches them on and are offered to an agent only when its allowlist grants the matching scope.
+   `read` and `write` check paths against the connected worktree; the shell is not contained and
+   reaches everything the application user can reach. See [Coding tools](specs/coding-tools.md).
+   Planning tools reuse the documentation and revision-checked board stores; see
+   [Agent planning tools](PLANNING-TOOLS.md). Repository
    setup is a separate fixed-operation provisioning path (keygen, access check, clone and
    worktree): no arbitrary commands, hooks, installs, commits or pushes. See
-   [Project connections](PROJECT-CONNECTIONS.md).
+   [Project connections](PROJECT-CONNECTIONS.md). Documentation saves separately use fixed,
+   local-only, path-scoped Git commits on the project Pilot branch. They disable hooks,
+   filters, signing, external diff and network protocols and preserve unrelated staging.
+   The owner-only file panel is a bounded allowlisted viewer, not a general file-write API.
+   See [Plan, files and local history](PLAN-SYNC.md).
 5. **Everything is behind the same door.** Every route — documents, agents, alerts, assets —
    passes the same authentication, session CSRF, origin and Host checks. There is no bypass
    mode, no anonymous route, and the process binds loopback by default — the only interface
@@ -87,9 +113,31 @@ the agent's own choices).
   use a request id derived from the question, so a retry cannot answer twice, and an
   already-answered question is refused.
 - **Interruption.** A tool is either safe to replay or not. After a crash, an unsafe tool
-  returns an interrupted result to the model instead of running again; a safe tool may rerun.
-- **Resumption.** Opening a harness resumes unfinished work from its checkpoint, which is how
-  a run survives the process that started it.
+  returns an interrupted result to the model instead of running again. A safe tool may rerun only
+  when the owning session is not marked uncertain. Uncertain lifecycle guards block model requests
+  and tool execution for named and root conversations. Recovery can journal and terminalize a
+  blocked scheduler task without making a model request.
+- **Reusable definitions.** With `DASHBOARD_REUSABLE_TOOLS=on` and the `reusable_tools` scope granted
+  to a bound named agent, that agent can durably define, list and invoke named JSON field
+  projections for its own project. A definition is data — a name, a revision and a bounded list of
+  field names — never code, a command, a URL or a credential, and invoking one copies selected
+  fields from a bounded JSON object. Definitions are stored as revisioned operations in the control
+  store under a per-agent scope, so a stale revision writes nothing, and admission rechecks the
+  agent's current versioned authority inside the same transaction. Existing conversations acquire
+  the tools on enablement or on a later grant, while an explicit owner removal is preserved; an
+  unbound owner dispatch and a fork session cannot use them. Both mutation and invocation are
+  replay-unsafe, so an interrupted call is never re-run automatically. Input and output are capped,
+  and numbers must be safe integer literals because JavaScript would otherwise round them silently.
+  This is not arbitrary tool creation, code execution or Cloudflare MCP Code Mode; inputs and results
+  can appear in the transcript. See [Reusable JSON tools](specs/reusable-json-tools.md).
+- **Resumption.** Opening a harness can resume unfinished work from its checkpoint only when the
+  uncertainty guards permit it. An uncertain interruption is not automatically continued. The
+  owner must review the conversation and project files, then acknowledge only after the exact
+  original submission is terminal, the conversation is idle and no submission is queued. A cold
+  acknowledgement check does not open the harness; the owner must first open the conversation in
+  Agents and wait for it to settle. Acknowledgement retains the original request identity and unsafe
+  tool intent, clears lifecycle uncertainty, and dispatches nothing. It does not undo effects or
+  establish exactly-once execution.
 - **Named sessions.** Each project's conversation is adopted into a durable, project-scoped
   session registry: a stable id, an owner-visible name, created and updated times, an optional
   *declared* model choice, and links to a board task, a documentation path or spec reference, and a
@@ -99,18 +147,24 @@ the agent's own choices).
   working state in the same control store as the approvals and the delivery ledger — one operation
   per revision, so the revision is a real compare-and-swap and no second database is introduced — and
   a rename, link or unlink with a stale revision is a conflict that changes nothing. The declared
-  model choice is recorded, never applied: the registry opens no harness and changes no selection.
+  model choice is recorded, never applied: the registry opens no harness and changes no selection. The
+  session-to-conversation identity is a separate revision-1 binding operation in the same control store, keyed by
+  project and session id with an audit outbox; the harness's in-process map is only a cache. A named session's
+  conversation is created once, then resolved from that binding after restart rather than silently forked again.
   See [Sessions](SESSIONS.md) and [Migrating the legacy conversation](MIGRATION.md).
 - **Durable execution state.** Each session also carries a durable **lifecycle** — a closed state
   (`idle`, `running`, `paused`, `interrupted`, `failed`), a revision, the attempt and request
   identity of the current or last generation, the reason it is not idle, and the last durable
   activity — in the same control store, one operation per revision. The five owner actions over it
   are explicit and revision-checked: `reconnect` attaches without starting anything, `resume`
-  continues a paused or interrupted session under its **original request identity** (so it can never
-  double-submit), `retry` starts a **new attempt with a new identity** only for a failed session,
-  `stop` cancels idempotently, and `pause` cancels but keeps the session resumable. Only `resume`
-  and `retry` may dispatch a model request; an uncertain interruption is refused with operator
-  attention rather than replayed. See [Session recovery](RECOVERY.md).
+  continues **pending durable work** under its **original request identity** (so it can never
+  double-submit); if that identity is already terminal, resume starts nothing and reports
+  `terminal`/`dispatched:false` instead of claiming new work, `retry` starts a **new attempt with a
+  new identity** only for a failed session, `stop` cancels idempotently, and `pause` cancels but
+  keeps a still-pending session resumable. Only `resume` and `retry` may dispatch a model request,
+  and only for pending or new work. An uncertain interruption blocks model and tool execution until
+  explicit owner acknowledgement proves terminal status, idle conversation and an empty queue.
+  Acknowledgement does not replay or undo the original effect. See [Session recovery](RECOVERY.md).
 
 ## The alert model
 
@@ -119,6 +173,37 @@ finished runs and failures are reported with no client attached. Alerts hold a V
 and a bounded subscription list, throttle repeats of the same kind of event per project, and
 drop endpoints the push service reports as gone. Payloads carry a title, one line of context
 and a link — never document text.
+
+## Owner-reviewed workspace updates
+
+The unreleased remote-update slice is a separate fixed-operation owner capability, not
+an agent tool or arbitrary Git endpoint. It shares `WorkspaceStore` project serialization
+with saves, refuses already-admitted project mutations and active/uncertain sessions/workers,
+and reads durable runner state even when execution is disabled. New scoped mutations,
+queue/palette dispatch and lifecycle dispatch refuse while the operation owns the project.
+Idle root and named conversations are checked before detaching; work is not canceled to
+make an update fit.
+
+A fetch updates only Git objects and a dedicated tracking ref. A clean merge preview writes
+unreferenced Git objects only. A bounded 10-minute transient review pins project/repository,
+key fingerprint, old head, fetched head and exact result. The incoming and resulting deltas
+are distinct. Apply consumes the review, rechecks state, validates the resulting canonical
+plan, prepares a two-parent commit when needed, and uses native `merge --ff-only` for the
+real index/worktree transaction. Configured filters/hooks/signing and custom merge drivers
+cannot execute. Dirty/staged data, unsafe transitions and ignored collisions are refused.
+
+This owner review is not a general durable approval-ledger record. Restart invalidates it,
+so a crash cannot replay it; Git history is evidence of a completed effect. An unconfirmed
+effect needs operator review, not automatic retry or rollback. This exception grants no
+push, reset, stash, rebase, branch selection, install or new agent scope.
+See [Repository update contract](specs/repository-updates.md).
+
+## Published documentation
+
+`docs-site/` is an isolated Astro Starlight static app over explicitly allowlisted canonical
+Markdown. Editorial metadata and built-link validation are independent of the runtime
+board schema. The app build does not bundle the site, expose runtime content, or configure
+public hosting. See [Documentation contract](DOCUMENTATION.md).
 
 ## The approval and delivery model
 
@@ -220,6 +305,13 @@ store cannot be opened, or its schema version is not the one the release manifes
 names, the start fails closed: the message names the cause, the lock is released, the exit is
 non-zero and nothing serves. Readiness asks that live handle, so it describes the database this
 process is actually using instead of opening a second connection beside it.
+
+A fresh control database is initialized privately and atomically hard-linked into place; this requires
+filesystem support for hard links. A missing main file with a remaining SQLite sidecar is refused,
+not replaced. A process crash can leave `.control-init-*` staging files or journals: do not remove
+these while any initializer could be active; investigate and preserve evidence for offline recovery.
+This protects cooperating first-open processes, not same-UID pathname races or power-loss durability
+of the directory entry.
 
 Before anything listens, startup also reads the durable **promotion history** from that store: when a
 promotion is recorded and the identity this build runs as is not the promoted candidate — or the

@@ -1,28 +1,36 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp,readFile,stat } from 'node:fs/promises';
+import { mkdir,mkdtemp,readFile,rm,stat,symlink,writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { createApp } from '../../src/server/main';
 import { localConfig } from '../../src/server/security';
 import { ControlStore } from '../../src/server/state/control-store';
 import { DeliveryLedger } from '../../src/server/state/delivery';
 import type { AlertPayload } from '../../src/server/alerts';
+import { MAX_STREAM_FRAME_BYTES } from '../../src/shared/stream';
+import { fauxAssistantMessage, fauxProvider } from '@earendil-works/pi-ai/providers/faux';
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 async function waitFor<T>(check: () => Promise<T | undefined>, timeoutMs = 10000): Promise<T> {
   const until = Date.now() + timeoutMs;
   for (;;) {
     const value = await check();
-    if (value !== undefined) return value;
+    if (value !== undefined && value !== false) return value;
     if (Date.now() > until) throw Error('condition was not met in time');
     await sleep(50);
   }
 }
 
-async function instance(agents: 'on' | 'off', dataRoot: string, agentPauseMs = 300) {
+async function instance(agents: 'on' | 'off', dataRoot: string, agentPauseMs = 300, durableControl = false) {
   const security = localConfig('http://127.0.0.1:0');
-  const created = await createApp({ dataRoot, browseRoots: [], security, agents, agentPauseMs });
+  const control = durableControl ? new ControlStore(dataRoot) : undefined;
+  const created = await createApp({ dataRoot, browseRoots: [], security, agents, agentPauseMs, ...(control ? { control } : {}) });
+  if (control) {
+    const closeApp = created.close.bind(created);
+    created.close = async () => { await closeApp(); control.close(); };
+  }
   await new Promise<void>(ok => created.server.listen(0, '127.0.0.1', ok));
   security.origin = 'http://127.0.0.1:' + (created.server.address() as { port: number }).port;
   const token = { 'x-dashboard-token': security.token };
@@ -33,7 +41,7 @@ async function instance(agents: 'on' | 'off', dataRoot: string, agentPauseMs = 3
   const project = listed[0] ?? await (await fetch(security.origin + '/api/projects', { method: 'POST', headers: writes, body: JSON.stringify({ name: 'Agents', managed: true, confirm: true }) })).json();
   const base = security.origin + '/api/projects/' + project.id + '/agents';
   const view = async () => (await (await fetch(base, { headers: token })).json()) as { enabled: boolean; view: any };
-  return { created, security, token, writes, project, base, view };
+  return { created, security, token, writes, project, base, view, control };
 }
 
 /**
@@ -68,6 +76,34 @@ async function deliveryInstance(root:string,sent:AlertPayload[],options:{failAll
 /** The ledger operations this instance holds, by kind: the count is the "recorded exactly once" proof. */
 const ledgerCounts=(store:ControlStore)=>(store.db.prepare('SELECT kind,count(*) AS n FROM operations GROUP BY kind ORDER BY kind').all() as {kind:string;n:number}[]).map(row=>({kind:String(row.kind),n:Number(row.n)}));
 
+test('ordinary Faux sessions ignore the configured worker acceptance delay',async()=>{
+  const root=await mkdtemp(join(tmpdir(),'dashboard-agent-worker-delay-'));
+  const security=localConfig('http://127.0.0.1:0');
+  const store=new ControlStore(root);
+  const app=await createApp({dataRoot:root,browseRoots:[],security,agents:'on',control:store,acceptanceFauxWorkerDelayMs:5000});
+  await new Promise<void>(ok=>app.server.listen(0,'127.0.0.1',ok));
+  security.origin='http://127.0.0.1:'+(app.server.address() as {port:number}).port;
+  const headers={'x-dashboard-token':security.token,origin:security.origin,'content-type':'application/json'};
+  try {
+    const start=Date.now();
+    const created=await fetch(security.origin+'/api/projects',{method:'POST',headers,body:JSON.stringify({name:'Ordinary session',managed:true,confirm:true})});
+    assert.equal(created.status,201);
+    const project=await created.json() as {id:string};
+    const response=await fetch(security.origin+'/api/projects/'+project.id+'/agents/input',{method:'POST',headers,body:JSON.stringify({text:'fast faux response'})});
+    assert.equal(response.status,200);
+    let view:{view:{entries:{text?:string}[]}}|undefined;
+    const replyDeadline=Date.now()+3000;
+    while(Date.now()<replyDeadline){
+      const current=await (await fetch(security.origin+'/api/projects/'+project.id+'/agents',{headers:{'x-dashboard-token':security.token}})).json() as {view:{entries:{text?:string}[]}};
+      view=current;
+      if(current.view.entries.some(entry=>entry.text?.includes('Scripted test reply')))break;
+      await sleep(20);
+    }
+    assert.ok(view?.view.entries.some(entry=>entry.text?.includes('Scripted test reply')));
+    assert.ok(Date.now()-start<4000,'ordinary Faux session did not wait for the worker acceptance delay');
+  } finally { await app.close(); store.close(); await rm(root,{recursive:true,force:true}); }
+});
+
 test('the agent harness is off unless the instance enables it',async()=>{
   const root=await mkdtemp(join(tmpdir(),'dashboard-agents-off-'));
   const app=await instance('off',root);
@@ -83,12 +119,34 @@ test('the agent harness is off unless the instance enables it',async()=>{
 test('a durable agent answers, steers, aborts, de-duplicates and survives a restart',async()=>{
   const root=await mkdtemp(join(tmpdir(),'dashboard-agents-on-'));
   const app=await instance('on',root,300);
+  const faux=fauxProvider({provider:'steering-faux',models:[{id:'fixture'}]});
+  let releaseProviderGate!:()=>void, providerReached=false;
+  const providerGate=new Promise<void>(resolve=>{releaseProviderGate=resolve;});
+  faux.setResponses([
+    () => fauxAssistantMessage('Scripted test reply — no model was called.\n\nYou said: hello from the test'),
+    () => fauxAssistantMessage('deduplicated response'),
+    async (_context,options) => {
+      providerReached=true;
+      await new Promise<void>((resolve,reject)=>{
+        const signal=options?.signal;
+        const cleanup=()=>signal?.removeEventListener('abort',onAbort);
+        const onAbort=()=>{cleanup();resolve();};
+        if(signal?.aborted){reject(new Error('provider request aborted'));return;}
+        signal?.addEventListener('abort',onAbort,{once:true});
+        void providerGate.then(()=>{cleanup();resolve();});
+      });
+      options?.signal?.throwIfAborted();
+      return fauxAssistantMessage('the paused response must not be delivered');
+    }
+  ]);
   const send=async(body:unknown)=>fetch(app.base+'/input',{method:'POST',headers:app.writes,body:JSON.stringify(body)});
   try{
+    app.created.providers.models.setProvider(faux.provider);
+    await app.created.providers.savePreferences({defaultModel:{provider:'steering-faux',modelId:'fixture'},favourites:[],allowRealModels:true});
     const empty=await app.view();
     assert.equal(empty.enabled,true);
     assert.deepEqual(empty.view.entries,[]);
-    assert.deepEqual(empty.view.model,{provider:'faux',modelId:'faux-1'});
+    assert.deepEqual(empty.view.model,{provider:'steering-faux',modelId:'fixture'});
     assert.equal(empty.view.working,false);
 
     // A scripted answer, committed to the transcript.
@@ -104,12 +162,15 @@ test('a durable agent answers, steers, aborts, de-duplicates and survives a rest
     const one=await (await send({text:'deduplicated',mode:'followUp',requestId:'same-request'})).json();
     const two=await (await send({text:'deduplicated',mode:'followUp',requestId:'same-request'})).json();
     assert.equal(one.submissionId,two.submissionId);
-    await waitFor(async()=>{const v=await app.view();return v.view.entries.filter((e:any)=>e.kind==='user'&&e.text==='deduplicated').length===1?v:undefined;});
+    const deduplicated=await waitFor(async()=>{const v=await app.view();return v.view.entries.some((e:any)=>e.kind==='assistant'&&e.text==='deduplicated response')?v:undefined;});
+    assert.equal(deduplicated.view.entries.filter((e:any)=>e.kind==='user'&&e.text==='deduplicated').length,1);
 
-    // Steering joins a busy run, and the queued item is visible while it waits.
-    assert.equal((await send({text:'[pause] hold the run open',mode:'followUp'})).status,200);
+    // The faux provider signals that it received the pause turn, then holds its response behind an
+    // explicit gate. Steering is admitted while that real provider request remains in flight.
+    assert.equal((await send({text:'hold the run open',mode:'followUp'})).status,200);
+    await waitFor(async()=>providerReached?true:undefined);
     assert.equal((await send({text:'steer: prefer pnpm',mode:'steer'})).status,200);
-    const busy=await waitFor(async()=>{const v=await app.view();return v.view.working?v:undefined;});
+    const busy=await waitFor(async()=>{const v=await app.view();return v.view.working&&v.view.inbox.some((item:any)=>item.mode==='steer'&&item.text.includes('prefer pnpm'))?v:undefined;});
     assert.equal(busy.view.working,true);
     assert.ok(busy.view.inbox.some((item:any)=>item.mode==='steer'&&item.text.includes('prefer pnpm')));
 
@@ -117,18 +178,22 @@ test('a durable agent answers, steers, aborts, de-duplicates and survives a rest
     assert.equal((await fetch(app.base+'/abort',{method:'POST',headers:app.writes,body:'{}'})).status,200);
     const stopped=await waitFor(async()=>{const v=await app.view();return v.view.working?undefined:v;});
     assert.deepEqual(stopped.view.inbox,[]);
+    assert.equal(stopped.view.entries.filter((e:any)=>e.kind==='assistant'&&e.text.includes('the paused response must not be delivered')).length,0);
 
     // Authentication and validation still apply to the agent routes.
     assert.equal((await fetch(app.base)).status,401);
     assert.equal((await send({text:''})).status,400);
-    // Request validation rejects an oversized message as a bad request; the host's own
-    // 413 bound also guards direct callers.
-    assert.equal((await send({text:'x'.repeat(9000)})).status,400);
-  }finally{await app.created.close();}
+    // An oversized message is refused with the limit named, in words a person can act on, rather
+    // than reported as a malformed field; the host's own 413 bound also guards direct callers.
+    const oversized=await send({text:'x'.repeat(9000)});
+    assert.equal(oversized.status,413);
+    assert.match(JSON.stringify(await oversized.json()),/The limit for one message is 8000/);
+  }finally{releaseProviderGate();await app.created.close();}
 
   // The transcript is in SQLite, so a new process opens the same conversation.
   const reopened=await instance('on',root,300);
   try{
+    reopened.created.providers.models.setProvider(faux.provider);
     const persisted=await waitFor(async()=>{const v=await reopened.view();return v.view.entries.length? v:undefined;});
     assert.ok(persisted.view.entries.some((e:any)=>e.kind==='assistant'&&/hello from the test/.test(e.text)));
     const file=join(root,'agents',reopened.project.id,'session.sqlite');
@@ -221,7 +286,7 @@ test('a real question is a durable delivery, its notification is the ledger outb
     const notifications=sent.filter(payload=>payload.tag==='pilot-question-'+question.id);
     assert.equal(notifications.length,1,'a question notifies once');
     assert.match(notifications[0].body,/wire the delivery ledger/);
-    assert.equal(notifications[0].url,'/?project='+app.project.id+'&view=Agents');
+    assert.equal(notifications[0].url,'/?project='+app.project.id+'&view=Agents&session=1&attention='+encodeURIComponent('question:'+question.id),'the notification deep-links to the exact question');
     assert.ok(!JSON.stringify(asked.delivery).includes('wire the delivery ledger'),'the ledger view returns no question text');
 
     assert.equal((await answer({questionId:question.id,text:'Yes, wire it'})).status,200);
@@ -338,10 +403,10 @@ test('a notification that reached no device is not a delivery, and the next star
  * the scopes forbid is refused with a precise reason and writes nothing, and the refusal is the
  * scope's rather than the tool's, because granting the scope makes the very same call succeed.
  */
-async function privilegeInstance(root:string,scopes:readonly string[]){
+async function privilegeInstance(root:string,scopes:readonly string[],seam:{delay?:number;started?:()=>void}={}){
  const security=localConfig('http://127.0.0.1:0');
  const store=new ControlStore(root);
- const created=await createApp({dataRoot:root,browseRoots:[],security,agents:'on',agentPauseMs:150,control:store});
+ const created=await createApp({dataRoot:root,browseRoots:[],security,agents:'on',agentPauseMs:150,control:store,recordNoteDelayMs:seam.delay,recordNoteStarted:seam.started});
  await new Promise<void>(ok=>created.server.listen(0,'127.0.0.1',ok));
  security.origin='http://127.0.0.1:'+(created.server.address() as {port:number}).port;
  const token={'x-dashboard-token':security.token};
@@ -384,6 +449,45 @@ test('a tool the scopes forbid is refused at dispatch with a precise reason and 
    assert.match(refusedText,/The record_note scope is not in this agent\u2019s allowlist/,'the refusal names the scope that was missing');
    assert.match(refusedText,/Append one line/,'the refusal says what granting it would allow');
    assert.equal(await stat(app.notesFile).then(()=>true).catch(()=>false),false,'a refused tool call wrote nothing at all');
+ }finally{await app.created.close();app.store.close();}
+});
+
+test('disabling the last legacy agent does not restore unrestricted tools to its session',async()=>{
+ const root=await mkdtemp(join(tmpdir(),'dashboard-disabled-legacy-'));
+ const app=await privilegeInstance(root,['read_notes','record_note']);
+ try{
+   await app.view();
+   app.created.agentStore!.update({agentId:app.agent.id,revision:app.agent.revision,patch:{enabled:false},actor:{kind:'owner',identity:'local'}});
+   assert.equal((await app.send({text:'[note must not become owner]',mode:'followUp'})).status,200);
+   assert.match(await transcriptText(app),/no active governing agent; no provider request was sent/i);
+   assert.equal(await stat(app.notesFile).then(()=>true).catch(()=>false),false);
+ }finally{await app.created.close();app.store.close();}
+});
+
+test('a revoked note scope stops an already queued append',async()=>{
+ const root=await mkdtemp(join(tmpdir(),'dashboard-revoked-note-'));
+ let entered=false;const app=await privilegeInstance(root,['read_notes','record_note'],{delay:300,started:()=>{entered=true;}});
+ try{
+   await app.view();
+   assert.equal((await app.send({text:'[note revoked while waiting]',mode:'followUp'})).status,200);
+   await waitFor(async()=>entered?true:undefined);
+   app.created.agentStore!.update({agentId:app.agent.id,revision:app.agent.revision,patch:{scopes:['read_notes']},actor:{kind:'owner',identity:'local'}});
+   assert.match(await transcriptText(app),/authority changed or is unavailable/i);
+   assert.equal(await stat(app.notesFile).then(()=>true).catch(()=>false),false);
+ }finally{await app.created.close();app.store.close();}
+});
+
+test('revoking and restoring a note scope does not revive an in-flight call',async()=>{
+ const root=await mkdtemp(join(tmpdir(),'dashboard-note-aba-'));
+ let entered=false;const app=await privilegeInstance(root,['read_notes','record_note'],{delay:300,started:()=>{entered=true;}});
+ try{
+   await app.view();assert.equal((await app.send({text:'[note must not revive]',mode:'followUp'})).status,200);
+   await waitFor(async()=>entered?true:undefined);
+   const actor={kind:'owner',identity:'local'};
+   const revoked=app.created.agentStore!.update({agentId:app.agent.id,revision:app.agent.revision,patch:{scopes:['read_notes']},actor});
+   app.created.agentStore!.update({agentId:app.agent.id,revision:revoked.revision,patch:{scopes:['read_notes','record_note']},actor});
+   assert.match(await transcriptText(app),/authority changed or is unavailable/i);
+   assert.equal(await stat(app.notesFile).then(()=>true).catch(()=>false),false);
  }finally{await app.created.close();app.store.close();}
 });
 
@@ -432,6 +536,17 @@ test('an agent is offered only the tools its scopes name, and a call to a tool i
  * reason and no side effect, a rebind takes effect at the next dispatch without a restart, and the
  * binding is durable across a restart. No model is called: the scripted provider drives the calls.
  */
+test('read_notes reports an unsafe path as unknown rather than as absent',async()=>{
+ const root=await mkdtemp(join(tmpdir(),'dashboard-unsafe-notes-'));
+ const app=await privilegeInstance(root,['read_notes']);
+ try{
+   await mkdir(join(app.project.path,'docs'),{recursive:true});
+   const outside=join(root,'outside-notes');await writeFile(outside,'private');await symlink(outside,app.notesFile);
+   await app.view();assert.equal((await app.send({text:'[read-notes]',mode:'followUp'})).status,200);
+   const text=await transcriptText(app);assert.match(text,/Notes could not be read safely/);assert.doesNotMatch(text,/No notes yet\.|private/);
+ }finally{await app.created.close();app.store.close();}
+});
+
 test('a session bound to an agent uses its scopes, the same session unbound refuses with a reason and writes nothing, and the rebind takes effect at the next dispatch',async()=>{
   const root=await mkdtemp(join(tmpdir(),'dashboard-agents-binding-'));
   const app=await privilegeInstance(root,['read_notes','record_note']);
@@ -445,15 +560,12 @@ test('a session bound to an agent uses its scopes, the same session unbound refu
     await waitFor(async()=>{const ok=await stat(app.notesFile).then(()=>true).catch(()=>false);return ok?true:undefined;});
     assert.match(await readFile(app.notesFile,'utf8'),/the bound session may write this/,'a bound session really used its agent\u2019s scope');
 
-    // Unbind the very same session: it now has no agent, so a tool call is refused with the reason.
-    // The tool differs (read_notes) only because the scripted provider never repeats a call it has
-    // already made in one conversation; the point proven is the authority, not the tool.
+    // Unbind the same session: dispatch is refused before any provider request or tool call.
     bind(1,null);
     const before=await readFile(app.notesFile,'utf8');
     assert.equal((await app.send({text:'[read-notes]',mode:'followUp'})).status,200);
     const refused=await transcriptText(app);
-    assert.match(refused,/blocked/i,'the refusal is reported in the transcript');
-    assert.match(refused,/No agent is bound to this session/,'the refusal names why there are no privileges');
+    assert.match(refused,/no active governing agent; no provider request was sent/i,'the refusal is reported before provider dispatch');
     assert.equal(await readFile(app.notesFile,'utf8'),before,'an unbound session wrote nothing');
   }finally{await app.created.close();app.store.close();}
 });
@@ -593,6 +705,44 @@ test('an image is refused at admission and again at dispatch when the model cann
   }finally{await app.created.close();}
 });
 
+test('the agent view and a model change report image capability, and the session query is bounded',async()=>{
+  const root=await mkdtemp(join(tmpdir(),'dashboard-agents-capability-'));
+  const app=await instance('on',root,150);
+  try{
+    // The capability travels with the view, so the composer needs no separate route.
+    const first=await fetch(app.base,{headers:app.token});
+    assert.equal(first.status,200);
+    const firstBody=await first.json() as {vision:{provider:string;modelId:string;acceptsImages:boolean}|null};
+    assert.ok(firstBody.vision,'the view reports image capability');
+    assert.equal(firstBody.vision.acceptsImages,true,'the scripted provider accepts images');
+
+    // A model change answers with the capability of the model now in force, and a later view agrees.
+    const textOnly=app.created.providers.models.getModels().find(model=>Array.isArray(model.input)&&!model.input.includes('image'));
+    assert.ok(textOnly,'this build offers a text-only model');
+    const changed=await fetch(app.base+'/model',{method:'POST',headers:app.writes,body:JSON.stringify({model:{provider:textOnly.provider,modelId:textOnly.id}})});
+    assert.equal(changed.status,200);
+    const changedBody=await changed.json() as {vision:{provider:string;modelId:string;acceptsImages:boolean}|null};
+    assert.ok(changedBody.vision);
+    assert.equal(changedBody.vision.acceptsImages,false);
+    assert.deepEqual({provider:changedBody.vision.provider,modelId:changedBody.vision.modelId},{provider:textOnly.provider,modelId:textOnly.id});
+    const after=await fetch(app.base,{headers:app.token});
+    const afterBody=await after.json() as {vision:{acceptsImages:boolean}|null};
+    assert.equal(afterBody.vision?.acceptsImages,false);
+
+    // The session query is bounded on the view and on the stream, and an explicit empty value is
+    // rejected consistently rather than silently meaning "root".
+    const tooLong='x'.repeat(201);
+    for(const path of [app.base+'?sessionId='+tooLong,app.base+'?sessionId=',app.base+'/stream?sessionId='+tooLong,app.base+'/stream?sessionId=']){
+      const response=await fetch(path,{headers:app.token});
+      assert.equal(response.status,422,path);
+      await response.body?.cancel();
+    }
+    const rootView=await fetch(app.base,{headers:app.token});
+    assert.equal(rootView.status,200);
+    assert.ok((await rootView.json() as {vision:unknown}).vision);
+  }finally{await app.created.close();}
+});
+
 /**
  * A resume and a retry re-submit the conversation's last input. That input can carry an image, and
  * the replay must carry it too: sending the text alone would silently drop it. The model is the
@@ -726,8 +876,8 @@ test('DEFECT2a: the scope vocabulary reports which scopes have an installed tool
   assert.ok(installed.includes('ask_question'), 'ask_question is installed');
   // Scopes with no installed tool
   const uninstalled = vocab.filter(s => !s.installed).map(s => s.scope);
-  assert.ok(uninstalled.includes('read_docs'), 'read_docs is uninstalled');
-  assert.ok(uninstalled.includes('write_docs'), 'write_docs is uninstalled');
+  assert.ok(installed.includes('read_docs'), 'read_docs is installed');
+  assert.ok(installed.includes('write_docs'), 'write_docs is installed');
   assert.ok(uninstalled.includes('file_read'), 'file_read is uninstalled');
   assert.ok(uninstalled.includes('run_tests'), 'run_tests is uninstalled');
   assert.ok(uninstalled.includes('fork'), 'fork is uninstalled');
@@ -738,10 +888,20 @@ test('DEFECT2a: the scope vocabulary reports which scopes have an installed tool
   assert.ok(uninstalled.includes('spend'), 'spend is uninstalled');
   assert.ok(uninstalled.includes('provision'), 'provision is uninstalled');
   assert.ok(uninstalled.includes('publish'), 'publish is uninstalled');
-  // Verify the total count: 16 scopes, 3 installed + 1 conditional (file_edit behind switch)
-  assert.equal(vocab.length, 16, 'there are exactly 16 scopes');
-  // file_edit is NOT installed by default (switch is off)
-  assert.ok(uninstalled.includes('file_edit'), 'file_edit is uninstalled by default (switch off)');
+  assert.ok(uninstalled.includes('reusable_tools'), 'reusable_tools is uninstalled by default');
+  // Verify the total count: 19 scopes, 5 always installed (planning, documentation and question
+  // tools), and 5 behind the instance switches (file_edit, the coding tools read/write plus the
+  // shell, and the reusable JSON projection tools).
+  assert.equal(vocab.length, 19, 'there are exactly 19 scopes');
+  // Every switched capability has NO installed tool by default.
+  for (const scope of ['file_edit', 'file_read', 'file_write', 'shell', 'reusable_tools'] as const)
+    assert.ok(uninstalled.includes(scope), scope + ' is uninstalled by default (its switch is off)');
+  // With the switches on, exactly those five become installed, and nothing else changes.
+  const withCoding = agentScopeVocabulary({ fileEdit: true, fileRead: true, fileWrite: true, shell: true, reusableTools: true });
+  const nowInstalled = withCoding.filter(s => s.installed).map(s => s.scope);
+  for (const scope of ['file_edit', 'file_read', 'file_write', 'shell', 'reusable_tools'] as const)
+    assert.ok(nowInstalled.includes(scope), scope + ' is installed when its switch is on');
+  assert.equal(nowInstalled.length, installed.length + 5, 'the switches install exactly five tools and no more');
 });
 
 test('DEFECT2b: an agent whose scope is granted but whose tool is not installed gets a 503 from the agent registry endpoint', async () => {
@@ -784,17 +944,22 @@ test('DEFECT2d: the agent prompt section lists only tools it can actually call',
   // A tool whose scope is installed is permitted when scopes include it
   const readNotesVerdict = authorizeToolUse({ scopes: ['read_notes'], tool: 'read_notes' });
   assert.ok(readNotesVerdict.permitted, 'read_notes tool is permitted when scope is held');
-  // A tool whose scope is NOT installed (e.g. read_docs) is NOT permitted even when the scope is held
-  // because authorizeToolUse checks scope membership, not installation status.
-  // The INSTALLATION check is done by the privilege extension section text.
+  // authorizeToolUse checks scope membership; installation is reported separately.
   // Verify the installedAgentScopes function:
   assert.ok(installed.includes('read_notes'));
   assert.ok(installed.includes('record_note'));
   assert.ok(installed.includes('ask_question'));
-  assert.ok(!installed.includes('read_docs'), 'read_docs is NOT in installedAgentScopes');
-  assert.ok(!installed.includes('write_docs'), 'write_docs is NOT in installedAgentScopes');
+  assert.ok(installed.includes('read_docs'), 'read_docs is installed');
+  assert.ok(installed.includes('write_docs'), 'write_docs is installed');
   assert.ok(!installed.includes('file_read'), 'file_read is NOT in installedAgentScopes');
+  assert.ok(!installed.includes('file_write'), 'file_write is NOT in installedAgentScopes');
+  assert.ok(!installed.includes('shell'), 'shell is NOT in installedAgentScopes');
   assert.ok(!installed.includes('run_tests'), 'run_tests is NOT in installedAgentScopes');
+  // The coding capabilities are per switch, and the shell is separable from read/write.
+  const coding = installedAgentScopes({ fileRead: true, fileWrite: true });
+  assert.ok(coding.includes('file_read') && coding.includes('file_write'));
+  assert.ok(!coding.includes('shell'), 'read and write do not install a shell');
+  assert.ok(installedAgentScopes({ shell: true }).includes('shell'));
   // file_edit is NOT in the default installed list (switch off)
   assert.ok(!installed.includes('file_edit'), 'file_edit is NOT in installedAgentScopes when switch off');
 });
@@ -811,4 +976,485 @@ test('DEFECT2e: enabling the file_edit switch makes the tool appear', async () =
   assert.ok(defaultInstalledScopes.includes('record_note'));
   assert.ok(defaultInstalledScopes.includes('read_notes'));
   assert.ok(!defaultInstalledScopes.includes('file_edit'), 'file_edit is not in default installed tools');
+});
+
+// ---- P0 DURABILITY: named-session conversation binding survives restart ----
+
+test('P0: a named (UUID) session resolves to the same conversation after a restart, and no duplicate fork is created', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agents-p0-durable-'));
+  const app = await instance('on', root, 100, true);
+  const sessionId = crypto.randomUUID();
+  try {
+    // Open the stream endpoint with sessionId -- this triggers ensureSessionConversation,
+    // which creates the fork and records the durable binding.
+    const streamResp = await fetch(app.base + '/stream?sessionId=' + sessionId, { headers: app.token });
+    assert.equal(streamResp.status, 200);
+    // Read a frame from the stream to confirm it connected.
+    const reader = streamResp.body!.getReader();
+    const decoder = new TextDecoder();
+    let buffered = '';
+    const until = Date.now() + 2000;
+    while (!buffered.includes('data: {') && Date.now() < until) {
+      const chunk = await reader.read();
+      if (chunk.done) break;
+      buffered += decoder.decode(chunk.value, { stream: true });
+    }
+    await reader.cancel();
+    // Read through the session view endpoint; a brace regex cannot safely parse nested transcript JSON.
+    const firstResponse = await (await fetch(app.base + '?sessionId=' + sessionId, { headers: app.token })).json() as any;
+    const firstConvId = firstResponse.view.conversationId;
+    assert.ok(firstConvId !== undefined && String(firstConvId).length > 0, 'a named session has a conversation id: ' + firstConvId);
+    const initialBinding = app.control!.db.prepare("SELECT count(*) AS n FROM operations WHERE kind='agent.conversation' AND project_id=? AND session_id=?").get(app.project.id, sessionId) as {n:number};
+    assert.equal(initialBinding.n, 1, 'the initial named session has one durable binding');
+    const conversationCount = () => {
+      const db = new DatabaseSync(join(root, 'agents', app.project.id, 'session.sqlite'));
+      try { return (db.prepare('SELECT count(*) AS n FROM conversations').get() as {n:number}).n; }
+      finally { db.close(); }
+    };
+    assert.equal(conversationCount(), 2, 'root plus exactly one named conversation exist');
+
+    // Send a real message to the named conversation and wait for its committed transcript entry.
+    const messageText = 'durable named transcript ' + crypto.randomUUID();
+    const submitted = await fetch(app.base + '/input', {
+      method: 'POST', headers: app.writes,
+      body: JSON.stringify({ text: messageText, mode: 'followUp', requestId: crypto.randomUUID(), sessionId })
+    });
+    assert.equal(submitted.status, 200, await submitted.text());
+    const populated = await waitFor(async () => {
+      const response = await (await fetch(app.base + '?sessionId=' + sessionId, { headers: app.token })).json() as any;
+      return response.view.entries.length > 0 ? response.view : undefined;
+    });
+    assert.ok(populated.entries.some((entry: any) => entry.text?.includes(messageText)), 'the named conversation committed the owner message: ' + JSON.stringify(populated.entries));
+    // Close and reopen on the same data root -- restart simulation.
+    await app.created.close();
+    const reopened = await instance('on', root, 100, true);
+    try {
+      // The named session resolves to the SAME conversation id after restart.
+      const restoredView = await (await fetch(reopened.base + '?sessionId=' + sessionId, { headers: reopened.token })).json() as any;
+      const secondConvId = restoredView.view.conversationId;
+      assert.equal(String(secondConvId), String(firstConvId), 'the restart resolves to the same conversation id: ' + firstConvId + ' vs ' + secondConvId);
+      assert.ok(restoredView.view.entries.some((entry: any) => entry.text?.includes(messageText)), "the owner's previous message remains visible after restart");
+      const afterRestartBinding = reopened.control!.db.prepare("SELECT count(*) AS n FROM operations WHERE kind='agent.conversation' AND project_id=? AND session_id=?").get(reopened.project.id, sessionId) as {n:number};
+      assert.equal(afterRestartBinding.n, 1, 'restart did not create a second binding');
+      assert.equal(conversationCount(), 2, 'restart did not create an orphan duplicate conversation');
+
+      // An entirely new named session creates its own binding (distinct conversation).
+      const secondSessionId = crypto.randomUUID();
+      const secondStreamResp = await fetch(reopened.base + '/stream?sessionId=' + secondSessionId, { headers: reopened.token });
+      assert.equal(secondStreamResp.status, 200);
+      await secondStreamResp.body?.cancel();
+      const secondView = await (await fetch(reopened.base + '?sessionId=' + secondSessionId, { headers: reopened.token })).json() as any;
+      const thirdConvId = secondView.view.conversationId;
+      assert.ok(thirdConvId !== undefined && String(thirdConvId).length > 0);
+      assert.notEqual(String(thirdConvId), String(firstConvId), 'a second named session gets a distinct conversation from the first');
+      // The third conversation is created as the second session opens, so the count is polled to the
+      // expected value rather than read once: a single read raced the creation and reported 2.
+      const thirdCount = await waitFor(async () => conversationCount() === 3 ? 3 : undefined);
+      assert.equal(thirdCount, 3, 'each named session has one conversation, with no orphan duplicates');
+      await new Promise(resolve => setTimeout(resolve, 50));
+      assert.equal(conversationCount(), 3, 'and no orphan duplicate appeared afterwards');
+    } finally {
+      await reopened.created.close();
+    }
+  } finally {
+    await app.created.close();
+  }
+});
+
+test('P0: the legacy numeric session still works as before (conversationIdOf path)', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agents-p0-legacy-'));
+  let app;
+  try {
+    app = await instance('on', root, 100);
+    // Use the root session (no sessionId parameter means root).
+    const resp = await fetch(app.base, { headers: app.token });
+    assert.equal(resp.status, 200);
+    const view = await resp.json() as any;
+    assert.equal(view.view.conversationId, '1', 'the legacy root session is always conversation 1');
+    assert.ok(view.enabled, 'agents are enabled');
+    // Submit to the root and verify it appears.
+    const inputResp = await fetch(app.base + '/input', {
+      method: 'POST', headers: app.writes,
+      body: JSON.stringify({ text: 'legacy message', mode: 'followUp', requestId: crypto.randomUUID() })
+    });
+    assert.equal(inputResp.status, 200);
+    await sleep(300);
+    const updated = await (await fetch(app.base, { headers: app.token })).json() as any;
+    const assistantReplies = updated.view.entries.filter((e: any) => e.kind === 'assistant');
+    assert.ok(assistantReplies.some((r: any) => r.text?.includes('legacy message')), 'legacy root conversation works after restart');
+  } finally {
+    if (app) await app.created.close();
+  }
+});
+
+test('two live streams hold one subscription each, and closing one leaves the other subscribed and dispatch-free', { timeout: 10000 }, async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agents-stream-two-tabs-'));
+  const app = await instance('on', root);
+  const original = app.created.agents.subscribe.bind(app.created.agents);
+  let subscribes = 0, disposed = 0;
+  app.created.agents.subscribe = async (...args: Parameters<typeof original>) => {
+    subscribes += 1;
+    const close = await original(...args);
+    return async () => { disposed += 1; await close(); };
+  };
+  /** Read from one stream until a chunk holds the text, so the test waits on a frame, not on a sleep. */
+  const readUntil = async (reader: ReadableStreamDefaultReader<Uint8Array>, text: string) => {
+    const decoder = new TextDecoder();
+    let seen = '';
+    for (let index = 0; index < 100; index += 1) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      seen += decoder.decode(value, { stream: true });
+      if (seen.includes(text)) return seen;
+    }
+    throw new Error('the stream never carried ' + text);
+  };
+  try {
+    const first = await fetch(app.base + '/stream', { headers: app.token });
+    assert.equal(first.status, 200);
+    const firstReader = first.body!.getReader();
+    const second = await fetch(app.base + '/stream', { headers: app.token });
+    assert.equal(second.status, 200);
+    const secondReader = second.body!.getReader();
+    await waitFor(async () => subscribes === 2 ? true : undefined);
+
+    // Closing one tab disposes exactly its own subscription and leaves the other one in place.
+    await firstReader.cancel();
+    await waitFor(async () => disposed === 1 ? true : undefined);
+    assert.equal(subscribes, 2, 'the surviving stream did not open a second subscription');
+
+    const sent = await fetch(app.base + '/input', {
+      method: 'POST',
+      headers: app.writes,
+      body: JSON.stringify({ text: 'seen by the remaining tab', mode: 'followUp' })
+    });
+    assert.equal(sent.status, 200);
+    const frame = await readUntil(secondReader, 'seen by the remaining tab');
+    assert.match(frame, /seen by the remaining tab/);
+    assert.equal(subscribes, 2, 'a frame needs no additional subscription');
+    assert.equal(disposed, 1);
+
+    await secondReader.cancel();
+    await waitFor(async () => disposed === 2 ? true : undefined);
+    const current = (await app.view()).view;
+    assert.equal(current.entries.filter((entry: { kind: string }) => entry.kind === 'user').length, 1, 'closing a stream dispatched nothing and duplicated nothing');
+    assert.equal(current.working, false);
+  } finally {
+    await app.created.close();
+  }
+});
+
+test('an agent stream disconnected during subscription disposes the late subscription', { timeout: 10000 }, async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agents-stream-disconnect-'));
+  const app = await instance('on', root);
+  let release!: () => void;
+  const pending = new Promise<void>(resolve => { release = resolve; });
+  let disposed = 0;
+  // Hold subscription setup after the retry frame has reached the client. This makes
+  // the disconnect-before-subscribe race deterministic, without a real slow provider.
+  app.created.agents.subscribe = async () => {
+    await pending;
+    return async () => { disposed++; };
+  };
+  const disconnected = new Promise<void>(resolve => {
+    app.created.server.once('request', (_req, res) => res.once('close', resolve));
+  });
+  try {
+    const response = await fetch(app.base + '/stream', { headers: app.token });
+    assert.equal(response.status, 200);
+    await response.body!.cancel();
+    await disconnected;
+    release();
+    await waitFor(async () => disposed === 1 ? true : undefined);
+    assert.equal(disposed, 1, 'the late subscription is disposed exactly once');
+  } finally {
+    release();
+    await app.created.close();
+  }
+});
+
+for (const delayed of [false, true]) test(`shutdown ends an attached SSE client and drains ${delayed ? 'late' : 'active'} subscription`, { timeout: 10000 }, async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agents-stream-shutdown-'));
+  const app = await instance('on', root);
+  let release!: () => void;
+  const pending = new Promise<void>(resolve => { release = resolve; });
+  let disposed = 0, agentsClosed = false;
+  const originalClose = app.created.agents.close.bind(app.created.agents);
+  app.created.agents.subscribe = async () => {
+    if (delayed) await pending;
+    return async () => { assert.equal(agentsClosed, false); disposed++; };
+  };
+  app.created.agents.close = async () => { agentsClosed = true; await originalClose(); };
+  try {
+    const response = await fetch(app.base + '/stream', { headers: app.token });
+    assert.equal(response.status, 200);
+    const closing = app.created.close();
+    // Do not cancel the client: the server must send EOF itself, even during setup.
+    assert.match(await response.text(), /retry: 3000/);
+    if (delayed) {
+      assert.equal(agentsClosed, false, 'agent shutdown waits for subscription setup');
+      assert.equal(disposed, 0);
+    }
+    release();
+    await closing;
+    assert.equal(disposed, 1);
+    assert.equal(agentsClosed, true);
+  } finally {
+    release();
+    if (!agentsClosed) await app.created.close();
+  }
+});
+
+test('P0: a first-time named session records exactly one conversation binding', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agents-p0-first-'));
+  const app = await instance('on', root, 100, true);
+  const sessionId = crypto.randomUUID();
+  try {
+    // Trigger binding creation via stream
+    const streamResp = await fetch(app.base + '/stream?sessionId=' + sessionId, { headers: app.token });
+    assert.equal(streamResp.status, 200);
+    await streamResp.body?.getReader()?.cancel();
+    await sleep(100);
+    // The harness binding is created. Verify via the view endpoint.
+    const view = await (await fetch(app.base + '?sessionId=' + sessionId, { headers: app.token })).json() as any;
+    assert.ok(view.view, 'the named session is accessible');
+    assert.ok(typeof view.view.conversationId === 'number' || typeof view.view.conversationId === 'string', 'it has a conversation id');
+    const rows = app.control!.db.prepare("SELECT count(*) AS n FROM operations WHERE kind='agent.conversation' AND project_id=? AND session_id=?").get(app.project.id, sessionId) as {n:number};
+    assert.equal(rows.n, 1, 'first access wrote exactly one durable binding');
+
+  } finally {
+    await app.created.close();
+  }
+});
+
+test('named startup adoption refuses uncertain resume without replaying root or named input', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pilot-named-uncertain-'));
+  let app = await instance('on', root, 100, true);
+  try {
+    const session = await app.created.sessions!.create({ projectId: app.project.id, name: 'Uncertain named session' });
+    await app.created.agents.submit(app.created.catalog.get(app.project.id), { sessionId: session.id, text: 'NAMED BEFORE RESTART', mode: 'followUp' });
+    await waitFor(async () => !(await app.created.agents.sessionView(app.created.catalog.get(app.project.id), session.id))!.working ? true : undefined);
+    const before = (await app.created.agents.sessionView(app.created.catalog.get(app.project.id), session.id))!.entries.length;
+    app.created.lifecycle!.markRunning({ projectId: app.project.id, sessionId: session.id, requestId: 'unproven-attempt' });
+    await app.created.close();
+    app = await instance('on', root, 100, true);
+    const record = app.created.lifecycle!.read(app.project.id, session.id);
+    assert.equal(record.state, 'interrupted');
+    assert.equal(record.uncertain, true);
+    const response = await fetch(app.security.origin + '/api/sessions/' + session.id + '/lifecycle/resume', { method: 'POST', headers: app.writes, body: JSON.stringify({ projectId: app.project.id, revision: record.revision }) });
+    assert.equal(response.status, 409);
+    assert.match((await response.json()).error, /uncertain|operator/i);
+    assert.equal((await app.created.agents.sessionView(app.created.catalog.get(app.project.id), session.id))!.entries.length, before);
+    assert.equal((await app.created.agents.view(app.created.catalog.get(app.project.id))).entries.length, 0);
+  } finally { await app.created.close(); }
+});
+
+test('named HTTP controls and lifecycle callbacks never act on the root or another named session', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pilot-named-http-'));
+  const app = await instance('on', root, 800, true);
+  const post = async (suffix: string, data: unknown) => fetch(app.base + suffix, { method: 'POST', headers: app.writes, body: JSON.stringify(data) });
+  const session = await app.created.sessions!.create({ projectId: app.project.id, name: 'Named controls' });
+  const other = await app.created.sessions!.create({ projectId: app.project.id, name: 'Other controls' });
+  const view = async (id?: string) => (await (await fetch(app.base + (id ? '?sessionId=' + id : ''), { headers: app.token })).json()).view;
+  const life = () => app.created.lifecycle!.read(app.project.id, session.id);
+  const action = async (name: string, revision = life().revision) => fetch(app.security.origin + '/api/sessions/' + session.id + '/lifecycle/' + name, { method: 'POST', headers: app.writes, body: JSON.stringify({ projectId: app.project.id, revision }) });
+  try {
+    assert.equal((await post('/input', { text: 'ROOT SENTINEL' })).status, 200);
+    await waitFor(async () => !(await view()).working ? true : undefined);
+    assert.equal((await post('/input', { sessionId: session.id, text: '[ask] named HTTP' })).status, 200);
+    await waitFor(async () => !(await view(session.id)).working && (await view(session.id)).questions.length ? true : undefined);
+    await waitFor(async () => life().state === 'idle' ? true : undefined);
+    const question = (await view(session.id)).questions[0];
+    assert.equal((await post('/answer', { sessionId: other.id, questionId: question.id, text: 'foreign' })).status, 404);
+    assert.equal((await post('/dismiss', { sessionId: session.id, questionId: question.id, reason: 'Defer this choice' })).status, 200);
+    await waitFor(async () => !(await view(session.id)).working ? true : undefined);
+    assert.ok((await view(session.id)).dismissals[question.id]);
+    assert.equal((await post('/answer', { sessionId: session.id, questionId: question.id, text: 'late' })).status, 409);
+    assert.equal((await post('/model', { sessionId: session.id, model: null })).status, 200);
+    await post('/input', { sessionId: session.id, text: '[pause] named replay only', requestId: 'named-original' });
+    await post('/input', { sessionId: other.id, text: '[pause] other input' });
+    await waitFor(async () => (await view(session.id)).working && (await view(other.id)).working ? true : undefined);
+    assert.equal((await action('pause')).status, 200);
+    assert.equal(life().state, 'paused');
+    assert.equal((await view(other.id)).working, true);
+    assert.equal((await action('resume')).status, 200);
+    assert.equal(life().state, 'idle', 'a terminal idempotent resume must not leave a phantom running attempt');
+    assert.ok(!(await view(session.id)).entries.some((entry: any) => entry.text.includes('ROOT SENTINEL')));
+    assert.equal((await post('/abort', { sessionId: other.id })).status, 200);
+    assert.equal((await view(other.id)).working, false);
+    // A transport refusal after admission is synthetic: no provider call or credential is used.
+    const model = app.created.providers.models.getModels().find(m => m.provider !== 'faux')!;
+    assert.ok(model);
+    await post('/model', { sessionId: session.id, model: { provider: model.provider, modelId: model.id } });
+    let checks = 0;
+    app.created.providers.assertUsable = async () => { if (++checks > 1) throw Error('synthetic transport refusal'); };
+    assert.equal((await post('/input', { sessionId: session.id, text: 'synthetic failure' })).status, 200);
+    await waitFor(async () => life().state === 'failed' ? true : undefined);
+    const rootBefore = (await view()).entries.length;
+    assert.equal((await action('retry')).status, 200);
+    await waitFor(async () => life().state === 'failed' ? true : undefined);
+    assert.equal((await view()).entries.length, rootBefore, 'retry callback carries the named identity');
+    // Keep stop idempotent and ensure it targets the named generation.
+    await post('/model', { sessionId: session.id, model: null });
+    await post('/input', { sessionId: session.id, text: '[pause] stop me' });
+    assert.equal((await action('stop')).status, 200);
+    assert.equal(life().state, 'idle');
+    const revision = life().revision;
+    assert.equal((await action('stop', revision)).status, 200);
+    assert.equal(life().revision, revision);
+  } finally { await app.created.close(); }
+});
+
+/** Reads data frames until the socket is quiet, so one coalesced batch is counted as it is. */
+async function quietFrames(reader: ReadableStreamDefaultReader<Uint8Array>, quietMs = 300): Promise<string[]> {
+  const decoder = new TextDecoder();
+  let buffer = '';
+  const frames: string[] = [];
+  for (;;) {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const quiet = new Promise<'quiet'>(resolve => { timer = setTimeout(() => resolve('quiet'), quietMs); });
+    const next = await Promise.race([reader.read(), quiet]);
+    clearTimeout(timer);
+    if (next === 'quiet') break;
+    const { value, done } = next as ReadableStreamReadResult<Uint8Array>;
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    for (;;) {
+      const boundary = buffer.indexOf('\n\n');
+      if (boundary < 0) break;
+      const frame = buffer.slice(0, boundary);
+      buffer = buffer.slice(boundary + 2);
+      if (frame.startsWith('data: ')) frames.push(frame.slice(6));
+    }
+  }
+  return frames;
+}
+
+test('a slow stream client keeps one pending snapshot and receives the newest one', { timeout: 10000 }, async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agents-stream-backpressure-'));
+  const app = await instance('on', root);
+  let push: ((view: unknown) => void) | undefined;
+  let disposed = 0;
+  app.created.agents.subscribe = async (_project, listener) => {
+    push = listener as unknown as (view: unknown) => void;
+    return async () => { disposed += 1; };
+  };
+  const padding = 'x'.repeat(256 * 1024);
+  const snapshot = (index: number) => ({
+    conversationId: 'c', working: false, attempt: null, entries: [], partial: 'snapshot-' + index + '-' + padding,
+    inbox: [], usage: { input: 0, output: 0, cost: 0 }, model: null, questions: [], updatedAt: String(index)
+  });
+  try {
+    const response = await fetch(app.base + '/stream', { headers: app.token });
+    assert.equal(response.status, 200);
+    await waitFor(async () => push ? true : undefined);
+    const reader = response.body!.getReader();
+    for (let index = 0; index < 20; index += 1) push!(snapshot(index));
+    const frames = await quietFrames(reader);
+    assert.equal(frames.length, 2, 'one frame is in flight and one is pending, not twenty');
+    assert.match((JSON.parse(frames.at(-1)!) as { partial: string }).partial, /^snapshot-19-/);
+    await reader.cancel();
+    await waitFor(async () => disposed === 1 ? true : undefined);
+  } finally {
+    await app.created.close();
+  }
+});
+
+test('an oversized snapshot ends the stream with one bounded error frame', { timeout: 10000 }, async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agents-stream-oversize-'));
+  const app = await instance('on', root);
+  let push: ((view: unknown) => void) | undefined;
+  let disposed = 0;
+  app.created.agents.subscribe = async (_project, listener) => {
+    push = listener as unknown as (view: unknown) => void;
+    return async () => { disposed += 1; };
+  };
+  try {
+    const response = await fetch(app.base + '/stream', { headers: app.token });
+    assert.equal(response.status, 200);
+    await waitFor(async () => push ? true : undefined);
+    push!({ conversationId: 'c', partial: 'x'.repeat(MAX_STREAM_FRAME_BYTES + 1024) });
+    const text = await response.text();
+    assert.match(text, /event: error/);
+    assert.match(text, /STREAM_SNAPSHOT_TOO_LARGE/);
+    assert.ok(text.length < 20_000, 'the refusal itself is not a snapshot-sized frame');
+    await waitFor(async () => disposed === 1 ? true : undefined);
+  } finally {
+    await app.created.close();
+  }
+});
+
+test('an oversized snapshot during backpressure still delivers the terminal reason', { timeout: 10000 }, async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agents-stream-oversize-blocked-'));
+  const app = await instance('on', root);
+  let push: ((view: unknown) => void) | undefined;
+  let disposed = 0;
+  app.created.agents.subscribe = async (_project, listener) => {
+    push = listener as unknown as (view: unknown) => void;
+    return async () => { disposed += 1; };
+  };
+  try {
+    const response = await fetch(app.base + '/stream', { headers: app.token });
+    assert.equal(response.status, 200);
+    await waitFor(async () => push ? true : undefined);
+    // The first write is larger than the socket high-water mark, so the terminal frame
+    // must wait for the drain event instead of being written behind it immediately.
+    push!({ conversationId: 'c', partial: 'normal-' + 'n'.repeat(512 * 1024) });
+    await sleep(50);
+    push!({ conversationId: 'c', partial: 'x'.repeat(MAX_STREAM_FRAME_BYTES + 1024) });
+    await sleep(50);
+    const text = await response.text();
+    assert.match(text, /data: .*normal-/, 'the in-flight full snapshot is delivered first');
+    assert.match(text, /STREAM_SNAPSHOT_TOO_LARGE/, 'the terminal reason survives the blocked socket');
+    assert.ok(text.length < 1_500_000, 'the oversized frame was never written');
+    await waitFor(async () => disposed === 1 ? true : undefined);
+  } finally {
+    await app.created.close();
+  }
+});
+
+test('shutdown completes while a stream is blocked on backpressure', { timeout: 10000 }, async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agents-stream-shutdown-backpressure-'));
+  const app = await instance('on', root);
+  let push: ((view: unknown) => void) | undefined;
+  let disposed = 0;
+  app.created.agents.subscribe = async (_project, listener) => {
+    push = listener as unknown as (view: unknown) => void;
+    return async () => { disposed += 1; };
+  };
+  const padding = 'x'.repeat(256 * 1024);
+  try {
+    const response = await fetch(app.base + '/stream', { headers: app.token });
+    assert.equal(response.status, 200);
+    await waitFor(async () => push ? true : undefined);
+    // The client does not read, so the socket is blocked and one snapshot is pending.
+    for (let index = 0; index < 10; index += 1) push!({ conversationId: 'c', partial: 'snapshot-' + index + '-' + padding });
+    await sleep(50);
+    const closing = app.created.close();
+    // The server owns EOF even though the client never read while frames were queued.
+    assert.match(await response.text(), /retry: 3000/);
+    await closing;
+    assert.equal(disposed, 1);
+  } finally {
+    await app.created.close();
+  }
+});
+
+test('reopening the read-only stream never dispatches or admits a message', { timeout: 10000 }, async () => {
+  const root = await mkdtemp(join(tmpdir(), 'agents-stream-no-dispatch-'));
+  const app = await instance('on', root);
+  try {
+    for (let index = 0; index < 3; index += 1) {
+      const response = await fetch(app.base + '/stream', { headers: app.token });
+      assert.equal(response.status, 200);
+      await response.body!.cancel();
+    }
+    await sleep(100);
+    const current = (await app.view()).view;
+    assert.equal(current.working, false);
+    assert.equal(current.entries.length, 0, 'no reconnect path submitted an input');
+    assert.equal(current.usage.input, 0, 'no reconnect path dispatched a model request');
+  } finally {
+    await app.created.close();
+  }
 });

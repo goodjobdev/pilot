@@ -28,8 +28,8 @@ async function withAgents(page:import('@playwright/test').Page,fixture:string){
   await page.getByRole('button',{name:'＋ Add project',exact:true}).first().click();
   await page.getByLabel('Project name').fill(fixture);
   await page.getByRole('button',{name:'Confirm & add project'}).click();
-  await page.getByRole('button',{name:'Agents',exact:true}).click();
-  await expect(page.locator('.agent-state')).toHaveText('Idle');
+  await page.getByRole('button',{name:'Session',exact:true}).click();
+  await expect(page.locator('details.activity-more > summary')).toContainText('Idle');
 }
 
 test('the composer uploads a picked image, refuses a bad one per image, and clears after a send',async({page})=>{
@@ -39,7 +39,7 @@ test('the composer uploads a picked image, refuses a bad one per image, and clea
   await withAgents(page,'Image composer fixture');
 
   // The picker is a real file input, and it offers the camera on a phone.
-  const picker=page.locator('input[type=file]');
+  const picker=page.getByLabel('Add an image');
   await expect(picker).toHaveAttribute('capture','environment');
   await expect(picker).toHaveAttribute('accept','image/jpeg,image/png,image/webp');
 
@@ -96,7 +96,7 @@ test('an image with no caption is sendable, and a second one past the limit is r
   // A message needs text or an image: with a ready image, and no text, Send is enabled.
   await page.getByLabel('Message the agent').fill('');
   await expect(page.getByRole('button',{name:'Send message'})).toBeDisabled();
-  await page.locator('input[type=file]').setInputFiles(good);
+  await page.getByLabel('Add an image').setInputFiles(good);
   await expect(page.locator('.image-item')).toHaveCount(1);
   await expect(page.getByRole('button',{name:'Send message'})).toBeEnabled();
   await page.getByRole('button',{name:'Send message'}).click();
@@ -104,7 +104,7 @@ test('an image with no caption is sendable, and a second one past the limit is r
   await expect(page.locator('.image-item')).toHaveCount(0);
 
   // Past the documented maximum, the extra image is refused on itself rather than silently dropped.
-  await page.locator('input[type=file]').setInputFiles([good,good,good,good,good,good,good]);
+  await page.getByLabel('Add an image').setInputFiles([good,good,good,good,good,good,good]);
   await expect(page.locator('.image-item')).toHaveCount(7);
   await expect(page.locator('.image-item.refused .image-refusal')).toContainText('one message');
 });
@@ -159,7 +159,7 @@ test('a send is held until an image that is still uploading has been stored',asy
   const held=new Promise<void>(resolve=>{release=resolve;});
   await page.route('**/agents/media',async route=>{await held;await route.continue();});
   await page.getByLabel('Message the agent').fill('this caption must not go without the image');
-  await page.locator('input[type=file]').setInputFiles(good);
+  await page.getByLabel('Add an image').setInputFiles(good);
   await expect(page.locator('.image-item')).toHaveCount(1);
   await expect(page.locator('.image-item .image-facts')).toContainText('Checking');
   // Nothing is stored yet, so the message is held: Send is disabled, the state says why, and no
@@ -181,6 +181,91 @@ test('a send is held until an image that is still uploading has been stored',asy
  * A preview fetch and an upload are two conditions. A preview that cannot be fetched is reported as
  * its own condition, is never described as a refusal, and never removes an image the server accepted.
  */
+test('an attachment-only draft sends once and renders from authenticated stored bytes after reload',async({page})=>{
+  const directory=await mkdtemp(join(tmpdir(),'pilot-browser-transcript-image-'));
+  const imagePath=join(directory,'transcript.png');
+  await writeFile(imagePath,png(8,6));
+  await withAgents(page,'Transcript image fixture');
+  const composer=page.getByLabel('Message the agent');
+  const inputRequests:Record<string,unknown>[]=[];
+  const apiBodies:string[]=[];
+  page.on('request',request=>{
+    const path=new URL(request.url()).pathname;
+    if(request.method()==='POST'&&path.endsWith('/agents/input'))inputRequests.push(request.postDataJSON() as Record<string,unknown>);
+  });
+  page.on('response',async response=>{
+    if(!/\/api\/projects\/.*\/agents(?:\/stream)?/.test(new URL(response.url()).pathname))return;
+    try{apiBodies.push(await response.text());}catch{/* A stream can close during a reload. */}
+  });
+  await expect(composer).toHaveValue('');
+  await page.getByLabel('Add an image').setInputFiles(imagePath);
+  await expect(page.locator('.image-item .image-facts')).toContainText('8×6');
+  await page.reload();
+  await expect(composer).toHaveValue('');
+  await expect(page.locator('.image-item .image-facts')).toContainText('8×6');
+  expect(inputRequests,'reload restores the draft without submitting').toHaveLength(0);
+
+  await page.getByRole('button',{name:'Send message'}).click();
+  const transcript=page.getByLabel('Agent transcript');
+  await expect.poll(()=>inputRequests.length).toBe(1);
+  expect(inputRequests[0].text).toBe('');
+  expect(inputRequests[0].images).toHaveLength(1);
+  await expect(transcript.locator('.agent-entry.user')).toHaveCount(1);
+  await expect(transcript.locator('.agent-entry.user')).not.toContainText('(no text)');
+  await expect(transcript.getByRole('img',{name:'User attachment'})).toHaveCount(1);
+  const attachment=transcript.getByRole('img',{name:'User attachment'}).first();
+  await expect.poll(()=>attachment.evaluate((img:HTMLImageElement)=>img.complete&&img.naturalWidth>0)).toBe(true);
+  expect(await attachment.getAttribute('src')).toMatch(/^blob:/);
+  const mediaResponses=page.waitForResponse(response=>response.request().method()==='GET'&&new URL(response.url()).pathname.startsWith('/api/media/'));
+  // Force a fresh transcript projection and authenticated media fetch from persisted server data.
+  await page.reload();
+  await expect(page.getByLabel('Agent transcript').locator('.agent-entry.user')).toHaveCount(1);
+  const restored=page.getByLabel('Agent transcript').getByRole('img',{name:'User attachment'});
+  await expect(restored).toHaveCount(1);
+  await expect.poll(()=>restored.evaluate((img:HTMLImageElement)=>img.complete&&img.naturalWidth>0)).toBe(true);
+  expect(await restored.getAttribute('src')).toMatch(/^blob:/);
+  const mediaResponse=await mediaResponses;
+  expect(mediaResponse.status()).toBe(200);
+  expect(inputRequests,'reloading the admitted transcript does not resend').toHaveLength(1);
+  await expect(page.getByLabel('Agent transcript').locator('.agent-entry.user')).toHaveCount(1);
+  const mediaId=(inputRequests[0].images as string[])[0];
+  await expect.poll(()=>apiBodies.some(body=>body.includes(mediaId))).toBe(true);
+  for(const body of apiBodies){expect(body).not.toContain(Buffer.from(png(8,6)).toString('base64'));}
+});
+
+test('a media redirect to another origin is not followed or rendered as a transcript image',async({page})=>{
+  const directory=await mkdtemp(join(tmpdir(),'pilot-browser-media-redirect-'));
+  const imagePath=join(directory,'redirect.png');
+  await writeFile(imagePath,png(8,6));
+  await withAgents(page,'Media redirect fixture');
+  const mediaResponse=page.waitForResponse(response=>response.request().method()==='GET'&&new URL(response.url()).pathname.startsWith('/api/media/'));
+  const composer=page.getByLabel('Message the agent');
+  await page.getByLabel('Add an image').setInputFiles(imagePath);
+  await expect(page.locator('.image-item .image-facts')).toContainText('8×6');
+  await composer.fill('image whose media lookup redirects');
+  await page.getByRole('button',{name:'Send message'}).click();
+  const transcript=page.getByLabel('Agent transcript');
+  await expect(transcript).toContainText('image whose media lookup redirects');
+  const attachment=transcript.getByRole('img',{name:'User attachment'});
+  await expect(attachment).toHaveCount(1);
+  await expect.poll(()=>attachment.evaluate((img:HTMLImageElement)=>img.complete&&img.naturalWidth>0)).toBe(true);
+  const mediaUrl=await attachment.getAttribute('src');
+  expect(mediaUrl).toMatch(/^blob:/);
+  const path=new URL((await mediaResponse).url()).pathname;
+  const destination='https://redirect-target.invalid/stolen-image';
+  let destinationRequests=0;
+  await page.route('https://redirect-target.invalid/**',route=>{
+    destinationRequests++;
+    return route.fulfill({status:200,contentType:'image/png',body:Buffer.from(png(8,6))});
+  });
+  await page.route(`**${path}`,route=>route.fulfill({status:302,headers:{location:destination}}));
+  await page.reload();
+  await expect(transcript).toContainText('image whose media lookup redirects');
+  await expect(transcript.getByRole('img',{name:'User attachment'})).toHaveCount(0);
+  await expect(transcript).toContainText(/unavailable|sign-in|expired/i);
+  expect(destinationRequests,'browser must not follow cross-origin media redirect').toBe(0);
+});
+
 test('a preview that cannot be fetched is its own condition and never removes the accepted image',async({page})=>{
   const directory=await mkdtemp(join(tmpdir(),'dashboard-browser-images-preview-'));
   const good=join(directory,'kept.png');
@@ -190,7 +275,7 @@ test('a preview that cannot be fetched is its own condition and never removes th
   page.on('request',request=>{if(request.method()==='POST'&&request.url().includes('/agents/input'))sent.push(JSON.parse(request.postData()??'{}'));});
   // The upload itself succeeds; only the owner-only fetch of the stored bytes fails.
   await page.route('**/api/media/**',route=>route.fulfill({status:403,contentType:'application/json',body:JSON.stringify({error:'not available'})}));
-  await page.locator('input[type=file]').setInputFiles(good);
+  await page.getByLabel('Add an image').setInputFiles(good);
   const item=page.locator('.image-item');
   await expect(item).toHaveCount(1);
   // The server accepted the bytes, so the image is ready: its stored facts are shown, nothing is

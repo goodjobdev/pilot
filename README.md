@@ -1,35 +1,57 @@
 # Pilot
 
-A self-hosted workspace where **the documentation is the source of work** and durable Pi
-agents work from it.
+A self-hosted remote harness for **Documentation Driven Development**, extending to
+**Design Documentation Driven Development (DDDD)**: documentation is the source of work,
+and durable Pi agents work from it.
+
+Start with the [user manual](docs/manual/index.md), [DDDD vision](docs/manual/vision.md),
+[project and board settings](docs/manual/settings.md), and
+[documentation contract](docs/DOCUMENTATION.md). Planned design tooling is not yet available.
 
 Write the intent first — behaviour, decisions, open questions, diagrams — then let an agent
 implement against that page. Pilot keeps the plan, the conversation and the result in one
-place, reachable from your phone, with the repositories still owning the truth.
+place, reachable from your phone, with the repositories still owning the truth. The ordered
+work for the current milestone, *Dependable from a phone*, is in [docs/PLAN.md](docs/PLAN.md).
 
 ## What it does
 
 - **A documentation wiki.** Browse, edit, search and render any Markdown in a registered
   project: diagrams, images, static HTML mockups, spec links and an open-questions inbox.
   Edits are revision-checked, so a second writer gets a conflict instead of losing work.
+  Fold every folder with Collapse all. A right-side Files / Changes panel previews code,
+  documents, images, uncommitted patches and local commit history.
 - **Durable agents.** One Pi Durable session per project, committed to SQLite as it runs:
   live transcript, steering, stopping, and questions the agent asks that you answer once.
-  A run that dies mid-tool resumes from its last checkpoint, and a tool that may have
-  partially run is reported as interrupted rather than repeated.
+  Certain work can continue from its last checkpoint. An uncertain interruption blocks model
+  and tool execution until the owner reviews the conversation and affected files, then acknowledges
+  only after terminal status, an idle conversation and an empty queue are verified. Acknowledgement
+  does not replay or undo the original effect. See [Session recovery](docs/RECOVERY.md).
+- **Bounded owner-created workers.** The owner can create a worker with a pinned model from the
+  allowed worker set, a default-deny scope list and fixed budgets, then start one bounded run. Model
+  turns run in the application harness; the report is canonical Markdown at
+  `docs/workers/<workerId>/<runId>.md` and is untrusted evidence, never accepted automatically.
+  There is no queue and no agent-created worker. See [Workers](docs/WORKERS.md).
 - **Named sessions.** Each project's conversation is adopted as a named, durable session with
   links to the board task, the specification and the workspace it is about. Names are unique
   within a project, every change is revision-checked, and a link is only accepted when the board,
   the documentation or the approved roots actually contain it. See
   [Sessions](docs/SESSIONS.md) and [Migrating the legacy conversation](docs/MIGRATION.md).
 - **Repository connections.** Generate a project deploy key in the UI and explicitly connect
-  an isolated review worktree; no automatic installs, commits or pushes.
+  an isolated review worktree; provisioning performs no installs, commits or pushes.
+  Read-only deploy keys work for private repositories without an account-wide GitHub login.
+  Subsequent documentation saves attempt narrow local commits, never automatic pushes.
+  The unreleased update adds **Workspace → Changes → Check remote changes** with incoming
+  and proposed-result diffs, explicitly confirmed fast-forwards/merges, and preservation guards.
+  See [Remote updates](docs/manual/remote-updates.md); nothing pulls or pushes automatically.
 - **Providers and models.** Add API keys or sign in from settings, pick a default for new
   sessions, and star favourites so they appear first. The scripted provider remains the free
   initial default; real calls require explicit opt-in.
 - **Phone alerts.** Web Push for questions, finished runs and failures, with a link that
   opens the exact project.
 - **A planning board.** The dependency canvas, milestone timeline and task list this app
-  started as, with spec links from work items into the wiki.
+  started as, with spec links from work items into the wiki. Board views and the Wiki plan
+  share `docs/dashboard/board.md`. Sync plan previews selected repository checklists before
+  applying a revision-checked, locally committed batch. See [Plan, files and local history](docs/PLAN-SYNC.md).
 
 ## How it fits together
 
@@ -77,6 +99,26 @@ pnpm exec playwright install chromium
 pnpm test:browser
 ```
 
+## Living documentation (Astro Starlight)
+
+Canonical user documentation lives under `docs/manual/`, contracts under `docs/specs/`,
+and reusable feature/design templates under `docs/templates/`. The Starlight app publishes
+only its explicit allowlist, with status badges and a static search index. It does not
+publish registered projects, runtime plans or operational evidence.
+
+```sh
+pnpm --dir docs-site install --frozen-lockfile
+pnpm --dir docs-site check
+pnpm --dir docs-site test
+pnpm --dir docs-site build
+pnpm --dir docs-site dev
+```
+
+This is a separate static app with its own lockfile; it does not add Astro to Pilot's
+production dependencies or replace Svelte. No public docs URL or deployment is configured.
+See [Writing documentation](docs/DOCUMENTATION.md) for metadata, link validation and the
+release definition of done.
+
 ## Layout
 
 | Path | What lives there |
@@ -107,9 +149,22 @@ exactly once.
   multi-tenant and there is no rate limiting.
 - **The agent harness is code execution.** Agent tools are bounded to a project's workspace,
   but a project you register is a directory the agent may write to. Run it in a container,
-  not on a workstation.
-- **The backup script covers documentation, not sessions.** Agent transcripts, alert keys and
-  credentials are deliberately excluded, so a restore needs a fresh sign-in.
+  not on a workstation. The optional coding tools are off unless the instance enables them
+  (`DASHBOARD_CODING_TOOLS=on`, and `DASHBOARD_SHELL=on` for commands) and an agent is granted
+  the matching scope. `read` and `write` stay inside the connected worktree; the agent shell is **not
+  contained** and can reach the whole data volume, including stored credentials. A separate,
+  owner-facing interactive terminal is opt-in with `DASHBOARD_TERMINAL=on` and grants the same broad
+  service-user access; it does not install or change the agent shell. See
+  [Coding tools](docs/specs/coding-tools.md) and the [terminal guide](docs/manual/terminal.md).
+- **The backup script covers documentation and working state, not credentials.** The archive
+  captures `catalog.json`, the agent session databases, the durable control store
+  (`control.sqlite`), managed projects' boards and documents, media, and settings. For an
+  external project it captures that project's `docs/dashboard` tree only. It deliberately
+  excludes `credentials/` (provider keys, sign-ins and project deploy keys) and `alerts/`
+  (the VAPID signing key and device endpoints). It also excludes the derived git worktrees
+  (`repositories/`, `forks/`), the rebuildable `snapshots/` board history and `service.lock`.
+  A restore needs a fresh sign-in, new deploy keys and alerts enabled again, and the
+  derived worktrees must be recreated.
 - **An unclean kill leaves a lock.** SIGKILL, OOM or power loss leaves `service.lock` and
   the application refuses to start until an operator confirms no writer remains and clears
   it — fail-closed, but with `restart: unless-stopped` that means a crash-loop until someone
@@ -117,7 +172,8 @@ exactly once.
 - **The default provider is a scripted local stand-in.** Real provider adapters are available
   through [Providers & models](docs/PROVIDER-SIGNIN.md); credentials and live sign-in are the
   owner's responsibility. Tests use synthetic providers, not billed acceptance calls. Agent
-  tools are still question/note operations, not a complete coding toolchain.
+  tools include bounded documentation reads and revision-checked planning board updates, not a
+  complete coding toolchain. See [Agent planning tools](docs/PLANNING-TOOLS.md).
 - **Uncommitted code is not a GitHub backup.** Repository worktrees and deployment keys are
   described in [Project connections](docs/PROJECT-CONNECTIONS.md). Review and back up before
   a real migration. Pilot supersedes the earlier dashboard, without automatically importing

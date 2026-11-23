@@ -1,7 +1,11 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
-import { closeSync, lstatSync, mkdirSync, openSync, realpathSync } from 'node:fs';
+import { closeSync, linkSync, lstatSync, mkdirSync, openSync, realpathSync, unlinkSync } from 'node:fs';
 import { resolve, join } from 'node:path';
+import { parseAgentIdentifier } from '../../shared/agent-registry';
+import { ActionTargetStore, actionTargetFingerprint } from './action-target-store';
+import { pushResourceKey } from './push-resource-key';
+import { ACCEPTANCE_ACTION_CLASSES, parseArtifactIdentity } from '../../shared/acceptance';
 import {
   boundedJson, canonicalJson, CONTROL_MAX_JSON_BYTES, CONTROL_RECORD_VERSION, exceedsJsonLimit,
   isLegalOperationTransition,
@@ -18,6 +22,8 @@ export class ControlStoreError extends Error {
 type Admission = {
   scope:ControlScope; idempotencyKey:string; kind:string; input:unknown;
   outbox:{kind:string;payload:unknown};
+  /** Synchronous internal precondition checked inside the same write transaction. */
+  guard?:()=>unknown;
 };
 function parseJson(value:string,label:string):unknown {
   try { return JSON.parse(value); } catch { throw new ControlStoreError(`Corrupt ${label} JSON`,'CORRUPT'); }
@@ -39,6 +45,15 @@ export class ControlStore {
   readonly db:DatabaseSync;
   private closed=false;
   readonly file:string;
+  /** Validate a caller-owned SQLite connection without opening, committing, or rolling back a transaction. */
+  static validateSchemaConnection(db:DatabaseSync):void {
+    const validator=Object.create(ControlStore.prototype) as ControlStore;
+    validator.validateExistingSchema(db,false);
+  }
+  static validateConnection(db:DatabaseSync):void {
+    const validator=Object.create(ControlStore.prototype) as ControlStore;
+    validator.validateExistingSchema(db,true);
+  }
   constructor(dataRoot:string) {
     const root=resolve(dataRoot);
     try { mkdirSync(root,{recursive:true,mode:0o700}); } catch(e) { if((e as NodeJS.ErrnoException).code!=='EEXIST') throw e; }
@@ -48,13 +63,13 @@ export class ControlStore {
     const canonicalRoot=realpathSync(root);
     this.file=join(canonicalRoot,'control.sqlite');
     this.assertSafeDatabasePaths();
-    let created=false;
-    try { const fd=openSync(this.file,'wx',0o600); closeSync(fd); created=true; }
-    catch(e) { if((e as NodeJS.ErrnoException).code!=='EEXIST') throw e; }
+    const created=this.initializeIfAbsent(canonicalRoot);
     this.assertSafeDatabasePaths();
     if(!created) {
       const check=new DatabaseSync(this.file,{readOnly:true});
-      try { this.validateExistingSchema(check); }
+      // The linked operation/outbox scans must observe one SQLite snapshot. Without a read
+      // transaction, a concurrent receipt update between queries can look like corruption.
+      try { check.exec('PRAGMA busy_timeout=5000; BEGIN;'); ControlStore.validateConnection(check); check.exec('COMMIT;'); }
       catch(error) {
         // A raw driver error (for example a scan over a layout the predicates happened to accept)
         // is still a schema verdict: never let it escape as an untyped SqliteError.
@@ -66,10 +81,34 @@ export class ControlStore {
     this.db=new DatabaseSync(this.file);
     try {
       this.db.exec('PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;');
-      if(created) this.initializeNew();
       this.db.exec('PRAGMA journal_mode=WAL;');
       this.assertSafeDatabasePaths();
     } catch(e) { try{this.db.close();}catch{} this.closed=true; throw e; }
+  }
+  /** Publish a fully initialized private database without exposing an empty target to other openers. */
+  private initializeIfAbsent(root:string):boolean {
+    try { lstatSync(this.file); return false; }
+    catch(error) { if((error as NodeJS.ErrnoException).code!=='ENOENT') throw error; }
+    // An orphaned target journal or WAL may contain the only recoverable state. Never attach it
+    // to a new empty store. A competing initializer may have published the main file meanwhile.
+    for(const suffix of ['-wal','-shm','-journal']) {
+      try { lstatSync(this.file+suffix); }
+      catch(error) { if((error as NodeJS.ErrnoException).code==='ENOENT')continue;throw error; }
+      try { lstatSync(this.file);return false; }
+      catch(error) { if((error as NodeJS.ErrnoException).code!=='ENOENT')throw error; }
+      throw new ControlStoreError('Control database is missing but SQLite sidecar evidence remains','CORRUPT');
+    }
+    const staging=join(root,'.control-init-'+randomUUID()+'.sqlite');
+    const fd=openSync(staging,'wx',0o600);closeSync(fd);
+    try {
+      const candidate=new DatabaseSync(staging);
+      try { candidate.exec('PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;'); this.initializeNew(candidate); }
+      finally { candidate.close(); }
+      // A hard link publishes the committed database atomically and never replaces an existing one.
+      // Competing initializers discard only their own staging file and validate the winner normally.
+      try { linkSync(staging,this.file);return true; }
+      catch(error) { if((error as NodeJS.ErrnoException).code==='EEXIST')return false;throw error; }
+    } finally { try { unlinkSync(staging); } catch(error) { if((error as NodeJS.ErrnoException).code!=='ENOENT')throw error; } }
   }
   private assertSafeDatabasePaths() {
     for(const path of [this.file,`${this.file}-wal`,`${this.file}-shm`,`${this.file}-journal`]) {
@@ -81,7 +120,7 @@ export class ControlStore {
       } catch(e) { if((e as NodeJS.ErrnoException).code!=='ENOENT') throw e; }
     }
   }
-  private validateExistingSchema(db:DatabaseSync) {
+  private validateExistingSchema(db:DatabaseSync,validateRecords=true) {
     const tables=db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").all() as {name:string}[];
     if(!tables.some(t=>t.name==='control_schema')) {
       if(tables.length) throw new ControlStoreError('Unmarked control database contains existing tables','SCHEMA');
@@ -93,12 +132,12 @@ export class ControlStore {
     if(version>SCHEMA_VERSION) throw new ControlStoreError('Control schema is newer than this Pilot build','SCHEMA');
     if(version!==SCHEMA_VERSION) throw new ControlStoreError('Unsupported control schema version','SCHEMA');
     this.verifyTables(db);
-    this.validateStoredRecords(db);
+    if(validateRecords) this.validateStoredRecords(db);
   }
-  private initializeNew() {
-    this.db.exec('BEGIN IMMEDIATE');
+  private initializeNew(db:DatabaseSync) {
+    db.exec('BEGIN IMMEDIATE');
     try {
-      this.db.exec(`
+      db.exec(`
         CREATE TABLE control_schema(version INTEGER PRIMARY KEY CHECK(version = ${SCHEMA_VERSION}));
         CREATE TABLE operations(
           id TEXT PRIMARY KEY, project_id TEXT NOT NULL, session_id TEXT NOT NULL, idempotency_key TEXT NOT NULL,
@@ -111,11 +150,12 @@ export class ControlStore {
           session_id TEXT NOT NULL, kind TEXT NOT NULL, payload_json TEXT NOT NULL, state TEXT NOT NULL,
           revision INTEGER NOT NULL, receipt_json TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
         );
+        CREATE INDEX outboxes_operation_id ON outboxes(operation_id);
         INSERT INTO control_schema(version) VALUES (${SCHEMA_VERSION});
       `);
-      this.verifyTables(this.db);
-      this.db.exec('COMMIT');
-    } catch(e) { try{this.db.exec('ROLLBACK');}catch{} throw e; }
+      this.verifyTables(db);
+      db.exec('COMMIT');
+    } catch(e) { try{db.exec('ROLLBACK');}catch{} throw e; }
   }
   private verifyTables(db:DatabaseSync) {
     const expected:Record<string,Record<string,string>>={
@@ -156,9 +196,9 @@ export class ControlStore {
   }
   private validateStoredRecords(db:DatabaseSync) {
     const page=128;
-    let last=0;
+    let last:number|null=null;
     for(;;) {
-      const rows=db.prepare('SELECT rowid,* FROM operations WHERE rowid>? ORDER BY rowid LIMIT ?').all(last,page) as Record<string,unknown>[];
+      const rows=(last===null ? db.prepare('SELECT rowid,* FROM operations ORDER BY rowid LIMIT ?').all(page) : db.prepare('SELECT rowid,* FROM operations WHERE rowid>? ORDER BY rowid LIMIT ?').all(last,page)) as Record<string,unknown>[];
       if(!rows.length) break;
       for(const raw of rows) {
         last=raw.rowid as number;
@@ -168,13 +208,15 @@ export class ControlStore {
         const out=this.outboxRow(links[0])!;
         if(out.operationId!==op.id || out.projectId!==op.projectId || out.sessionId!==op.sessionId || out.receiptPresent!==op.receiptPresent || (op.receiptPresent && boundedJson(out.receipt)!==boundedJson(op.receipt)))
           throw new ControlStoreError('Corrupt operation/outbox linkage','CORRUPT');
+        if(operationDigest(op.kind,{input:op.input,outbox:{kind:out.kind,payload:out.payload}})!==op.inputDigest)
+          throw new ControlStoreError('Corrupt operation input digest','CORRUPT');
         if(out.state==='delivered' && !out.receiptPresent) throw new ControlStoreError('Delivered outbox has no receipt evidence','CORRUPT');
       }
       if(rows.length<page) break;
     }
-    last=0;
+    last=null;
     for(;;) {
-      const rows=db.prepare('SELECT rowid,* FROM outboxes WHERE rowid>? ORDER BY rowid LIMIT ?').all(last,page) as Record<string,unknown>[];
+      const rows=(last===null ? db.prepare('SELECT rowid,* FROM outboxes ORDER BY rowid LIMIT ?').all(page) : db.prepare('SELECT rowid,* FROM outboxes WHERE rowid>? ORDER BY rowid LIMIT ?').all(last,page)) as Record<string,unknown>[];
       if(!rows.length) break;
       for(const raw of rows) {
         last=raw.rowid as number;
@@ -224,6 +266,58 @@ export class ControlStore {
       receipt:row.receipt_json===null?null:parseJson(jsonText(row.receipt_json,'outbox receipt'),'outbox receipt'),receiptPresent:row.receipt_json!==null,createdAt:row.created_at,updatedAt:row.updated_at};
     try{return validateOutboxRecord(value);}catch(e){throw new ControlStoreError('Corrupt outbox record: '+(e as Error).message,'CORRUPT');}
   }
+  private actionResourceKey(value:unknown,scope:ControlScope):string|undefined {
+    if(!value || typeof value!=='object' || Array.isArray(value)) throw new Error('bad action');
+    const action=value as Record<string,unknown>;
+    if(typeof action.actionClass!=='string' || !(ACCEPTANCE_ACTION_CLASSES as readonly string[]).includes(action.actionClass)) throw new Error('bad class');
+    let resourceKey:string|undefined;
+    if(action.resourceKey!==undefined) {
+      if(typeof action.resourceKey!=='string' || !/^resource-[a-f0-9]{64}$/.test(action.resourceKey)) throw new Error('bad resource');
+      resourceKey=action.resourceKey;
+    }
+    if(action.actionClass==='deploy' || action.actionClass==='push') {
+      // Legacy keyless push intents cannot be safely associated with a branch. Reject resource
+      // admissions until their history has been reviewed; never silently invent a key for them.
+      if(resourceKey===undefined) throw new Error('missing resource');
+      const projectId=parseAgentIdentifier(action.projectId), targetId=parseAgentIdentifier(action.targetId);
+      for(const field of ['sessionId','agentId','evidenceId','acceptanceId']) parseAgentIdentifier(action[field]);
+      const artifact=parseArtifactIdentity(action.artifact), content=parseArtifactIdentity({revision:action.contentRevision,commit:artifact.commit});
+      if(projectId!==scope.projectId || scope.sessionId!=='accepted-actions' || !Number.isSafeInteger(action.targetRevision) || (action.targetRevision as number)<1 || typeof action.targetDigest!=='string' || !/^[a-f0-9]{64}$/.test(action.targetDigest)) throw new Error('bad intent');
+      const hash=createHash('sha256').update(JSON.stringify(['pilot-accepted-target-v2',projectId,action.actionClass,targetId,action.targetRevision,action.targetDigest,content.revision,content.commit])).digest('hex');
+      if(artifact.revision!=='action-'+hash) throw new Error('bad binding');
+    }
+    return resourceKey;
+  }
+  private assertPushTargetBinding(value:unknown,scope:ControlScope,resourceKey:string|undefined,historical:boolean):void {
+    const action=value as Record<string,unknown>, targets=new ActionTargetStore(this);
+    const target=historical
+      ? targets.readRevision(scope.projectId,String(action.targetId),action.targetRevision as number)
+      : targets.resolve(scope.projectId,String(action.targetId),action.targetRevision as number,'push');
+    if(!target.enabled || target.definition.kind!=='push' || action.targetDigest!==actionTargetFingerprint(target) || resourceKey!==pushResourceKey(target.definition.repositoryDigest,target.definition.branch)) throw new Error('target mismatch');
+  }
+  private assertResourceAvailable(resourceKey:string,scope:ControlScope,idempotencyKey:string) {
+    // Stream the complete history while holding the admission write lock. The scan remains
+    // intentionally global: corruption and legacy keyless push records must block every resource,
+    // and no validated index exists that could safely replace this check. Streaming avoids a
+    // page-sized row allocation and repeated query preparation; it does not bound scan time. Parse
+    // actual strings in JS so SQLite text operations cannot hide NULs.
+    const rows=this.db.prepare("SELECT rowid,* FROM operations WHERE kind='accepted.action' ORDER BY rowid").iterate() as Iterable<Record<string,unknown>>;
+    for(const raw of rows) {
+      const op=this.operationRow(raw)!;
+      let storedKey:string|undefined;
+      try {
+        storedKey=this.actionResourceKey(op.input,op);
+        if((op.input as {actionClass?:unknown})?.actionClass==='push') this.assertPushTargetBinding(op.input,op,storedKey,true);
+        const links=this.db.prepare('SELECT * FROM outboxes WHERE operation_id=? LIMIT 2').all(op.id) as Record<string,unknown>[];
+        if(links.length!==1) throw new Error('bad linkage');
+        const out=this.outboxRow(links[0])!;
+        if(out.projectId!==op.projectId || out.sessionId!==op.sessionId || operationDigest(op.kind,{input:op.input,outbox:{kind:out.kind,payload:out.payload}})!==op.inputDigest) throw new Error('bad digest');
+      }
+      catch { throw new ControlStoreError('An invalid historical action prevents resource admission.','INVALID'); }
+      if(storedKey===resourceKey && !(op.projectId===scope.projectId && op.sessionId===scope.sessionId && op.idempotencyKey===idempotencyKey))
+        throw new ControlStoreError('An action holds this resource; reconciliation is required before another effect.','INVALID');
+    }
+  }
   admit(input:Admission):{operation:OperationRecord;outbox:OutboxRecord;existing:boolean} {
     const scope=validateScope(input.scope);
     try {
@@ -231,14 +325,32 @@ export class ControlStore {
       if(!/^[a-z][a-z0-9.-]{0,79}$/.test(input.outbox.kind)) throw new Error('Invalid outbox kind');
       const digest=operationDigest(input.kind,{input:input.input,outbox:input.outbox}), inputJson=boundedJson(input.input);
       const payloadJson=boundedJson(input.outbox.payload);
+      let resourceKey:string|undefined;
+      if(input.kind==='accepted.action') {
+        try { resourceKey=this.actionResourceKey(input.input,scope); }
+        catch { throw new ControlStoreError('Invalid accepted action or canonical resource.','INVALID'); }
+      }
       return this.transaction(()=>{
+        if(input.kind==='accepted.action' && (input.input as {actionClass?:unknown})?.actionClass==='push') {
+          // Bind the barrier to the current, revision-checked target in the same writer transaction.
+          // The configured digest is still an assertion, not proof of external repository identity.
+          try { this.assertPushTargetBinding(input.input,scope,resourceKey,false); }
+          catch { throw new ControlStoreError('The push resource does not match its current configured target.','INVALID'); }
+        }
+        if(resourceKey!==undefined) this.assertResourceAvailable(resourceKey,scope,input.idempotencyKey);
+        const verdict=input.guard?.();
+        if(verdict && typeof (verdict as {then?:unknown}).then==='function'){void Promise.resolve(verdict).catch(()=>{});throw new Error('Admission guard must be synchronous');}
         const found=this.operationRow(this.db.prepare('SELECT * FROM operations WHERE project_id=? AND session_id=? AND idempotency_key=?').get(scope.projectId,scope.sessionId,input.idempotencyKey) as Record<string,unknown>|undefined);
         if(found) {
           if(found.inputDigest!==digest || found.kind!==input.kind) throw new ControlStoreError('Idempotency key was already used with different content','CONFLICT');
-          const out=this.outboxRow(this.db.prepare('SELECT * FROM outboxes WHERE operation_id=?').get(found.id) as Record<string,unknown>|undefined);
-          if(!out) throw new ControlStoreError('Operation has no corresponding outbox evidence','CORRUPT');
+          const links=this.db.prepare('SELECT * FROM outboxes WHERE operation_id=? LIMIT 2').all(found.id) as Record<string,unknown>[];
+          if(links.length!==1) throw new ControlStoreError('Operation has invalid outbox evidence','CORRUPT');
+          const out=this.outboxRow(links[0])!;
           if(out.operationId!==found.id || out.projectId!==scope.projectId || out.sessionId!==scope.sessionId)
             throw new ControlStoreError('Operation/outbox linkage is corrupt','CORRUPT');
+          if((out.state==='delivered'&&!out.receiptPresent) || found.receiptPresent!==out.receiptPresent || (found.receiptPresent&&canonicalJson(found.receipt)!==canonicalJson(out.receipt)) ||
+             operationDigest(found.kind,{input:found.input,outbox:{kind:out.kind,payload:out.payload}})!==found.inputDigest)
+            throw new ControlStoreError('Operation/outbox evidence is corrupt','CORRUPT');
           return {operation:found,outbox:out,existing:true};
         }
         const timestamp=now(), operationId=randomUUID(), outboxId=randomUUID();

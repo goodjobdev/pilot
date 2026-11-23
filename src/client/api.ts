@@ -3,16 +3,21 @@ import type { DocEntry,DocSnapshot } from '../shared/docs';
 import type { AgentView } from '../shared/agent';
 import type { ActionDescriptor,LiveActivity } from '../shared/actions';
 import type { AgentAuditEntry,AgentModelChoice,AgentRecord } from '../shared/agent-registry';
-import type { MediaView } from '../shared/images';
+import { ACCEPTED_IMAGE_TYPES, type ImageCapability, type MediaView } from '../shared/images';
+import type { AttentionByKind, AttentionCounts, AttentionItem, AttentionPage } from '../shared/attention';
+import type { ApprovalKind, ApprovalRecord, ApprovalScope, ApprovalState, ApprovalTarget } from '../shared/approvals';
+import type { WorkerLimits, WorkerRecord, WorkerRun, WorkerScope } from '../shared/workers';
 const token=document.querySelector<HTMLMetaElement>('meta[name="dashboard-token"]')?.content??'';
 let csrf='';
 export type ApiErrorKind = 'http' | 'session' | 'network';
-export class ApiError extends Error {constructor(public status:number,message:string,public kind:ApiErrorKind='http'){super(message);}}
+export class ApiError extends Error {constructor(public status:number,message:string,public kind:ApiErrorKind='http',public code?:string){super(message);}}
 /** True when the request was answered by the sign-in layer rather than the application. */
 export function isSessionExpired(error:unknown):boolean{return error instanceof ApiError&&error.kind==='session';}
 let onExpiry:(()=>void)|null=null;
 /** Registers a single handler so any request can report an expired session. */
 export function whenSessionExpires(handler:()=>void){onExpiry=handler;}
+/** Reports an expired sign-in found by a path that does not use `request` (the event stream). */
+export function reportSessionExpired(){onExpiry?.();}
 export async function request<T>(path:string,method='GET',data?:unknown,retried=false):Promise<T> {
   let res:Response;
   try{
@@ -36,7 +41,7 @@ export async function request<T>(path:string,method='GET',data?:unknown,retried=
     await session();
     return request<T>(path,method,data,true);
   }
-  if(!res.ok)throw new ApiError(res.status,value.error??'Request failed');
+  if(!res.ok)throw new ApiError(res.status,value.error??'Request failed','http',typeof value.code==='string'?value.code:undefined);
   return value as T;
 }
 let renewing:Promise<void>|undefined;
@@ -50,11 +55,20 @@ export type ActionScope={projectId?:string;sessionId?:string};
 export interface ActionListView{readOnly:true;scope:{projectId:string|null;sessionId:string|null};actions:ActionDescriptor[]}
 /** One execution: the id that ran and the handler's own result. */
 export interface ActionExecution{action:string;result:unknown}
+export interface TerminalInfo{id:string;projectId:string;projectName:string;cwd:string;createdAt:string;connected:boolean}
 /** One scope of the closed vocabulary, with the one line that describes what granting it would allow. */
 export interface AgentScopeOption{scope:string;description:string;installed:boolean}
 /** The registry as the server offers it: every agent, the vocabulary, the offered models and the switch. */
 export interface AgentRegistryView{agents:AgentRecord[];scopes:AgentScopeOption[];models:AgentModelChoice[];fileEdit:{enabled:boolean;mode:string|null}}
-export interface AgentDetailView{agent:AgentRecord;history:AgentAuditEntry[]}
+export interface AgentDetailView{agent:AgentRecord;history:AgentAuditEntry[];budgetUsage:{requestsAccounted:number}}
+/** One project's worker records, its runs, the owner policy and the fixed limits. */
+export interface WorkerView{
+  workers:WorkerRecord[];runs:WorkerRun[];
+  policy:{revision:number;allowedWorkerModels:{provider:string;modelId:string}[];defaultWorkerModel:{provider:string;modelId:string}|null}|null;
+  liveWorkers:number;activeRunId:string|null;limits:WorkerLimits;scopes:WorkerScope[];
+  /** Newest reports only, bounded: a changed or missing canonical file is reported, never hidden. */
+  reportIntegrity?:Record<string,{state:'intact'|'changed'|'missing'|'unsafe';expectedSha256:string;actualSha256:string|null;expectedBytes:number;actualBytes:number|null}>;
+}
 /** The actor a change is made by. The interface always declares the owner: it is the authenticated session. */
 export interface AgentActorBody{kind:'owner'|'agent';identity:string}
 /** The projects an agent may act in: every project explicitly, or a named set (never an empty one). */
@@ -80,17 +94,44 @@ export interface SessionBindingView{
   authority:{agentId:string|null;scopes:string[]|null;projects:string[]|null;emptyReason:string|null};
   agents:AgentRecord[];
 }
+export interface AcceptedActionHistoryView{projectId:string;truncated:boolean;nextBefore:string|null;items:{id:string;revision:number;actionClass:string;state:'uncertain'|'not-started'|'receipt-recorded';agentId:string;sessionId:string;targetId:string;targetRevision:number;artifact:{revision:string;commit:string|null};receiptCommit:string|null;createdAt:string;updatedAt:string}[]}
+export type ActionObservation='checked-uncertain'|'checked-no-effect-visible'|'checked-effect-visible';
+export interface ActionObservationsView{action:AcceptedActionHistoryView['items'][number];limit:number;reviews:{revision:number;actionRevision:number;actionState:string;observation:ActionObservation;observedBy:string;observedAt:string}[]}
 /** One recorded file edit, as the read side reports it, with the diff that proves it. */
 export interface FileEditRecordView{
   id:string;projectId:string;agentId:string|null;path:string;mode:'propose-only'|'auto-apply';
   applied:boolean;created:boolean;bytes:number;diff:string;diffBytes:number;diffTruncated:boolean;
   createdAt:string;changedBy:{kind:'owner'|'agent';identity:string};
 }
+/** One attention page. The exact count and the capped page are separate fields on purpose. */
+export interface AttentionView{
+  projectId:string;items:AttentionItem[];page:AttentionPage;count:AttentionCounts;
+  limits:{perPage:number;listedCap:number;policy:'proposed'};
+  sources:{questions:'read'|'empty'|'unavailable';approvals:'read'|'unavailable';lifecycle:'read'|'unavailable'};
+}
+export interface AttentionCountView{
+  projectId:string;count:AttentionCounts;
+  limits:{perPage:number;listedCap:number;policy:'proposed'};
+  sources:AttentionView['sources'];
+}
+export interface ApprovalView{
+  id:string;kind:ApprovalKind;scope:ApprovalScope;target:ApprovalTarget;issuedAt:string;expiresAt:string;
+  state:ApprovalState;consumedAt:string|null;consumedBy:string|null;revokedAt:string|null;
+}
 export interface FileEditLedgerView{
   readOnly:true;projectId:string;enabled:boolean;mode:'propose-only'|'auto-apply';
   limits:{fileBytes:number;diffBytes:number;edits:number};edits:FileEditRecordView[];truncated:boolean;
 }
+export interface CommitTargetView{
+  target:null|{revision:number;enabled:boolean;definition:{kind:'commit';repositoryId:string;branch:string}};
+  available:false;reason:string;
+}
 export const api={
+  actionHistory:(projectId:string,before?:string)=>request<AcceptedActionHistoryView>('/projects/'+projectId+'/action-history'+(before?'?before='+encodeURIComponent(before):'')),
+  actionObservations:(projectId:string,id:string)=>request<ActionObservationsView>('/projects/'+projectId+'/action-history/'+id+'/observations'),
+  recordActionObservation:(projectId:string,id:string,actionRevision:number,revision:number,observation:ActionObservation)=>request<ActionObservationsView>('/projects/'+projectId+'/action-history/'+id+'/observations','POST',{actionRevision,revision,observation}),
+  commitTarget:(projectId:string)=>request<CommitTargetView>('/projects/'+projectId+'/action-targets/commit'),
+  saveCommitTarget:(projectId:string,revision:number,enabled:boolean)=>request<CommitTargetView>('/projects/'+projectId+'/action-targets/commit','POST',{revision,enabled}),
   projects:()=>request<Project[]>('/projects'),
   register:(data:unknown)=>request<Project>('/projects','POST',data),
   board:(id:string)=>request<Snapshot>('/projects/'+id+'/board'),
@@ -107,16 +148,32 @@ export const api={
   subscribeAlerts:(body:{endpoint:string;keys:{p256dh:string;auth:string}})=>request<{count:number}>('/alerts/subscribe','POST',body),
   unsubscribeAlerts:(endpoint:string)=>request<{count:number}>('/alerts/unsubscribe','POST',{endpoint}),
   testAlert:()=>request<{sent:number;failed:number;skipped:boolean}>('/alerts/test','POST',{}),
-  agents:(id:string)=>request<{enabled:boolean;view:AgentView|null}>('/projects/'+id+'/agents'),
+  /**
+   * The agent view for one project and, optionally, one session. The response also carries the
+   * image capability of the model that session would dispatch under, or null when it cannot be read
+   * (for example a named session with no conversation yet). It is the same request that already
+   * opens the project harness; there is no separate capability route.
+   */
+  agents:(id:string,sessionId?:string)=>request<{enabled:boolean;view:AgentView|null;vision:ImageCapability|null}>('/projects/'+id+'/agents'+(sessionId?'?sessionId='+encodeURIComponent(sessionId):'')),
   /** A message carries text, the ids of stored images, or both. */
-  agentInput:(id:string,body:{text:string;mode:'followUp'|'steer'|'reject';requestId?:string;images?:string[]})=>request<{submissionId:string;queued:boolean}>('/projects/'+id+'/agents/input','POST',body),
-  agentAbort:(id:string)=>request<{ok:true}>('/projects/'+id+'/agents/abort','POST',{}),
-  agentAnswer:(id:string,body:{questionId:string;text:string})=>request<{submissionId:string}>('/projects/'+id+'/agents/answer','POST',body),
+  agentInput:(id:string,body:{text:string;mode:'followUp'|'steer'|'reject';requestId?:string;sessionId?:string;images?:string[]})=>request<{submissionId:string;queued:boolean}>('/projects/'+id+'/agents/input','POST',body),
+  agentAbort:(id:string,sessionId?:string)=>request<{ok:true}>('/projects/'+id+'/agents/abort','POST',{sessionId}),
+  agentAnswer:(id:string,body:{questionId:string;text:string;sessionId?:string})=>request<{submissionId:string}>('/projects/'+id+'/agents/answer','POST',body),
   /**
    * One image, through the upload path. The declared name and type travel with it but the server
    * decides what the bytes are; a refusal is answered with the server's own per-image reason and code.
    */
-  uploadImage:(id:string,body:{data:string;name?:string;declaredType?:string})=>request<{media:MediaView}>('/projects/'+id+'/agents/media','POST',body),
+  uploadImage:(id:string,body:{data:string;name?:string;declaredType?:string;sessionId?:string})=>request<{media:MediaView}>('/projects/'+id+'/agents/media','POST',body),
+
+  /**
+   * One attached file, or a long paste the interface decided to keep as a document, stored in the
+   * project's connected worktree. The message then names the path, so an agent reads it with its own
+   * contained read rather than the model being handed bytes it cannot take.
+   */
+  uploadAttachment:(id:string,body:{data:string;name:string})=>request<{attachment:{path:string;name:string;bytes:number}}>('/projects/'+id+'/agents/attachments','POST',body),
+  /** One session's thinking level; null returns it to the host default. */
+  agentThinking:(id:string,body:{thinkingLevel:string|null;sessionId?:string})=>request<unknown>('/projects/'+id+'/agents/thinking','POST',body),
+
   /**
    * The command registry, its live read-only projection and one action's execution. The registry is
    * the only source of what the palette may offer: nothing in the client hardcodes a capability.
@@ -127,8 +184,28 @@ export const api={
   /** The per-session agent binding: read the binding and its authority, or write one revision of it. */
   sessionBinding:(projectId:string,sessionId:string)=>request<SessionBindingView>('/sessions/'+encodeURIComponent(sessionId)+'/agent?projectId='+encodeURIComponent(projectId)),
   bindSession:(projectId:string,sessionId:string,body:{revision:number;agentId:string|null;actor:AgentActorBody})=>request<{binding:SessionBindingView['binding'];authority:SessionBindingView['authority']}>('/sessions/'+encodeURIComponent(sessionId)+'/agent','POST',{projectId,...body}),
+  /**
+   * The attention surface: a read-only projection of questions, approvals, failures and interrupted
+   * runs. Reading it opens no harness, changes nothing and sends no POST.
+   */
+  attention:(projectId:string,options:{cursor?:string|null;limit?:number}={})=>{
+    const query=new URLSearchParams();
+    if(options.cursor)query.set('cursor',options.cursor);
+    if(options.limit!==undefined)query.set('limit',String(options.limit));
+    const suffix=query.toString();
+    return request<AttentionView>('/projects/'+projectId+'/attention'+(suffix?'?'+suffix:''));
+  },
+  /** The exact open count, from its own query: it is never derived from the capped page. */
+  attentionCount:(projectId:string)=>request<AttentionCountView>('/projects/'+projectId+'/attention/count'),
+  /** One approval, consumed only when the owner reviewed its exact target. */
+  consumeApproval:(id:string,body:{scope:ApprovalScope;kind:ApprovalKind;target:ApprovalTarget;consumedBy:string})=>request<{approval:ApprovalRecord;target:ApprovalTarget}>('/approvals/'+encodeURIComponent(id)+'/consume','POST',body),
+  revokeApproval:(id:string,body:{scope:ApprovalScope;revokedBy:string;reason?:string|null})=>request<{approval:ApprovalRecord}>('/approvals/'+encodeURIComponent(id)+'/revoke','POST',body),
+  /** Owner acknowledgement after server verification. This records review and never dispatches. */
+  acknowledgeUncertainty:(projectId:string,sessionId:string,revision:number)=>request<{lifecycle:{state:string;revision:number;reason:string|null};dispatched:false;outcome:'acknowledged'}>('/sessions/'+encodeURIComponent(sessionId)+'/lifecycle/acknowledge-uncertainty','POST',{projectId,revision}),
+  /** One explicit lifecycle action. Only resume and retry can dispatch a model request. */
+  lifecycleAction:(projectId:string,sessionId:string,action:'reconnect'|'resume'|'retry'|'stop'|'pause',body:{revision:number;reason?:string})=>request<{lifecycle:{state:string;revision:number;reason:string|null};dispatched:boolean;cancelled:boolean;unchanged:boolean;outcome:'dispatched'|'cancelled'|'terminal'|'unchanged';reason:string|null}>('/sessions/'+encodeURIComponent(sessionId)+'/lifecycle/'+action,'POST',{projectId,...body}),
   /** A dismissal carries a reason and is recorded as its own durable entry, distinct from an answer. */
-  dismissQuestion:(projectId:string,body:{questionId:string;reason:string})=>request<{submissionId:string|null}>('/projects/'+projectId+'/agents/dismiss','POST',body),
+  dismissQuestion:(projectId:string,body:{questionId:string;reason:string;sessionId?:string})=>request<{submissionId:string|null}>('/projects/'+projectId+'/agents/dismiss','POST',body),
   actions:(scope:ActionScope={})=>{
     const query=new URLSearchParams();
     if(scope.projectId)query.set('projectId',scope.projectId);
@@ -136,13 +213,24 @@ export const api={
     const suffix=query.toString();
     return request<ActionListView>('/actions'+(suffix?'?'+suffix:''));
   },
-  actionActivity:(projectId:string)=>request<LiveActivity>('/actions/activity?projectId='+encodeURIComponent(projectId)),
+  actionActivity:(projectId:string,sessionId?:string)=>request<LiveActivity>('/actions/activity?projectId='+encodeURIComponent(projectId)+(sessionId?'&sessionId='+encodeURIComponent(sessionId):'')),
   /**
    * The agent registry and the bounded file-edit ledger. The interface reads and writes the same
    * authenticated routes as everything else and is never the enforcement point: every rule — the
    * closed vocabulary, the offered model, the workspace scope, the budgets and the governance
    * decision — is decided by the server, and a refusal arrives with the server's own words.
    */
+  /**
+   * Bounded, owner-created workers (W1). The interface is not the enforcement point: it reads the
+   * server's own view and limits, and every refusal arrives in the server's words. No call here
+   * accepts a report automatically, queues work or creates a worker as an agent.
+   */
+  workers:(projectId:string)=>request<WorkerView>('/projects/'+projectId+'/workers'),
+  createWorker:(projectId:string,body:{name:string;model?:{provider:string;modelId:string};scopes?:string[]})=>request<{worker:WorkerRecord}>('/projects/'+projectId+'/workers','POST',body),
+  revokeWorker:(projectId:string,workerId:string,revision:number)=>request<{worker:WorkerRecord;run:WorkerRun|null;cancelled:boolean;outcome:string}>('/projects/'+projectId+'/workers/'+encodeURIComponent(workerId)+'/revoke','POST',{revision}),
+  startWorkerRun:(projectId:string,workerId:string)=>request<{run:WorkerRun}>('/projects/'+projectId+'/workers/'+encodeURIComponent(workerId)+'/runs','POST',{}),
+  workerRun:(projectId:string,runId:string)=>request<{run:WorkerRun}>('/projects/'+projectId+'/workers/runs/'+encodeURIComponent(runId)),
+  stopWorkerRun:(projectId:string,runId:string)=>request<{run:WorkerRun;cancelled:boolean;unchanged:boolean;outcome:string}>('/projects/'+projectId+'/workers/runs/'+encodeURIComponent(runId)+'/stop','POST',{}),
   agentRegistry:()=>request<AgentRegistryView>('/agents'),
   agent:(id:string)=>request<AgentDetailView>('/agents/'+encodeURIComponent(id)),
   createAgent:(body:{draft:AgentDraftBody;actor:AgentActorBody})=>request<{agent:AgentRecord}>('/agents','POST',body),
@@ -151,15 +239,26 @@ export const api={
   fileEdits:(projectId:string)=>request<FileEditLedgerView>('/projects/'+projectId+'/file-edits'),
   writeFileEdit:(projectId:string,body:{request:{agentId:string|null;path:string;content:string;mode?:'propose-only'|'auto-apply'};actor:AgentActorBody})=>request<{edit:FileEditRecordView;written:boolean}>('/projects/'+projectId+'/file-edits','POST',body),
   runAction:(id:string,body:{params?:Record<string,unknown>;scope?:ActionScope}={})=>request<ActionExecution>('/actions/execute','POST',{id,...body}),
+  terminalPreview:()=>request<{controlOrigin:string|null}>('/terminal-preview'),
+  terminals:(projectId:string)=>request<{terminals:TerminalInfo[]}>('/projects/'+encodeURIComponent(projectId)+'/terminals'),
+  openTerminal:(projectId:string,body:{cols:number;rows:number})=>request<{terminal:TerminalInfo}>('/projects/'+encodeURIComponent(projectId)+'/terminals','POST',body),
+  terminalTicket:(projectId:string,terminalId:string)=>request<{ticket:string}>('/terminals/'+encodeURIComponent(terminalId)+'/ticket','POST',{projectId}),
+  closeTerminal:(projectId:string,terminalId:string)=>request<{closed:boolean}>('/terminals/'+encodeURIComponent(terminalId),'DELETE',{projectId}),
 };
 export function assetUrl(id:string,path:string){return '/api/projects/'+id+'/docs/asset?path='+encodeURIComponent(path);}
 /**
  * Stored media is served owner-only, so it is fetched with the session header and shown as a blob
  * URL: an <img src> request cannot carry that header. The URL is the caller's to revoke.
  */
-export async function mediaBlobUrl(id:string):Promise<string>{
-  const res=await fetch('/api/media/'+id,{headers:{'x-dashboard-token':token}});
+export async function mediaBlobUrl(id:string,signal?:AbortSignal):Promise<string>{
+  const res=await fetch('/api/media/'+encodeURIComponent(id),{redirect:'manual',headers:{'x-dashboard-token':token},signal});
+  if(res.type==='opaqueredirect'||res.status===0||(res.status>=300&&res.status<400)){
+    reportSessionExpired();
+    throw new ApiError(res.status,'Your sign-in has expired. Reload to view the attachment.','session');
+  }
   if(!res.ok)throw new ApiError(res.status,'Image unavailable');
+  const mime=res.headers.get('content-type')?.split(';',1)[0].trim().toLowerCase();
+  if(!(ACCEPTED_IMAGE_TYPES as readonly string[]).includes(mime??''))throw new ApiError(res.status,'Image unavailable');
   return URL.createObjectURL(await res.blob());
 }
 /**
@@ -179,32 +278,6 @@ export async function assetBlobUrl(id:string,path:string):Promise<string>{
 export async function assetText(id:string,path:string):Promise<string>{
   const res=await assetResponse(id,path);
   return res.text();
-}
-/**
- * Reads the agent view as server-sent events.
- *
- * EventSource cannot send the dashboard session header, so the same frames are
- * read from a streaming fetch instead; in hosted mode Cloudflare supplies the
- * Access assertion for this same-origin request.
- */
-export async function agentStream(id:string,onView:(view:AgentView)=>void,signal:AbortSignal,sessionId?:string):Promise<void>{
-  const qs=sessionId?'?sessionId='+encodeURIComponent(sessionId):'';
-  const res=await fetch('/api/projects/'+id+'/agents/stream'+qs,{headers:{'x-dashboard-token':token},signal});
-  if(!res.ok||!res.body)throw new ApiError(res.status,'Agent stream unavailable');
-  const reader=res.body.getReader(),decoder=new TextDecoder();
-  let buffer='';
-  for(;;){
-    const {value,done}=await reader.read();
-    if(done)return;
-    buffer+=decoder.decode(value,{stream:true});
-    const frames=buffer.split('\n\n');
-    buffer=frames.pop()??'';
-    for(const frame of frames){
-      const line=frame.split('\n').find(entry=>entry.startsWith('data: '));
-      if(!line)continue;
-      try{onView(JSON.parse(line.slice(6)) as AgentView);}catch{/* a malformed frame is ignored, the next one still applies */}
-    }
-  }
 }
 export function download(name:string,text:string,type='text/plain'){
  const url=URL.createObjectURL(new Blob([text],{type})),a=document.createElement('a');a.href=url;a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);

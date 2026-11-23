@@ -1,0 +1,27 @@
+{
+  "name": "pilot-docs",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "packageManager": "pnpm@12.10.1",
+  "scripts": {
+    "prepare": "node prepare.mjs",
+    "dev": "node prepare.mjs && astro dev --host 127.0.0.1",
+    "check": "node prepare.mjs && astro check",
+    "build": "node prepare.mjs && astro build && node validate.mjs",
+    "test": "node --test test/*.test.mjs",
+    "preview": "astro preview --host 127.0.0.1"
+  },
+  "dependencies": {
+    "astro": "7.4.5",
+    "@astrojs/starlight": "0.42.8",
+    "@astrojs/markdown-remark": "7.3.5",
+    "yaml": "2.9.1"
+  },
+  "devDependencies": {
+    "@astrojs/check": "0.9.12",
+    "typescript": "5.9.3"
+  }
+}

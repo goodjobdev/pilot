@@ -9,6 +9,7 @@ import {fauxProvider,fauxAssistantMessage,fauxToolCall} from '@earendil-works/pi
 import type {Provider} from '@earendil-works/pi-ai';
 import type {Project} from '../../src/shared/model';
 import {randomUUID} from 'node:crypto';
+import { MAX_OUTPUT_TOKENS_DEFAULT } from '../../src/shared/harness-settings';
 const root=()=>mkdtemp(join(tmpdir(),'pilot-providers-'));
 async function eventually(check:()=>Promise<boolean>){for(let i=0;i<100;i++){if(await check())return;await new Promise(ok=>setTimeout(ok,25));}throw Error('Timed out');}
 
@@ -102,7 +103,9 @@ test('UI-driven login prompts are one-use, cancellable, and never return stored 
 
 test('real-model selection drives the harness with explicit opt-in, persists, and never falls back to faux',async()=>{
  const directory=await root(),fake=fauxProvider({provider:'test-real',models:[{id:'test-model'}]});
- fake.setResponses([(_context,options)=>{assert.equal(options?.maxTokens,4096);return fauxAssistantMessage('Selected provider reply');}]);
+ // The request carries the instance's own output bound, which is what the person can change in
+ // Harness settings; it is no longer a hard 4,096 for every model.
+ fake.setResponses([(_context,options)=>{assert.equal(options?.maxTokens,MAX_OUTPUT_TOKENS_DEFAULT);return fauxAssistantMessage('Selected provider reply');}]);
  const store=new ProviderStore(directory,[fake.provider]),host=new HarnessHost({dataRoot:directory,enabled:true,providers:store});
  const project:Project={id:randomUUID(),name:'Disposable',managed:true,path:directory,repository:'',created:new Date().toISOString()};
  try{
@@ -123,15 +126,40 @@ test('real-model selection drives the harness with explicit opt-in, persists, an
  }finally{await host.close();await store.close();}
 });
 
-test('model policy stops a tool loop at eight requests',async()=>{
+test('model policy stops a tool loop at the configured request bound',async()=>{
  const directory=await root(),fake=fauxProvider({provider:'test-real',models:[{id:'loop'}]});
  fake.setResponses(Array.from({length:12},()=>()=>fauxAssistantMessage([fauxToolCall('read_notes',{})],{stopReason:'toolUse'})));
- const store=new ProviderStore(directory,[fake.provider]),host=new HarnessHost({dataRoot:directory,enabled:true,providers:store});
+ // The instance's own bound, stated to the harness: the loop is stopped at it rather than at a
+ // number baked into the harness, and the refusal names it.
+ const store=new ProviderStore(directory,[fake.provider]),host=new HarnessHost({dataRoot:directory,enabled:true,providers:store,maxModelTurns:8});
  const project:Project={id:randomUUID(),name:'Loop',managed:true,path:directory,repository:'',created:new Date().toISOString()};
  try{
   await store.savePreferences({defaultModel:{provider:'test-real',modelId:'loop'},favourites:[],allowRealModels:true});
   await host.submit(project,{text:'bounded loop',mode:'followUp'});
   await eventually(async()=>fake.state.callCount>=8&&!(await host.view(project)).working);
   assert.equal(fake.state.callCount,8);
+ }finally{await host.close();await store.close();}
+});
+
+test('the owner can change the model request limit without restarting the harness',async()=>{
+ const directory=await root(),fake=fauxProvider({provider:'test-real',models:[{id:'dynamic-loop'}]});
+ fake.setResponses(Array.from({length:12},()=>()=>fauxAssistantMessage([fauxToolCall('read_notes',{})],{stopReason:'toolUse'})));
+ const store=new ProviderStore(directory,[fake.provider]);let limit=2;
+ const host=new HarnessHost({dataRoot:directory,enabled:true,providers:store,maxModelTurns:8,currentMaxModelTurns:async()=>limit});
+ const project:Project={id:randomUUID(),name:'Dynamic limit',managed:true,path:directory,repository:'',created:new Date().toISOString()};
+ try{
+  await store.savePreferences({defaultModel:{provider:'test-real',modelId:'dynamic-loop'},favourites:[],allowRealModels:true});
+  await host.submit(project,{text:'first bounded loop',mode:'followUp'});
+  await eventually(async()=>fake.state.callCount>=2&&!(await host.view(project)).working);
+  assert.equal(fake.state.callCount,2);
+  limit=4;
+  await host.submit(project,{text:'second bounded loop',mode:'followUp'});
+  await eventually(async()=>fake.state.callCount>=6&&!(await host.view(project)).working);
+  assert.equal(fake.state.callCount,6);
+  limit=0;
+  fake.setResponses([...Array.from({length:5},()=>()=>fauxAssistantMessage([fauxToolCall('read_notes',{})],{stopReason:'toolUse'})),()=>fauxAssistantMessage('Unlimited run finished')]);
+  await host.submit(project,{text:'continuous run',mode:'followUp'});
+  await eventually(async()=>!(await host.view(project)).working&&(await host.view(project)).entries.some(e=>e.text==='Unlimited run finished'));
+  assert.equal(fake.state.callCount,12);
  }finally{await host.close();await store.close();}
 });

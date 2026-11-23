@@ -14,8 +14,12 @@ touches a real project. It is deliberately narrow:
 | Logs | json-file, 10 MiB x 3 |
 
 The image contains the built client, the bundled server and production
-dependencies only. Nothing in it can start the agent harness yet; that arrives
-with the next phase and inherits the same boundaries.
+dependencies only. Its pnpm package-manager cache is provisioned at `/data/pnpm` on
+the writable data volume, owned by UID 10001. This lets terminal commands honor a
+project's `packageManager` pin (the image's bootstrap pnpm is not a substitute for
+the project's pinned version) without writing to the read-only image filesystem.
+Nothing in it can start the agent harness yet; that arrives with the next phase and
+inherits the same boundaries.
 
 ## Use
 
@@ -44,6 +48,8 @@ docker inspect pi-workspace-pilot --format '{{.Config.User}} {{.HostConfig.Reado
 docker port pi-workspace-pilot                     # must show 127.0.0.1 only
 docker exec pi-workspace-pilot id                  # must show uid 10001, never 0
 docker exec pi-workspace-pilot sh -c 'test ! -e /var/run/docker.sock && echo "no docker socket"'
+# Optional production-like packageManager resolution smoke (requires Docker/network):
+# deploy/pilot/pnpm-store-smoke.sh pi-workspace-pilot:local
 curl -fsS -H 'Host: pilot-dashboard.example.com' http://127.0.0.1:4319/healthz   # the origin host, not 127.0.0.1
 curl -s -o /dev/null -w '%{http_code}\n' -H 'Host: pilot-dashboard.example.com' http://127.0.0.1:4319/api/projects   # 401 without a session
 ```
