@@ -2,12 +2,15 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { ROOT_CONVERSATION_ID } from '@earendil-works/pi-durable';
+import { fauxAssistantMessage, fauxProvider, fauxToolCall } from '@earendil-works/pi-ai/providers/faux';
+import { ProviderStore } from '../../src/server/providers';
 import { ControlStore } from '../../src/server/state/control-store';
+import { ForkActivityUncertain } from '../../src/server/state/fork-activity-uncertain';
 import { SessionRegistry, createSessionResourcePort } from '../../src/server/state/session-registry';
 import { ApprovalStore } from '../../src/server/state/approval-store';
 import { AcceptanceStore } from '../../src/server/state/acceptance-store';
@@ -63,7 +66,7 @@ async function waitFor<T>(read: () => Promise<T | undefined>, timeoutMs = 15_000
   const deadline = Date.now() + timeoutMs;
   for (;;) {
     const value = await read();
-    if (value !== undefined) return value;
+    if (value !== undefined && value !== false) return value;
     if (Date.now() > deadline) throw new Error('the condition was not met in time');
     await new Promise((resolve) => setTimeout(resolve, 20));
   }
@@ -140,8 +143,13 @@ async function fixture(): Promise<Fixture> {
     projectFolder: (id) => projects.get(id)?.path,
     forkRootParent: join(data, FORK_ROOT_DIRECTORY),
     worktrees: createForkWorktreePort(),
+    allowUnpinnedRemovalForTests: true,
     transcripts,
-    sessions
+    sessions,
+    assertQuiescent: async (projectId, childSessionId) => {
+      const view = await agents.sessionView(projectOf(projectId), childSessionId);
+      if (!view || view.working || view.inbox.length) throw new ForkError('The child is not quiescent.', 'CONFLICT');
+    }
   };
   const forks = new ForkStore(store, forkOptions);
   const approvals = new ApprovalStore(store);
@@ -207,6 +215,353 @@ async function createForkFor(f: Fixture, subject: Subject, cutoffEntryId: number
 async function createFork(f: Fixture, cutoffEntryId: number, overrides: { target?: unknown; baseCommit?: string } = {}): Promise<ForkRecord> {
   return await createForkFor(f, { project: f.project, repo: f.repo, baseCommit: f.baseCommit, parentSessionId: f.parentSessionId }, cutoffEntryId, overrides);
 }
+
+test('creation fences an unrecorded child and a competing creation until the fork record is durable', async () => {
+  const f = await fixture();
+  let release!: () => void;
+  const barrier = new Promise<void>(resolve => { release = resolve; });
+  try {
+    await parentSubmit(f, 'creation fence');
+    const cutoffEntryId = (await parentEntries(f))[0].id;
+    let childId: string | undefined, entered = false;
+    const base = f.forkOptions;
+    const forks = new ForkStore(f.store, { ...base,
+      transcripts: { ...base.transcripts, fork: async input => { const child = await base.transcripts.fork(input); childId = child.childSessionId; return child; } },
+      worktrees: { ...base.worktrees, create: async input => { entered = true; await barrier; await base.worktrees.create(input); } }
+    });
+    const input = { projectId: f.project.id, parentSessionId: f.parentSessionId, baseCommit: f.baseCommit, cutoffEntryId };
+    const creating = forks.create(input);
+    await waitFor(async () => entered && childId ? true : undefined);
+    assert.ok(childId); assert.equal(forks.read(f.project.id, childId), null);
+    assert.throws(() => forks.assertCreationDispatchable(f.project.id, childId!), /requires operator review/);
+    assert.doesNotThrow(() => forks.assertCreationDispatchable(f.project.id, f.parentSessionId));
+    assert.doesNotThrow(() => forks.assertCreationDispatchable(f.second.project.id, childId!));
+    await forkRefusal(forks.create(input), 'CONFLICT');
+    release();
+    const created = await creating;
+    assert.equal(created.fork.state, 'paused');
+    assert.doesNotThrow(() => forks.assertCreationDispatchable(f.project.id, childId!));
+  } finally { release(); await f.cleanup(); }
+});
+
+test('a creation rechecks target ownership under the project fence before making a transcript', async () => {
+  const f = await fixture(); let release!: () => void;
+  const barrier = new Promise<void>(resolve => { release = resolve; });
+  const second = new ControlStore(f.data), delayed = new ForkStore(second, f.forkOptions);
+  try {
+    await parentSubmit(f, 'competing target'); const cutoffEntryId = (await parentEntries(f))[0].id;
+    const access = delayed as unknown as { assertTargetFree(project: string, root: string, target: string): Promise<void> };
+    const original = access.assertTargetFree.bind(delayed); let paused = false;
+    access.assertTargetFree = async (...args) => { await original(...args); if (!paused) { paused = true; await barrier; } };
+    const input = { projectId: f.project.id, parentSessionId: f.parentSessionId, baseCommit: f.baseCommit, cutoffEntryId, target: 'shared-target' };
+    const losing = delayed.create(input);
+    await waitFor(async () => paused ? true : undefined);
+    const winner = await f.forks.create(input); assert.equal(winner.created, true);
+    release(); await forkRefusal(losing, 'CONFLICT');
+    assert.equal(f.forks.list(f.project.id).length, 1);
+    assert.equal(await exists(winner.fork.worktreePath), true);
+  } finally { release(); second.close(); await f.cleanup(); }
+});
+
+test('a cached fork root replaced by a symlink is refused before creating another child', async () => {
+  const f = await fixture();
+  try {
+    await parentSubmit(f, 'root replacement'); const cutoffEntryId = (await parentEntries(f))[0].id;
+    const first = await createFork(f, cutoffEntryId); const root = dirname(first.worktreePath);
+    const replacement = join(f.root, 'replacement-root'); await mkdir(replacement);
+    await rename(root, root + '-moved'); await symlink(replacement, root);
+    await forkRefusal(f.forks.create({ projectId: f.project.id, parentSessionId: f.parentSessionId, baseCommit: f.baseCommit, cutoffEntryId, target: 'unexpected' }), 'OUTSIDE_ROOT');
+    assert.deepEqual(await readdir(replacement), []);
+  } finally { await f.cleanup(); }
+});
+
+test('failed creations and replaced worktree identities never authorize forced deletion', async () => {
+  const f = await fixture();
+  try {
+    await parentSubmit(f, 'ownership proof'); const cutoffEntryId = (await parentEntries(f))[0].id;
+    const failing = new ForkStore(f.store, { ...f.forkOptions, worktrees: { ...f.forkOptions.worktrees, create: async ({ path }) => { await mkdir(path); await writeFile(join(path, 'sentinel.txt'), 'unowned'); throw Error('lost creation result'); } } });
+    const failed = await failing.create({ projectId: f.project.id, parentSessionId: f.parentSessionId, baseCommit: f.baseCommit, cutoffEntryId, target: 'unowned' });
+    assert.equal(failed.created, false);
+    await forkRefusal(failing.discard({ projectId: f.project.id, childSessionId: failed.fork.childSessionId, revision: failed.fork.revision, force: true }), 'CONFLICT');
+    assert.equal(await readFile(join(failed.fork.worktreePath, 'sentinel.txt'), 'utf8'), 'unowned');
+    const valid = await createFork(f, cutoffEntryId, { target: 'owned' });
+    await rename(valid.worktreePath, valid.worktreePath + '-moved'); await mkdir(valid.worktreePath); await writeFile(join(valid.worktreePath, 'sentinel.txt'), 'replacement');
+    await forkRefusal(f.forks.discard({ projectId: f.project.id, childSessionId: valid.childSessionId, revision: valid.revision, force: true }), 'CONFLICT');
+    assert.equal(await readFile(join(valid.worktreePath, 'sentinel.txt'), 'utf8'), 'replacement');
+  } finally { await f.cleanup(); }
+});
+
+test('an uncertain transcript fork keeps the creation fence held across store reopen', async () => {
+  const f = await fixture();
+  try {
+    await parentSubmit(f, 'uncertain creation');
+    const cutoffEntryId = (await parentEntries(f))[0].id;
+    let childId: string | undefined;
+    const base = f.forkOptions;
+    const forks = new ForkStore(f.store, { ...base, transcripts: { ...base.transcripts, fork: async input => { childId = (await base.transcripts.fork(input)).childSessionId; throw Error('lost transcript receipt'); } } });
+    await forkRefusal(forks.create({ projectId: f.project.id, parentSessionId: f.parentSessionId, baseCommit: f.baseCommit, cutoffEntryId }), 'UNAVAILABLE');
+    assert.ok(childId);
+    const reopenedStore = new ControlStore(f.data);
+    try {
+      const reopened = new ForkStore(reopenedStore, base);
+      assert.throws(() => reopened.assertCreationDispatchable(f.project.id, childId!), /requires operator review/);
+    } finally { reopenedStore.close(); }
+  } finally { await f.cleanup(); }
+});
+
+test('discard fences dispatch and competing lifecycle changes while quiescence is checked', async () => {
+  const f = await fixture(); let release!: () => void;
+  const barrier = new Promise<void>(resolve => { release = resolve; });
+  try {
+    await parentSubmit(f, 'discard fence');
+    const fork = await createFork(f, (await parentEntries(f))[0].id);
+    let checking = false;
+    const forks = new ForkStore(f.store, { ...f.forkOptions, assertQuiescent: async (projectId, childSessionId) => {
+      checking = true; await barrier; await f.forkOptions.assertQuiescent!(projectId, childSessionId);
+    } });
+    const input = { projectId: f.project.id, childSessionId: fork.childSessionId, revision: fork.revision };
+    const discarding = forks.discard(input);
+    await waitFor(async () => checking ? true : undefined);
+    assert.throws(() => forks.assertCreationDispatchable(f.project.id, fork.childSessionId), /cannot dispatch/);
+    await forkRefusal(forks.resume(input), 'CONFLICT');
+    await forkRefusal(forks.dispatchChild({parentSessionId:f.parentSessionId,  projectId: f.project.id, childSessionId: fork.childSessionId, text: 'should not run' , invocationId: 'fixture-1'}), 'CONFLICT');
+    assert.equal(await exists(fork.worktreePath), true);
+    release();
+    const discarded = await discarding;
+    assert.equal(discarded.fork.state, 'discarded');
+  } finally { release(); await f.cleanup(); }
+});
+
+test('an awaited child tool fences discard across store connections and preserves sibling isolation', async () => {
+  const f = await fixture(); let release!: () => void;
+  const barrier = new Promise<void>(resolve => { release = resolve; });
+  let entered = false;
+  const otherStore = new ControlStore(f.data), other = new ForkStore(otherStore, f.forkOptions);
+  try {
+    await parentSubmit(f, 'tool lifecycle fence');
+    const fork = await createFork(f, (await parentEntries(f))[0].id);
+    const { fork: active } = await f.forks.resume({ projectId: f.project.id, childSessionId: fork.childSessionId, revision: fork.revision });
+    const running = f.forks.withToolFence(f.project.id, fork.childSessionId, async () => {
+      entered = true;
+      assert.doesNotThrow(() => f.forks.assertCreationDispatchable(f.project.id, fork.childSessionId));
+      await f.forks.withToolFence(f.project.id, fork.childSessionId, async () => { f.forks.assertCreationDispatchable(f.project.id, fork.childSessionId); });
+      await barrier;
+      assert.equal(await exists(fork.worktreePath), true);
+    });
+    await waitFor(async () => entered ? true : undefined);
+    assert.throws(() => other.assertCreationDispatchable(f.project.id, fork.childSessionId), /cannot dispatch/);
+    assert.doesNotThrow(() => other.assertCreationDispatchable(f.second.project.id, fork.childSessionId));
+    assert.doesNotThrow(() => other.assertCreationDispatchable(f.project.id, f.parentSessionId));
+    await forkRefusal(other.discard({ projectId: f.project.id, childSessionId: fork.childSessionId, revision: active.revision }), 'CONFLICT');
+    let competingStarted = false;
+    await forkRefusal(other.withToolFence(f.project.id, fork.childSessionId, async () => { competingStarted = true; }), 'CONFLICT');
+    assert.equal(competingStarted, false);
+    release(); await running;
+    assert.doesNotThrow(() => other.assertCreationDispatchable(f.project.id, fork.childSessionId));
+    await forkRefusal(other.discard({ projectId: f.project.id, childSessionId: fork.childSessionId, revision: active.revision }), 'UNAVAILABLE');
+    assert.equal(other.read(f.project.id, fork.childSessionId)!.state, 'active');
+  } finally { release(); otherStore.close(); await f.cleanup(); }
+});
+
+test('provider and model tool activity fence discard and write only to the fork worktree', async () => {
+  const f = await fixture(); let release!: () => void, releaseProvider!: () => void;
+  const barrier = new Promise<void>(resolve => { release = resolve; });
+  const providerBarrier = new Promise<void>(resolve => { releaseProvider = resolve; });
+  const fake = fauxProvider({ provider: 'fork-write-faux', models: [{ id: 'fixture' }] });
+  const hostRoot = join(f.root, 'fork-host'); await mkdir(hostRoot);
+  const providers = new ProviderStore(hostRoot, [fake.provider]);
+  await providers.savePreferences({ defaultModel: { provider: 'fork-write-faux', modelId: 'fixture' }, favourites: [], allowRealModels: true });
+  let entered = false, gated = false, providerEntered = false, acceptanceCalls = 0, forkDisclosure = false;
+  const host = new HarnessHost({ dataRoot: f.data, enabled: true, providers,
+    privileges: { authority: async () => ({ agentId: 'agent', model: null, scopes: ['file_write', 'record_note', 'accept'], projects: [f.project.id], emptyReason: null }) },
+    acceptanceTools: { read: projectId => f.acceptance.readProject({ projectId }), accept: async () => { acceptanceCalls++; throw Error('must not accept'); } },
+    sessionGate: (projectId, sessionId) => { f.forks.assertCreationDispatchable(projectId, sessionId); const current = f.forks.read(projectId, sessionId); if (current && current.state !== 'active') throw Error('fork not active'); },
+    withSessionTool: (projectId, sessionId, work) => f.forks.withToolFence(projectId, sessionId, async () => { if (!gated) { gated = true; entered = true; await barrier; } return work(); }),
+    withSessionProvider: (projectId, sessionId, work) => f.forks.withToolFence(projectId, sessionId, work),
+    coding: { enabled: true, shell: false, root: () => f.repo, isFork: (projectId, sessionId) => f.forks.read(projectId, sessionId) !== null,
+      sessionRoot: async (projectId, sessionId) => f.forks.read(projectId, sessionId)?.worktreePath ?? f.repo }
+  });
+  try {
+    await parentSubmit(f, 'forked coding');
+    const fork = await createFork(f, (await parentEntries(f))[0].id);
+    const { fork: active } = await f.forks.resume({ projectId: f.project.id, childSessionId: fork.childSessionId, revision: fork.revision });
+    await host.setModel(f.project, { provider: 'fork-write-faux', modelId: 'fixture' }, fork.childSessionId);
+    fake.setResponses([async context => { providerEntered = true; forkDisclosure = JSON.stringify(context).includes('This is a fork: parent-workspace'); await providerBarrier; return fauxAssistantMessage([fauxToolCall('write', { path: 'child.txt', content: 'child only' })], { stopReason: 'toolUse' }); }, () => fauxAssistantMessage('Fork write finished.')]);
+    await host.submit(f.project, { sessionId: fork.childSessionId, text: 'write child file', mode: 'followUp' });
+    await waitFor(async () => providerEntered ? true : undefined);
+    assert.equal(forkDisclosure, true);
+    await forkRefusal(f.forks.discard({ projectId: f.project.id, childSessionId: fork.childSessionId, revision: active.revision }), 'CONFLICT');
+    releaseProvider();
+    await waitFor(async () => entered ? true : undefined);
+    await forkRefusal(f.forks.discard({ projectId: f.project.id, childSessionId: fork.childSessionId, revision: active.revision }), 'CONFLICT');
+    assert.equal(await exists(join(fork.worktreePath, 'child.txt')), false);
+    release();
+    await waitFor(async () => (await host.sessionView(f.project, fork.childSessionId))?.entries.some(entry => entry.text.includes('Fork write finished.')) ? true : undefined);
+    assert.equal(await readFile(join(fork.worktreePath, 'child.txt'), 'utf8'), 'child only');
+    assert.equal(await exists(join(f.repo, 'child.txt')), false);
+    fake.setResponses([() => fauxAssistantMessage([fauxToolCall('record_note', { text: 'must not write parent' })], { stopReason: 'toolUse' }), () => fauxAssistantMessage('Parent tool refused.')]);
+    await host.submit(f.project, { sessionId: fork.childSessionId, text: 'try parent tool', mode: 'followUp' });
+    await waitFor(async () => (await host.sessionView(f.project, fork.childSessionId))?.entries.some(entry => entry.text.includes('Parent tool refused.')) ? true : undefined);
+    const view = await host.sessionView(f.project, fork.childSessionId);
+    assert.match(JSON.stringify(view?.entries), /targets the parent project workspace/);
+    assert.equal(await exists(join(f.repo, 'docs', 'notes.md')), false);
+    fake.setResponses([() => fauxAssistantMessage([fauxToolCall('acceptance_accept', { evidenceId: 'evidence', artifact: { revision: 'revision', commit: null }, actionClass: 'commit' })], { stopReason: 'toolUse' }), () => fauxAssistantMessage('Parent acceptance refused.')]);
+    await host.submit(f.project, { sessionId: fork.childSessionId, text: 'try parent acceptance', mode: 'followUp' });
+    await waitFor(async () => (await host.sessionView(f.project, fork.childSessionId))?.entries.some(entry => entry.text.includes('Parent acceptance refused.')) ? true : undefined);
+    assert.equal(acceptanceCalls, 0);
+  } finally { releaseProvider(); release(); await host.close(); await providers.close(); await f.cleanup(); }
+});
+
+test('cancellation waits for an outstanding child tool, and an interrupted reservation survives reopen', async () => {
+  const f = await fixture(); let finish!: () => void;
+  const barrier = new Promise<void>(resolve => { finish = resolve; });
+  try {
+    await parentSubmit(f, 'tool cancellation');
+    const fork = await createFork(f, (await parentEntries(f))[0].id);
+    const { fork: active } = await f.forks.resume({ projectId: f.project.id, childSessionId: fork.childSessionId, revision: fork.revision });
+    const controller = new AbortController(); let entered = false;
+    const running = f.forks.withToolFence(f.project.id, fork.childSessionId, async () => { entered = true; await barrier; controller.signal.throwIfAborted(); });
+    await waitFor(async () => entered ? true : undefined); controller.abort();
+    await forkRefusal(f.forks.discard({ projectId: f.project.id, childSessionId: fork.childSessionId, revision: active.revision }), 'CONFLICT');
+    f.store.close(); finish(); await assert.rejects(running);
+    const reopenedStore = new ControlStore(f.data);
+    try {
+      const reopened = new ForkStore(reopenedStore, f.forkOptions);
+      assert.throws(() => reopened.assertCreationDispatchable(f.project.id, fork.childSessionId), /operator review/);
+      await forkRefusal(reopened.withToolFence(f.project.id, fork.childSessionId, async () => {}), 'CONFLICT');
+    } finally { reopenedStore.close(); }
+  } finally { finish(); await f.cleanup(); }
+});
+
+test('a real child harness abort of a hanging provider result retains the fence',async()=>{
+ const f=await fixture(),fake=fauxProvider({provider:'fork-hanging-result',models:[{id:'fixture'}]});let entered:()=>void=()=>{},providerSettled=false;const seen=new Promise<void>(resolve=>entered=resolve);
+ const provider={...fake.provider,streamSimple:(()=>({[Symbol.asyncIterator](){return {async next(){return {done:true,value:undefined};},async return(){return {done:true,value:undefined};}};},result(){entered();return new Promise(()=>{});}})) as unknown as typeof fake.provider.streamSimple};
+ const hostRoot=join(f.root,'hanging-host');await mkdir(hostRoot);const providers=new ProviderStore(hostRoot,[provider]);await providers.savePreferences({defaultModel:{provider:'fork-hanging-result',modelId:'fixture'},favourites:[],allowRealModels:true});
+ const host=new HarnessHost({dataRoot:f.data,enabled:true,providers,sessionGate:(projectId,sessionId)=>{f.forks.assertCreationDispatchable(projectId,sessionId);const fork=f.forks.read(projectId,sessionId);if(fork&&fork.state!=='active')throw Error('fork not active');},withSessionProvider:async(projectId,sessionId,work)=>{try{return await f.forks.withToolFence(projectId,sessionId,work);}finally{providerSettled=true;}}});
+ try{
+  await parentSubmit(f,'hanging provider');const fork=await createFork(f,(await parentEntries(f))[0].id);const {fork:active}=await f.forks.resume({projectId:f.project.id,childSessionId:fork.childSessionId,revision:fork.revision});
+  await host.setModel(f.project,{provider:'fork-hanging-result',modelId:'fixture'},fork.childSessionId);await host.submit(f.project,{sessionId:fork.childSessionId,text:'start',mode:'followUp'});
+  await Promise.race([seen,new Promise<never>((_,reject)=>setTimeout(()=>reject(Error('provider did not start')),3000))]);await host.abort(f.project,fork.childSessionId);
+  await waitFor(async()=>providerSettled?true:undefined);assert.equal(f.forks.lifecycleStatus(f.project.id,fork.childSessionId)?.state,'held');
+  await forkRefusal(f.forks.discard({projectId:f.project.id,childSessionId:fork.childSessionId,revision:active.revision}),'CONFLICT');
+ }finally{await host.close();await providers.close();await f.cleanup();}
+});
+
+test('a provider error event followed by success still retains the child fence',async()=>{
+ const f=await fixture(),fake=fauxProvider({provider:'fork-error-then-done',models:[{id:'fixture'}]});let providerSettled=false;
+ const message=fauxAssistantMessage('reported success');
+ const provider={...fake.provider,streamSimple:(()=>({async *[Symbol.asyncIterator](){yield {type:'error',error:message};yield {type:'done',message};},async result(){return message;}})) as unknown as typeof fake.provider.streamSimple};
+ const hostRoot=join(f.root,'error-host');await mkdir(hostRoot);const providers=new ProviderStore(hostRoot,[provider]);await providers.savePreferences({defaultModel:{provider:'fork-error-then-done',modelId:'fixture'},favourites:[],allowRealModels:true});
+ const host=new HarnessHost({dataRoot:f.data,enabled:true,providers,sessionGate:(projectId,sessionId)=>f.forks.assertCreationDispatchable(projectId,sessionId),withSessionProvider:async(projectId,sessionId,work)=>{try{return await f.forks.withToolFence(projectId,sessionId,work);}finally{providerSettled=true;}}});
+ try{
+  await parentSubmit(f,'provider errors');const fork=await createFork(f,(await parentEntries(f))[0].id);const {fork:active}=await f.forks.resume({projectId:f.project.id,childSessionId:fork.childSessionId,revision:fork.revision});
+  await host.setModel(f.project,{provider:'fork-error-then-done',modelId:'fixture'},fork.childSessionId);await host.submit(f.project,{sessionId:fork.childSessionId,text:'start',mode:'followUp'});
+  await waitFor(async()=>providerSettled?true:undefined);assert.equal(f.forks.lifecycleStatus(f.project.id,fork.childSessionId)?.state,'held');
+  await forkRefusal(f.forks.discard({projectId:f.project.id,childSessionId:fork.childSessionId,revision:active.revision}),'CONFLICT');
+ }finally{await host.close();await providers.close();await f.cleanup();}
+});
+
+test('an unconfirmed child provider outcome retains its lifecycle fence across reopen', async () => {
+  const f=await fixture();
+  try{
+    await parentSubmit(f,'uncertain provider');const fork=await createFork(f,(await parentEntries(f))[0].id);
+    const {fork:active}=await f.forks.resume({projectId:f.project.id,childSessionId:fork.childSessionId,revision:fork.revision});
+    await assert.rejects(f.forks.withToolFence(f.project.id,fork.childSessionId,async()=>{throw new ForkActivityUncertain();}),/could not be confirmed stopped/);
+    await forkRefusal(f.forks.discard({projectId:f.project.id,childSessionId:fork.childSessionId,revision:active.revision}),'CONFLICT');
+    const reopenedStore=new ControlStore(f.data);
+    try{const reopened=new ForkStore(reopenedStore,f.forkOptions);await forkRefusal(reopened.withToolFence(f.project.id,fork.childSessionId,async()=>{}),'CONFLICT');}
+    finally{reopenedStore.close();}
+  }finally{await f.cleanup();}
+});
+
+test('swallowed nested uncertainty and outstanding descendants cannot release a fork fence', async () => {
+ for(const scenario of ['swallowed','outstanding'] as const){
+  const f=await fixture();let release:()=>void=()=>{};
+  try{
+   await parentSubmit(f,'nested activity');const fork=await createFork(f,(await parentEntries(f))[0].id);
+   await f.forks.resume({projectId:f.project.id,childSessionId:fork.childSessionId,revision:fork.revision});
+   let child:Promise<void>|undefined;
+   await f.forks.withToolFence(f.project.id,fork.childSessionId,async()=>{
+    if(scenario==='swallowed')await f.forks.withToolFence(f.project.id,fork.childSessionId,async()=>{throw new ForkActivityUncertain();}).catch(()=>{});
+    else {child=f.forks.withToolFence(f.project.id,fork.childSessionId,async()=>{await new Promise<void>(resolve=>release=resolve);});await new Promise(resolve=>setImmediate(resolve));}
+   });
+   assert.throws(()=>f.forks.assertCreationDispatchable(f.project.id,fork.childSessionId),/operator review/);
+   release();await child;
+   await forkRefusal(f.forks.withToolFence(f.project.id,fork.childSessionId,async()=>{}),'CONFLICT');
+  }finally{release();await f.cleanup();}
+ }
+});
+
+test('a delayed inherited callback cannot acquire a new fork fence after its parent returns',async()=>{
+ const f=await fixture();let release:()=>void=()=>{};
+ try{
+  await parentSubmit(f,'late child');const fork=await createFork(f,(await parentEntries(f))[0].id);await f.forks.resume({projectId:f.project.id,childSessionId:fork.childSessionId,revision:fork.revision});
+  const gate=new Promise<void>(resolve=>release=resolve);let late:Promise<unknown>|undefined,started=false;
+  await f.forks.withToolFence(f.project.id,fork.childSessionId,async()=>{late=(async()=>{await gate;await f.forks.withToolFence(f.project.id,fork.childSessionId,async()=>{started=true;});})();});
+  release();await assert.rejects(late!,/closed or uncertain/);assert.equal(started,false);
+  await f.forks.withToolFence(f.project.id,fork.childSessionId,async()=>{started=true;});assert.equal(started,true,'unrelated fresh activity can still acquire');
+ }finally{release();await f.cleanup();}
+});
+
+test('a child tool does not start during discard or while paused, and a settled failure releases its fence', async () => {
+  const f = await fixture(); let release!: () => void;
+  const barrier = new Promise<void>(resolve => { release = resolve; });
+  try {
+    await parentSubmit(f, 'tool admission fence');
+    const fork = await createFork(f, (await parentEntries(f))[0].id); let starts = 0;
+    await forkRefusal(f.forks.withToolFence(f.project.id, fork.childSessionId, async () => { starts++; }), 'ILLEGAL');
+    await f.forks.resume({ projectId: f.project.id, childSessionId: fork.childSessionId, revision: fork.revision });
+    await assert.rejects(f.forks.withToolFence(f.project.id, fork.childSessionId, async () => { throw Error('settled tool failure'); }), /settled tool failure/);
+    assert.doesNotThrow(() => f.forks.assertCreationDispatchable(f.project.id, fork.childSessionId));
+    const paused = await createFork(f, (await parentEntries(f))[0].id);
+    let checking = false;
+    const discarder = new ForkStore(f.store, { ...f.forkOptions, assertQuiescent: async () => { checking = true; await barrier; } });
+    const discarding = discarder.discard({ projectId: f.project.id, childSessionId: paused.childSessionId, revision: paused.revision });
+    await waitFor(async () => checking ? true : undefined);
+    await forkRefusal(f.forks.withToolFence(f.project.id, paused.childSessionId, async () => { starts++; }), 'CONFLICT');
+    assert.equal(starts, 0);
+    release(); await discarding;
+  } finally { release(); await f.cleanup(); }
+});
+
+test('discard refuses when the child is busy or quiescence cannot be verified', async () => {
+  const f = await fixture();
+  try {
+    await parentSubmit(f, 'busy child');
+    const fork = await createFork(f, (await parentEntries(f))[0].id);
+    const input = { projectId: f.project.id, childSessionId: fork.childSessionId, revision: fork.revision };
+    const busy = new ForkStore(f.store, { ...f.forkOptions, assertQuiescent: async () => { throw new ForkError('The child is busy.', 'CONFLICT'); } });
+    await forkRefusal(busy.discard(input), 'CONFLICT');
+    const unavailable = new ForkStore(f.store, { ...f.forkOptions, assertQuiescent: undefined });
+    await forkRefusal(unavailable.discard(input), 'UNAVAILABLE');
+    assert.equal(await exists(fork.worktreePath), true);
+    assert.equal(f.forks.read(f.project.id, fork.childSessionId)?.revision, fork.revision);
+    assert.doesNotThrow(() => f.forks.assertCreationDispatchable(f.project.id, fork.childSessionId));
+  } finally { await f.cleanup(); }
+});
+
+test('a crash after removal but before the fork receipt keeps the lifecycle fence held', async () => {
+  const f = await fixture();
+  const admit = f.store.admit.bind(f.store);
+  try {
+    await parentSubmit(f, 'interrupted discard');
+    const fork = await createFork(f, (await parentEntries(f))[0].id);
+    f.store.admit = input => {
+      const record = input.input as { state?: unknown };
+      if (input.kind === 'session.fork' && record.state === 'discarded') throw Error('lost receipt');
+      return admit(input);
+    };
+    await assert.rejects(f.forks.discard({ projectId: f.project.id, childSessionId: fork.childSessionId, revision: fork.revision }));
+    assert.equal(await exists(fork.worktreePath), false);
+    f.store.admit = admit;
+    const reopenedStore = new ControlStore(f.data);
+    try {
+      const reopened = new ForkStore(reopenedStore, f.forkOptions);
+      assert.throws(() => reopened.assertCreationDispatchable(f.project.id, fork.childSessionId), /operator review/);
+      await forkRefusal(reopened.discard({ projectId: f.project.id, childSessionId: fork.childSessionId, revision: fork.revision }), 'CONFLICT');
+    } finally { reopenedStore.close(); }
+  } finally { f.store.admit = admit; await f.cleanup(); }
+});
 
 test('a fork record is strictly validated and every figure it refuses fails closed', () => {
   const base = {
@@ -385,7 +740,7 @@ test('a paused child refuses to dispatch anything, and an explicit resume is wha
 
     // A dispatch attempt on a paused child is refused, and the transcript port was not reached at all —
     // so no submission, no admission and no model request of any kind could have happened.
-    const message = await forkRefusal(f.forks.dispatchChild({ projectId: f.project.id, childSessionId: fork.childSessionId, text: 'never dispatched from a paused child' }), 'ILLEGAL');
+    const message = await forkRefusal(f.forks.dispatchChild({parentSessionId:f.parentSessionId,  projectId: f.project.id, childSessionId: fork.childSessionId, text: 'never dispatched from a paused child' , invocationId: 'fixture-2'}), 'ILLEGAL');
     assert.match(message, /paused/);
     assert.deepEqual(f.transcriptCalls, callsBefore, 'a refused dispatch calls nothing at all');
     const after = await childEntries(f, fork.childSessionId);
@@ -399,9 +754,9 @@ test('a paused child refuses to dispatch anything, and an explicit resume is wha
     assert.equal((await f.forks.resume({ projectId: f.project.id, childSessionId: fork.childSessionId, revision: resumed.fork.revision })).outcome, 'unchanged', 'resuming an active fork is a legal no-op');
     assert.equal(f.forks.read(f.project.id, fork.childSessionId)!.revision, resumed.fork.revision, 'the no-op wrote no revision');
 
-    // With the fork active the guarded dispatch really reaches the child, under a stable identity.
-    const dispatched = await f.forks.dispatchChild({ projectId: f.project.id, childSessionId: fork.childSessionId, text: 'child work' });
-    assert.equal(dispatched.requestId, 'fork:' + fork.childSessionId, 'the submission identity is derived from the fork alone');
+    // With the fork active the guarded dispatch really reaches the child, under a stable caller identity.
+    const dispatched = await f.forks.dispatchChild({parentSessionId:f.parentSessionId,  projectId: f.project.id, childSessionId: fork.childSessionId, text: 'child work', invocationId: 'fixture-success' });
+    assert.match(dispatched.requestId, new RegExp('^fork:' + fork.childSessionId + ':[a-f0-9]{64}$'));
     assert.ok(f.transcriptCalls.includes('dispatch'), 'the active fork really dispatched');
     const settled = await waitFor(async () => {
       const view = await f.agents.sessionView(f.project, fork.childSessionId);
@@ -409,11 +764,240 @@ test('a paused child refuses to dispatch anything, and an explicit resume is wha
       return view.entries.some((entry) => entry.kind === 'assistant' && entry.text.includes('child work')) ? view : undefined;
     });
     assert.ok(settled.entries.length > before.length, 'the child really ran after its resume');
-    // A discarded fork refuses to dispatch too, and a failed one needs an operator first.
-    const discarded = await f.forks.discard({ projectId: f.project.id, childSessionId: fork.childSessionId, revision: resumed.fork.revision });
-    assert.equal(discarded.fork.state, 'discarded');
-    assert.match(await forkRefusal(f.forks.dispatchChild({ projectId: f.project.id, childSessionId: fork.childSessionId, text: 'after the discard' }), 'ILLEGAL'), /discarded/);
+    const second = await f.forks.dispatchChild({parentSessionId:f.parentSessionId,  projectId: f.project.id, childSessionId: fork.childSessionId, text: 'a distinct child task', invocationId: 'fixture-second-dispatch' });
+    assert.notEqual(second.requestId, dispatched.requestId);
+    const afterSecond = await f.agents.sessionView(f.project, fork.childSessionId);
+    assert.ok(afterSecond?.entries.some(entry => entry.text === 'a distinct child task'));
+    const beforeRetry = afterSecond!.entries.length;
+    const dispatchCalls = f.transcriptCalls.filter(call => call === 'dispatch').length;
+    await f.forks.dispatchChild({parentSessionId:f.parentSessionId,  projectId: f.project.id, childSessionId: fork.childSessionId, text: 'a distinct child task', invocationId: 'fixture-second-dispatch' });
+    assert.equal((await f.agents.sessionView(f.project, fork.childSessionId))?.entries.length, beforeRetry, 'an exact successful retry does not append duplicate input');
+    assert.equal(f.transcriptCalls.filter(call => call === 'dispatch').length, dispatchCalls, 'an exact successful retry does not resubmit');
+    await assert.rejects(f.forks.dispatchChild({parentSessionId:f.parentSessionId,  projectId: f.project.id, childSessionId: fork.childSessionId, text: 'changed payload', invocationId: 'fixture-second-dispatch' }), /already admitted with different input/);
+    const reopenedStore = new ControlStore(f.data);
+    try {
+      const reopened = new ForkStore(reopenedStore, f.forkOptions);
+      const replay = await reopened.dispatchChild({parentSessionId:f.parentSessionId,  projectId: f.project.id, childSessionId: fork.childSessionId, text: 'a distinct child task', invocationId: 'fixture-second-dispatch' });
+      assert.equal(replay.requestId, second.requestId);
+    } finally { reopenedStore.close(); }
+    // Active discard refuses even after the observed run settles: a view cannot rule out another
+    // asynchronous submission still being admitted.
+    assert.match(await forkRefusal(f.forks.discard({ projectId: f.project.id, childSessionId: fork.childSessionId, revision: resumed.fork.revision }), 'UNAVAILABLE'), /concurrent input admission/);
+    assert.equal(f.forks.read(f.project.id, fork.childSessionId)!.state, 'active');
   } finally { await f.cleanup(); }
+});
+
+test('fork dispatch waits outside the project serial lock while retaining its lifecycle fence', async () => {
+  const f = await fixture();
+  let release: () => void = () => {}, entered: () => void = () => {}, restore: (() => void) | undefined;
+  const gate = new Promise<void>(resolve => release = resolve);
+  const started = new Promise<void>(resolve => entered = resolve);
+  try {
+    await parentSubmit(f, 'wait lock');
+    const fork = await createFork(f, (await parentEntries(f))[0].id);
+    await f.forks.resume({ projectId: f.project.id, childSessionId: fork.childSessionId, revision: fork.revision });
+    type Submission = { id: unknown; wait: (...args: any[]) => Promise<unknown> };
+    type Conversation = { submit: (...args: any[]) => Promise<Submission> };
+    type Harness = { conversation: (...args: any[]) => Promise<Conversation | undefined> };
+    const host = f.agents as unknown as { open: (project: Project) => Promise<{ harness: Harness }> };
+    const hosted = await host.open(f.project);
+    const original = hosted.harness.conversation.bind(hosted.harness);
+    hosted.harness.conversation = async (...args: any[]) => {
+      const conversation = await original(...args);
+      if (String(args[0]) !== fork.childSessionId || !conversation) return conversation;
+      return new Proxy(conversation, { get(target, key, receiver) {
+        if (key === 'submit') return async (...submitArgs: any[]) => {
+          const submission = await target.submit(...submitArgs);
+          return new Proxy(submission, { get(inner, property, submissionReceiver) {
+            if (property === 'wait') return async () => { entered(); await gate; return { status: 'unanswered', reason: 'model_error' }; };
+            return Reflect.get(inner, property, submissionReceiver);
+          } });
+        };
+        return Reflect.get(target, key, receiver);
+      } });
+    };
+    restore = () => { hosted.harness.conversation = original; };
+    const pending = f.forks.dispatchChild({parentSessionId:f.parentSessionId,  projectId: f.project.id, childSessionId: fork.childSessionId, text: 'wait outside lock', invocationId: 'wait-lock-test' });
+    await started;
+    const aborting = f.agents.abort(f.project, fork.childSessionId);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const abortUnlocked = await Promise.race([aborting.then(() => true, () => true), new Promise<boolean>(resolve => { timer = setTimeout(() => resolve(false), 500); })]);
+    if (timer) clearTimeout(timer);
+    release();
+    await aborting.catch(() => {});
+    await assert.rejects(pending, /provider activity could not be confirmed stopped/);
+    assert.equal(abortUnlocked, true, 'abort obtains the project serial lock while dispatch waits');
+    assert.equal(f.forks.lifecycleStatus(f.project.id, fork.childSessionId)?.state, 'held', 'unanswered work retains the lifecycle barrier');
+  } finally { release(); restore?.(); await f.cleanup(); }
+});
+
+test('ordinary child submission can pass its fork gate before the lifecycle fence and submit after the fence is held', async () => {
+  const f = await fixture();
+  let releaseSubmit: () => void = () => {}, submitEntered: () => void = () => {}, releaseFence: () => void = () => {}, fenceEntered: () => void = () => {};
+  const submitGate = new Promise<void>(resolve => releaseSubmit = resolve), submitStarted = new Promise<void>(resolve => submitEntered = resolve);
+  const fence = new Promise<void>(resolve => releaseFence = resolve), fenceStarted = new Promise<void>(resolve => fenceEntered = resolve);
+  let passedForkGate = false, submitInvoked = false;
+  try {
+    await parentSubmit(f, 'ordinary submission race');
+    const fork = await createFork(f, (await parentEntries(f))[0].id);
+    await f.forks.resume({ projectId: f.project.id, childSessionId: fork.childSessionId, revision: fork.revision });
+    const host = f.agents as unknown as {
+      options: { sessionGate?: (projectId: string, sessionId: string) => void };
+      open: (project: Project) => Promise<{ harness: { conversation: (...args: any[]) => Promise<any> } }>;
+    };
+    host.options.sessionGate = (projectId, sessionId) => {
+      f.forks.assertCreationDispatchable(projectId, sessionId);
+      if (projectId === f.project.id && sessionId === fork.childSessionId) passedForkGate = true;
+    };
+    const hosted = await host.open(f.project);
+    const originalConversation = hosted.harness.conversation.bind(hosted.harness);
+    hosted.harness.conversation = async (...args: any[]) => {
+      const conversation = await originalConversation(...args);
+      if (String(args[0]) !== fork.childSessionId || !conversation) return conversation;
+      return new Proxy(conversation, { get(target, key, receiver) {
+        if (key === 'submit') return async (...submitArgs: any[]) => {
+          submitInvoked = true;
+          submitEntered();
+          await submitGate;
+          return target.submit(...submitArgs);
+        };
+        const value = Reflect.get(target, key, target);
+        return typeof value === 'function' ? value.bind(target) : value;
+      } });
+    };
+    const ordinary = f.agents.submit(f.project, { sessionId: fork.childSessionId, text: 'ordinary input', mode: 'followUp' });
+    await waitFor(async () => passedForkGate && submitInvoked ? true : undefined);
+    assert.equal(submitInvoked, true, 'the real ordinary submit path reached conversation.submit after passing its configured fork gate');
+    const fenced = f.forks.withToolFence(f.project.id, fork.childSessionId, async () => { fenceEntered(); await fence; });
+    await fenceStarted;
+    assert.equal(f.forks.lifecycleStatus(f.project.id, fork.childSessionId)?.state, 'held');
+    assert.equal(passedForkGate, true);
+    releaseSubmit();
+    await submitStarted;
+    assert.equal(f.forks.lifecycleStatus(f.project.id, fork.childSessionId)?.state, 'held');
+    releaseFence();
+    await Promise.all([ordinary, fenced]);
+  } finally { releaseSubmit(); releaseFence(); await f.cleanup(); }
+});
+
+test('a receipt-write failure after child submission stays fenced and is not replayed after reopen', async () => {
+  const f = await fixture();
+  try {
+    await parentSubmit(f, 'receipt failure');
+    const fork = await createFork(f, (await parentEntries(f))[0].id);
+    await f.forks.resume({ projectId: f.project.id, childSessionId: fork.childSessionId, revision: fork.revision });
+    const store = f.store as ControlStore & { updateOperation: ControlStore['updateOperation'] };
+    const original = store.updateOperation.bind(store);
+    let failed = false;
+    store.updateOperation = ((id, scope, revision, state, receipt) => {
+      if (state === 'succeeded' && !failed) { failed = true; throw new Error('injected receipt persistence failure'); }
+      return original(id, scope, revision, state, receipt);
+    }) as ControlStore['updateOperation'];
+    const input = { projectId: f.project.id, parentSessionId: f.parentSessionId, childSessionId: fork.childSessionId, text: 'settled before receipt failure', invocationId: 'receipt-failure' };
+    await assert.rejects(f.forks.dispatchChild(input), /provider activity could not be confirmed stopped/);
+    assert.equal(failed, true);
+    assert.ok((await f.agents.sessionView(f.project, fork.childSessionId))?.entries.some(entry => entry.text === input.text), 'transcript submission settled before the receipt failure');
+    assert.equal(f.forks.lifecycleStatus(f.project.id, fork.childSessionId)?.state, 'held');
+    store.updateOperation = original;
+
+    const reopenedStore = new ControlStore(f.data);
+    let replayCalls = 0;
+    try {
+      const reopened = new ForkStore(reopenedStore, { ...f.forkOptions, transcripts: { ...f.forkOptions.transcripts, dispatch: async () => { replayCalls++; } } });
+      await assert.rejects(reopened.dispatchChild(input), /cannot dispatch/);
+      assert.equal(replayCalls, 0, 'the pending durable admission is not replayed after reopen');
+      assert.equal(reopened.lifecycleStatus(f.project.id, fork.childSessionId)?.state, 'held');
+    } finally { reopenedStore.close(); }
+  } finally { await f.cleanup(); }
+});
+
+test('fork action dispatch holds the lifecycle fence across a delayed transcript call on two stores',async()=>{
+ const f=await fixture();let release:()=>void=()=>{},entered:()=>void=()=>{};
+ const otherStore=new ControlStore(f.data);
+ const gate=new Promise<void>(resolve=>release=resolve),started=new Promise<void>(resolve=>entered=resolve);let pending:Promise<unknown>|undefined,admittedState:string|null=null;
+ try{
+  await parentSubmit(f,'admission race');const fork=await createFork(f,(await parentEntries(f))[0].id);
+  await f.forks.resume({projectId:f.project.id,childSessionId:fork.childSessionId,revision:fork.revision});
+  const raced=new ForkStore(otherStore,{...f.forkOptions,
+   transcripts:{...f.forkOptions.transcripts,dispatch:async()=>{entered();await gate;admittedState=f.forks.read(f.project.id,fork.childSessionId)?.state??null;}}
+  });
+  pending=raced.dispatchChild({parentSessionId:f.parentSessionId, projectId:f.project.id,childSessionId:fork.childSessionId,text:'synthetic delayed admission', invocationId: 'fixture-4'});await started;
+  assert.equal(f.forks.lifecycleStatus(f.project.id,fork.childSessionId)?.state,'held');
+  await forkRefusal(f.forks.discard({projectId:f.project.id,childSessionId:fork.childSessionId,revision:1}),'CONFLICT');
+  await forkRefusal(f.forks.dispatchChild({parentSessionId:f.parentSessionId, projectId:f.project.id,childSessionId:fork.childSessionId,text:'competing admission', invocationId: 'fixture-5'}),'CONFLICT');
+  release();await pending;assert.equal(admittedState,'active','the delayed callback observed an unchanged active record');
+  assert.equal(f.forks.lifecycleStatus(f.project.id,fork.childSessionId),null,'settled dispatch releases the fence');
+  await raced.withToolFence(f.project.id,fork.childSessionId,async()=>{});
+ }finally{release();if(pending)await pending.catch(()=>{});otherStore.close();await f.cleanup();}
+});
+
+test('a paused fork action refuses before transcript dispatch or fence acquisition',async()=>{
+ const f=await fixture();let calls=0;
+ try{
+  await parentSubmit(f,'paused dispatch');const fork=await createFork(f,(await parentEntries(f))[0].id);
+  const paused=new ForkStore(f.store,{...f.forkOptions,transcripts:{...f.forkOptions.transcripts,dispatch:async()=>{calls++;}}});
+  assert.match(await forkRefusal(paused.dispatchChild({parentSessionId:f.parentSessionId, projectId:f.project.id,childSessionId:fork.childSessionId,text:'must not dispatch', invocationId: 'fixture-6'}),'ILLEGAL'),/paused/);
+  assert.equal(calls,0);assert.equal(paused.lifecycleStatus(f.project.id,fork.childSessionId),null);
+ }finally{await f.cleanup();}
+});
+
+test('controlled host project refusal before submit releases the dispatch fence',async()=>{
+ const f=await fixture();
+ try{
+  await parentSubmit(f,'unavailable project');const fork=await createFork(f,(await parentEntries(f))[0].id);
+  await f.forks.resume({projectId:f.project.id,childSessionId:fork.childSessionId,revision:fork.revision});
+  const host=f.agents as unknown as {options:{projectGate?:(id:string)=>void}};
+  host.options.projectGate=()=>{throw Error('project temporarily unavailable');};
+  const unavailable=new ForkStore(f.store,{...f.forkOptions,transcripts:{...f.forkOptions.transcripts,dispatch:async({projectId,childSessionId,requestId,text})=>{await f.agents.dispatchToSession(f.project,childSessionId,{requestId,text});}}});
+  await forkRefusal(unavailable.dispatchChild({parentSessionId:f.parentSessionId, projectId:f.project.id,childSessionId:fork.childSessionId,text:'not submitted', invocationId: 'fixture-7'}),'UNAVAILABLE');
+  assert.equal(unavailable.lifecycleStatus(f.project.id,fork.childSessionId),null);
+ }finally{await f.cleanup();}
+});
+
+test('conversation unavailable before submit releases the dispatch fence',async()=>{
+ const f=await fixture();
+ try{
+  await parentSubmit(f,'unavailable conversation');const fork=await createFork(f,(await parentEntries(f))[0].id);
+  await f.forks.resume({projectId:f.project.id,childSessionId:fork.childSessionId,revision:fork.revision});
+  const unavailable=new ForkStore(f.store,{...f.forkOptions,transcripts:{...f.forkOptions.transcripts,dispatch:async({requestId,text})=>{await f.agents.dispatchToSession(f.project,'999999',{requestId,text});}}});
+  await forkRefusal(unavailable.dispatchChild({parentSessionId:f.parentSessionId, projectId:f.project.id,childSessionId:fork.childSessionId,text:'not submitted', invocationId: 'fixture-8'}),'UNAVAILABLE');
+  assert.equal(unavailable.lifecycleStatus(f.project.id,fork.childSessionId),null);
+ }finally{await f.cleanup();}
+});
+
+test('a conversation.submit rejection or interrupt after invocation retains the dispatch fence',async()=>{
+ const f=await fixture();let restore:(()=>void)|undefined;
+ try{
+  await parentSubmit(f,'submit interruption');const fork=await createFork(f,(await parentEntries(f))[0].id);
+  await f.forks.resume({projectId:f.project.id,childSessionId:fork.childSessionId,revision:fork.revision});
+  type TestConversation={submit:(...args:any[])=>Promise<unknown>};
+  type TestHarness={conversation:(...args:any[])=>Promise<TestConversation|undefined>};
+  const host=f.agents as unknown as {open:(project:Project)=>Promise<{harness:TestHarness}>};
+  const hosted=await host.open(f.project),original=hosted.harness.conversation.bind(hosted.harness);
+  hosted.harness.conversation=async(...args:any[])=>{
+   const conversation=await original(...args);
+   if(String(args[0])!==fork.childSessionId||!conversation)return conversation;
+   return new Proxy(conversation,{get(target,key,receiver){if(key==='submit')return async()=>{const interrupted=Error('synthetic submit interruption');interrupted.name='AbortError';throw interrupted;};return Reflect.get(target,key,receiver);}});
+  };
+  restore=()=>{hosted.harness.conversation=original;};
+  const dispatch=new ForkStore(f.store,{...f.forkOptions,transcripts:{...f.forkOptions.transcripts,dispatch:async({projectId,childSessionId,requestId,text})=>{await f.agents.dispatchToSession(f.project,childSessionId,{requestId,text});}}});
+  await assert.rejects(dispatch.dispatchChild({parentSessionId:f.parentSessionId, projectId:f.project.id,childSessionId:fork.childSessionId,text:'possibly submitted', invocationId: 'fixture-9'}),/provider activity could not be confirmed stopped/);
+  assert.equal(dispatch.lifecycleStatus(f.project.id,fork.childSessionId)?.state,'held');
+ }finally{restore?.();await f.cleanup();}
+});
+
+test('uncertain fork action transcript failure retains the lifecycle fence across reopen',async()=>{
+ const f=await fixture();
+ try{
+  await parentSubmit(f,'uncertain dispatch');const fork=await createFork(f,(await parentEntries(f))[0].id);
+  await f.forks.resume({projectId:f.project.id,childSessionId:fork.childSessionId,revision:fork.revision});
+  const uncertain=new ForkStore(f.store,{...f.forkOptions,transcripts:{...f.forkOptions.transcripts,dispatch:async()=>{throw Error('lost dispatch receipt');}}});
+  await assert.rejects(uncertain.dispatchChild({parentSessionId:f.parentSessionId, projectId:f.project.id,childSessionId:fork.childSessionId,text:'possibly admitted', invocationId: 'fixture-10'}),/could not be confirmed stopped/);
+  assert.equal(uncertain.lifecycleStatus(f.project.id,fork.childSessionId)?.state,'held');
+  const reopenedStore=new ControlStore(f.data);
+  try{const reopened=new ForkStore(reopenedStore,f.forkOptions);assert.equal(reopened.lifecycleStatus(f.project.id,fork.childSessionId)?.state,'held');await forkRefusal(reopened.dispatchChild({parentSessionId:f.parentSessionId, projectId:f.project.id,childSessionId:fork.childSessionId,text:'must not retry', invocationId: 'fixture-11'}),'CONFLICT');}
+  finally{reopenedStore.close();}
+ }finally{await f.cleanup();}
 });
 
 test('a fork inherits no approval, no accepted artifact, no grant and no queue', async () => {
@@ -499,7 +1083,7 @@ test('a discard refuses a dirty worktree, succeeds with an explicit force, and i
     assert.equal(await git(f.repo, ['worktree', 'list']).then((listing) => listing.includes(fork.worktreePath)), true, 'git still has the worktree registered');
     // A failed fork cannot be resumed or dispatched into, and an operator resolves it by discarding.
     assert.match(await forkRefusal(f.forks.resume({ projectId: f.project.id, childSessionId: fork.childSessionId, revision: dirty.fork.revision }), 'ILLEGAL'), /failed/);
-    assert.match(await forkRefusal(f.forks.dispatchChild({ projectId: f.project.id, childSessionId: fork.childSessionId, text: 'x' }), 'ILLEGAL'), /needs an operator/);
+    assert.match(await forkRefusal(f.forks.dispatchChild({parentSessionId:f.parentSessionId,  projectId: f.project.id, childSessionId: fork.childSessionId, text: 'x' , invocationId: 'fixture-12'}), 'ILLEGAL'), /needs an operator/);
 
     // The explicit force is what removes it, at the revision the record now holds.
     const forced = await f.forks.discard({ projectId: f.project.id, childSessionId: fork.childSessionId, revision: dirty.fork.revision, force: true });

@@ -5,6 +5,9 @@ test('provider credentials, defaults and favourites can be managed from the UI w
  await page.getByRole('button',{name:'Providers & models',exact:true}).click();
  const dialog=page.getByRole('dialog');
  await expect(dialog.getByRole('heading',{name:'Providers & models'})).toBeVisible();
+ await expect(dialog).toContainText("Ordinary sessions use the instance's configurable turn and output limits");
+ await dialog.getByLabel('Provider',{exact:true}).selectOption('openai-codex');
+ await expect(dialog.getByRole('note')).toContainText('model generation is currently unavailable');
  await dialog.getByLabel('Provider',{exact:true}).selectOption('openai');
  await dialog.getByLabel('Provider API key').fill('browser-fake-key-not-a-credential');
  await dialog.getByRole('button',{name:/Save API key|Replace API key/}).click();
@@ -36,11 +39,11 @@ test('a phone user can add a repository and manage its public deploy key',async(
  await page.goto('/');
  await page.getByRole('button',{name:'Show project sidebar'}).click();
  await page.getByRole('button',{name:'＋ Add project',exact:true}).first().click();
- let dialog=page.getByRole('dialog');
+ let dialog=page.getByRole('dialog',{name:'Add a project'});
  await dialog.getByLabel('Project name').fill('Repository phone fixture');
  await dialog.getByLabel(/Repository URL/).fill('https://github.com/example/disposable.git');
  await dialog.getByRole('button',{name:'Confirm & add project'}).click();
- dialog=page.getByRole('dialog');
+ dialog=page.getByRole('dialog',{name:'Repository & deploy key'});
  await expect(dialog.getByRole('heading',{name:'Repository & deploy key'})).toBeVisible();
  await dialog.getByRole('button',{name:'Generate project deploy key',exact:true}).click();
  await expect(dialog.getByLabel('Project public deploy key')).toHaveValue(/^ssh-ed25519 /);

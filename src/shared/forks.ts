@@ -68,9 +68,9 @@ export type ForkAttentionReason = (typeof FORK_ATTENTION_REASONS)[number];
 
 /** The fixed, path-free sentence each reason is reported with. */
 export const FORK_ATTENTION_DETAILS: Readonly<Record<ForkAttentionReason, string>> = Object.freeze({
-  'worktree-create-failed': 'Creating the child worktree from the recorded base commit failed, so this fork was never usable and is recorded here rather than hidden. Inspect the fork target and discard the fork before trying again; this build never quietly retries a git worktree operation and never removes a worktree it did not finish creating.',
-  'worktree-dirty': 'The child worktree holds uncommitted or untracked changes, and this build never removes them implicitly: those changes exist nowhere else. Inspect the worktree, then discard the fork again with an explicit force when the changes are not needed.',
-  'worktree-remove-refused': 'git refused to remove the child worktree and nothing was forced, so the worktree is still there and the fork is unchanged. Inspect it, then discard again with an explicit force when it is safe to remove.',
+  'worktree-create-failed': 'Creating the child worktree from the recorded base commit failed, so this fork was never usable and is recorded here rather than hidden. Inspect the target before deciding what to do; Pilot does not automatically remove an existing worktree or quietly retry creation.',
+  'worktree-dirty': 'The child worktree holds uncommitted or untracked changes that may exist nowhere else. Inspect and preserve the work; automatic removal is unavailable, even with force.',
+  'worktree-remove-refused': 'The worktree removal did not return a confirmed outcome. It may have completed; inspect the worktree and Git state before deciding what to do. Nothing is retried automatically.',
   'worktree-unreadable': 'The child worktree could not be inspected: git could not report whether it holds uncommitted or untracked changes, so this build removed nothing and claims nothing about its contents. Inspect it by hand before deciding what to do.',
   'child-session-refused': 'The child transcript conversation was created but its named session could not be, so the fork is recorded here rather than hidden. Inspect the project sessions before trying again.'
 });

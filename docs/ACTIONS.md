@@ -85,7 +85,7 @@ to the five **agent registry** actions, which need a durable control store.
 | id | effect | writes |
 |---|---|---|
 | `session.lifecycle.reconnect` | reads the durable lifecycle record and returns it unchanged | no |
-| `session.lifecycle.resume` | writes the running transition, then dispatches under the record's original request identity | yes |
+| `session.lifecycle.resume` | writes the running transition; if the original identity is still pending it dispatches under that identity, and if the identity is already terminal it starts nothing and settles the record | yes |
 | `session.lifecycle.retry` | writes a new attempt, then dispatches under an identity derived from the revision | yes |
 | `session.lifecycle.stop` | asks the harness to cancel, then writes the idle transition | yes |
 | `session.lifecycle.pause` | asks the harness to cancel, then writes the paused transition with its reason | yes |
@@ -192,6 +192,15 @@ written inside the project's own tree, and the policy that decides who may accep
 `acceptance.accept` performs no commit, push, deploy, spend, provision or publish: it records the
 decision and returns it. Nothing in this registry performs the thing an acceptance is about.
 
+Two capabilities outside this registry now do perform the thing an acceptance is about, as
+**agent-facing harness tools** rather than palette actions: `commit_preview`, `commit_accepted`,
+`push_preview` and `push_accepted` (see [docs/AGENTS.md](AGENTS.md), *The bounded commit and push
+capability*). They are installed only behind the default-off deployment switches
+`DASHBOARD_AGENT_COMMIT` and `DASHBOARD_AGENT_PUSH`, only with the durable control store, only for a
+bound named agent whose allowlist grants `commit` or `push`, and only for an exact owner-configured
+target under an `agent-may-accept` policy whose class decision is `full-auto`. They are not action
+ids, so they do not appear in `/api/actions`, the palette or the slash surface.
+
 ### Forks — scope: `project`, and `project` + `session` for the fork itself
 
 A **fork** is one child session branched from a parent transcript at an exact cutoff entry, with its
@@ -211,8 +220,9 @@ None of the four commits, pushes, deploys, spends, provisions or publishes. `for
 the parent's working tree, never copies an uncommitted or staged change and never runs `git stash`;
 `fork.resume` makes no model request and grants nothing. Whether an *active* child is dispatched into
 is not an action of this registry in this build: the guarded dispatch lives in the fork store, and the
-owner surface offers creation, listing, resume and discard. See `docs/FORKS.md` for the model, the
-bounds and the honest limits.
+owner surface offers creation, listing, resume, discard and the two fence-recovery routes described in
+`docs/FORKS.md` (they release a held fence after a quiescence check and perform no dispatch, replay or
+removal). See `docs/FORKS.md` for the model, the bounds and the honest limits.
 
 ### The agent registry and its privilege scopes — scope: none
 
@@ -249,6 +259,37 @@ all**; in **auto-apply** it writes the file atomically. The mode in force comes 
 policy rather than from an assumption. Neither action commits, pushes, deploys, spends, provisions or
 publishes, and neither ever edits outside the connected worktree. See `docs/AGENTS.md`.
 
+### The local deploy and publish tools — scope: `deploy` and `publish`
+
+These are **agent-harness tools**, not palette actions, so no `ACTION_IDS` entry describes them and
+`/api/actions` does not list them. Each is installed only when its own deployment switch is on, and
+each is governed by the existing agent scope of the same name plus a bound named agent and the
+acceptance policy:
+
+| Tool | Scope | Instance switch | Effect |
+|---|---|---|---|
+| `deploy_preview` | `deploy` | `DASHBOARD_DEPLOY=on` | reads the project's configured built artifact and its SHA-256 manifest digest beside the owner-configured target; copies and promotes nothing |
+| `deploy_accepted` | `deploy` | `DASHBOARD_DEPLOY=on` | promotes exactly the accepted artifact: staged copy, read-back digest, immutable generation, atomic `current`-link swap, previous generation retained |
+| `publish_preview` | `publish` | `DASHBOARD_PUBLISH=on` | reads an exact, bounded set of reviewed files with their digests; copies and publishes nothing |
+| `publish_accepted` | `publish` | `DASHBOARD_PUBLISH=on` | copies exactly the accepted files into the owner-configured publication root through a staged copy and one atomic rename, then reads the digests back |
+
+The destination is **not a tool argument**. The owner sets the exact deployment target directory and
+artifact path, or publication root, through the authenticated, revision-checked route
+`POST /api/projects/:id/action-destinations/(deploy|publish)`; the target must already be a real
+directory under the operator-configured browse roots. The model supplies no path, directory, command
+or credential. `publish` does name the reviewed files it wants published, as paths relative to the
+project's connected worktree; a path that escapes the worktree, a symlink at any component, a
+non-regular file, a file over the per-file cap and a total over the total cap are refused before any
+copy.
+
+Both effects run through the existing `AcceptedActionExecutor`: same-session evidence must already be
+accepted for the exact target-bound artifact under `agent-may-accept` and the action class set to
+`full-auto`. The action intent is durable before the effect, a succeeded effect records a receipt and
+an outcome, and an interruption is reported as **uncertain** while its intent and barrier remain. A
+duplicate invocation is refused and never replayed. Neither tool talks to a provider, a CDN, Cloudflare
+or a CI system: they are local filesystem operations, and the same-UID shell can reach the same
+directories. See `docs/AGENTS.md` and `docs/specs/local-release-targets.md`.
+
 ## Preconditions, action by action
 
 Every code below is from the closed vocabulary. A request that trips one of them changes nothing.
@@ -261,7 +302,9 @@ and changes nothing.
 ("Only a paused or interrupted session can be resumed"), `INTERRUPTION_CERTAIN` (an interruption
 whose effect cannot be proven idempotent is refused, and nothing is replayed), `DISPATCH_AVAILABLE`
 (this instance can dispatch at all — otherwise the request is refused before any revision is
-claimed).
+claimed). A terminal original identity is not refused: the action returns `outcome: "terminal"`
+with `dispatched: false`, starts no new work and settles the record. It never mints a fresh identity
+or replays the terminal effect.
 
 **`session.lifecycle.retry`** — `SESSION_EXISTS`, `REVISION_MATCHES`, `STATE_FAILED` ("Only a
 failed session can be retried"), `DISPATCH_AVAILABLE`.
@@ -352,13 +395,11 @@ discarded first). No-op: resuming an already active fork returns the record unch
 revision.
 
 **`fork.discard`** — `PROJECT_REGISTERED`, `FORK_EXISTS`, `REVISION_MATCHES`,
-`TARGET_IN_FORK_ROOT` (the worktree path the *record* carries is still inside the designated fork
-root; a record that says otherwise is refused as an escape and nothing is removed), `WORKTREE_CLEAN`
-(the child worktree holds no uncommitted or untracked change, or the caller explicitly forces it — a
-dirty worktree becomes the named operator-attention state `worktree-dirty` and is left exactly where
-it is), `TRANSITION_LEGAL`. A worktree git will not remove or cannot report becomes
-`worktree-remove-refused` or `worktree-unreadable`; nothing is ever forced implicitly. No-op:
-discarding a fork whose worktree is already gone completes the discard and removes nothing.
+`TARGET_IN_FORK_ROOT`, `WORKTREE_CLEAN`, `TRANSITION_LEGAL`. Active forks cannot be discarded:
+input admission is not atomically coordinated with lifecycle changes. For a paused or failed fork,
+production closes the record only if its recorded worktree is already absent; automatic removal of an
+existing worktree is unavailable even with `force`. An already-discarded fork is a no-op. See
+[Forks](FORKS.md) for the remaining races and recovery limitations.
 
 **`agent.list`** — no precondition beyond the schema. No-op: a registry with no agent reads as an
 empty list beside the full scope vocabulary.
@@ -506,13 +547,66 @@ five actions exist because their handlers exist, and they are withheld from ever
 explicitly enabled the runner. That is an availability decision, not a stub — with the switch on the
 same handlers really submit, claim, run and settle jobs.
 
+The agent commit and push tools are deliberately **not** registry actions and are not listed here: they
+are harness tools bound to one project, one owner-configured target and one accepted artifact. They are
+installed per instance by `DASHBOARD_AGENT_COMMIT`/`DASHBOARD_AGENT_PUSH` and are absent from the
+harness entirely while those switches are off, rather than present and failing.
+
 Approvals record an authorisation and never perform the thing authorised: `approval.consume` returns
 the exact target it spent the grant on. Performing a commit, push, deploy, spend, provision or
 publish stays a separate, explicit step that no action in this registry takes.
 
+## Installed `spend` and `provision` agent tools (not registry actions)
+
+Two consequential classes now have a real, installed, **default-off** model-facing path. They are
+harness tools for a bound named agent, not registry actions: the palette does not offer them, no
+`/api/actions` id names them, and the command surface above still performs no spend or provision. The
+tools are described in `docs/AGENTS.md`; this section records what the installed code does and does
+not claim.
+
+Both need the deployment switch, the durable control store, a bound named agent holding the class's
+scope, a project inside that agent's project scope, evidence for the exact artifact, that agent's
+acceptance for the class, and `agent-may-accept` with `full-auto` for the class. The live scope,
+project, target and policy are rechecked around the effect. Evidence is still a claim: it is not proof
+that the charge is justified or that the resource is safe.
+
+**`spend`** (`spend_preview`, `spend_accepted`) sends one metered `POST` to one owner-configured
+billing endpoint. Deployment supplies `DASHBOARD_SPEND_BILLING_URL` (HTTPS, or HTTP only for a
+loopback stub), `DASHBOARD_SPEND_ACCOUNT_ID`, `DASHBOARD_SPEND_CURRENCY`,
+`DASHBOARD_SPEND_PROJECT_CAP_MINOR`, `DASHBOARD_SPEND_CHARGE_CAP_MINOR` and optionally
+`DASHBOARD_SPEND_TIMEOUT_MS`. The bearer credential is a private `credentials/spend-billing.json`
+file under the data root — outside every project root, never a model argument and never returned to
+the model. The adapter refuses an amount above the per-charge cap or one that would exceed the
+per-project cap before sending, reserves the amount durably in the same transaction it checks, and
+refuses a repeat of the same accepted artifact from its durable intent instead of sending it again.
+A reservation is not refunded: an admitted amount keeps counting against the cap even if the charge
+is later refused, fails or remains unknown.
+It refuses redirects, requires the exact JSON media type and a provider charge id, bounds the
+response, and never retries. A non-2xx status, redirect, timeout, lost response or unverifiable body
+is recorded as **unknown**; the intent and the cap reservation are retained and nothing replays
+automatically. It does **not** claim provider-side exactly-once (the provider decides whether to
+honour the idempotency key) and it is **not** a global spending cap: it bounds only charges Pilot
+sends through this one target. A revocation check cannot cancel a request already in flight.
+
+**`provision`** (`provision_preview`, `provision_accepted`) creates exactly one Pilot-owned local
+directory with a bounded `manifest.json` at `<approved root>/<projectId>/<targetId>` (the target is
+fixed; `DASHBOARD_PROVISION_ROOT` names the approved root and `DASHBOARD_PROVISION_ACTIONS=on`
+installs the tool). The manifest is written in a staging directory and published with one atomic
+`rename`; a repeat of the same content returns the recorded receipt and different content conflicts.
+Path escapes, symlinked roots, parents, targets or manifests, an existing target that is not a
+Pilot-owned resource and oversized input are refused before publication, and the approved root must
+overlap neither the data root nor a registered project. It creates no infrastructure, runs no
+template and calls no provider. It is not a sandbox: check-then-use on a filesystem is not atomic, so
+another same-user process can still substitute a path between calls.
+
+Neither tool makes an acceptance into an execution: the acceptance is one input, and the adapter's own
+target, artifact, cap and policy checks are what decide whether anything happens.
+
 ## The live projection
 
-`GET /api/actions/activity?projectId=<uuid>` answers what is actually happening, read-only. Its
+`GET /api/actions/activity?projectId=<uuid>&sessionId=<id>` answers what is actually happening,
+read-only. `sessionId` is optional: without it the project's own conversation is read, and with it the
+named session's conversation is read (or the named absence `no-conversation` when it has none). Its
 contract is declared in `src/shared/actions.ts` beside the registry, so the producer and the reader
 cannot disagree about a field.
 
@@ -525,12 +619,28 @@ cannot disagree about a field.
   is a legal value to write *at*, not a fact about a generation, so it is never reported as the state
   `idle`. `revision` is `0` there because a first write must claim revision 0, not because one
   happened.
-- **Tool activity is only ever what the harness reports.** The projection reads the project's
-  conversation view and reports the tool calls it carries and the diagnostic counts each result
-  carries. Nothing is invented to fill the view.
-- **A call and a result are not paired.** The view this build can read does not carry the call id, so
-  calls and results are reported as two ordered lists. No outcome is attributed to a call the data
-  does not attribute it to.
+- **Tool activity is only ever what the harness reports.** The projection reads the conversation view
+  it was asked for and reports the tool calls it carries and the result messages it carries. Nothing is
+  invented to fill the view.
+- **A call and a result are not paired.** The view this build maps carries no reliable call id, so
+  calls and results are reported as two ordered lists. No outcome is attributed to a call the data does
+  not attribute it to. Raw transcript messages do carry the provider's call id; exposing it would widen
+  the shared view contract, so pairing stays a future capability with its own spec change.
+- **Timing is recorded, never derived.** An instant is the entry's own timestamp, or `null` with the
+  named reason `no-instant-recorded-in-the-transcript`. A result's duration is only the harness's own
+  measured `durationMs`, or `null` with the named reason `no-duration-reported-by-the-harness`. Two
+  instants are never subtracted, so a recovered transcript with clock skew cannot produce a negative
+  elapsed time. A call's instant is the assistant message timestamp that carried it, not a separately
+  recorded tool start: this harness view records no such start.
+- **An outcome comes only from the protocol.** `ok`, `warned`, `failed`, `interrupted` and `cancelled`
+  are derived from the result's own error flag and the harness diagnostic codes. An `interrupted`
+  result is `certainty: uncertain` because it may have partially run. An `aborted` result is a
+  cancellation the owner knows about, but its effect is not proven, so its certainty is `uncertain`:
+  the harness emits `aborted` after a non-restart abort even in the execute phase. Only `abandoned`
+  is a phase-proven cancellation with no execution (`certainty: certain`). A `warned` result
+  completed with warnings; it is not a failure. A known protocol class (`completed`, `blocked`,
+  `tool-unavailable`, `invalid-arguments`, `error`, `unknown`) is carried; the diagnostic message
+  never is.
 - **Not knowing is a state, not an absence**, and the three non-answers are distinct:
 
   | `state` | means | `reason` |
@@ -542,20 +652,27 @@ cannot disagree about a field.
   | `failed` | the read was attempted and failed | `harness-could-not-be-read` |
 
   The first two absences are deliberately different states: "there is no conversation" is not
-  "the conversation has nothing in it yet", and neither is reported as the other. Reported activity
-  is reported whatever else is true, so a view that carries tool calls is never described as an
-  absence.
+  "the conversation has nothing in it yet", and neither is reported as the other. Their fixed
+  sentences name the scope that was asked about, so a named session is never described as the
+  project conversation. Reported activity is reported whatever else is true, so a view that carries
+  tool calls is never described as an absence.
 
   A failed read reports fixed text: a harness error may name a filesystem path, so it is never echoed
   into the payload.
 - **The payload is bounded and carries no path, token, request identity or conversation text.** A
-  call is a name and an instant (never its arguments), a result is its diagnostic counts and the
-  outcome they imply, and the two caps (200 sessions, 50 tool events per list) are echoed in
-  `limits` with a `truncated` flag when they bite.
-- **The owner can see it.** The palette renders this projection under *Live projection*: the run state
-  of the chosen session (or of the first few registered ones), and the tool activity or the named
-  absence the payload carries. It shows only what the payload contains — it adds no row for a session
-  the projection reports nothing about, and it presents an absence as the named absence it is.
+  call is a name and an instant (never its arguments), a result is its own name, diagnostic counts,
+  outcome, certainty and measured duration (never its output or message), and the two caps (200
+  sessions, 50 tool events per list) are echoed in `limits` with a `truncated` flag and exact
+  `omitted` counts when they bite. A cap is a non-negative integer: 0 is a real empty bound, a value
+  above the maximum is clamped to 200 or 50, and `limits` reports the value that was really applied.
+  A negative, fractional or non-numeric cap is refused as an invalid request rather than coerced.
+- **The owner can see it in two places.** The palette renders this projection under *Live projection*:
+  the run state of the chosen session (or of the first few registered ones), and the tool activity or
+  the named absence the payload carries. The session view renders a compact *Session activity*
+  timeline for the selected session: its durable run state, the newest recorded call or result instant, the last
+  bounded calls and results, and a sentence saying how many older events are not shown. Both show only
+  what the payload contains — they add no row for a session the projection reports nothing about, and
+  they present an absence as the named absence it is.
 
 One honest caveat: reading the conversation view **attaches** that conversation exactly as the
 Agents view does, because this build exposes no other surface for reading tool activity. The
@@ -568,7 +685,7 @@ nothing is attached at all.
 | Route | Method | What it does |
 |---|---|---|
 | `/api/actions` | GET | the implemented actions the caller can use in its scope (`?projectId=`, `?sessionId=`). Read-only. |
-| `/api/actions/activity` | GET | the live projection for one project (`?projectId=<uuid>`, required). Read-only. |
+| `/api/actions/activity` | GET | the live projection for one project (`?projectId=<uuid>`, required) and optionally one named session (`&sessionId=<id>`). Read-only. |
 | `/api/actions/execute` | POST | executes one action: `{ "id": "...", "params": {...}, "scope": {"projectId": "...", "sessionId": "..."} }`. |
 | `/api/sessions/:id/queue` | GET | the session's queue with its revision, entries and bounds (`?projectId=` required). Read-only. |
 | `/api/sessions/:id/queue/:operation` | POST | the ten queue writes — `append`, `edit`, `reorder`, `remove`, `clear`, `cancel`, `claim`, `release`, `submit`, `reconcile` — each with its own body, statuses and refusals (`docs/QUEUE.md`). |
@@ -593,6 +710,10 @@ nothing is attached at all.
 | `/api/agents/:id/archive` | POST | closes one agent so it is never in force again: `{ "revision": n, "actor": { ... } }`. |
 | `/api/projects/:id/file-edits` | GET | one project's proposed and applied file edits, each with its diff, beside the mode in force. Read-only, and refused (503) while the capability is disabled. |
 | `/api/projects/:id/file-edits` | POST | records one bounded change: `{ "request": { "agentId": null, "path": "...", "content": "...", "mode": "propose-only" }, "actor": { ... } }`. The path must stay inside the project's connected repository worktree; `written` in the answer says whether a file was really written. |
+| `/api/projects/:id/action-destinations/deploy` | GET | the project's configured local deployment destination and revision, with whether this instance installs the deploy tool. Read-only. |
+| `/api/projects/:id/action-destinations/deploy` | POST | writes the next destination revision: `{ "revision": n, "enabled": true, "artifactPath": "dist", "targetDirectory": "/canonical/dir" }`. The directory must be an existing real directory under the configured browse roots; configuring it executes nothing. |
+| `/api/projects/:id/action-destinations/publish` | GET | the project's configured local publication root and revision, with whether this instance installs the publish tool. Read-only. |
+| `/api/projects/:id/action-destinations/publish` | POST | writes the next destination revision: `{ "revision": n, "enabled": true, "publicationRoot": "/canonical/dir" }`. The directory must be an existing real directory under the configured browse roots; configuring it executes nothing. |
 
 All three sit behind the same owner-only authentication as every other route, behind the unchanged
 Host check, and the write carries the same origin and CSRF enforcement. The scope may be supplied in
@@ -628,7 +749,8 @@ and the routes are what a script or a dispatcher calls directly.
 The fork routes are the same shape one more time: they call the same store methods the `fork.*`
 handlers call, so the two cannot disagree about what an operation does. The fork a write acts on is the
 one in the path — its child session, which is the fork's identity — so a caller addresses a fork and
-never a path, and the worktree it removes is the one the durable record carries. While the instance has
+never a path. Discard of an existing worktree is currently unavailable even with force; an absent
+worktree may be closed. While the instance has
 no fork capability (the agent harness is off) the routes refuse with a named reason (503) and the
 actions are absent from the registry rather than listed and failing. The queue's own claim and submit
 routes refuse a **fork child** (409) rather than dispatching its input into the project's root
@@ -636,11 +758,9 @@ conversation: this project's queue dispatcher submits into the root conversation
 input would reach the wrong transcript entirely. See `docs/FORKS.md`.
 
 The acceptance routes are the same shape again: they call the same store methods the `acceptance.*`
-handlers call. The policy write always acts as the authenticated owner. The acceptance write takes the
-actor the body **declares** — beside the request or inside it (`request.actor`), the shape the registry
-publishes for `acceptance.accept` — and takes the authenticated owner only when the body declares no
-actor at all; a body that declares both and disagrees is refused 422, so which identity is accepting is
-never ambiguous and a declared agent is never silently recorded as the owner. The completion record's
+handlers call. Policy and acceptance writes through these authenticated interfaces act as the owner;
+a submitted agent identity is refused, not treated as authentication. Agent acceptance is available
+only through an explicitly bound agent session. The completion record's
 Markdown is written inside the project the scope names, and the state the answer reports is the file
 read back rather than assumed.
 
@@ -716,7 +836,11 @@ parameters and preconditions. Nothing in the client lists a capability of its ow
   revision parameter declares the queue read it comes from, and a claim is refused before the instance
   that cannot dispatch is asked to; the live projection distinguishes `none`, `no-conversation`,
   `unavailable` and `failed`, reports a session with no lifecycle row as an absence rather than as
-  `idle`, never invents an entry and declares exactly the contract fields; all four `fork.*`
+  `idle`, derives a failed, an interrupted and an aborted outcome with their recorded instants and the
+  harness duration, refuses a negative instant or duration as measured data, treats a zero cap as an
+  empty list, clamps a cap above the maximum and refuses a negative, fractional or non-numeric one,
+  reports the exact omitted counts at its bounds, keeps paths, arguments and diagnostic messages out,
+  and declares exactly the contract fields; all four `fork.*`
   actions are driven through the registry against synthetic ports, with a paused child refusing a
   dispatch the port never sees; and all seven new actions are driven through the registry, with the
   eleven new precondition codes each matching a refusal a handler really produces.
@@ -777,6 +901,16 @@ parameters and preconditions. Nothing in the client lists a capability of its ow
   cutoff, an unknown parent, an escaping or symlinked target, a taken target) creating nothing; the
   documented fork bound; and a stored record that does not validate read as corruption. **No real
   provider is called and no container is started in this suite.** See `docs/FORKS.md`.
+- `tests/browser/activity.spec.ts` — the session view's compact timeline on a phone viewport: the
+  named absence before any tool, a `record_note` call and its `ok` result with a recorded instant and
+  duration, three tools over the view bound with the truncation sentence, no tool argument in the
+  timeline, a session switch that clears the root conversation's call, and a held response for the
+  previous session that is discarded after the switch.
+- `tests/unit/activity.test.ts` — the pure projection: failed, interrupted, cancelled, `ok`, `warned`
+  and unclassifiable outcomes, missing instants and durations with their named reasons, a negative
+  duration refused, the independent bounds, a zero bound and invalid bounds, the shared outcome
+  label (`warned · completed (not failed)`, `cancelled (uncertain) · aborted`), and no path, argument
+  or diagnostic message carried.
 - `tests/browser/actions.spec.ts` — the palette opens from the keyboard, lists exactly the registry's
   actions for its scope, executes real actions, shows the handler's results and shows a refusal;
   a declared model choice is parsed in the palette and recorded by the handler; a revision-bound action

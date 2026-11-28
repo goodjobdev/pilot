@@ -43,7 +43,7 @@ export interface DocRef { path: string; anchor: string | null }
 export interface DocHeading { level: number; title: string; slug: string; line: number }
 export interface DocEntry { path: string; name: string; kind: DocKind; bytes: number; modified: string }
 export interface OpenQuestion { id: string; text: string; done: boolean; line: number; anchor: string | null; heading: string }
-export interface DocSnapshot { path: string; kind: DocKind; revision: string; text: string; headings: DocHeading[]; questions: OpenQuestion[] }
+export interface DocSnapshot { path: string; kind: DocKind; revision: string; text: string; headings: DocHeading[]; questions: OpenQuestion[]; commit?: import('./workspace').SaveCommit }
 
 /** Repository-relative Markdown path, or an error explaining why it is not one. */
 export function normalizeDocPath(value: string): string {

@@ -14,6 +14,7 @@ this uses, so no image library was added.
 | Pixels on either side of one stored image, after any resize | 2000 (`MAX_IMAGE_DIMENSION`) |
 | Images in one message | 6 (`MAX_IMAGES_PER_MESSAGE`) |
 | Base64 the processor may produce for one image | 4,500,000 bytes |
+| Bytes of one stored image (decoded from that base64 limit) | 3,375,000 bytes |
 
 The constants live in one place, `src/shared/images.ts`, and both the server and the composer read
 them from there. Everything above the per-image byte cap is bounded again by the application's
@@ -100,21 +101,24 @@ storing bytes it could not verify.
 - **A media id is never a path.** It must be 64 lowercase hex characters; the path is derived from it
   as `media/<id>.bin`, so there is no separator to inject. An id of any other shape is simply
   unknown (404).
-- **The container itself is validated, never assumed.** `<data root>/media` must be a real directory
-  this process can write, and an upload checks exactly that before it decodes or stores anything — so a
-  broken data root is a named refusal, never a raw filesystem error the owner cannot act on. A `media`
-  that is a **symbolic link** is never followed, a `media` that is **not a directory** is not read as
-  an empty store, and a `media` that is **not writable by this process** is refused, each with its own
-  reason. An upload against any of those is `503` with code `media-container` and stores nothing; a
-  read of an object under such a container is a plain `404`, because a read goes through the
-  contained-path helper below, which refuses a symlink at every component. A data root that has never
-  stored an image has no `media` directory at all: the first accepted image creates it `0700`, as it
-  always has. A backup treats the same container as fail-closed rather than capturing nothing
-  ([Backup](BACKUP.md)).
-- Reads go through the same contained-path helper as the rest of the application
-  (`src/server/paths.ts`), which refuses absolute paths, `..` and **a symlink at any path
-  component** — so neither a symlinked object nor a symlinked `media` directory is ever followed.
-  The bytes are sniffed again on read, and bytes that are not a JPEG, PNG or WebP are not served.
+- **The container is checked before upload.** `<data root>/media` is checked as a writable directory;
+  an observed symlink, non-directory or unwritable directory is refused with `503` and code
+  `media-container`. A read through an observed symlink is reported as `404`. A data root that has
+  never stored an image has no `media` directory: the first accepted image creates it `0700`. A
+  backup treats an unusable container as fail-closed ([Backup](BACKUP.md)).
+- Reads use the Linux `/proc` descriptor-relative bounded reader only (`src/server/linux-procfs-read.ts`):
+  it pins each directory and regular-file inode, caps reads at the current processor output limit
+  (3,375,000 bytes), checks for file changes and has no pathname fallback. Missing paths, symlinks,
+  non-regular files, oversized files and bytes without an accepted image signature are reported as
+  ordinary misses. Reads sniff image signatures but do not fully decode images; recognized signatures
+  on truncated or corrupt content may still be served. Compatibility with every historic or externally
+  restored media object has not been established; objects above the current limit are refused as misses.
+  A procfs verification failure and unexpected read/traversal failures return `503`; `ENOENT` after
+  verification is ambiguous between a missing media object and a missing traversal component and is
+  treated as a miss. Descriptor pinning does not establish root identity or enforce mount, hardlink or
+  same-UID isolation; pinned parents can be renamed.
+- Writes remain pathname-based and are still vulnerable to parent/leaf races. The upload-time container
+  check is not atomic with subsequent writes.
 - **Retention:** nothing is deleted automatically. An object lives as long as the data root; a
   refused upload writes nothing, and removing media is a deliberate operator action on the data root
   (there is no delete route).
@@ -170,6 +174,27 @@ twice**, against the model in play, using the model's own declared input modalit
   back, the replay refuses with a clear reason instead of sending the text alone. A replay that
   carries images also runs the dispatch-time vision check above.
 
+## Image capability in the agent view
+
+The composer names a model's image support before a send. That reading travels with the agent
+view, so there is no separate capability route:
+
+- `GET /api/projects/<id>/agents?sessionId=<id>` returns `{enabled, view, delivery, vision}`.
+  `vision` is `{provider, modelId, acceptsImages}` when it can be read, and `null` when it cannot.
+- `POST /api/projects/<id>/agents/model` returns the changed view plus `vision` for the model now
+  in force, so a model change cannot leave an older reading on screen.
+- The `sessionId` query accepts 1–200 characters, the same bound used elsewhere; anything else is
+  `422`.
+
+`null` is honest rather than a guess: a named session with no conversation yet has no model to
+read. The composer then says the capability could not be read, and the server's admission and
+dispatch checks stay authoritative. An unknown model accepts nothing.
+
+**The view request opens the project harness.** Opening a harness runs `harness.resume()`, which
+may continue an existing checkpoint. The capability read adds no separate route and makes no model
+request, but the view it travels with is not execution-free: it can resume work that was already
+running. That is existing behaviour of the view, stated here because the composer depends on it.
+
 ## The composer
 
 `src/client/ImageComposer.svelte` owns the image half of the agent composer: a file picker (with the
@@ -182,8 +207,65 @@ shows the server's own reason on that image. A preview that cannot be fetched is
 condition, never as a refusal, and it never removes an image the server has already accepted.
 One image can be removed before sending, and a message needs text or at least one accepted image.
 
-An upload in flight is not a stored image, so the composer **holds the message** until it is. While any
-selected image is still uploading, Send and Steer are disabled, the state is named next to them, and a
-send attempted anyway is refused with its own reason rather than sending the text without the image —
-the strip is never cleared while an upload is outstanding. A message is never sent whose accepted image
-has not been stored yet.
+An upload in flight or a saved reference under lookup is not a stored image, so the composer
+**holds the message** until it is settled. While any selected image is `uploading` or `checking`,
+Send and Steer are disabled, the state is named next to them, and a send attempted anyway is refused
+with its own reason rather than sending the text without the image — the strip is never cleared
+while an upload or a lookup is outstanding. A message is never sent whose accepted image has not
+been stored and confirmed.
+
+## Drafts, saved references and local storage
+
+The composer keeps one text draft per project and session in the browser
+(`src/client/drafts.ts`). Its key is `pilot.draft.v1:<projectId>:<sessionKey>`, where the unnamed
+conversation uses `root`. A per-project `pilot.session.v1:<projectId>` preference returns a reload
+to the session that was open; the server's session list validates it, and an unknown id falls back
+to the root conversation.
+
+**What an image can be.** The strip distinguishes these states, and only `ready` is sendable:
+
+| State | Meaning |
+|---|---|
+| `uploading` | The bytes are being uploaded. The message is held. |
+| `checking` | A saved server id is being looked up after a reload. The message is held. |
+| `ready` | A stored media id. It may be sent. |
+| `refused` | The server refused the bytes, with its own reason. It stays visible and cannot be sent. |
+| `failed` | The upload did not reach the server, or the image was refused or not stored earlier. |
+| `missing` | A `404` from the server, or an upload that never finished and has no stored bytes. |
+
+A lookup of a saved reference is read-only. **Only `404` proves the server does not have the
+object.** A network, sign-in, permission or server failure keeps the reference in `checking`, keeps
+its media id in the saved draft, and offers **Retry lookup**; it is never turned into `missing`.
+Recovery never re-uploads and never sends. A send is held while any item is `uploading` or
+`checking`.
+
+**What is stored.** Text, media ids, and bounded metadata (name, size, dimensions, note, failure
+reason). Image bytes, blob URLs, file handles and unknown fields are never stored. The text is
+whatever the person typed and may itself contain a secret; the store adds no credential of its own.
+
+**Retention.** No age, clock or count rule deletes a valid draft. A draft is removed when a send is
+admitted, by the explicit **Clear local drafts** action, or when a newer save replaces the same key.
+A corrupt record is reported and **left in place** rather than deleted; the next save of the same
+identity replaces it.
+
+**Technical storage bounds.** These are storage limits, not accepted product policy: 64 KiB of
+UTF-8 text, 2 MiB of drafts per browser profile, and 16 KiB of failure notes in one draft. A text or
+profile refusal is visible and keeps the draft in the tab. When only failure notes exceed their
+bound, the notes are dropped with a visible count while every sendable reference is kept. The text
+bound is larger than the server's 8000-character message limit even when every character takes four
+UTF-8 bytes.
+
+**A refused save is never silent.** The latest state stays in memory across session switches, the
+composer says it is not saved, names the last saved time, and offers **Copy draft** and **Download
+draft**. If a send is attempted while the attempt record cannot be saved, the composer warns that
+admission can still succeed while the reply is lost, and that a reload may not recognise it as
+already sent. A small best-effort warning marker is written for the next load; after a reload the
+warning distinguishes a last saved version from no saved version at all, and says to check the
+transcript before resending. The marker can fail to write when storage is full, and the interface
+says so. Copying or downloading keeps the text only; it does not prevent a duplicate admission.
+
+**Sign-out and privacy.** There is no application sign-out route. Hosted mode signs in through
+Cloudflare Access, whose sign-out is external to this application and cannot be observed here. A
+transient `401` never clears drafts. On a shared device, use **Clear local drafts** (confirmed, local
+only) or clear the browser's site data. Drafts are not encrypted and are readable by scripts on the
+same origin.

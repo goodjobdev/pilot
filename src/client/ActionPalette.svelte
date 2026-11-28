@@ -25,6 +25,7 @@
  import { onMount } from 'svelte';
  import { api,ApiError } from './api';
  import type { ActionDescriptor,ActionParamType,LiveActivity,LiveRunState } from '../shared/actions';
+ import { toolOutcomeLabel } from '../shared/activity';
  let {projectId=null,onclose=()=>{}}:{projectId:string|null;onclose:()=>void}=$props();
  let actions=$state<ActionDescriptor[]>([]),sessions=$state<{id:string;name:string;revision:number}[]>([]);
  let sessionId=$state(''),query=$state('');
@@ -163,10 +164,14 @@
  function harnessSummary():string{
    const tool=activity?.harness;
    if(!tool)return '';
-   if(tool.state==='reported')return 'Tool activity: reported by '+tool.source+': '+tool.invocations.length+' call(s) and '+tool.results.length+' result(s)'+(tool.truncated?' (bounded: the most recent are shown)':'')+'. A call and a result are two lists: the view carries no call id, so nothing here pairs them.';
+   if(tool.state==='reported')return 'Tool activity: reported by '+tool.source+': '+tool.invocations.length+' call(s) and '+tool.results.length+' result(s)'+(tool.truncated?' (bounded: '+tool.omitted.invocations+' older call(s) and '+tool.omitted.results+' older result(s) are not shown)':'')+'. Calls and results are two lists; the projection carries no call identity, so nothing here pairs them. A call instant is the assistant message record, not a tool start.';
    return 'Tool activity: '+tool.state+' ('+tool.reason+') — '+tool.detail;
  }
- function instant(at:number|null):string{return at===null?'no instant reported':'at '+new Date(at).toISOString();}
+ function instant(at:number|null,reason:string|null):string{return at===null?'no instant reported ('+(reason??'no reason reported')+')':'at '+new Date(at).toISOString();}
+ /** A call's instant is the assistant message that carried it, never a separately recorded tool start. */
+ function callInstant(at:number|null,reason:string|null):string{return at===null?'assistant message instant not reported ('+(reason??'no reason reported')+')':'assistant message recorded at '+new Date(at).toISOString();}
+ function duration(ms:number|null,reason:string|null):string{return ms===null?'no duration reported ('+(reason??'no reason reported')+')':ms+' ms';}
+ function toolOmitted():string{const tool=activity?.harness;if(!tool)return '';const calls=tool.omitted.invocations+Math.max(0,tool.invocations.length-6),results=tool.omitted.results+Math.max(0,tool.results.length-6);return calls+results===0?'':' ('+calls+' older call(s) and '+results+' older result(s) omitted)' ;}
 </script>
 <div class="palette-backdrop" role="presentation" onclick={(event)=>{if(event.target===event.currentTarget)onclose();}}>
  <div class="palette" role="dialog" aria-modal="true" aria-label="Command palette">
@@ -195,13 +200,13 @@
    {#if activity.harness.invocations.length||activity.harness.results.length}
    <ul class="palette-events">
     {#each activity.harness.invocations.slice(0,6) as invocation}
-    <li><code>call</code> {invocation.name} {instant(invocation.at)}</li>
+    <li><code>call</code> {invocation.name} {callInstant(invocation.at,invocation.atReason)}</li>
     {/each}
     {#each activity.harness.results.slice(0,6) as completed}
-    <li><code>result</code> {completed.outcome} — {completed.errors} error(s), {completed.warnings} warning(s), {completed.notices} notice(s) {instant(completed.at)}</li>
+    <li><code>result</code> {completed.name??'tool'} · {toolOutcomeLabel(completed)} · {completed.errors} error(s), {completed.warnings} warning(s), {completed.notices} notice(s) · {duration(completed.durationMs,completed.durationReason)} {instant(completed.at,completed.atReason)}</li>
     {/each}
-    {#if activity.truncated||activity.harness.truncated}
-    <li>Bounded: at most {activity.limits.sessions} sessions and {activity.limits.toolEvents} events per list are reported.</li>
+    {#if activity.truncated||activity.harness.truncated||activity.harness.invocations.length>6||activity.harness.results.length>6}
+    <li>Bounded: at most {activity.limits.sessions} sessions and {activity.limits.toolEvents} events per list are reported{toolOmitted()}.</li>
     {/if}
    </ul>
    {/if}

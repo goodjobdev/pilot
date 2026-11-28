@@ -1,14 +1,17 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { chmod,mkdir,mkdtemp,readFile,readdir,rm,stat,symlink,unlink,writeFile } from 'node:fs/promises';
+import { chmod,mkdir,mkdtemp,readFile,readdir,rename,rm,stat,symlink,unlink,writeFile } from 'node:fs/promises';
+import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { deflateSync } from 'node:zlib';
 import { createHash } from 'node:crypto';
 import { request } from 'node:http';
 import { createApp } from '../../src/server/main';
+import { ControlStore } from '../../src/server/state/control-store';
 import { localConfig } from '../../src/server/security';
-import { MEDIA_CONTAINER_CODE,MediaContainerError,MediaStore,MAX_PREPARED_BASE64_BYTES } from '../../src/server/media-store';
+import { MEDIA_CONTAINER_CODE,MediaContainerError,MediaReadUnavailableError,MediaStore,MAX_PREPARED_BASE64_BYTES,MAX_STORED_MEDIA_BYTES } from '../../src/server/media-store';
+import { readLinuxProcfsRegularFileBeneathForTest } from '../../src/server/linux-procfs-read';
 import { createNodePhotonImages } from '@earendil-works/pi-durable/images/node';
 import { MAX_IMAGE_BYTES,MAX_IMAGE_DIMENSION,readImageSize,scanImageMetadata,sniffImageType,uniqueImageFiles } from '../../src/shared/images';
 
@@ -260,6 +263,134 @@ test('a media container that is not a usable directory is refused by name, and n
   }finally{
     await rm(root,{recursive:true,force:true});
     await rm(outside,{recursive:true,force:true});
+  }
+});
+
+test('default MediaStore.get is descriptor-pinned, size-bounded, regular-file-only, and closes descriptors',async(t)=>{
+  if(process.platform!=='linux'){t.skip('requires Linux procfs');return;}
+  const root=await mkdtemp(join(tmpdir(),'dashboard-media-get-'));
+  const outside=await mkdtemp(join(tmpdir(),'dashboard-media-out-'));
+  try{
+    await mkdir(join(root,'media'));
+    const bytes=png(6,4),id=createHash('sha256').update(bytes).digest('hex');
+    await writeFile(join(root,'media',id+'.bin'),bytes);
+    const store=new MediaStore(root);
+    const before=(await readdir('/proc/self/fd')).length;
+    for(let i=0;i<8;i++)assert.deepEqual(await store.get(id),{bytes,mimeType:'image/png'});
+    assert.ok((await readdir('/proc/self/fd')).length<=before+1,'successful reads close all descriptors');
+
+    await writeFile(join(outside,'linked.bin'),bytes);
+    const linkedId='a'.repeat(64);
+    await symlink(join(outside,'linked.bin'),join(root,'media',linkedId+'.bin'));
+    assert.equal(await store.get(linkedId),null,'leaf symlinks are ordinary misses');
+    await rm(join(root,'media'),{recursive:true,force:true});
+    await symlink(outside,join(root,'media'));
+    assert.equal(await store.get(linkedId),null,'symlinked media parents are ordinary misses');
+    await unlink(join(root,'media'));
+    await mkdir(join(root,'media'));
+
+    const oversized='b'.repeat(64);
+    await writeFile(join(root,'media',oversized+'.bin'),Buffer.alloc(MAX_STORED_MEDIA_BYTES+1,0x41));
+    assert.equal(await store.get(oversized),null,'oversized records are refused without an unbounded read');
+    const fifo='c'.repeat(64);
+    execFileSync('mkfifo',[join(root,'media',fifo+'.bin')]);
+    assert.equal(await store.get(fifo),null,'special files are refused without blocking');
+    assert.ok((await readdir('/proc/self/fd')).length<=before+1,'refusal paths close all descriptors');
+  }finally{
+    await rm(root,{recursive:true,force:true});
+    await rm(outside,{recursive:true,force:true});
+  }
+});
+
+test('procfs reads stay pinned across deterministic parent and leaf swaps',async(t)=>{
+  if(process.platform!=='linux'){t.skip('requires Linux procfs');return;}
+  const root=await mkdtemp(join(tmpdir(),'dashboard-media-pinned-'));
+  const outside=await mkdtemp(join(tmpdir(),'dashboard-media-pinned-out-'));
+  try{
+    const original=png(6,4),replacement=png(7,5),id=createHash('sha256').update(original).digest('hex');
+    await mkdir(join(root,'media'));
+    await writeFile(join(root,'media',id+'.bin'),original);
+    await writeFile(join(outside,id+'.bin'),replacement);
+    let parentSwapped=false;
+    const parentRead=await readLinuxProcfsRegularFileBeneathForTest(root,'media/'+id+'.bin',MAX_STORED_MEDIA_BYTES,{
+      afterDirectoryPinned:async(path)=>{
+        if(path!==join(root,'media')||parentSwapped)return;
+        parentSwapped=true;
+        await rename(join(root,'media'),join(root,'media-pinned'));
+        await symlink(outside,join(root,'media'));
+      }
+    });
+    assert.equal(parentSwapped,true);
+    assert.deepEqual(Buffer.from(parentRead),Buffer.from(original),'the read stays anchored to the pinned directory');
+    await unlink(join(root,'media'));
+    await rename(join(root,'media-pinned'),join(root,'media'));
+
+    let leafSwapped=false;
+    const leafRead=await readLinuxProcfsRegularFileBeneathForTest(root,'media/'+id+'.bin',MAX_STORED_MEDIA_BYTES,{
+      afterLeafPinned:async()=>{
+        if(leafSwapped)return;
+        leafSwapped=true;
+        await rename(join(root,'media',id+'.bin'),join(root,'media',id+'.saved'));
+        await symlink(join(outside,id+'.bin'),join(root,'media',id+'.bin'));
+      }
+    });
+    assert.equal(leafSwapped,true);
+    assert.deepEqual(Buffer.from(leafRead),Buffer.from(original),'the read stays anchored to the pinned leaf');
+  }finally{
+    await rm(root,{recursive:true,force:true});
+    await rm(outside,{recursive:true,force:true});
+  }
+});
+
+test('procfs backend failures return 503 on GET, queue image resolution, and image submission',{
+  skip:process.env.PILOT_TEST_EXPECT_PROCFS_UNAVAILABLE!=='1'?'run via scripts/test-linux-media-seccomp.sh with the deny-statfs profile':false
+},async()=>{
+  const root=await mkdtemp(join(tmpdir(),'dashboard-media-unavailable-'));
+  const security=localConfig('http://127.0.0.1:0');
+  const control=new ControlStore(root);
+  const app=await createApp({dataRoot:root,browseRoots:[],security,agents:'on',agentPauseMs:100,control});
+  try {
+    await new Promise<void>((resolve,reject)=>{app.server.once('error',reject);app.server.listen(0,'127.0.0.1',()=>{app.server.removeListener('error',reject);resolve();});});
+    const address=app.server.address();
+    if(!address||typeof address==='string')throw new Error('Test server did not bind a TCP port');
+    security.origin='http://127.0.0.1:'+address.port;
+    const token={'x-dashboard-token':security.token},headers={...token,'content-type':'application/json',origin:security.origin};
+    const post=(path:string,body:unknown)=>fetch(security.origin+path,{method:'POST',headers,body:JSON.stringify(body),signal:AbortSignal.timeout(5000)});
+    const project=await (await post('/api/projects',{name:'Seccomp media',managed:true,confirm:true})).json() as {id:string};
+    const base='/api/projects/'+project.id+'/agents';
+    const uploaded=await post(base+'/media',{data:Buffer.from(png(6,4)).toString('base64')});
+    const uploadText=await uploaded.text();
+    assert.equal(uploaded.status,201,uploadText);
+    const media=(JSON.parse(uploadText) as {media:{id:string}}).media;
+    const store=new MediaStore(root);
+    await assert.rejects(store.get(media.id),MediaReadUnavailableError);
+    const mediaGet=await fetch(security.origin+'/api/media/'+media.id,{headers:token,signal:AbortSignal.timeout(5000)});
+    const mediaGetBody=await mediaGet.json() as {code?:string};
+    assert.equal(mediaGet.status,503);
+    assert.equal(mediaGetBody.code,'media-read-unavailable');
+    const session=await (await post('/api/sessions',{projectId:project.id,name:'Seccomp queue'})).json() as {session:{id:string}};
+    const queue=await post('/api/sessions/'+session.session.id+'/queue/append',{projectId:project.id,revision:0,text:'queued image',images:[media.id]});
+    const queueBody=await queue.json() as {code?:string};
+    assert.equal(queue.status,503);
+    assert.equal(queueBody.code,'media-read-unavailable','queue image resolution surfaces the media backend failure');
+    const submitted=await post(base+'/input',{text:'submitted image',images:[media.id],mode:'followUp'});
+    const submittedBody=await submitted.json() as {code?:string};
+    assert.equal(submitted.status,503);
+    assert.equal(submittedBody.code,'media-read-unavailable','submission surfaces the media backend failure');
+  }finally{
+    try {
+      app.server.closeAllConnections();
+      let closed=false;
+      const close=app.close().then(()=>{closed=true;});
+      let shutdownTimer:NodeJS.Timeout|undefined;
+      try {
+        await Promise.race([close,new Promise((_,reject)=>{shutdownTimer=setTimeout(()=>reject(new Error('Test app shutdown exceeded 10 seconds')),10_000);})]);
+      } finally { if(shutdownTimer)clearTimeout(shutdownTimer); }
+      assert.equal(closed,true,'the test app and its stores must close before removing their data root');
+    } finally {
+      try { control.close(); }
+      finally { await rm(root,{recursive:true,force:true}); }
+    }
   }
 });
 

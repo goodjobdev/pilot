@@ -7,7 +7,7 @@ import { randomUUID } from 'node:crypto';
 import { ControlStore } from '../../src/server/state/control-store';
 import { AgentStore } from '../../src/server/state/agent-store';
 import {
-  AGENT_BUDGET_BOUNDS, AGENT_SCOPES, AGENT_SCOPE_DESCRIPTIONS, AGENT_TOOL_SCOPES, AgentError, agentScopeVocabulary,
+  AGENT_BUDGET_BOUNDS, AGENT_MAX_SCOPES, AGENT_SCOPES, AGENT_SCOPE_DESCRIPTIONS, AGENT_TOOL_SCOPES, AgentError, agentScopeVocabulary,
   authorizeToolUse, decideScopeChange, parseAgentBudgets, parseAgentScopes, parseAgentWorkspace, projectScopeAllows, scopesInForceFor,
   type AgentActor, type AgentDraft, type AgentRecord, type AgentScope
 } from '../../src/shared/agent-registry';
@@ -56,9 +56,119 @@ async function refused(work: () => unknown, code: AgentError['code']): Promise<s
   throw new Error('expected a refusal, but the call succeeded');
 }
 
+test('authority and revision fingerprint share one SQLite snapshot across connections',async()=>{
+ const f=await fixture(),second=new ControlStore(f.root);
+ try{
+  const other=new AgentStore(second,{models:()=>OFFERED,projectKnown:id=>id===f.projectId});
+  const agent=f.agents.create({draft:f.draft(),actor:OWNER});
+  f.agents.bindSession({projectId:f.projectId,sessionId:'s',revision:0,agentId:agent.id,actor:OWNER});
+  const old=f.agents.versionedAuthorityForSession({projectId:f.projectId,sessionId:'s'});
+  const authority=f.agents.authorityForSession.bind(f.agents);let interleaved=false;
+  f.agents.authorityForSession=input=>{
+   const value=authority(input);
+   if(!interleaved){interleaved=true;const revoked=other.update({agentId:agent.id,revision:agent.revision,patch:{scopes:[]},actor:OWNER});other.update({agentId:agent.id,revision:revoked.revision,patch:{scopes:agent.scopes},actor:OWNER});}
+   return value;
+  };
+  const snapshot=f.agents.versionedAuthorityForSession({projectId:f.projectId,sessionId:'s'});
+  const after=f.agents.versionedAuthorityForSession({projectId:f.projectId,sessionId:'s'});
+  assert.equal(interleaved,true);assert.deepEqual(snapshot,old);assert.notEqual(after.authorityVersion,old.authorityVersion);assert.deepEqual(after.scopes,old.scopes);
+ }finally{second.close();await f.cleanup();}
+});
+
+test('disabled or concurrently revoked agent actors cannot update or archive another agent', async () => {
+  for (const action of ['update', 'archive'] as const) for (const change of ['disabled', 'archived', 'scopes'] as const) {
+    const f = await fixture();
+    const second = new ControlStore(f.root);
+    try {
+      const other = new AgentStore(second, { models: () => OFFERED, projectKnown: id => id === f.projectId });
+      const actor = f.agents.create({ draft: f.draft({ name: 'Actor', scopes: ['read_notes'] }), actor: OWNER });
+      const target = f.agents.create({ draft: f.draft({ name: 'Target', scopes: ['read_notes'] }), actor: OWNER });
+      const admit = f.store.admit.bind(f.store); let changed = false;
+      f.store.admit = input => {
+        if (!changed && input.kind === 'agent.record' && input.scope.sessionId === target.id) {
+          changed = true;
+          if (change === 'archived') other.archive({ agentId: actor.id, revision: actor.revision, actor: OWNER });
+          else other.update({ agentId: actor.id, revision: actor.revision, patch: change === 'disabled' ? { enabled: false } : { scopes: [] }, actor: OWNER });
+        }
+        return admit(input);
+      };
+      const agentActor = { kind: 'agent', identity: actor.id };
+      const write = () => action === 'update' ? f.agents.update({ agentId: target.id, revision: target.revision, patch: { scopes: ['read_notes'] }, actor: agentActor }) : f.agents.archive({ agentId: target.id, revision: target.revision, actor: agentActor });
+      await refused(write, 'NOT_PERMITTED');
+      assert.equal(f.agents.read(target.id).revision, target.revision);
+      await refused(write, 'NOT_PERMITTED');
+    } finally { second.close(); await f.cleanup(); }
+  }
+});
+
+test('an agent actor cannot change session or conversation bindings', async () => {
+  const f = await fixture();
+  try {
+    const agent = f.agents.create({ draft: f.draft(), actor: OWNER });
+    const actor = { kind: 'agent', identity: agent.id };
+    await refused(() => f.agents.bindSession({ projectId: f.projectId, sessionId: 'session', revision: 0, agentId: agent.id, actor }), 'NOT_PERMITTED');
+    await refused(() => f.agents.recordConversation({ projectId: f.projectId, sessionId: 'session', conversationId: 1, actor }), 'NOT_PERMITTED');
+    assert.equal(f.agents.binding(f.projectId, 'session'), null); assert.equal(f.agents.conversation(f.projectId, 'session'), null);
+  } finally { await f.cleanup(); }
+});
+
+test('agent governance cannot silently widen another agent’s workspace or budgets', async () => {
+  const f = await fixture();
+  try {
+    const actor = f.agents.create({ draft: f.draft({ name: 'Actor', scopes: ['read_notes'] }), actor: OWNER });
+    const target = f.agents.create({ draft: f.draft({ name: 'Target', scopes: ['read_notes'] }), actor: OWNER });
+    for (const patch of [{ workspace: { scope: { kind: 'all' }, subpath: '' } }, { budgets: { ...target.budgets, maxJobsPerHour: null } }, { enabled: false }, { description: 'changed' }])
+      await refused(() => f.agents.update({ agentId: target.id, revision: target.revision, patch, actor: { kind: 'agent', identity: actor.id } }), 'NOT_PERMITTED');
+    assert.equal(f.agents.read(target.id).revision, target.revision);
+  } finally { await f.cleanup(); }
+});
+
+test('competing projects cannot bind the same global session concurrently', async () => {
+  const f = await fixture(), second = new ControlStore(f.root), otherProject = randomUUID();
+  try {
+    const other = new AgentStore(second, { models: () => OFFERED, projectKnown: () => true });
+    const admit = f.store.admit.bind(f.store); let raced = false;
+    f.store.admit = input => {
+      if (!raced && input.kind === 'agent.conversation') {
+        raced = true; other.recordConversation({ projectId: otherProject, sessionId: 'shared', conversationId: 2, actor: OWNER });
+      }
+      return admit(input);
+    };
+    await refused(() => f.agents.recordConversation({ projectId: f.projectId, sessionId: 'shared', conversationId: 1, actor: OWNER }), 'STORAGE');
+    assert.equal(other.conversation(otherProject, 'shared')?.conversationId, 2);
+    const count = f.store.db.prepare("SELECT COUNT(*) AS n FROM operations WHERE session_id=? AND kind='agent.conversation'").get('shared') as { n: number };
+    assert.equal(count.n, 1);
+  } finally { second.close(); await f.cleanup(); }
+});
+
+test('moving an agent away does not restore legacy owner authority in its old project', async () => {
+  const f = await fixture();
+  try {
+    const agent = f.agents.create({ draft: f.draft(), actor: OWNER });
+    const other = randomUUID();
+    const agents = new AgentStore(f.store, { models: () => OFFERED, projectKnown: () => true });
+    agents.update({ agentId: agent.id, revision: agent.revision, patch: { workspace: { scope: { kind: 'projects', projectIds: [other] }, subpath: '' } }, actor: OWNER });
+    assert.deepEqual(agents.authority(f.projectId), { agentId: null, scopes: [] });
+  } finally { await f.cleanup(); }
+});
+
+test('concurrent creation with the same name is checked inside admission', async () => {
+  const f = await fixture(), second = new ControlStore(f.root);
+  try {
+    const other = new AgentStore(second, { models: () => OFFERED, projectKnown: id => id === f.projectId });
+    const admit = f.store.admit.bind(f.store); let raced = false;
+    f.store.admit = input => {
+      if (!raced && input.kind === 'agent.record') { raced = true; other.create({ draft: f.draft(), actor: OWNER }); }
+      return admit(input);
+    };
+    await refused(() => f.agents.create({ draft: f.draft(), actor: OWNER }), 'DUPLICATE_NAME');
+    assert.equal(f.agents.live().length, 1);
+  } finally { second.close(); await f.cleanup(); }
+});
+
 test('the scope vocabulary is closed, described, and every scope governs at least one declared tool or is a stated capability', () => {
   // The vocabulary is exactly the documented set, and every scope carries one description.
-  assert.deepEqual([...AGENT_SCOPES], ['read_notes', 'record_note', 'ask_question', 'read_docs', 'write_docs', 'file_read', 'file_edit', 'run_tests', 'fork', 'accept', 'commit', 'push', 'deploy', 'spend', 'provision', 'publish']);
+  assert.deepEqual([...AGENT_SCOPES], ['reusable_tools', 'read_notes', 'record_note', 'ask_question', 'read_docs', 'write_docs', 'file_read', 'file_write', 'file_edit', 'shell', 'run_tests', 'fork', 'accept', 'commit', 'push', 'deploy', 'spend', 'provision', 'publish']);
   for (const scope of AGENT_SCOPES) {
     assert.equal(typeof AGENT_SCOPE_DESCRIPTIONS[scope], 'string');
     assert.ok(AGENT_SCOPE_DESCRIPTIONS[scope].length > 10, scope + ' has a real description');
@@ -71,7 +181,7 @@ test('the scope vocabulary is closed, described, and every scope governs at leas
   // action registry and the acceptance record name (fork, accept, commit, push, deploy, spend,
   // provision, publish) — none is a label with nothing behind it.
   const toolScopes = new Set(Object.values(AGENT_TOOL_SCOPES));
-  for (const scope of ['read_notes', 'record_note', 'ask_question', 'read_docs', 'write_docs', 'file_read', 'file_edit', 'run_tests'] as AgentScope[]) {
+  for (const scope of ['reusable_tools', 'read_notes', 'record_note', 'ask_question', 'read_docs', 'write_docs', 'file_read', 'file_write', 'file_edit', 'shell', 'run_tests'] as AgentScope[]) {
     assert.ok(toolScopes.has(scope), scope + ' governs a declared tool');
   }
 });
@@ -230,17 +340,19 @@ test('archiving closes an agent, frees its name, and the scopes in force follow 
     const first = f.agents.create({ draft: f.draft({ scopes: ['read_notes', 'record_note'] }), actor: OWNER });
     // The scopes in force for the project are the enabled agent's own allowlist.
     assert.deepEqual(f.agents.authority(f.projectId), { agentId: first.id, scopes: ['read_notes', 'record_note'] });
-    // Disabling it takes it out of force entirely: with no live agent bound, the owner's own dispatch
-    // is in force and nothing is narrowed.
+    // Disabling the last agent cannot silently restore unrestricted owner authority.
     const disabled = f.agents.update({ agentId: first.id, revision: first.revision, patch: { enabled: false }, actor: OWNER });
-    assert.deepEqual(f.agents.authority(f.projectId), { agentId: null, scopes: null });
+    assert.deepEqual(f.agents.authority(f.projectId), { agentId: null, scopes: [] });
+    assert.deepEqual(f.agents.authorityForSession({ projectId: f.projectId, sessionId: 'legacy' }).scopes, []);
+    const reopened = new AgentStore(f.store, { models: () => OFFERED, projectKnown: () => true });
+    assert.deepEqual(reopened.authority(f.projectId), { agentId: null, scopes: [] });
     f.agents.update({ agentId: first.id, revision: disabled.revision, patch: { enabled: true }, actor: OWNER });
 
     const archived = f.agents.archive({ agentId: first.id, revision: 3, actor: OWNER });
     assert.equal(archived.archived, true);
     assert.equal(archived.revision, 4);
     assert.deepEqual([...archived.scopes], ['read_notes', 'record_note'], 'archiving keeps every field it held');
-    assert.deepEqual(f.agents.authority(f.projectId), { agentId: null, scopes: null }, 'an archived agent is never in force');
+    assert.deepEqual(f.agents.authority(f.projectId), { agentId: null, scopes: [] }, 'an archived agent cannot restore unrestricted owner authority');
     // An archived agent is never changed again, and archiving twice is a conflict.
     await refused(() => f.agents.archive({ agentId: first.id, revision: 4, actor: OWNER }), 'CONFLICT');
     await refused(() => f.agents.update({ agentId: first.id, revision: 4, patch: { description: 'back' }, actor: OWNER }), 'CONFLICT');
@@ -326,8 +438,9 @@ test('a session binding is revision-checked and durable, and the same session wi
     assert.equal(bound.revision, 1);
     assert.deepEqual(bound.boundBy, OWNER);
     assert.ok(Number.isFinite(Date.parse(bound.boundAt)), 'the binding records when it was made');
-    // The authority now follows the bound agent: its scopes and its project scope.
-    assert.deepEqual(f.agents.authorityForSession({ projectId: f.projectId, sessionId: '1' }), { agentId: agent.id, scopes: ['read_notes', 'record_note'], projects: [f.projectId], emptyReason: null });
+    // The authority now follows the bound agent: its scopes, its project scope, and the model it
+    // declares — which that agent's sessions take unless the owner chooses one for the session.
+    assert.deepEqual(f.agents.authorityForSession({ projectId: f.projectId, sessionId: '1' }), { agentId: agent.id, model: agent.model, scopes: ['read_notes', 'record_note'], projects: [f.projectId], emptyReason: null });
     // A stale revision writes nothing.
     const stale = await refused(() => f.agents.bindSession({ projectId: f.projectId, sessionId: '1', revision: 0, agentId: null, actor: OWNER }), 'CONFLICT');
     assert.match(stale, /binding revision 1, not 0/);
@@ -352,13 +465,98 @@ test('a session binding is revision-checked and durable, and the same session wi
   } finally { await f.cleanup(); }
 });
 
+test('a conversation binding is recorded exactly once, is durable across a reopen, and a second creation with different content is refused', async () => {
+  const f = await fixture();
+  try {
+    const sessionId = 'e6a7b8c9-0d1e-4f2a-8b3c-4d5e6f7a8b9c';
+    // First call records revision 1.
+    const recorded = f.agents.recordConversation({ projectId: f.projectId, sessionId, conversationId: 42, actor: OWNER });
+    assert.equal(recorded.revision, 1);
+    assert.equal(recorded.conversationId, 42);
+    assert.deepEqual(recorded.createdBy, OWNER);
+    assert.ok(Number.isFinite(Date.parse(recorded.createdAt)), 'the binding records when it was made');
+
+    // Same content returns the existing binding.
+    const same = f.agents.recordConversation({ projectId: f.projectId, sessionId, conversationId: 42, actor: OWNER });
+    assert.equal(same.conversationId, 42);
+    assert.equal(same.revision, 1);
+
+    // Different content is refused with CONFLICT.
+    const conflict = await refused(() => f.agents.recordConversation({ projectId: f.projectId, sessionId, conversationId: 99, actor: OWNER }), 'CONFLICT');
+    assert.match(conflict, /already bound to conversation 42/);
+
+    // The binding survives a new store handle on the same data root.
+    const reopened = new AgentStore(f.store, { models: () => OFFERED, projectKnown: () => true });
+    const restored = reopened.conversation(f.projectId, sessionId);
+    assert.notEqual(restored, null);
+    assert.equal(restored!.conversationId, 42);
+    assert.equal(restored!.revision, 1);
+
+    // A second session in the same project has its own binding.
+    const secondSessionId = 'f0a1b2c3-4d5e-6f7a-8b9c-0d1e2f3a4b5c';
+    const second = f.agents.recordConversation({ projectId: f.projectId, sessionId: secondSessionId, conversationId: 7, actor: OWNER });
+    assert.equal(second.conversationId, 7);
+
+    // A foreign-project session has its own binding.
+    const otherProject = randomUUID();
+    const otherSessionId = 'c3d4e5f6-a7b8-4c9d-0e1f-2a3b4c5d6e7f';
+    const otherBinding = f.agents.recordConversation({ projectId: otherProject, sessionId: otherSessionId, conversationId: 99, actor: OWNER });
+    assert.equal(otherBinding.conversationId, 99);
+
+    // Two distinct sessions each have exactly one binding operation row.
+    const rows = f.store.db.prepare("SELECT kind, count(*) AS n FROM operations WHERE kind='agent.conversation' GROUP BY kind").all() as { kind: string; n: number }[];
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].n, 3, 'three conversation binding operations across projects and sessions');
+    const outboxes = f.store.db.prepare("SELECT kind, count(*) AS n FROM outboxes WHERE kind='agent.conversation' GROUP BY kind").all() as { kind: string; n: number }[];
+    assert.equal(outboxes.length, 1);
+    assert.equal(outboxes[0].n, 3, 'three conversation binding outbox rows');
+  } finally { await f.cleanup(); }
+});
+
+test('a conversation binding for a session whose binding already exists with identical content returns existing', async () => {
+  const f = await fixture();
+  try {
+    const sessionId = 'a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d';
+    f.agents.recordConversation({ projectId: f.projectId, sessionId, conversationId: 12, actor: OWNER });
+    // Idempotent repeat.
+    const repeat = f.agents.recordConversation({ projectId: f.projectId, sessionId, conversationId: 12, actor: OWNER });
+    assert.equal(repeat.conversationId, 12);
+    // Exactly one operation row.
+    const rows = f.store.db.prepare("SELECT count(*) AS n FROM operations WHERE kind='agent.conversation' AND session_id=?").get(sessionId) as { n: number };
+    assert.equal(rows.n, 1);
+  } finally { await f.cleanup(); }
+});
+
+test('a conversation binding moved into a foreign scope is corruption, never a missing binding', async () => {
+  const f = await fixture();
+  try {
+    const sessionId = 'd4e5f6a7-b8c9-4012-8345-6789abcdef01';
+    f.agents.recordConversation({ projectId: f.projectId, sessionId, conversationId: 23, actor: OWNER });
+    const foreignProject = randomUUID();
+    f.store.db.prepare("UPDATE operations SET project_id=? WHERE kind='agent.conversation' AND session_id=?").run(foreignProject, sessionId);
+    await refused(() => f.agents.conversation(f.projectId, sessionId), 'STORAGE');
+    await refused(() => f.agents.recordConversation({ projectId: f.projectId, sessionId, conversationId: 24, actor: OWNER }), 'STORAGE');
+  } finally { await f.cleanup(); }
+});
+
+ test('a conversation binding refuses non-integer conversationId and missing fields', async () => {
+  const f = await fixture();
+  try {
+    const sessionId = 'b2c3d4e5-f6a7-4b8c-9d0e-1f2a3b4c5d6e';
+    const invalidConv = await refused(() => f.agents.recordConversation({ projectId: f.projectId, sessionId, conversationId: 0, actor: OWNER }), 'INVALID');
+    assert.match(invalidConv, /conversationId must be a positive integer/);
+    const invalidConv2 = await refused(() => f.agents.recordConversation({ projectId: f.projectId, sessionId, conversationId: 1.5, actor: OWNER }), 'INVALID');
+    assert.match(invalidConv2, /conversationId must be a positive integer/);
+  } finally { await f.cleanup(); }
+});
+
 test('the scope list is canonical, bounded and duplicate-free, and an oversize registry is refused', async () => {
   const f = await fixture();
   try {
     assert.deepEqual([...parseAgentScopes([])], []);
     assert.deepEqual([...parseAgentScopes(['publish', 'commit', 'read_notes'])], ['read_notes', 'commit', 'publish']);
     assert.equal(parseAgentScopes(AGENT_SCOPES.map((scope) => scope)).length, AGENT_SCOPES.length, 'the whole vocabulary is the documented maximum, and it is accepted');
-    assert.throws(() => parseAgentScopes(Array.from({ length: 17 }, () => 'read_notes' as AgentScope)), (error: Error) => error instanceof AgentError);
+    assert.throws(() => parseAgentScopes(Array.from({ length: AGENT_MAX_SCOPES + 1 }, () => 'read_notes' as AgentScope)), (error: Error) => error instanceof AgentError);
     assert.throws(() => parseAgentScopes('read_notes'), (error: Error) => error instanceof AgentError);
     // Every agent is one control-store operation per revision: the record is bounded JSON.
     const record = f.agents.create({ draft: f.draft({ description: 'x'.repeat(400) }), actor: OWNER });

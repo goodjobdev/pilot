@@ -43,3 +43,22 @@ test('legacy scripts are inert; unsafe names and unsupported formats rejected',(
  assert.throws(()=>previewImport(emptyBoard(),[{name:'../secret.md',content:''}]));
  assert.throws(()=>previewImport(emptyBoard(),[{name:'x.zip',content:''}]));
 });
+test('stable task IDs survive renames and file moves, with explicit dependencies and no duplicates',()=>{
+ const first=previewImport(emptyBoard(),[{name:'docs/plan.md',content:'# Work\n- [ ] Add storage <!-- pilot:task STORE -->\n- [ ] Add UI <!-- pilot:task UI --> <!-- pilot:depends STORE -->'}]);
+ const board=applyImport(emptyBoard(),first,first.candidates.map(c=>c.id),first.relationships.map(e=>e.id));
+ assert.equal(board.tasks.length,2);assert.equal(board.relationships.length,1);assert.equal(board.tasks[1].title,'Add UI');assert.doesNotMatch(board.tasks[1].description,/pilot:/);
+ const next=previewImport(board,[{name:'docs/moved.md',content:'# Renamed section\n- [x] Store the data <!-- pilot:task STORE -->\n- [ ] Add UI <!-- pilot:task UI --> <!-- pilot:depends STORE -->'}]);
+ assert.equal(next.candidates[0].task.id,board.tasks[0].id);assert.equal(next.candidates[0].change,'changed');assert.equal(next.candidates[0].task.status,'done');assert.equal(next.relationships.length,0);
+ const applied=applyImport(board,next,next.candidates.map(c=>c.id),[]);assert.equal(applied.tasks.length,2);assert.equal(applied.tasks[0].title,'Store the data');
+ assert.throws(()=>previewImport(board,[{name:'a.md',content:'- [ ] One <!-- pilot:task SAME -->\n- [ ] Two <!-- pilot:task SAME -->'}]),/Duplicate/);
+});
+test('sync ignores fenced/commented examples and reports missing dependency IDs',()=>{
+ const preview=previewImport(emptyBoard(),[{name:'docs/work.md',content:'```md\n- [ ] Example\n```\n<!--\n- [ ] Hidden example\n-->\n- [ ] Actual <!-- pilot:task ACTUAL --> <!-- pilot:depends MISSING -->'}]);
+ assert.equal(preview.candidates.length,1);assert.equal(preview.candidates[0].task.title,'Actual');assert.equal(preview.relationships.length,0);assert.match(preview.warnings[0],/MISSING/);
+});
+test('milestone metadata ignores commented examples and nested fence demonstrations',()=>{
+ const hidden=previewImport(emptyBoard(),[{name:'examples.md',content:'# Examples\n````md\n```md\n# M9 — Not a milestone\nStatus: done\n```\n````\n<!--\n# M8 — Also not a milestone\nStatus: done\n-->\n- [ ] Actual work <!-- pilot:task REAL -->\n'}]);
+ assert.equal(hidden.milestones.length,0);assert.equal(hidden.candidates.length,1);assert.equal(hidden.candidates[0].task.status,'todo');
+ const real=previewImport(emptyBoard(),[{name:'m1.md',content:'# M1 — Real milestone\n<!-- Status: done -->\n```md\nStatus: done\n```\nStatus: pending\n- [ ] Child work\n'}]);
+ assert.equal(real.milestones.length,1);assert(real.candidates.every(candidate=>candidate.task.status==='todo'));
+});

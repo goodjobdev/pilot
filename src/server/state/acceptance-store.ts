@@ -1,16 +1,16 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { readFile } from 'node:fs/promises';
+import { readBoundedFile } from '../bounded-file-read';
 import { CONTROL_RECORD_VERSION, exceedsJsonLimit, validateOperationRecord, validateOutboxRecord, type ControlScope, type OperationRecord, type OutboxRecord } from '../../shared/control-state';
 import {
   ACCEPTANCE_MAX_COMMANDS, ACCEPTANCE_MAX_EVIDENCE_ITEMS, ACCEPTANCE_MAX_EVIDENCE_READ, ACCEPTANCE_MAX_INLINE_DIFF_BYTES, ACCEPTANCE_MAX_OUTPUT_BYTES,
   ACCEPTANCE_IDENTITY_PATTERN, ACCEPTANCE_POLICY_ABSENCE, ACCEPTANCE_POLICY_ABSENCE_DETAIL,
   AcceptanceError, acceptanceMarkdown, canonicalEvidenceInput, checkTestEvidence, decideAcceptance, defaultAcceptancePolicy,
   parseAcceptancePolicyUpdate, parseAcceptanceRequest, validateAcceptanceRecord, validateCompletionRecord, validateCompletionRecordRequest, validateStoredAcceptancePolicy,
-  type AcceptancePolicy, type AcceptanceRecord, type CompletionRecord, type CompletionRecordRequest
+  type AcceptancePolicy, type AcceptancePolicyDefinition, type AcceptanceRecord, type CompletionRecord, type CompletionRecordRequest
 } from '../../shared/acceptance';
 import { z } from 'zod';
 import { atomicWrite } from '../board-store';
-import { ControlStore, ControlStoreError } from './control-store';
+import { ControlStore, ControlStoreError, operationDigest } from './control-store';
 import { safePath } from '../paths';
 
 /**
@@ -46,6 +46,10 @@ const ACCEPTANCE_KIND = 'acceptance.acceptance';
 const POLICY_OUTBOX = 'acceptance.policy-version';
 const EVIDENCE_OUTBOX = 'acceptance.evidence-record';
 const ACCEPTANCE_OUTBOX = 'acceptance.decision';
+class EvidenceRenderRefused extends Error {}
+class EvidenceAdmissionRefused extends ControlStoreError {
+  constructor() { super('Evidence authority changed before admission', 'CONFLICT'); }
+}
 /**
  * The control store scopes operations by project and session, while the policy is a deployment
  * setting and a record's session is optional. The storage bucket is therefore a bucket, never the
@@ -85,6 +89,10 @@ export type ProjectAcceptanceView = {
 export type EvidenceResult = { readonly evidence: EvidenceView; readonly written: boolean };
 /** What an acceptance answers with: the decision, and the evidence it was bound to. */
 export type AcceptanceResult = { readonly acceptance: AcceptanceRecord; readonly evidence: EvidenceView };
+type AcceptancePolicyHistory = {
+  readonly current: AcceptancePolicy;
+  readonly definitions: ReadonlyMap<number, AcceptancePolicyDefinition>;
+};
 
 export type AcceptanceStoreOptions = {
   clock?: () => Date;
@@ -187,39 +195,58 @@ export class AcceptanceStore {
     this.id = options.id ?? (() => 'ac-' + randomUUID());
   }
 
+  /** Admission authority must be read through the transaction's own connection. */
+  usesControlStore(store: ControlStore): boolean { return this.store === store; }
+
   /** The policy in force. An unwritten policy is reported as the documented default, and says so. */
   readPolicy(): AcceptancePolicy {
+    return this.withReadSnapshot(() => this.readPolicyHistory().current);
+  }
+
+  /** Validate every historical revision once and retain the definitions only for this read. */
+  private readPolicyHistory(): AcceptancePolicyHistory {
     const rows = this.select('SELECT id FROM operations WHERE project_id=? AND session_id=? AND kind=? ORDER BY rowid', [UNNAMED, UNNAMED, POLICY_KIND]);
-    let latest: { operation: OperationRecord; revision: number } | null = null;
+    const definitions = new Map<number, AcceptancePolicyDefinition>([[0, defaultAcceptancePolicy()]]);
+    let latest: { meta: ReturnType<AcceptanceStore['policyMeta']>; definition: AcceptancePolicyDefinition } | null = null;
+    let expectedRevision = 1;
     for (const row of rows) {
       const operation = this.operation(String(row.id), { projectId: UNNAMED, sessionId: UNNAMED });
       const meta = this.policyMeta(operation);
-      if (latest !== null && meta.revision === latest.revision) throw corrupt('Corrupt acceptance storage: two policy records share revision ' + meta.revision);
-      if (latest === null || meta.revision > latest.revision) latest = { operation, revision: meta.revision };
+      let definition: AcceptancePolicyDefinition;
+      try { definition = validateStoredAcceptancePolicy(operation.input); }
+      catch { throw corrupt('A stored acceptance policy revision is corrupt.'); }
+      if (meta.revision !== expectedRevision++) throw corrupt('Corrupt acceptance storage: policy revision history is not contiguous.');
+      definitions.set(meta.revision, definition);
+      latest = { meta, definition };
     }
-    if (latest === null)
-      return Object.freeze({
-        ...defaultAcceptancePolicy(),
-        revision: 0,
-        recorded: false as const,
-        absenceReason: ACCEPTANCE_POLICY_ABSENCE.notRecorded,
-        absenceDetail: ACCEPTANCE_POLICY_ABSENCE_DETAIL,
-        updatedAt: null,
-        updatedBy: null
-      }) as AcceptancePolicy;
-    let definition;
-    try { definition = validateStoredAcceptancePolicy(latest.operation.input); }
-    catch (error) { throw corrupt('A stored acceptance policy is corrupt: ' + (error as Error).message); }
-    const meta = this.policyMeta(latest.operation);
-    return Object.freeze({
-      ...definition,
-      revision: meta.revision,
-      recorded: true as const,
-      absenceReason: null,
-      absenceDetail: null,
-      updatedAt: meta.updatedAt,
-      updatedBy: meta.updatedBy
-    }) as AcceptancePolicy;
+    if (latest === null) {
+      const definition = defaultAcceptancePolicy();
+      definitions.set(0, definition);
+      return {
+        current: Object.freeze({
+          ...definition,
+          revision: 0,
+          recorded: false as const,
+          absenceReason: ACCEPTANCE_POLICY_ABSENCE.notRecorded,
+          absenceDetail: ACCEPTANCE_POLICY_ABSENCE_DETAIL,
+          updatedAt: null,
+          updatedBy: null
+        }) as AcceptancePolicy,
+        definitions
+      };
+    }
+    return {
+      current: Object.freeze({
+        ...latest.definition,
+        revision: latest.meta.revision,
+        recorded: true as const,
+        absenceReason: null,
+        absenceDetail: null,
+        updatedAt: latest.meta.updatedAt,
+        updatedBy: latest.meta.updatedBy
+      }) as AcceptancePolicy,
+      definitions
+    };
   }
 
   /**
@@ -262,7 +289,7 @@ export class AcceptanceStore {
    * the canonical request — and that call rewrites the Markdown, which is how a file a crash never
    * wrote is repaired. A record is never updated: there is no path that changes one.
    */
-  async recordEvidence(input: { projectId: unknown; evidence: unknown }): Promise<EvidenceResult> {
+  async recordEvidence(input: { projectId: unknown; evidence: unknown; authorizeAdmission?:()=>unknown; signal?:AbortSignal }): Promise<EvidenceResult> {
     const projectId = requireIdentifier(input?.projectId, 'projectId');
     const request = validateCompletionRecordRequest(input?.evidence, this.clock());
     const root = this.options.projectRoot(projectId);
@@ -271,6 +298,13 @@ export class AcceptanceStore {
     // The evidence is checked before anything is written: a claim that contradicts its own output,
     // or a result for a command the record does not say was run, records nothing at all.
     const tests = request.tests.map((claim) => checkTestEvidence(claim, request.commands));
+    const authorize=()=>{
+      input.signal?.throwIfAborted();
+      const checked=input.authorizeAdmission?.();
+      if(checked&&typeof (checked as {then?:unknown}).then==='function'){void Promise.resolve(checked).catch(()=>{});throw new Error('Evidence admission authorization must be synchronous.');}
+      input.signal?.throwIfAborted();
+    };
+    try{authorize();}catch{throw new AcceptanceError('Evidence authority changed before admission; no new record was written.','CONFLICT');}
     const identity = evidenceIdentity(canonicalEvidenceInput({ projectId, request }));
     const scope = this.bucket(projectId, request.sessionId);
     let record = this.materialize(projectId, request, tests, identity.id);
@@ -282,14 +316,17 @@ export class AcceptanceStore {
           idempotencyKey: identity.key,
           kind: EVIDENCE_KIND,
           input: record,
-          outbox: { kind: EVIDENCE_OUTBOX, payload: { version: 1, evidenceId: record.id, revision: record.artifact.revision } }
+          outbox: { kind: EVIDENCE_OUTBOX, payload: { version: 1, evidenceId: record.id, revision: record.artifact.revision } },
+          guard:()=>{try{authorize();}catch{throw new EvidenceAdmissionRefused();}}
         });
       } catch (error) {
+        if (error instanceof EvidenceAdmissionRefused)
+          throw new AcceptanceError('Evidence authority changed before admission; this call wrote no new record.', 'CONFLICT');
         if (error instanceof ControlStoreError && error.code === 'CONFLICT') {
           // A concurrent writer recorded the same evidence first. That is the same record, so it is
           // read back rather than refused; anything else is a storage fault.
           const raced = this.byKey(EVIDENCE_KIND, projectId, identity.key);
-          if (raced === null) throw storage('The durable store refused the completion record (' + error.message + ') and no record of it can be read back');
+          if (raced === null) throw new AcceptanceError('Evidence authority changed or admission conflicted; no new record was written.','CONFLICT');
           record = this.evidenceRecord(raced);
         } else {
           throw storage('The durable store refused the completion record: ' + (error as Error).message);
@@ -299,7 +336,20 @@ export class AcceptanceStore {
       record = this.evidenceRecord(existing);
     }
     const acceptance = this.acceptanceFor(projectId, record.id);
-    const markdown = await this.writeMarkdown(root, record, acceptance);
+    // A durable record must never be reported as absent if authority changes after admission.
+    try{authorize();}catch{
+      const markdown=await this.markdownState(root,record,acceptance);
+      return Object.freeze({evidence:Object.freeze({readOnly:true as const,record,markdown,acceptance}),written:false});
+    }
+    let markdown:AcceptanceMarkdownReport;
+    try{markdown=await this.writeMarkdown(root,record,acceptance,()=>{try{authorize();}catch{throw new EvidenceRenderRefused();}});}
+    catch(error){
+      // Admission may already be durable. A render failure must not look like the record was never
+      // created; report the observed Markdown state without logging a path or claiming a write.
+      if(!(error instanceof EvidenceRenderRefused))console.error('The completion record is durable, but its Markdown rendering could not be written.');
+      markdown=await this.markdownState(root,record,acceptance);
+      return Object.freeze({evidence:Object.freeze({readOnly:true as const,record,markdown,acceptance}),written:false});
+    }
     return Object.freeze({ evidence: Object.freeze({ readOnly: true as const, record, markdown, acceptance }), written: markdown.state === 'current' });
   }
 
@@ -307,8 +357,10 @@ export class AcceptanceStore {
   async readEvidence(input: { projectId: unknown; evidenceId: unknown }): Promise<EvidenceView> {
     const projectId = requireIdentifier(input?.projectId, 'projectId');
     const evidenceId = requireIdentifier(input?.evidenceId, 'evidenceId');
-    const record = this.evidenceRecord(this.requireEvidence(projectId, evidenceId));
-    const acceptance = this.acceptanceFor(projectId, record.id);
+    const { record, acceptance } = this.withReadSnapshot(() => {
+      const record = this.evidenceRecord(this.requireEvidence(projectId, evidenceId));
+      return { record, acceptance: this.acceptanceFor(projectId, record.id) };
+    });
     const root = this.options.projectRoot(projectId);
     return Object.freeze({
       readOnly: true as const,
@@ -318,25 +370,33 @@ export class AcceptanceStore {
     });
   }
 
-  /** The policy in force and every completion record of one project, newest last. */
-  async readProject(input: { projectId: unknown }): Promise<ProjectAcceptanceView> {
+  /** The policy in force and bounded completion records, oldest first (newest last). */
+  async readProject(input: { projectId: unknown; sessionId?: unknown }): Promise<ProjectAcceptanceView> {
     const projectId = requireIdentifier(input?.projectId, 'projectId');
-    const rows = this.select('SELECT id,session_id FROM operations WHERE project_id=? AND kind=? ORDER BY rowid', [projectId, EVIDENCE_KIND]);
-    const truncated = rows.length > ACCEPTANCE_MAX_EVIDENCE_READ;
-    const records: CompletionRecord[] = rows.slice(0, ACCEPTANCE_MAX_EVIDENCE_READ).map((row) => {
-      const operation = this.operation(String(row.id), { projectId, sessionId: String(row.session_id) });
-      return this.evidenceRecord(operation);
+    const sessionId = input.sessionId === undefined ? undefined : requireIdentifier(input.sessionId, 'sessionId');
+    const snapshot = this.withReadSnapshot(() => {
+      const policyHistory = this.readPolicyHistory();
+      const rows = sessionId === undefined
+        ? this.select('SELECT id,session_id FROM operations WHERE project_id=? AND kind=? ORDER BY rowid LIMIT ?', [projectId, EVIDENCE_KIND, ACCEPTANCE_MAX_EVIDENCE_READ + 1])
+        : this.select('SELECT id,session_id FROM operations WHERE project_id=? AND kind=? AND session_id=? ORDER BY rowid LIMIT ?', [projectId, EVIDENCE_KIND, sessionId, ACCEPTANCE_MAX_EVIDENCE_READ + 1]);
+      const truncated = rows.length > ACCEPTANCE_MAX_EVIDENCE_READ;
+      const entries = rows.slice(0, ACCEPTANCE_MAX_EVIDENCE_READ).map((row) => {
+        const operation = this.operation(String(row.id), { projectId, sessionId: String(row.session_id) });
+        const record = this.evidenceRecord(operation);
+        const acceptance = this.acceptanceFor(projectId, record.id, policyHistory);
+        return { record, acceptance };
+      });
+      return { policy: policyHistory.current, entries, truncated };
     });
     const root = this.options.projectRoot(projectId);
     const evidence: EvidenceView[] = [];
-    for (const record of records) {
-      const acceptance = this.acceptanceFor(projectId, record.id);
+    for (const { record, acceptance } of snapshot.entries) {
       evidence.push(Object.freeze({ readOnly: true as const, record, markdown: await this.markdownState(root, record, acceptance), acceptance }));
     }
     return Object.freeze({
       readOnly: true as const,
       projectId,
-      policy: this.readPolicy(),
+      policy: snapshot.policy,
       evidence: Object.freeze(evidence),
       limits: Object.freeze({
         evidence: ACCEPTANCE_MAX_EVIDENCE_READ,
@@ -345,7 +405,7 @@ export class AcceptanceStore {
         outputBytes: ACCEPTANCE_MAX_OUTPUT_BYTES,
         inlineDiffBytes: ACCEPTANCE_MAX_INLINE_DIFF_BYTES
       }),
-      truncated
+      truncated: snapshot.truncated
     });
   }
 
@@ -358,7 +418,7 @@ export class AcceptanceStore {
    * accepting identity. An agent acceptance records the rule that permitted it. The own artifact
    * identity in the request is what future callers are bound to: a new revision needs new evidence.
    */
-  async accept(input: { projectId: unknown; request: unknown }): Promise<AcceptanceResult> {
+  async accept(input: { projectId: unknown; request: unknown; authorizeAdmission?: () => unknown }): Promise<AcceptanceResult> {
     const projectId = requireIdentifier(input?.projectId, 'projectId');
     const request = parseAcceptanceRequest(input?.request);
     const root = this.options.projectRoot(projectId);
@@ -383,6 +443,8 @@ export class AcceptanceStore {
     const policy = this.readPolicy();
     const decision = decideAcceptance({ actor: request.actor, actionClass: request.actionClass, policy });
     if (!decision.permitted) throw new AcceptanceError(decision.message, 'NOT_PERMITTED');
+    if (request.actor.kind === 'agent' && typeof input.authorizeAdmission !== 'function')
+      throw new AcceptanceError('An agent acceptance requires a trusted synchronous admission authority; no decision was recorded.', 'NOT_PERMITTED');
     const acceptance = validateAcceptanceRecord({
       version: 1,
       id: this.mintId(),
@@ -403,13 +465,18 @@ export class AcceptanceStore {
       singleUse: true
     });
     const scope = this.bucket(projectId, record.sessionId);
+    const authorize=()=>{const checked=input.authorizeAdmission?.();if(checked&&typeof (checked as {then?:unknown}).then==='function'){void Promise.resolve(checked).catch(()=>{});throw new Error('Admission authorization must be synchronous');}};
     try {
       this.store.admit({
         scope,
         idempotencyKey: 'acceptance.' + record.id,
         kind: ACCEPTANCE_KIND,
         input: acceptance,
-        outbox: { kind: ACCEPTANCE_OUTBOX, payload: { version: 1, evidenceId: record.id, actionClass: request.actionClass } }
+        outbox: { kind: ACCEPTANCE_OUTBOX, payload: { version: 1, evidenceId: record.id, actionClass: request.actionClass } },
+        guard: () => {
+          if (JSON.stringify(this.readPolicy()) !== JSON.stringify(policy)) throw new ControlStoreError('Acceptance policy changed before admission', 'CONFLICT');
+          try { authorize(); } catch { throw new ControlStoreError('Acceptance authority changed before admission', 'CONFLICT'); }
+        }
       });
     } catch (error) {
       if (error instanceof ControlStoreError && error.code === 'CONFLICT') {
@@ -419,6 +486,7 @@ export class AcceptanceStore {
             'This artifact was accepted concurrently at ' + raced.acceptedAt + ' by ' + raced.acceptedBy.kind + ' `' + raced.acceptedBy.identity + '`; an acceptance is single use',
             'ALREADY_ACCEPTED'
           );
+        throw new AcceptanceError('Acceptance policy or authority changed before admission; no decision was recorded.', 'CONFLICT');
       }
       throw storage('The durable store refused the acceptance: ' + (error as Error).message);
     }
@@ -427,10 +495,10 @@ export class AcceptanceStore {
     // tell them it already exists. The state of the Markdown file on disk is re-derived instead, so
     // the answer reports what is really there (and re-reading the evidence repairs the file).
     let markdown: AcceptanceMarkdownReport;
-    try { markdown = await this.writeMarkdown(root, record, acceptance); }
-    catch {
+    try { markdown = await this.writeMarkdown(root, record, acceptance, input.authorizeAdmission?()=>{try{authorize();}catch{throw new EvidenceRenderRefused();}}:undefined); }
+    catch (error) {
       markdown = await this.markdownState(root, record, acceptance);
-      console.error('The acceptance of evidence ' + record.id + ' is durable, but its Markdown record could not be written; the answer reports the state of the file on disk, and recording the same evidence again writes it.');
+      if(!(error instanceof EvidenceRenderRefused))console.error('The acceptance of evidence ' + record.id + ' is durable, but its Markdown record could not be written; the answer reports the state of the file on disk, and recording the same evidence again writes it.');
     }
     return Object.freeze({ acceptance, evidence: Object.freeze({ readOnly: true as const, record, markdown, acceptance }) });
   }
@@ -438,6 +506,24 @@ export class AcceptanceStore {
   /* -------------------------------------------------------------------------------------------- *
    * Internals.
    * -------------------------------------------------------------------------------------------- */
+
+  /** A synchronous SQLite read snapshot; nested admission guards reuse the caller's transaction. */
+  private withReadSnapshot<T>(read: () => T): T {
+    const db = this.store.db;
+    const ownsTransaction = !db.isTransaction;
+    try {
+      if (ownsTransaction) db.exec('BEGIN');
+      const result = read();
+      if (result && typeof (result as { then?: unknown }).then === 'function')
+        throw new Error('Acceptance read snapshot callback must be synchronous');
+      if (ownsTransaction) db.exec('COMMIT');
+      return result;
+    } catch (error) {
+      if (ownsTransaction) { try { db.exec('ROLLBACK'); } catch {} }
+      if (error instanceof AcceptanceError) throw error;
+      throw storage('The durable control store could not complete an acceptance read snapshot: ' + (error as Error).message);
+    }
+  }
 
   private bucket(projectId: string, sessionId: string | null): ControlScope {
     return { projectId, sessionId: sessionId ?? UNNAMED };
@@ -475,6 +561,7 @@ export class AcceptanceStore {
     let record: CompletionRecord;
     try { record = validateCompletionRecord(operation.input); }
     catch (error) { throw corrupt('A stored completion record is corrupt: ' + (error as Error).message); }
+    if (operation.projectId !== record.projectId || operation.sessionId !== (record.sessionId ?? UNNAMED)) throw corrupt('The stored completion record does not match its scope');
     const outbox = this.outboxFor(operation);
     if (outbox.kind !== EVIDENCE_OUTBOX) throw corrupt('Acceptance storage holds an unexpected outbox kind');
     if (outbox.state !== 'pending') throw corrupt('A completion record outbox must stay pending for the life of the record');
@@ -499,25 +586,46 @@ export class AcceptanceStore {
     if ('acceptance.policy.r' + meta.revision !== operation.idempotencyKey) throw corrupt('A stored acceptance policy version does not match its own key');
     return meta;
   }
-  private acceptanceRecord(operation: OperationRecord): AcceptanceRecord {
+  private acceptanceRecord(operation: OperationRecord, history: AcceptancePolicyHistory = this.readPolicyHistory()): AcceptanceRecord {
     if (operation.kind !== ACCEPTANCE_KIND) throw corrupt('Acceptance storage holds an unexpected operation kind');
     let record: AcceptanceRecord;
     try { record = validateAcceptanceRecord(operation.input); }
     catch (error) { throw corrupt('A stored acceptance is corrupt: ' + (error as Error).message); }
+    if (operation.projectId !== record.projectId || operation.sessionId !== (record.sessionId ?? UNNAMED) || operation.idempotencyKey !== 'acceptance.' + record.evidenceId)
+      throw corrupt('The stored acceptance does not match its scope or evidence key');
     const outbox = this.outboxFor(operation);
     if (outbox.kind !== ACCEPTANCE_OUTBOX) throw corrupt('Acceptance storage holds an unexpected outbox kind');
     if (outbox.state !== 'pending') throw corrupt('An acceptance outbox must stay pending for the life of the decision');
     const payload = outbox.payload as { version?: unknown; evidenceId?: unknown; actionClass?: unknown } | null;
     if (!payload || payload.version !== 1 || payload.evidenceId !== record.evidenceId || payload.actionClass !== record.actionClass)
       throw corrupt('The stored acceptance outbox payload does not describe its decision');
+    // A snapshot is a claim about the policy at admission, not proof against coordinated database
+    // rewriting. Validate the append-only history first, then resolve the exact cited revision.
+    const latest = history.current;
+    const revision = record.policy.revision;
+    if (revision > latest.revision || record.policy.recorded !== (revision > 0))
+      throw corrupt('The stored acceptance cites an unavailable policy revision');
+    const definition = history.definitions.get(revision);
+    if (!definition) throw corrupt('The stored acceptance cites an unavailable policy revision');
+    const policy = { ...latest, ...definition, revision, recorded: revision > 0 } as AcceptancePolicy;
+    const decision = decideAcceptance({ actor: { kind: record.acceptedBy.kind, identity: record.acceptedBy.identity }, actionClass: record.actionClass, policy });
+    if (record.policy.mode !== policy.mode || record.policy.classDecision !== policy.actionClasses[record.actionClass] || !decision.permitted || record.acceptedBy.policyRule !== decision.policyRule)
+      throw corrupt('The stored acceptance does not match its cited policy decision');
     return record;
   }
   /** The acceptance of one evidence record, or null. Read by the key the evidence identity produces. */
-  private acceptanceFor(projectId: string, evidenceId: string): AcceptanceRecord | null {
-    const rows = this.select('SELECT * FROM operations WHERE project_id=? AND kind=? AND idempotency_key=? LIMIT 2', [projectId, ACCEPTANCE_KIND, 'acceptance.' + evidenceId]);
-    if (rows.length === 0) return null;
-    if (rows.length > 1) throw corrupt('Corrupt acceptance storage: the same evidence holds two acceptances');
-    return this.acceptanceRecord(decodeOperationRow(rows[0]));
+  private acceptanceFor(projectId: string, evidenceId: string, history?: AcceptancePolicyHistory): AcceptanceRecord | null {
+    const read = (): AcceptanceRecord | null => {
+      const rows = this.select('SELECT * FROM operations WHERE project_id=? AND kind=? AND idempotency_key=? LIMIT 2', [projectId, ACCEPTANCE_KIND, 'acceptance.' + evidenceId]);
+      if (rows.length === 0) return null;
+      if (rows.length > 1) throw corrupt('Corrupt acceptance storage: the same evidence holds two acceptances');
+      const acceptance = this.acceptanceRecord(decodeOperationRow(rows[0]), history);
+      const evidence = this.evidenceRecord(this.requireEvidence(projectId, evidenceId));
+      if (acceptance.projectId !== evidence.projectId || acceptance.sessionId !== evidence.sessionId || acceptance.evidenceId !== evidence.id || acceptance.subject.kind !== evidence.subject.kind || acceptance.subject.id !== evidence.subject.id || acceptance.artifact.revision !== evidence.artifact.revision || acceptance.artifact.commit !== evidence.artifact.commit)
+        throw corrupt('The stored acceptance does not match its completion record');
+      return acceptance;
+    };
+    return history === undefined ? this.withReadSnapshot(read) : read();
   }
   /**
    * The one operation row for a key in a bucket, or null. Within a project a key names at most one
@@ -547,14 +655,14 @@ export class AcceptanceStore {
    * `current` without reading the file back would assert a state the caller never verified, and
    * `written` would be true for a file that is not there.
    */
-  private async writeMarkdown(root: string, record: CompletionRecord, acceptance: AcceptanceRecord | null): Promise<AcceptanceMarkdownReport> {
+  private async writeMarkdown(root: string, record: CompletionRecord, acceptance: AcceptanceRecord | null, beforeWrite?:()=>void): Promise<AcceptanceMarkdownReport> {
     const path = this.markdownPath(record);
     const rendered = acceptanceMarkdown(record, acceptance);
     let file: string;
     try { file = await safePath(root, path, true); }
     catch (error) { throw storage('The durable Markdown record could not be placed in the project (the path is not contained): ' + (error as Error).message); }
-    try { await atomicWrite(file, rendered); }
-    catch (error) { throw storage('The durable Markdown record could not be written in the project: ' + (error as Error).message); }
+    try { beforeWrite?.();await atomicWrite(file, rendered, beforeWrite); }
+    catch (error) { if(error instanceof EvidenceRenderRefused)throw error;throw storage('The durable Markdown record could not be written in the project: ' + (error as Error).message); }
     return this.markdownState(root, record, acceptance);
   }
   /** Whether the Markdown file on disk still renders exactly the durable record. Read only. */
@@ -565,7 +673,7 @@ export class AcceptanceStore {
     try { file = await safePath(root, path); }
     catch { return Object.freeze({ path, state: 'missing' as const }); }
     try {
-      const text = await readFile(file, 'utf8');
+      const text = (await readBoundedFile(file, 2*1024*1024)).toString('utf8');
       return Object.freeze({ path, state: text === acceptanceMarkdown(record, acceptance) ? 'current' as const : 'stale' as const });
     } catch (error) {
       return Object.freeze({ path, state: (error as NodeJS.ErrnoException).code === 'ENOENT' ? 'missing' as const : 'unreadable' as const });
@@ -578,7 +686,10 @@ export class AcceptanceStore {
   private outboxFor(operation: OperationRecord): OutboxRecord {
     const rows = this.select('SELECT * FROM outboxes WHERE operation_id=? LIMIT 2', [operation.id]);
     if (rows.length !== 1) throw corrupt('Acceptance storage holds no unambiguous outbox row for one of its operations');
-    return decodeOutboxRow(rows[0]);
+    const outbox = decodeOutboxRow(rows[0]);
+    if (outbox.operationId !== operation.id || outbox.projectId !== operation.projectId || outbox.sessionId !== operation.sessionId || operation.state !== 'pending' || outbox.state !== 'pending' || operation.receiptPresent || outbox.receiptPresent || operation.inputDigest !== operationDigest(operation.kind, { input: operation.input, outbox: { kind: outbox.kind, payload: outbox.payload } }))
+      throw corrupt('Acceptance storage has inconsistent operation or outbox evidence');
+    return outbox;
   }
   /**
    * Read-only SELECTs over the reviewed control schema. The store exposes no enumeration API, so

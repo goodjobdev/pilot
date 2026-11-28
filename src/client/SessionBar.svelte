@@ -16,13 +16,16 @@
   * own words. The session list shows every named session with its agent, lifecycle, last activity and
   * linked work, and "New session" creates one with per-field validation.
   */
- let {projectId,sessionId,view=null,agentsVersion=0,onerror=()=>{},onsessionchange=()=>{}}:{projectId:string;sessionId:string;view?:AgentView|null;agentsVersion?:number;onerror?:(message:string)=>void;onsessionchange?:(sessionId:string)=>void}=$props();
+ let {projectId,sessionId,view=null,agentsVersion=0,compact=false,listOpen=false,onlistchange=()=>{},onerror=()=>{},onsessionchange=()=>{}}:{projectId:string;sessionId:string;view?:AgentView|null;agentsVersion?:number;compact?:boolean;listOpen?:boolean;onlistchange?:(open:boolean)=>void;onerror?:(message:string)=>void;onsessionchange?:(sessionId:string)=>void}=$props();
 
  let sessions=$state<SessionOverview[]>([]);
  let agents=$state<AgentRecord[]>([]);
+ let installedScopes=$state<string[]>([]);
  let selectedId=$state('');
  let binding=$state<SessionBindingView|null>(null);
- let listOpen=$state(false),creating=$state(false);
+ // The list is a layer of the route, so its open state belongs to the shell. This component asks
+ // for a change; the shell records it and passes the new value back.
+ let creating=$state(false);
  let newName=$state(''),nameError=$state('');
  let problem=$state(''),message=$state(''),busy=$state(false);
 
@@ -33,8 +36,8 @@
    if(authority.scopes===null)return'the owner\u2019s own dispatch (nothing narrowed)';
    if(authority.scopes.length===0)return'none — every tool is refused';
    const granted=authority.scopes;
-   const installed=granted.filter(s=>['ask_question','record_note','read_notes'].includes(s));
-   const uninstalled=granted.filter(s=>!['ask_question','record_note','read_notes'].includes(s));
+   const installed=granted.filter(scope=>installedScopes.includes(scope));
+   const uninstalled=granted.filter(scope=>!installedScopes.includes(scope));
    if(uninstalled.length===0)return granted.join(', ');
    const avail=installed.length>0?installed.join(', '):'(none)';
    const unavail=uninstalled.join(', ')+' [unavailable — no tool installed]';
@@ -46,7 +49,7 @@
   try{sessions=(await api.sessions(projectId)).sessions;}catch(error){problem=(error as Error).message;onerror(problem);}
  }
  async function loadAgents(){
-  try{agents=(await api.agentRegistry()).agents.filter(agent=>!agent.archived);}catch{agents=[];}
+  try{const registry=await api.agentRegistry();agents=registry.agents.filter(agent=>!agent.archived);installedScopes=registry.scopes.filter(entry=>entry.installed).map(entry=>entry.scope);}catch{agents=[];installedScopes=[];}
  }
  async function load(){await loadSessions();await loadAgents();}
  async function loadBinding(id:string){
@@ -57,8 +60,9 @@
  // Re-read the agents when the manager reports a change, so a just-created agent is selectable.
  $effect(()=>{void agentsVersion;void loadAgents();});
  $effect(()=>{const id=selectedId;if(id)void loadBinding(id);});
- // The live conversation is the session the transcript belongs to; make it the default selection.
- $effect(()=>{if(sessionId&&sessionId!==selectedId&&!binding){selectedId=sessionId;}});
+ // Follow the route's session: a person's choice, Back, Forward and a restored selection all
+ // arrive as this prop. The binding is re-read for the session now shown.
+ $effect(()=>{if(sessionId&&sessionId!==selectedId)selectedId=sessionId;});
 
  async function chooseAgent(value:string){
   if(busy)return;busy=true;problem='';message='';
@@ -75,15 +79,17 @@
   if(busy)return;busy=true;nameError='';problem='';message='';
   try{
    const created=await api.createSession({projectId,name:newName});
-   newName='';creating=false;selectedId=created.session.id;
+   newName='';creating=false;
+   selectedId=created.session.id;
    await load();await loadBinding(created.session.id);
+   onlistchange(false);onsessionchange(created.session.id);
    message='Created session '+created.session.name+'.';
   }catch(error){
    const text=(error as Error).message;
    nameError=/name/.test(text)?text:text;problem=/name/.test(text)?'':text;
   }finally{busy=false;}
  }
- function openSession(id:string){selectedId=id;listOpen=false;onsessionchange(id);}
+ function openSession(id:string){selectedId=id;onlistchange(false);onsessionchange(id);}
  function linksOf(session:SessionOverview):string{
   if(!session.links.length)return 'no linked work';
   return session.links.map(link=>link.kind==='task'?'task '+link.taskId?.slice(0,8):link.kind==='document'?(link.path??'document'):'workspace').join(', ');
@@ -91,12 +97,7 @@
  function lifecycleOf(session:SessionOverview):string{return session.lifecycle.recorded?(session.lifecycle.state??'unknown'):'no lifecycle record';}
 </script>
 <section class="session-bar" aria-label="Session">
- <div class="session-current">
-  <span class="eyebrow">SESSION</span>
-  <strong>{selected?.name??('conversation '+selectedId)}</strong>
-  <span class="pill" class:live={selectedId===sessionId}>{selectedId===sessionId?'live conversation':'not the live conversation'}</span>
-  <span class="session-life">{selected?lifecycleOf(selected):'no lifecycle record'}</span>
- </div>
+ {#snippet bindingControls()}
  <label class="agent-picker">Agent for this session
   <select aria-label="Agent for this session" value={binding?.authority.agentId??''} disabled={busy} onchange={e=>void chooseAgent(e.currentTarget.value)}>
    <option value="">No agent (unbound — no privileges)</option>
@@ -104,9 +105,17 @@
   </select>
  </label>
  <span class="session-scopes" role="status">Scopes in effect: {scopeText}{binding?.authority.emptyReason&&!binding.authority.scopes?.length?' — '+binding.authority.emptyReason:''}</span>
+ {/snippet}
+ <div class="session-current">
+  <strong>{selected?.name??'Project conversation'}</strong>
+ </div>
+ <details class="session-more">
+  <summary>Agent controls</summary>
+  {@render bindingControls()}
+ </details>
  <div class="session-actions">
-  <button class="compact-button" aria-label="Sessions" aria-expanded={listOpen} onclick={()=>{listOpen=!listOpen;creating=false;}}><Icon name="list" size={14}/><span>Sessions</span></button>
-  <button class="compact-button" aria-label="New session" onclick={()=>{creating=!creating;listOpen=false;nameError='';}}><Icon name="plus" size={14}/><span>New session</span></button>
+  <button class="compact-button" aria-label="Sessions" aria-expanded={listOpen} onclick={()=>{onlistchange(!listOpen);creating=false;}}><Icon name="list" size={14}/><span>Sessions</span></button>
+  <button class="compact-button" aria-label="New session" onclick={()=>{creating=!creating;onlistchange(false);nameError='';}}><Icon name="plus" size={14}/><span>New session</span></button>
  </div>
 </section>
 {#if message}<p class="session-message" role="status">{message}</p>{/if}
@@ -130,24 +139,29 @@
  {/each}
 </div>
 {/if}
-<SessionDetails {projectId} sessionId={selectedId} view={selectedId===sessionId?view:null} {binding} session={selected}/>
+<SessionDetails {projectId} sessionId={selectedId} view={selectedId===sessionId?view:null} {binding} {installedScopes} session={selected}/>
 <style>
  .session-bar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:8px 12px;border-bottom:1px solid var(--line);background:var(--bg)}
  .session-current{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
- .session-current .eyebrow{padding:0}
- .session-life{font:9px var(--mono);color:var(--muted)}
+ .session-current{min-width:0;flex:1 1 0;font-size:13px}
+ .session-current strong{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:100%}
  .agent-picker{min-width:200px;font-size:10px}
  .session-scopes{font-size:11px;color:var(--muted);flex:1 1 240px;min-width:0;overflow-wrap:anywhere}
+ .session-more{min-width:0;font-size:12px}
+ .session-more[open]{flex:1 1 100%;order:3}
+ .session-more summary{cursor:pointer;color:var(--muted);font:11px var(--mono)}
+ .session-more[open]{display:flex;flex-direction:column;gap:6px;width:100%}
+ .session-more .agent-picker{min-width:0}
  .session-actions{display:flex;gap:6px;margin-left:auto}
+ @media(max-width:650px){.session-actions :global(button){min-width:36px;min-height:36px}.session-actions :global(button span){display:none}.session-more summary{font-size:10px}}
  .session-message{color:var(--muted);font-size:11px;margin:4px 12px}
  .session-problem{margin:6px 12px}
  .session-create{display:flex;align-items:flex-end;gap:8px;flex-wrap:wrap;padding:8px 12px;border-bottom:1px solid var(--line)}
  .session-create label{min-width:220px}
- .session-list{border-bottom:1px solid var(--line);padding:8px 12px;display:flex;flex-direction:column;gap:6px;max-height:30dvh;overflow:auto}
+ .session-list{flex:0 0 auto;min-height:0;border-bottom:1px solid var(--line);padding:8px 12px;display:flex;flex-direction:column;gap:6px;max-height:30dvh;overflow-y:auto;overflow-x:hidden}
  .session-row{display:flex;flex-direction:column;gap:3px;width:100%;text-align:left;background:transparent;border:1px solid transparent;border-radius:4px;padding:7px 8px}
  .session-row.active{border-color:var(--accent);background:color-mix(in srgb,var(--accent) 8%,transparent)}
  .session-name{font-size:12px;font-weight:600;overflow-wrap:anywhere}
  .session-meta{font:10px var(--mono);color:var(--muted);overflow-wrap:anywhere}
- .pill.live{color:var(--accent);border-color:color-mix(in srgb,var(--accent) 40%,var(--line))}
  .field-error{display:block;color:var(--danger);line-height:1.5}
 </style>

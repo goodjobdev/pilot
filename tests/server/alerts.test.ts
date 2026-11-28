@@ -12,7 +12,7 @@ async function waitFor<T>(check: () => T | undefined | Promise<T | undefined>, t
   const until = Date.now() + timeoutMs;
   for (;;) {
     const value = await check();
-    if (value !== undefined) return value;
+    if (value !== undefined && value !== false) return value;
     if (Date.now() > until) throw Error('condition was not met in time');
     await sleep(50);
   }
@@ -98,6 +98,8 @@ test('an agent question, a finished run and a failure each alert once',async()=>
     assert.match(questionAlert.payload.body,/invoice export/);
     assert.match(questionAlert.payload.url,/project=/);
     assert.match(questionAlert.payload.url,/view=Agents/);
+    assert.match(questionAlert.payload.url,/session=/);
+    assert.match(questionAlert.payload.url,/attention=question%3A/);
 
     // A finished run alerts too.
     await waitFor(()=>app.sent.find(entry=>/finished/.test(entry.payload.title)));

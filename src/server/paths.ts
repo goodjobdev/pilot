@@ -7,7 +7,18 @@ export async function safePath(root:string,path:string,createParents=false):Prom
   for(let i=0;i<parts.length;i++) {
     at=join(at,parts[i]);
     try {const s=await lstat(at);if(s.isSymbolicLink())throw Error('Symlinks are not permitted in managed paths');if(i<parts.length-1&&!s.isDirectory())throw Error('Parent is not a directory');}
-    catch(e) {if((e as NodeJS.ErrnoException).code!=='ENOENT')throw e;if(i<parts.length-1&&createParents)await mkdir(at,{mode:0o700});}
+    catch(e) {
+      if((e as NodeJS.ErrnoException).code!=='ENOENT')throw e;
+      if(i<parts.length-1&&createParents) {
+        try { await mkdir(at,{mode:0o700}); }
+        catch(createError) {
+          if((createError as NodeJS.ErrnoException).code!=='EEXIST')throw createError;
+          const winner=await lstat(at);
+          if(winner.isSymbolicLink())throw Error('Symlinks are not permitted in managed paths');
+          if(!winner.isDirectory())throw Error('Parent is not a directory');
+        }
+      }
+    }
   }
   return at;
 }

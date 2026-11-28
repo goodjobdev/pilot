@@ -31,8 +31,8 @@ function syntheticPort() {
   };
   const port: SessionLifecyclePort = {
     authoriseDispatch: async () => { seen.authorisations += 1; },
-    resume: async ({ requestId }) => { seen.dispatched.push({ action: 'resume', requestId }); },
-    retry: async ({ requestId }) => { seen.dispatched.push({ action: 'retry', requestId }); },
+    resume: async ({ requestId }) => { seen.dispatched.push({ action: 'resume', requestId }); return { kind: 'dispatched' as const }; },
+    retry: async ({ requestId }) => { seen.dispatched.push({ action: 'retry', requestId }); return { kind: 'dispatched' as const }; },
     cancel: async () => { seen.cancel += 1; }
   };
   return { seen, port };
@@ -242,6 +242,63 @@ test('lifecycle: an uncertain interruption is refused with operator attention in
   } finally { await f.cleanup(); }
 });
 
+test('lifecycle: a resume that finds a terminal identity reports terminal and settles idle, not running', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pilot-lifecycle-terminal-'));
+  const store = new ControlStore(root);
+  const lifecycle = new SessionLifecycleStore(store, { clock: CLOCK });
+  let resumes = 0;
+  const port: SessionLifecyclePort = {
+    authoriseDispatch: async () => {},
+    resume: async () => { resumes += 1; return { kind: 'terminal' as const, reason: 'No additional work was started: the original request is already complete.' }; },
+    retry: async () => ({ kind: 'dispatched' as const }),
+    cancel: async () => {}
+  };
+  const service = new SessionLifecycleService(lifecycle, port, { clock: CLOCK });
+  try {
+    lifecycle.markRunning({ projectId: PROJECT, sessionId: SESSION, requestId: 'original-request' });
+    const paused = await service.run(PROJECT, SESSION, 'pause', { revision: 1 });
+    const resumed = await service.run(PROJECT, SESSION, 'resume', { revision: paused.record.revision });
+    assert.equal(resumes, 1, 'the port resolved the planned identity once');
+    assert.equal(resumed.outcome, 'terminal');
+    assert.equal(resumed.dispatched, false, 'a terminal identity claims no new work');
+    assert.equal(resumed.cancelled, false);
+    assert.equal(resumed.unchanged, false);
+    assert.equal(resumed.record.state, 'idle', 'the response carries the settled state, never a false running');
+    assert.equal(resumed.record.requestId, 'original-request', 'the terminal identity is not replaced by a fresh one');
+    assert.match(resumed.reason ?? '', /No additional work was started/);
+    assert.equal(lifecycle.read(PROJECT, SESSION).state, 'idle', 'the durable record matches the response');
+  } finally {
+    store.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('lifecycle: a terminal resume leaves genuinely running other work alone instead of writing a false idle', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'pilot-lifecycle-terminal-working-'));
+  const store = new ControlStore(root);
+  const lifecycle = new SessionLifecycleStore(store, { clock: CLOCK });
+  const port: SessionLifecyclePort = {
+    authoriseDispatch: async () => {},
+    resume: async () => ({ kind: 'terminal' as const, reason: 'No additional work was started by this resume: the original request is already terminal, and other work is running in this session.', stillWorking: true }),
+    retry: async () => ({ kind: 'dispatched' as const }),
+    cancel: async () => {}
+  };
+  const service = new SessionLifecycleService(lifecycle, port, { clock: CLOCK });
+  try {
+    lifecycle.markRunning({ projectId: PROJECT, sessionId: SESSION, requestId: 'original-request' });
+    const paused = await service.run(PROJECT, SESSION, 'pause', { revision: 1 });
+    const resumed = await service.run(PROJECT, SESSION, 'resume', { revision: paused.record.revision });
+    assert.equal(resumed.outcome, 'terminal');
+    assert.equal(resumed.dispatched, false, 'the resume itself started no new work');
+    assert.equal(resumed.record.state, 'running', 'other work keeps the record running; the service does not write a false idle');
+    assert.match(resumed.reason ?? '', /other work is running/);
+    assert.equal(lifecycle.read(PROJECT, SESSION).state, 'running');
+  } finally {
+    store.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test('lifecycle: startup adoption is deterministic and idempotent, and a settled session is not adopted', async () => {
   const f = await fixture();
   try {
@@ -338,8 +395,8 @@ test('lifecycle: two concurrent retries at one revision dispatch exactly once, r
   const both = new Promise<void>((resolve) => { release = resolve; });
   const port: SessionLifecyclePort = {
     authoriseDispatch: async () => { arrived += 1; if (arrived === 2) release(); await both; },
-    resume: async ({ requestId }) => { dispatched.push('resume:' + requestId); },
-    retry: async ({ requestId }) => { dispatched.push('retry:' + requestId); },
+    resume: async ({ requestId }) => { dispatched.push('resume:' + requestId); return { kind: 'dispatched' as const }; },
+    retry: async ({ requestId }) => { dispatched.push('retry:' + requestId); return { kind: 'dispatched' as const }; },
     cancel: async () => {}
   };
   const service = new SessionLifecycleService(lifecycle, port, { clock: CLOCK });
@@ -371,8 +428,8 @@ test('lifecycle: a refused dispatch closes the authorised attempt as failed, nev
   let attempts = 0;
   const port: SessionLifecyclePort = {
     authoriseDispatch: async () => {},
-    resume: async () => {},
-    retry: async () => { attempts += 1; if (attempts === 1) throw new Error('The harness refused the dispatch at /private/tmp/agent-session.sqlite'); },
+    resume: async () => ({ kind: 'dispatched' as const }),
+    retry: async () => { attempts += 1; if (attempts === 1) throw new Error('The harness refused the dispatch at /private/tmp/agent-session.sqlite'); return { kind: 'dispatched' as const }; },
     cancel: async () => {}
   };
   const service = new SessionLifecycleService(lifecycle, port, { clock: CLOCK });
@@ -417,4 +474,46 @@ test('lifecycle: a paused session is resumable, and the harness\'s own settled h
     assert.equal(resumed.record.requestId, 'live-generation', 'resume continued under the original request identity');
     assert.equal(resumed.record.attempt, paused.record.attempt, 'resume continues the same attempt');
   } finally { await f.cleanup(); }
+});
+
+test('lifecycle: a terminal settle conflict returns the concurrent pause or settle without a 500 or overwrite', async () => {
+  for (const concurrent of ['paused', 'idle'] as const) {
+    const root = await mkdtemp(join(tmpdir(), 'pilot-lifecycle-terminal-race-'));
+    const store = new ControlStore(root);
+    const lifecycle = new SessionLifecycleStore(store, { clock: CLOCK });
+    const port: SessionLifecyclePort = {
+      authoriseDispatch: async () => {},
+      resume: async () => ({ kind: 'terminal' as const, reason: 'No additional work was started: the original request is already complete.' }),
+      retry: async () => ({ kind: 'dispatched' as const }),
+      cancel: async () => {}
+    };
+    const service = new SessionLifecycleService(lifecycle, port, { clock: CLOCK });
+    try {
+      lifecycle.markRunning({ projectId: PROJECT, sessionId: SESSION, requestId: 'original-request' });
+      const paused = await service.run(PROJECT, SESSION, 'pause', { revision: 1 });
+      const originalWrite = lifecycle.write.bind(lifecycle);
+      let injected = false;
+      lifecycle.write = (record: SessionLifecycleRecord) => {
+        if (!injected && record.state === 'idle') {
+          injected = true;
+          // A concurrent owner pause, or the harness's own settle, wins the same revision first.
+          originalWrite(concurrent === 'paused'
+            ? { ...record, state: 'paused', reason: 'concurrent owner pause' }
+            : { ...record, state: 'idle', reason: null });
+        }
+        return originalWrite(record);
+      };
+      const resumed = await service.run(PROJECT, SESSION, 'resume', { revision: paused.record.revision });
+      assert.equal(injected, true, 'the competing writer ran at the terminal settle revision');
+      assert.equal(resumed.outcome, 'terminal');
+      assert.equal(resumed.dispatched, false);
+      assert.equal(resumed.record.state, concurrent, 'the concurrent writer owns the state; it is returned unchanged');
+      assert.equal(resumed.record.revision, paused.record.revision + 2);
+      assert.match(resumed.reason ?? '', /concurrent lifecycle action/);
+      assert.equal(lifecycle.read(PROJECT, SESSION).state, concurrent, 'the durable record matches the returned record');
+    } finally {
+      store.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  }
 });

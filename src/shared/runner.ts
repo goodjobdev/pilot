@@ -172,7 +172,7 @@ export type RunnerCommand = {
   readonly argv: readonly string[];
 };
 
-/** The closed outcome set. 'timed-out' is a known outcome: this build stopped the run at its wall clock. */
+/** The closed outcome set. 'timed-out' requires a port-confirmed stop; an unconfirmed stop remains uncertain. */
 export const RUNNER_OUTCOMES = ['succeeded', 'failed', 'timed-out'] as const;
 export type RunnerOutcome = (typeof RUNNER_OUTCOMES)[number];
 
@@ -828,7 +828,7 @@ export type RunnerSettleVerdict =
 /**
  * The settle verdict for one job, decided from the durable record alone:
  *
- * - a run that recorded a result is settled on it;
+ * - a running job with a result is corrupt and refused; a valid running job has no result;
  * - a run that recorded nothing becomes 'job-interrupted': whether it executed cannot be established,
  *   and it is never re-run to find out;
  * - a claimed job becomes 'job-not-run': the record proves nothing executed, because a run writes
@@ -846,9 +846,10 @@ export function runnerSettleVerdict(job: RunnerJobRecord): RunnerSettleVerdict {
       reason: 'Job ' + job.id + ' is pending and has not been claimed, so there is nothing to settle; claim it first, or leave it pending for a dispatcher'
     });
   if (job.state === 'claimed') return Object.freeze({ kind: 'attention' as const, reason: 'job-not-run' as const });
-  return job.result === null
-    ? Object.freeze({ kind: 'attention' as const, reason: 'job-interrupted' as const })
-    : Object.freeze({ kind: 'settle' as const });
+  // Strict storage validation already rejects this combination. Also refuse direct callers rather
+  // than treating a purported result on a running job as proof of remote termination.
+  if (job.result !== null) throw new RunnerError('A running job cannot carry a result; its outcome requires investigation', 'CORRUPT');
+  return Object.freeze({ kind: 'attention' as const, reason: 'job-interrupted' as const });
 }
 
 /** What the owner reads for one project: the jobs, the allowlist and the bounds this build enforces. */
