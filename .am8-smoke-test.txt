@@ -1,0 +1,5 @@
+AM8 smoke test. Safe to delete.
+
+Purpose: verify that commits carry the human account as author (contribution
+credit) and the AM8 machine account as committer, and that a pull request
+opened by AM8 cannot be approved by AM8 but can be approved by the human.
